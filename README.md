@@ -101,19 +101,30 @@ User guide (upstream docs tree, still accurate for features):
 
 [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
 
+## Contributing
+
+External contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for setup, commit style, and PR expectations. Security reports: [`SECURITY.md`](SECURITY.md).
+
 ## Relationship to upstream
 
 This repository is a fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build).
 We intend to pull upstream fixes periodically while keeping the privacy
-hard-offs. Grok / Grok Build / xAI / SpaceXAI are trademarks of their
-respective owners; this project is not affiliated with or endorsed by xAI.
+hard-offs.
+
+**Credit:** original Grok Build is developed and published by SpaceXAI under
+Apache-2.0. Gork Build is an independent community distribution and is **not**
+affiliated with, endorsed by, or sponsored by SpaceXAI or xAI. Grok, Grok Build,
+xAI, and SpaceXAI are trademarks of their respective owners.
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE).
+Apache License 2.0 — see [`LICENSE`](LICENSE) and attribution in [`NOTICE`](NOTICE).
+
+Upstream copyright (SpaceXAI) is retained as required by Apache-2.0. Community
+modifications are copyright the Gork Build contributors.
 
 ## Security
 
 Please do **not** open public issues for security reports that include secrets.
-For this fork: open a private security advisory on GitHub, or contact the
-maintainer. Upstream policy: https://hackerone.com/x
+See [`SECURITY.md`](SECURITY.md).

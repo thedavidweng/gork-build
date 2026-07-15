@@ -3,7 +3,7 @@ name = "xai-grok-pager-bin"
 version = "0.1.220-alpha.4"
 edition.workspace = true
 license = "Apache-2.0"
-authors = ["xAI"]
+authors = ["Gork Build contributors"]
 default-run = "gork"
 
 # Composition-root binary for the Gork Build TUI (privacy fork of Grok Build).

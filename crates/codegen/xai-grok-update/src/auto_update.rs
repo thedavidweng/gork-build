@@ -38,7 +38,7 @@ fn manual_install_cmd() -> &'static str {
 /// Build a reinstall hint for a known installer type.
 fn reinstall_hint(installer: &str) -> String {
     match installer {
-        "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
+        "npm" => "Please reinstall via npm:\n  npm i -g @gork-build/gork".to_string(),
         "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
         _ => format!("Please reinstall via:\n  {}", manual_install_cmd()),
     }
@@ -2061,7 +2061,7 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>) 
     warn_if_other_grok_processes_running();
 
     let version_arg = match target {
-        Some(ver) => format!("@xai-official/grok@{ver}"),
+        Some(ver) => format!("@gork-build/gork@{ver}"),
         None => {
             // All current callers resolve the version via get_latest_version
             // (which applies max(stable, alpha) for the alpha channel) before
@@ -2072,7 +2072,7 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>) 
                 "install_npm called without a resolved version, falling back to dist-tag"
             );
             format!(
-                "@xai-official/grok@{}",
+                "@gork-build/gork@{}",
                 if channel == "alpha" {
                     "alpha"
                 } else {
@@ -3203,7 +3203,7 @@ mod tests {
         let hint = reinstall_hint("npm");
         assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
         assert!(
-            hint.contains("@xai-official/grok"),
+            hint.contains("@gork-build/gork"),
             "should name the package: {hint}"
         );
     }
