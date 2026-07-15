@@ -132,14 +132,14 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
 
 const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[
     EnumChoice {
-        canonical: "opt-in",
-        display: "Opt in",
-        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
+        canonical: "opt-out",
+        display: "Opt out (default)",
+        description: "Gork Build default. Do not retain coding session data or use it for training. Research uploads are hard-disabled in this build.",
     },
     EnumChoice {
-        canonical: "opt-out",
-        display: "Opt out",
-        description: "Do not retain coding session data. Code requests will not be used for training.",
+        canonical: "opt-in",
+        display: "Opt in",
+        description: "Ask the API account to allow retention for product improvement. Gork Build still blocks client-side research uploads.",
     },
 ];
 
@@ -1046,15 +1046,14 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: false,
         },
         // SHELL-owned. Persisted in auth metadata (not config.toml).
-        // Reads from `PagerLocalSnapshot.coding_data_sharing_opt_out`.
-        // Default "opt-in" matches `AuthEntry::coding_data_retention_opt_out = false`.
+        // Gork Build default: opt-out (privacy by default).
         // ZDR / non-admin guards are enforced at dispatch time.
         SettingMeta {
             key: "coding_data_sharing",
             category: SettingCategory::Privacy,
             owner: SettingOwner::Shell,
             label: "Coding data sharing",
-            description: "Controls whether SpaceXAI may retain and train on coding session data.",
+            description: "Server-side retention preference. Gork Build never performs research/trace uploads regardless.",
             keywords: &[
                 "privacy",
                 "data",
@@ -1067,7 +1066,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "opt-out",
             ],
             kind: SettingKind::Enum {
-                default: "opt-in",
+                default: "opt-out",
                 choices: CODING_DATA_SHARING_CHOICES,
                 supports_preview: false,
             },
@@ -1221,12 +1220,12 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Advanced,
             owner: SettingOwner::Shell,
             label: "Auto-update",
-            description: "Automatically download and install pager updates on startup. \
-                          Restart required.",
+            description: "Automatically download and install updates on startup \
+                          (uses upstream x.ai channels if enabled). Gork Build default: off.",
             keywords: &[
                 "auto", "update", "updates", "upgrade", "version", "install", "channel",
             ],
-            kind: SettingKind::Bool { default: true },
+            kind: SettingKind::Bool { default: false },
             restart_required: true,
             hidden_in_minimal: false,
         },

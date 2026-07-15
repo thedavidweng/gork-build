@@ -478,24 +478,13 @@ pub async fn run_update_if_available(
 
     let current_config = config::load_config().await;
 
-    // Skip update check if auto-update is explicitly disabled.
-    if current_config.cli.auto_update == Some(false) {
+    // Gork Build: auto-update from x.ai install channels is OFF by default.
+    // Users who want it must set `[cli] auto_update = true` explicitly.
+    if current_config.cli.auto_update != Some(true) {
         return Ok(false);
     }
 
-    // Resolve effective auto_update: None defaults to true (first-run).
-    let auto_update = current_config.cli.auto_update.unwrap_or(true);
-
-    if current_config.cli.auto_update.is_none()
-        && let Err(e) = config::update_config(|st| {
-            if st.cli.auto_update.is_none() {
-                st.cli.auto_update = Some(true);
-            }
-        })
-        .await
-    {
-        tracing::warn!("Failed to save auto-update setting: {}", e);
-    }
+    let auto_update = true;
 
     let current_version = get_installed_grok_version();
     // installer is guaranteed Some by the guard at the top of this function.

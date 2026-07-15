@@ -257,7 +257,8 @@ pub struct PagerLocalSnapshot {
     pub plan_mode_active: bool,
     /// `[cli].show_tips` mirror. `None` = no TOML override → default `true`.
     pub show_tips: Option<bool>,
-    /// `[cli].auto_update` mirror. `None` = no TOML override → default `true`.
+    /// `[cli].auto_update` mirror. `None` = no TOML override → default `false`
+    /// in Gork Build (no silent x.ai channel updates).
     pub auto_update: Option<bool>,
     /// Process-wide vim-mode scrollback flag. Mirrors
     /// `appearance::cache::load_vim_mode()` at snapshot time.
@@ -289,7 +290,8 @@ impl Default for PagerLocalSnapshot {
             auto_mode: false,
             current_model_name: None,
             available_models: Vec::new(),
-            coding_data_sharing_opt_out: false,
+            // Gork Build: privacy by default.
+            coding_data_sharing_opt_out: true,
             plan_mode_active: false,
             show_tips: None,
             auto_update: None,
@@ -638,7 +640,7 @@ pub fn current_value_for(
         )),
         // CLI batch: snapshot mirrors; `None` → effective default `true`.
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
-        "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
+        "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(false))),
         // fork_secondary_model: baseline value folds to empty string.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
@@ -831,15 +833,12 @@ mod tests {
                         "max_thoughts_width default drifts from UiConfig::default()",
                     );
                 }
-                // coding_data_sharing: no UiConfig field; default pinned
-                // against auth metadata (opt_out=false → "opt-in").
+                // coding_data_sharing: Gork Build privacy default is opt-out.
                 ("coding_data_sharing", SettingKind::Enum { default, .. }) => {
-                    let expected = "opt-in";
+                    let expected = "opt-out";
                     assert_eq!(
                         *default, expected,
-                        "coding_data_sharing registry default must be 'opt-in' — \
-                         the on-disk source of truth is `AuthEntry::coding_data_retention_opt_out: \
-                         bool` (defaults to `false`, i.e. user has NOT opted out)",
+                        "coding_data_sharing registry default must be 'opt-out' in Gork Build",
                     );
                 }
                 // CLI batch: fields live on CliConfig, not UiConfig.
@@ -849,9 +848,9 @@ mod tests {
                 }
                 ("auto_update", SettingKind::Bool { default }) => {
                     assert!(
-                        *default,
-                        "auto_update registry default must be true \
-                         (matches auto_update.rs's `.unwrap_or(true)`)"
+                        !*default,
+                        "auto_update registry default must be false in Gork Build \
+                         (no silent x.ai channel updates)"
                     );
                 }
                 // vim_mode: Option<bool>; None → false.

@@ -67,11 +67,12 @@ fn show_privacy_info_zdr() {
     let effects = dispatch(Action::ShowPrivacyInfo, &mut app);
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
-    assert!(text.contains("Zero Data Retention"));
+    assert!(text.contains("Gork Build"));
+    assert!(text.contains("Zero Data Retention") || text.contains("Enterprise Zero Data Retention"));
+    assert!(text.contains("research uploads: disabled") || text.contains("Client research uploads"));
 }
 
-/// `/privacy` info-print uses the desktop-aligned "privacy mode" /
-/// "share data" labels from the user's intentional rewrite.
+/// Gork Build `/privacy` always advertises the hard client privacy posture.
 #[test]
 fn show_privacy_info_opted_out() {
     let mut app = test_app_with_agent();
@@ -80,10 +81,9 @@ fn show_privacy_info_opted_out() {
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
     assert!(
-        text.contains("Privacy: privacy mode"),
-        "info-print must use 'Privacy: privacy mode' (desktop-aligned label): {text}",
+        text.contains("Gork Build") && text.contains("privacy mode"),
+        "info-print must mention Gork Build privacy mode: {text}",
     );
-    assert!(text.contains("/privacy opt-in"));
 }
 
 #[test]
@@ -94,10 +94,10 @@ fn show_privacy_info_opted_in() {
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
     assert!(
-        text.contains("Privacy: share data"),
-        "info-print must use 'Privacy: share data' (desktop-aligned label): {text}",
+        text.contains("Gork Build") && text.contains("share data"),
+        "info-print must mention Gork Build share-data account state: {text}",
     );
-    assert!(text.contains("/privacy opt-out"));
+    assert!(text.contains("/privacy opt-out") || text.contains("opt-out"));
 }
 
 /// The info-print uses desktop-aligned labels ("privacy mode" /

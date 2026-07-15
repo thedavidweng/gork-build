@@ -127,23 +127,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
 }
 impl Default for TelemetryConfig {
     fn default() -> Self {
-        let (baked_url, baked_key, baked_token, baked_enabled) = internal_defaults();
-        let build_url = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
-        let build_key = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
-        let build_token = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
-        let mixpanel_enabled = baked_enabled || build_token.is_some();
-        let (events_url, events_api_key, mixpanel_token) = (
-            build_url.or(baked_url),
-            build_key.or(baked_key),
-            build_token.or(baked_token),
-        );
+        // Gork Build: no baked or build-time product-telemetry endpoints.
+        // External OTEL (customer collector) remains opt-in via config/env.
+        let _ = internal_defaults();
+        let _ = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
+        let _ = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
+        let _ = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
         Self {
-            enabled: None,
-            events_url,
-            events_api_key,
-            mixpanel_token,
-            mixpanel_enabled,
-            trace_upload: None,
+            enabled: Some(false),
+            events_url: None,
+            events_api_key: None,
+            mixpanel_token: None,
+            mixpanel_enabled: false,
+            trace_upload: Some(false),
             otel_enabled: None,
             otel_metrics_exporter: None,
             otel_logs_exporter: None,
@@ -224,14 +220,14 @@ mod tests {
         assert_eq!(build_env_default(Some(" key ")), Some("key".to_owned()));
     }
     #[test]
-    fn default_is_build_env_layer_when_feature_off() {
+    fn default_is_privacy_hard_off() {
+        // Gork Build: product telemetry endpoints are never baked in.
         let cfg = TelemetryConfig::default();
-        let url = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
-        let key = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
-        let token = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
-        assert_eq!(cfg.mixpanel_enabled, token.is_some());
-        assert_eq!(cfg.events_url, url);
-        assert_eq!(cfg.events_api_key, key);
-        assert_eq!(cfg.mixpanel_token, token);
+        assert!(!cfg.mixpanel_enabled);
+        assert_eq!(cfg.events_url, None);
+        assert_eq!(cfg.events_api_key, None);
+        assert_eq!(cfg.mixpanel_token, None);
+        assert_eq!(cfg.trace_upload, Some(false));
+        assert_eq!(cfg.enabled, Some(false));
     }
 }

@@ -74,26 +74,27 @@ pub(super) fn dispatch_show_session_info(app: &mut AppView) -> Vec<Effect> {
 pub(super) fn dispatch_show_privacy_info(app: &mut AppView) -> Vec<Effect> {
     let mut lines = Vec::new();
 
+    // Gork Build always ships as a privacy build (no research telemetry / GCS
+    // traces). Server-side retention flags are still shown for honesty.
+    lines.push("  Product: Gork Build (privacy fork of Grok Build)");
+    lines.push("  Client research uploads: disabled (hard-off in this build)");
+    lines.push("  Product analytics (Mixpanel / events): disabled");
+    lines.push("  Model inference: required for the agent (files the agent reads are sent to the model API)");
+    lines.push("");
+
     if app.is_zdr {
-        // Enterprise ZDR -- the team has disabled retention entirely.
-        lines.push("  Zero Data Retention: enabled");
-        lines.push("  Your data is not retained or used for training (ZDR enabled).");
+        lines.push("  Account: Enterprise Zero Data Retention");
+        lines.push("  Server retention / training: blocked for your team.");
     } else if app.coding_data_retention_opt_out {
-        // Coding data sharing opted out -- matches desktop's "Privacy mode" state.
-        lines.push("  Privacy: privacy mode");
-        lines.push("  Your code data will not be trained on or used to improve the product.");
-        lines.push("");
-        lines.push("  Use /privacy opt-in to share data and help improve the product.");
+        lines.push("  Account: privacy mode (coding data retention opted out)");
+        lines.push("  Prefer: keep this on. Use /privacy opt-in only if you want server-side sharing.");
     } else {
-        // Coding data sharing opted in -- matches desktop's "Share data" state.
-        lines.push("  Privacy: share data");
-        lines.push("  Usage and code data may be used by SpaceXAI to improve the product.");
-        lines.push("");
-        lines.push("  Use /privacy opt-out to enable privacy mode.");
+        lines.push("  Account: share data (coding data retention opted in)");
+        lines.push("  Gork Build still blocks client research uploads; prefer /privacy opt-out.");
     }
 
     lines.push("");
-    lines.push("  Learn more: https://x.ai/legal");
+    lines.push("  Docs: https://github.com/thedavidweng/gork-build");
     let text = lines.join("\n");
     push_system_to_any_agent(app, &text);
     vec![]

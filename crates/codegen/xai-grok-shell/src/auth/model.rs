@@ -162,7 +162,13 @@ impl GrokAuth {
     /// retention. Use this for trace-upload and research-data gates.
     /// Product analytics (`telemetry_enabled`) and user-facing sync
     /// features should use `is_zdr_team()` directly.
+    ///
+    /// Gork Build ([`xai_grok_version::PRIVACY_BUILD`]) always returns `true`:
+    /// research data never leaves the machine regardless of account flags.
     pub fn is_data_collection_disabled(&self) -> bool {
+        if xai_grok_version::research_data_collection_forbidden() {
+            return true;
+        }
         self.is_zdr_team() || self.coding_data_retention_opt_out
     }
 
@@ -205,7 +211,8 @@ impl Default for GrokAuth {
             organization_role: None,
             user_blocked_reason: None,
             team_blocked_reasons: vec![],
-            coding_data_retention_opt_out: false,
+            // Gork Build: privacy by default.
+            coding_data_retention_opt_out: xai_grok_version::PRIVACY_BUILD,
             has_grok_code_access: None,
             refresh_token: None,
             expires_at: None,
