@@ -45,7 +45,7 @@ Comparison at a glance:
 | Mixpanel / product events | On by default in releases | **Hard-off** |
 | GCS research / session traces | Upload pipeline present | **Hard-off** |
 | Whole-repo research packaging | Present upstream | **Disabled** |
-| Auto-update channel | x.ai installers | **None** (rebuild from this repo) |
+| Auto-update | Yes | **No** |
 | Coding-data retention default | Share / opt-in | **Privacy / opt-out** |
 
 ---
