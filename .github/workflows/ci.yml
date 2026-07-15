@@ -1,0 +1,103 @@
+# Gork Build CI — compile the `gork` binary and run privacy-focused tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Fast path: unit tests that pin Gork Build privacy hard-offs.
+  test-privacy:
+    name: Privacy tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: privacy-tests
+          cache-targets: "true"
+
+      - name: Test privacy-critical crates
+        run: |
+          cargo test -p xai-grok-version --lib
+          cargo test -p xai-mixpanel --lib
+          cargo test -p xai-grok-telemetry --lib default_is_privacy
+          cargo test -p xai-grok-shell --lib data_collection -- --nocapture
+          cargo test -p xai-grok-shell --lib manager_collection -- --nocapture
+          cargo test -p xai-grok-update --lib test_reinstall_hint -- --nocapture
+
+  # Build the community CLI binary.
+  build-gork:
+    name: Build gork
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-gork
+          cache-targets: "true"
+
+      - name: Build gork (release)
+        run: cargo build -p xai-grok-pager-bin --release
+
+      - name: Smoke gork CLI
+        run: |
+          set -euo pipefail
+          BIN=target/release/gork
+          test -x "$BIN"
+          "$BIN" --version
+          HELP=$("$BIN" --help)
+          echo "$HELP" | head -20
+          echo "$HELP" | grep -q 'Gork Build TUI'
+          echo "$HELP" | grep -q 'Usage: gork'
+          # argv0 mapping: binary named gork must not be forced back to grok
+          echo "smoke ok"
+
+      - name: Upload gork binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gork-linux-x86_64
+          path: target/release/gork
+          if-no-files-found: error
+          retention-days: 14
