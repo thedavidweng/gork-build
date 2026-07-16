@@ -109,6 +109,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
         return Ok(());
     }
 
+    // Probe / network failures only — not privacy policy hard-off.
     if let Some(error) = status.error.as_deref() {
         println!(
             "Gork Build - v{} [{}]",
@@ -119,6 +120,21 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
     }
 
     let channel_label = format!(" [{}]", status.channel);
+
+    // Expected policy state for Gork Build: no vendor update path, not a failure.
+    if vendor_auto_update_forbidden()
+        && !status.update_available
+        && status.latest_version.is_none()
+        && status.auto_update == Some(false)
+    {
+        println!(
+            "Gork Build - v{}{}",
+            status.current_version, channel_label
+        );
+        println!("Auto-update: disabled (privacy build never installs from vendor channels).");
+        println!("{}", vendor_update_blocked_message());
+        return Ok(());
+    }
 
     if status.update_available {
         if let Some(latest_version) = status.latest_version.as_deref() {
@@ -152,6 +168,9 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     let channel = update_config.channel.clone();
 
     // Privacy build: do not probe vendor update endpoints at all.
+    // Leave `error` as None — this is expected policy, not a failed check.
+    // `auto_update: Some(false)` + no latest is the machine-readable signal;
+    // human text comes from print_update_status.
     if vendor_auto_update_forbidden() {
         return UpdateStatus {
             current_version,
@@ -160,7 +179,7 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
             installer,
             channel,
             auto_update: Some(false),
-            error: Some(vendor_update_blocked_message()),
+            error: None,
         };
     }
 
@@ -3501,11 +3520,31 @@ mod tests {
         );
         assert_eq!(status.latest_version, None);
         assert_eq!(status.auto_update, Some(false));
-        let err = status.error.expect("must explain why update is blocked");
-        assert!(
-            err.contains("never installs from vendor") || err.contains("x.ai"),
-            "unexpected status error: {err}"
+        // Policy hard-off is not a probe failure — leave error empty so
+        // print_update_status does not render "Update check failed: ...".
+        assert_eq!(
+            status.error, None,
+            "privacy hard-off must not use the error slot (healthy build)"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn print_update_status_privacy_is_informational_not_failure() {
+        clear_installer_test_escape_env();
+        assert!(vendor_auto_update_forbidden());
+        let status = UpdateStatus {
+            current_version: "0.1.0".into(),
+            latest_version: None,
+            update_available: false,
+            installer: None,
+            channel: "stable".into(),
+            auto_update: Some(false),
+            error: None,
+        };
+        // Must succeed without panicking; human output is informational.
+        print_update_status(&status, false).expect("print must succeed");
+        print_update_status(&status, true).expect("json print must succeed");
     }
 
     #[tokio::test]
