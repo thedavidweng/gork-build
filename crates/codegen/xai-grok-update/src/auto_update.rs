@@ -44,8 +44,12 @@ fn reinstall_hint(installer: &str) -> String {
     }
 }
 
-/// Env var that integration tests set to exercise installer mechanics against
-/// local mocks. Must never be set in production user environments.
+/// Env var that **debug-profile integration tests** may set to `"1"` so local
+/// mock installer suites can exercise download/swap mechanics.
+///
+/// **Release product binaries ignore this entirely** (`cfg(debug_assertions)`
+/// only). Even in debug, only the exact value `"1"` relaxes the gate — empty
+/// or other values do not.
 const TEST_ALLOW_UPDATE_ENV: &str = "GORK_TEST_ALLOW_UPDATE";
 
 /// Gork Build never auto-updates from vendor (x.ai) channels. Enabling that
@@ -55,13 +59,19 @@ const TEST_ALLOW_UPDATE_ENV: &str = "GORK_TEST_ALLOW_UPDATE";
 /// Callers must check it, and [`run_install_script`] enforces it as the
 /// last line of defense.
 ///
-/// When [`TEST_ALLOW_UPDATE_ENV`] is set, the gate is relaxed so crate
-/// integration tests can drive installer code against local fake servers.
-/// Production binaries never set that variable.
+/// Debug-only test hook: when built with `debug_assertions` and
+/// `GORK_TEST_ALLOW_UPDATE=1`, the gate is relaxed for crate integration
+/// tests against local fake servers. **Release builds never honor the env
+/// var** — privacy hard-off cannot be re-enabled at runtime in product
+/// binaries.
 #[inline]
 pub fn vendor_auto_update_forbidden() -> bool {
-    if std::env::var_os(TEST_ALLOW_UPDATE_ENV).is_some() {
-        return false;
+    // Release product paths: always honor privacy. No env re-enable.
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var(TEST_ALLOW_UPDATE_ENV).as_deref() == Ok("1") {
+            return false;
+        }
     }
     xai_grok_version::PRIVACY_BUILD || xai_grok_version::research_data_collection_forbidden()
 }
@@ -3380,6 +3390,46 @@ mod tests {
         assert!(
             !msg.contains("curl -fsSL https://x.ai/cli"),
             "must not recommend vendor installers: {msg}"
+        );
+        privacy_gate_restore(allow);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_escape_hatch_requires_exact_one_and_debug_assertions() {
+        let (allow,) = privacy_gate_guard();
+        // Empty / arbitrary values must NOT open the gate.
+        // SAFETY: serial
+        unsafe {
+            std::env::set_var(TEST_ALLOW_UPDATE_ENV, "");
+        }
+        assert!(
+            vendor_auto_update_forbidden(),
+            "empty env must not disable privacy gate"
+        );
+        unsafe {
+            std::env::set_var(TEST_ALLOW_UPDATE_ENV, "yes");
+        }
+        assert!(
+            vendor_auto_update_forbidden(),
+            "non-1 env must not disable privacy gate"
+        );
+        unsafe {
+            std::env::set_var(TEST_ALLOW_UPDATE_ENV, "1");
+        }
+        // cargo test is a debug_assertions build: exact "1" relaxes the gate
+        // so integration suites can exercise install mechanics.
+        #[cfg(debug_assertions)]
+        assert!(
+            !vendor_auto_update_forbidden(),
+            "debug + GORK_TEST_ALLOW_UPDATE=1 should relax gate for installer tests"
+        );
+        // Document release semantics: without debug_assertions the env is ignored.
+        // (This branch is not taken under `cargo test`, but keeps the contract explicit.)
+        #[cfg(not(debug_assertions))]
+        assert!(
+            vendor_auto_update_forbidden(),
+            "release builds must ignore GORK_TEST_ALLOW_UPDATE"
         );
         privacy_gate_restore(allow);
     }

@@ -120,7 +120,8 @@ jobs:
         run: |
           # Crates that compile cleanly as lib tests in the open-source
           # snapshot. Full xai-grok-shell --lib currently fails upstream
-          # (missing test helpers / partial monorepo cut).
+          # (missing test helpers / partial monorepo cut) — so we filter to
+          # privacy resolver tests that do compile when the crate builds.
           cargo test -p xai-grok-version --lib
           cargo test -p xai-mixpanel --lib
           cargo test -p xai-grok-telemetry --lib default_is_privacy
@@ -129,6 +130,12 @@ jobs:
           cargo test -p xai-grok-update --lib privacy -- --nocapture
           cargo test -p xai-grok-update --lib reinstall_hint -- --nocapture
           cargo test -p xai-grok-update --lib refuses_minimum -- --nocapture
+          cargo test -p xai-grok-update --lib test_escape_hatch -- --nocapture
+          # Telemetry / trace resolvers: env/config/remote cannot re-enable.
+          # Integration test (not --lib): full shell unit tests fail upstream
+          # (missing WorkspaceOps::for_test helpers); this binary drives the
+          # shipped Config resolvers without those helpers.
+          cargo test -p xai-grok-shell --test privacy_resolvers -- --nocapture
 
       - name: Static install chokepoint inventory
         run: |

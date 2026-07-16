@@ -11,7 +11,13 @@ Background (why the hard-offs exist):
 
 These are compile-time / resolver-level hard-offs. Remote settings, env vars,
 and config files **cannot** re-enable them while
-`xai_grok_version::PRIVACY_BUILD == true`.
+`xai_grok_version::PRIVACY_BUILD == true` (including product telemetry
+env vars such as `GROK_TELEMETRY_*` and vendor update settings).
+
+**Residual (debug/test only):** debug-profile builds of the updater crate
+may honor `GORK_TEST_ALLOW_UPDATE=1` so integration tests can exercise
+local mock installers. **Release product binaries ignore that variable
+entirely** (`cfg(debug_assertions)` gate). Never set it outside tests.
 
 1. **Research / trace uploads** — `resolve_trace_upload()` always returns
    `false`. `get_trace_context` never builds an upload method for GCS session
@@ -30,6 +36,8 @@ and config files **cannot** re-enable them while
    update and minimum-version enforcement also **fail closed** under the
    privacy build — they refuse vendor install rather than overwrite the binary.
    Update by rebuilding from this repository or community releases.
+   Release builds cannot re-enable vendor install via env (see residual note
+   above for the debug-only test hook).
 6. **Sentry** — no compile-time DSN; only an explicit runtime `SENTRY_DSN`
    can enable crash reporting.
 
