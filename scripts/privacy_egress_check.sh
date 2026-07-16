@@ -23,6 +23,7 @@ PROXY_PORT="${PRIVACY_EGRESS_PORT:-18080}"
 LISTEN="127.0.0.1:${PROXY_PORT}"
 echo "$WORKDIR" >"$WORKDIR/workdir.path"
 
+# Destinations that must never appear during a privacy-hard-off smoke session.
 DENY_REGEX='(mixpanel\.com|api\.mixpanel\.com|x\.ai|storage\.googleapis\.com|sentry\.io|ingest\.sentry\.io)'
 
 python3 "$ROOT/scripts/privacy_egress_proxy.py" --listen "$LISTEN" --log "$LOG" &
@@ -33,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Readiness: must confirm proxy accepts connections ---
+# --- Readiness: proxy process alive AND accepts TCP ---
 READY=0
 for _ in $(seq 1 50); do
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -52,25 +53,32 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 echo "proxy ready on ${LISTEN} (pid=$PROXY_PID)"
 
-# --- Positive control: prove the proxy records destinations ---
-CONTROL_PORT=$((PROXY_PORT + 1))
-python3 - <<PY &
-import http.server, socketserver
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
-    def log_message(self, *a): pass
-with socketserver.TCPServer(("127.0.0.1", ${CONTROL_PORT}), H) as httpd:
-    httpd.handle_request()
+# --- Positive control: CONNECT a sentinel host so the log must gain a line ---
+# (CONNECT is logged before the upstream connect attempt; failure is OK.)
+python3 - <<PY
+import socket
+s = socket.create_connection(("127.0.0.1", ${PROXY_PORT}), 2)
+req = (
+    b"CONNECT positive-control.test:443 HTTP/1.1\r\n"
+    b"Host: positive-control.test:443\r\n"
+    b"\r\n"
+)
+s.sendall(req)
+try:
+    s.recv(256)
+except OSError:
+    pass
+s.close()
+print("positive control CONNECT sent")
 PY
-CONTROL_PID=$!
-# wait for control server
-for _ in $(seq 1 30); do
-  if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',${CONTROL_PORT}),0.2); s.close()" 2>/dev/null; then
-    break
-  fi
-  sleep 0.05
-done
+
+if [[ ! -s "$LOG" ]] || ! grep -Fiq 'positive-control.test' "$LOG"; then
+  echo "FAIL: positive control did not record positive-control.test (proxy not capturing)"
+  echo "log contents:"; cat "$LOG" || true
+  exit 1
+fi
+echo "positive control recorded host; clearing log before gork smoke"
+: >"$LOG"
 
 export HTTP_PROXY="http://${LISTEN}"
 export HTTPS_PROXY="http://${LISTEN}"
@@ -79,24 +87,6 @@ export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export NO_PROXY=""
 export no_proxy=""
-
-# Fetch via proxy so host log must gain 127.0.0.1 (or localhost)
-python3 - <<PY
-import urllib.request
-proxy = urllib.request.ProxyHandler({"http": "http://${LISTEN}", "https": "http://${LISTEN}"})
-opener = urllib.request.build_opener(proxy)
-opener.open("http://127.0.0.1:${CONTROL_PORT}/", timeout=5).read()
-print("positive control request ok")
-PY
-wait "$CONTROL_PID" 2>/dev/null || true
-
-if [[ ! -s "$LOG" ]] || ! grep -Eiq '127\.0\.0\.1|localhost' "$LOG"; then
-  echo "FAIL: positive control did not record a host in proxy log (proxy not capturing)"
-  echo "log contents:"; cat "$LOG" || true
-  exit 1
-fi
-echo "positive control recorded host(s); clearing log before gork smoke"
-: >"$LOG"
 
 export GROK_HOME="$WORKDIR/grok-home"
 mkdir -p "$GROK_HOME"
@@ -135,7 +125,7 @@ echo "==> Host log after gork:"
 if [[ -s "$LOG" ]]; then
   sort -u "$LOG" | tee "$WORKDIR/hosts.unique.txt"
 else
-  echo "(empty — no CONNECT/HTTP destinations recorded after positive control clear)"
+  echo "(empty — no CONNECT/HTTP destinations after positive control clear)"
   : >"$WORKDIR/hosts.unique.txt"
 fi
 
