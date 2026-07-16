@@ -7,7 +7,9 @@
 //! Set `GROK_TEST_VERSION` to manually exercise either path without producing
 //! a real out-of-date build.
 
-use crate::auto_update::{get_installer, run_install_script};
+use crate::auto_update::{
+    get_installer, run_install_script, vendor_auto_update_forbidden, vendor_update_blocked_message,
+};
 use crate::version::{
     UpdateConfig, fetch_latest_version, get_installed_grok_version, write_version_cache,
 };
@@ -23,7 +25,7 @@ enum MinimumVersionDecision {
 
 /// Outcome of a successful enforcement pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EnforcementOutcome {
+pub(crate) enum EnforcementOutcome {
     Allowed,
     /// New binary on disk; caller MUST restart — running process is still old.
     Upgraded,
@@ -92,6 +94,13 @@ pub(crate) enum MinimumVersionError {
          Run `gork update` to install the latest allowed version."
     )]
     TargetBelowFloor { target: String, minimum: String },
+    /// Privacy build: never auto-install from vendor channels to satisfy a floor.
+    #[error("{message}")]
+    VendorUpdateForbidden {
+        current: String,
+        minimum: String,
+        message: String,
+    },
 }
 
 /// Pure check against the configured floor. Empty / whitespace-only
@@ -189,7 +198,9 @@ fn pick_target_version(latest: Option<&str>, minimum: &str) -> String {
 
 /// Call once at startup, before any user-facing UI. On `Ok(Upgraded)` the
 /// caller MUST restart. On `Err`, print and exit non-zero.
-async fn enforce_minimum_version(
+///
+/// `pub(crate)` so unit tests can drive the shipped enforcement path.
+pub(crate) async fn enforce_minimum_version(
     minimum_version: Option<&str>,
     update_config: &UpdateConfig,
 ) -> Result<EnforcementOutcome, MinimumVersionError> {
@@ -201,6 +212,22 @@ async fn enforce_minimum_version(
     };
 
     info!(%current, %minimum, "minimum_version: below floor; attempting auto-update");
+
+    // Privacy / Gork Build: never satisfy a remote or local floor by pulling
+    // vendor (x.ai) installers — that would replace this fork with official
+    // Grok Build. Fail closed with rebuild guidance instead.
+    if vendor_auto_update_forbidden() {
+        warn!(%current, %minimum, "minimum_version: vendor auto-update forbidden (privacy build)");
+        let message = format!(
+            "This version of Gork Build ({current}) is below the configured floor ({minimum}).\n\n{}",
+            vendor_update_blocked_message()
+        );
+        return Err(MinimumVersionError::VendorUpdateForbidden {
+            current,
+            minimum,
+            message,
+        });
+    }
 
     // `None` is "default on"; only explicit `false` opts out.
     let cfg = config::load_config().await;
@@ -219,7 +246,7 @@ async fn enforce_minimum_version(
 
     info!(%current, %target, installer, "minimum_version: installing upgrade");
     eprintln!(
-        "This version of Grok ({current}) is no longer supported. \
+        "This version of Gork ({current}) is no longer supported. \
          Updating to {target}…"
     );
 
@@ -379,6 +406,70 @@ mod tests {
         match saved {
             Some(v) => unsafe { std::env::set_var("GROK_TEST_VERSION", v) },
             None => unsafe { std::env::remove_var("GROK_TEST_VERSION") },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn privacy_build_refuses_minimum_version_vendor_install() {
+        // Ensure the product privacy gate is active (not the installer-test escape hatch).
+        let allow_saved = std::env::var("GORK_TEST_ALLOW_UPDATE").ok();
+        let ver_saved = std::env::var("GROK_TEST_VERSION").ok();
+        // SAFETY: #[serial]
+        unsafe {
+            std::env::remove_var("GORK_TEST_ALLOW_UPDATE");
+            std::env::set_var("GROK_TEST_VERSION", "0.1.50");
+        }
+
+        assert!(
+            crate::auto_update::vendor_auto_update_forbidden(),
+            "privacy gate must be active for this test"
+        );
+
+        let cfg = UpdateConfig {
+            proxy_base_url: "https://example.invalid/v1".into(),
+            auth_scope: "test".into(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".into(),
+            npm_registry: None,
+        };
+
+        let err = enforce_minimum_version(Some("9.9.9"), &cfg)
+            .await
+            .expect_err("must fail closed without vendor install");
+        match err {
+            MinimumVersionError::VendorUpdateForbidden {
+                current,
+                minimum,
+                message,
+            } => {
+                assert_eq!(current, "0.1.50");
+                assert_eq!(minimum, "9.9.9");
+                assert!(
+                    message.contains("never installs from vendor")
+                        || message.contains("x.ai")
+                        || message.contains("cargo build"),
+                    "message must guide rebuild, got: {message}"
+                );
+                assert!(
+                    !message.contains("curl -fsSL https://x.ai/cli"),
+                    "must not recommend vendor curl installer: {message}"
+                );
+            }
+            other => panic!("expected VendorUpdateForbidden, got {other:?}"),
+        }
+
+        // SAFETY: restore
+        unsafe {
+            match allow_saved {
+                Some(v) => std::env::set_var("GORK_TEST_ALLOW_UPDATE", v),
+                None => std::env::remove_var("GORK_TEST_ALLOW_UPDATE"),
+            }
+            match ver_saved {
+                Some(v) => std::env::set_var("GROK_TEST_VERSION", v),
+                None => std::env::remove_var("GROK_TEST_VERSION"),
+            }
         }
     }
 }

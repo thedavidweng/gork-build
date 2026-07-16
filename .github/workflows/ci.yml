@@ -118,13 +118,57 @@ jobs:
 
       - name: Test privacy-critical crates
         run: |
-          # Keep this list to crates that compile cleanly as lib tests in the
-          # open-source snapshot. Full xai-grok-shell --lib currently fails
-          # upstream (missing test helpers / partial monorepo cut).
+          # Crates that compile cleanly as lib tests in the open-source
+          # snapshot. Full xai-grok-shell --lib currently fails upstream
+          # (missing test helpers / partial monorepo cut).
           cargo test -p xai-grok-version --lib
           cargo test -p xai-mixpanel --lib
           cargo test -p xai-grok-telemetry --lib default_is_privacy
-          cargo test -p xai-grok-update --lib test_reinstall_hint -- --nocapture
+          # Updater hard-off: bottom chokepoint, leader ensure_latest, manual
+          # update, status/background, minimum-version refuse vendor install.
+          cargo test -p xai-grok-update --lib privacy -- --nocapture
+          cargo test -p xai-grok-update --lib reinstall_hint -- --nocapture
+          cargo test -p xai-grok-update --lib refuses_minimum -- --nocapture
+
+      - name: Static install chokepoint inventory
+        run: |
+          set -euo pipefail
+          # Product install entry must gate on vendor_auto_update_forbidden.
+          grep -n 'vendor_auto_update_forbidden' \
+            crates/codegen/xai-grok-update/src/auto_update.rs \
+            crates/codegen/xai-grok-update/src/minimum_version.rs
+          # run_install_script must contain the privacy early return.
+          grep -n 'if vendor_auto_update_forbidden' \
+            crates/codegen/xai-grok-update/src/auto_update.rs
+          # Default internal bases must still be the vendor CDN (so the gate
+          # is what blocks them — not a silent empty list).
+          grep -n 'https://x.ai/cli' crates/codegen/xai-grok-update/src/version.rs
+
+  # Optional supply-chain scan (advisory DB; non-blocking until the fork
+  # pins deny.toml / allowlists for the full monorepo graph).
+  cargo-audit:
+    name: cargo audit (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit 2>&1 | tee cargo-audit.log || true
+      - name: Upload audit log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-audit-log
+          path: cargo-audit.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ── Build ─────────────────────────────────────────────────────────────────
   build-gork:
