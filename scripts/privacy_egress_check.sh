@@ -15,19 +15,14 @@ if [[ ! -x "$BIN" ]]; then
   BIN=target/release/gork
 fi
 
-# Prefer runner temp on GHA; fall back to local TMPDIR.
 BASE_TMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 WORKDIR="${PRIVACY_EGRESS_WORKDIR:-$(mktemp -d "${BASE_TMP}/gork-privacy-egress.XXXXXX")}"
 mkdir -p "$WORKDIR"
 LOG="$WORKDIR/hosts.txt"
 PROXY_PORT="${PRIVACY_EGRESS_PORT:-18080}"
 LISTEN="127.0.0.1:${PROXY_PORT}"
-# Export for CI artifact upload path discovery.
-echo "PRIVACY_EGRESS_WORKDIR=$WORKDIR" >>"${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
 echo "$WORKDIR" >"$WORKDIR/workdir.path"
 
-# Destinations that must never appear during a privacy-hard-off smoke session.
-# (Model/auth hosts are not exercised here — no login; update/telemetry must stay quiet.)
 DENY_REGEX='(mixpanel\.com|api\.mixpanel\.com|x\.ai|storage\.googleapis\.com|sentry\.io|ingest\.sentry\.io)'
 
 python3 "$ROOT/scripts/privacy_egress_proxy.py" --listen "$LISTEN" --log "$LOG" &
@@ -38,16 +33,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for proxy
+# --- Readiness: must confirm proxy accepts connections ---
+READY=0
 for _ in $(seq 1 50); do
-  if (echo >"/dev/tcp/127.0.0.1/${PROXY_PORT}") >/dev/null 2>&1; then
-    break
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "FAIL: privacy egress proxy process exited during startup (pid=$PROXY_PID)"
+    exit 1
   fi
-  # bash /dev/tcp may be missing; fall back to python
-  if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',${PROXY_PORT}),1); s.close()" 2>/dev/null; then
+  if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',${PROXY_PORT}),0.2); s.close()" 2>/dev/null; then
+    READY=1
     break
   fi
   sleep 0.1
+done
+if [[ "$READY" -ne 1 ]]; then
+  echo "FAIL: privacy egress proxy did not become ready on ${LISTEN}"
+  exit 1
+fi
+echo "proxy ready on ${LISTEN} (pid=$PROXY_PID)"
+
+# --- Positive control: prove the proxy records destinations ---
+CONTROL_PORT=$((PROXY_PORT + 1))
+python3 - <<PY &
+import http.server, socketserver
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
+with socketserver.TCPServer(("127.0.0.1", ${CONTROL_PORT}), H) as httpd:
+    httpd.handle_request()
+PY
+CONTROL_PID=$!
+# wait for control server
+for _ in $(seq 1 30); do
+  if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',${CONTROL_PORT}),0.2); s.close()" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
 done
 
 export HTTP_PROXY="http://${LISTEN}"
@@ -55,23 +77,37 @@ export HTTPS_PROXY="http://${LISTEN}"
 export ALL_PROXY="http://${LISTEN}"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
-# Avoid accidental system proxy bypass for this process tree.
 export NO_PROXY=""
 export no_proxy=""
 
-# Isolated home so we do not touch the developer ~/.grok
+# Fetch via proxy so host log must gain 127.0.0.1 (or localhost)
+python3 - <<PY
+import urllib.request
+proxy = urllib.request.ProxyHandler({"http": "http://${LISTEN}", "https": "http://${LISTEN}"})
+opener = urllib.request.build_opener(proxy)
+opener.open("http://127.0.0.1:${CONTROL_PORT}/", timeout=5).read()
+print("positive control request ok")
+PY
+wait "$CONTROL_PID" 2>/dev/null || true
+
+if [[ ! -s "$LOG" ]] || ! grep -Eiq '127\.0\.0\.1|localhost' "$LOG"; then
+  echo "FAIL: positive control did not record a host in proxy log (proxy not capturing)"
+  echo "log contents:"; cat "$LOG" || true
+  exit 1
+fi
+echo "positive control recorded host(s); clearing log before gork smoke"
+: >"$LOG"
+
 export GROK_HOME="$WORKDIR/grok-home"
 mkdir -p "$GROK_HOME"
-
-# Try to re-enable telemetry via env (must still not dial out under privacy).
 export GROK_TELEMETRY_ENABLED=1
 export GROK_TELEMETRY_TRACE_UPLOAD=1
 
 echo "==> gork --version"
-"$BIN" --version || true
+"$BIN" --version
 
 echo "==> gork --help (smoke)"
-"$BIN" --help >/dev/null || true
+"$BIN" --help >/dev/null
 
 echo "==> gork update (must refuse vendor install without dialing x.ai)"
 set +e
@@ -79,23 +115,27 @@ UPDATE_OUT="$("$BIN" update 2>&1)"
 UPDATE_EC=$?
 set -e
 echo "$UPDATE_OUT" | head -40
-# Expect non-zero or an explicit privacy refusal message.
-if echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|x\.ai|rebuild from source|Auto-update is not available'; then
+if echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available'; then
   echo "update path reported privacy/manual messaging (ok)"
 elif [[ "$UPDATE_EC" -ne 0 ]]; then
   echo "update exited non-zero (ok for privacy build)"
 else
-  echo "WARN: gork update exited 0 without privacy message; host log still checked"
+  echo "FAIL: gork update exited 0 without privacy refusal message"
+  exit 1
 fi
 
-# Brief pause for any deferred network tasks
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  echo "FAIL: proxy died during gork smoke"
+  exit 1
+fi
+
 sleep 1
 
-echo "==> Host log:"
+echo "==> Host log after gork:"
 if [[ -s "$LOG" ]]; then
   sort -u "$LOG" | tee "$WORKDIR/hosts.unique.txt"
 else
-  echo "(empty — no CONNECT/HTTP destinations recorded)"
+  echo "(empty — no CONNECT/HTTP destinations recorded after positive control clear)"
   : >"$WORKDIR/hosts.unique.txt"
 fi
 

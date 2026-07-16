@@ -258,6 +258,8 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x target/release/gork scripts/privacy_egress_check.sh
+          export PRIVACY_EGRESS_WORKDIR="${RUNNER_TEMP}/gork-privacy-egress"
+          mkdir -p "$PRIVACY_EGRESS_WORKDIR"
           GORK_BIN=target/release/gork ./scripts/privacy_egress_check.sh
 
       - name: Upload egress host log
@@ -265,6 +267,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: privacy-egress-hosts
-          path: ${{ runner.temp }}/gork-privacy-egress.*/hosts*.txt
+          path: ${{ runner.temp }}/gork-privacy-egress/**
           if-no-files-found: ignore
           retention-days: 14
