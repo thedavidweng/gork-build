@@ -96,7 +96,7 @@ jobs:
           echo "smoke ok"
 
       - name: Upload gork binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gork-linux-x86_64
           path: target/release/gork
