@@ -162,13 +162,12 @@ jobs:
           # is what blocks them — not a silent empty list).
           grep -n 'https://x.ai/cli' crates/codegen/xai-grok-update/src/version.rs
 
-  # Optional supply-chain scan (advisory DB; non-blocking until the fork
-  # pins deny.toml / allowlists for the full monorepo graph).
+  # Supply-chain hard gate: fails on any vulnerability not ignored in audit.toml.
+  # Ignore list is residual monorepo debt (rsa unfixed; quick-xml major pin).
   cargo-audit:
-    name: cargo audit (informational)
+    name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
@@ -177,8 +176,13 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: cargo audit
-        run: cargo audit 2>&1 | tee cargo-audit.log || true
+      - name: cargo audit (hard gate)
+        run: |
+          set -euo pipefail
+          # Fail on unignored vulnerabilities. Unmaintained/unsound/yanked
+          # packages are warned by default; do not use --deny warnings yet
+          # (large monorepo has residual unmaintained transitive crates).
+          cargo audit 2>&1 | tee cargo-audit.log
       - name: Upload audit log
         if: always()
         uses: actions/upload-artifact@v7
