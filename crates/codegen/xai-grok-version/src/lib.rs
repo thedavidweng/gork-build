@@ -1,6 +1,40 @@
-//! Installed grok CLI version, lockstepped with shipping binaries.
+//! Installed Gork Build CLI version, lockstepped with shipping binaries.
+//!
+//! **Gork Build** is a community privacy fork of xAI Grok Build (same role as
+//! VSCodium vs VS Code): same codebase, no product telemetry, no research
+//! trace uploads, no xAI branding. Model inference still uses the user's
+//! credentials against the Grok API — that is the only network path required
+//! for the agent to work.
 
 use semver::Version;
+
+/// Compile-time privacy fork switch. Always `true` in Gork Build.
+/// Upstream Grok Build would set this to `false`.
+pub const PRIVACY_BUILD: bool = true;
+
+/// User-facing product name for this fork.
+pub const PRODUCT_NAME: &str = "Gork Build";
+
+/// Preferred CLI binary / command name for this fork.
+pub const PRODUCT_CLI: &str = "gork";
+
+/// One-line positioning (README, `--version` help, welcome copy).
+pub const PRODUCT_TAGLINE: &str =
+    "VSCodium-style community build of Grok Build — vendor telemetry removed";
+
+/// `true` when research telemetry, Mixpanel, GCS session traces, and similar
+/// non-inference uploads must stay off. Always true while [`PRIVACY_BUILD`].
+#[inline]
+pub fn research_data_collection_forbidden() -> bool {
+    PRIVACY_BUILD
+}
+
+/// `true` when coding-data retention is locked to **opt-out** (no UI/API path
+/// may opt the account into sharing/training retention).
+#[inline]
+pub fn coding_data_retention_locked_opt_out() -> bool {
+    PRIVACY_BUILD
+}
 
 pub const TEST_VERSION_ENV: &str = "GROK_TEST_VERSION";
 
@@ -43,6 +77,26 @@ pub fn display_version_with_commit(version_with_commit: &str, channel_label: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gork Build privacy policy constants — compile-time hard-offs that
+    /// resolvers and updaters consult. These must stay true for this fork.
+    #[test]
+    fn privacy_build_locks_research_and_retention_policy() {
+        assert!(
+            PRIVACY_BUILD,
+            "Gork Build must ship with PRIVACY_BUILD=true"
+        );
+        assert!(
+            research_data_collection_forbidden(),
+            "research_data_collection_forbidden must follow PRIVACY_BUILD"
+        );
+        assert!(
+            coding_data_retention_locked_opt_out(),
+            "coding data retention must be locked opt-out under PRIVACY_BUILD"
+        );
+        assert_eq!(PRODUCT_CLI, "gork");
+        assert_eq!(PRODUCT_NAME, "Gork Build");
+    }
 
     /// Display formatting invariant matrix — verifies label appending
     /// works correctly across all label states (alpha, stable, empty).
