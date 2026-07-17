@@ -4,6 +4,13 @@ name = "xai-grok-update"
 version = "0.1.220-alpha.4"
 edition.workspace = true
 
+[features]
+default = []
+# Enables the `GORK_TEST_ALLOW_UPDATE=1` escape hatch for local mock installer
+# integration tests only. Never enabled by product binaries / `cargo run` /
+# default `cargo build`. Privacy hard-off cannot be disabled without this feature.
+updater-integration-tests = []
+
 [dependencies]
 anyhow = { workspace = true }
 futures = { workspace = true }
