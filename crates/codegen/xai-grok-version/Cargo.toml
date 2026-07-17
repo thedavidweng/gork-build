@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-grok-version"
 version = "0.2.0-dev"
 edition.workspace = true
-description = "Lockstepped grok CLI version."
+description = "Lockstepped Gork Build CLI version and privacy-build constants."
 
 [dependencies]
 semver = { workspace = true }
