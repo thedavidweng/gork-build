@@ -1,0 +1,39 @@
+# Fail closed if the privacy patch series no longer rebuilds the locked tip.
+name: Patch roundtrip
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: patch-roundtrip-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-roundtrip:
+    name: Lint + roundtrip
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure locked base is present
+        run: |
+          set -euo pipefail
+          BASE=$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("maint/upstream.lock.toml").read_text())["commit"])
+          PY
+          )
+          git cat-file -e "${BASE}^{commit}" || git fetch --no-tags origin "$BASE"
+
+      - name: patchctl lint (includes roundtrip against lock.patch_tip)
+        run: python3 maint/scripts/patchctl.py lint

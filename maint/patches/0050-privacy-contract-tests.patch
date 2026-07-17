@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:26 -0700
+Subject: [PATCH] privacy-contract-tests: resolver and privacy regression tests
+
+Gork-Patch-Id: privacy-contract-tests
+Gork-Invariant: privacy-contracts-present
+Gork-Risk: critical
+---
+ .../xai-grok-shell/tests/privacy_resolvers.rs | 79 +++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+ create mode 100644 crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
+
+diff --git a/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ade06704bf2baeddb34f7d5c61dc48b13e05f38
+--- /dev/null
++++ b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
+@@ -0,0 +1,79 @@
++//! Privacy hard-off regression tests for telemetry / trace-upload resolvers.
++//!
++//! Integration tests (not `#[cfg(test)]` unit tests) so they compile against the
++//! normal shell library — full `xai-grok-shell --lib` unit tests currently fail
++//! upstream due to missing test helpers.
++//!
++//! These drive the **shipped** `Config::resolve_telemetry_mode` /
++//! `resolve_trace_upload` entry points with env, config, and remote settings
++//! that would re-enable product telemetry on upstream Grok Build.
++
++use serial_test::serial;
++use xai_grok_config_types::RemoteSettings;
++use xai_grok_shell::agent::config::{Config, TelemetryMode};
++
++#[test]
++#[serial]
++fn privacy_build_telemetry_mode_ignores_env_config_and_remote() {
++    assert!(
++        xai_grok_version::research_data_collection_forbidden(),
++        "this fork must lock research collection off"
++    );
++    // SAFETY: #[serial]
++    unsafe {
++        std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
++    }
++    let mut cfg = Config::default();
++    cfg.features.telemetry = Some(TelemetryMode::Enabled);
++    cfg.requirements.telemetry.pin(
++        TelemetryMode::Enabled,
++        xai_grok_shell::config::RequirementSource::Unknown,
++    );
++    cfg.remote_settings = Some(RemoteSettings {
++        telemetry_enabled: Some(true),
++        telemetry_mode: Some("enabled".into()),
++        ..Default::default()
++    });
++    let r = cfg.resolve_telemetry_mode();
++    assert!(
++        r.value.is_disabled(),
++        "privacy hard-off must win over env/config/remote: mode={:?}",
++        r.value
++    );
++    unsafe {
++        std::env::remove_var("GROK_TELEMETRY_ENABLED");
++    }
++}
++
++#[test]
++#[serial]
++fn privacy_build_trace_upload_ignores_env_config_and_remote() {
++    assert!(xai_grok_version::research_data_collection_forbidden());
++    // SAFETY: #[serial]
++    unsafe {
++        std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
++        std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "1");
++    }
++    let mut cfg = Config::default();
++    cfg.features.telemetry = Some(TelemetryMode::Enabled);
++    cfg.telemetry.trace_upload = Some(true);
++    cfg.requirements
++        .trace_upload
++        .pin(true, xai_grok_shell::config::RequirementSource::Unknown);
++    cfg.remote_settings = Some(RemoteSettings {
++        telemetry_enabled: Some(true),
++        telemetry_mode: Some("enabled".into()),
++        trace_upload_enabled: Some(true),
++        ..Default::default()
++    });
++    let r = cfg.resolve_trace_upload();
++    assert!(
++        !r.value,
++        "privacy hard-off must win over env/config/remote for trace upload"
++    );
++    assert!(!cfg.is_trace_upload_enabled());
++    unsafe {
++        std::env::remove_var("GROK_TELEMETRY_ENABLED");
++        std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD");
++    }
++}
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
+prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
+prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+-- 
+2.50.1 (Apple Git-155)
+

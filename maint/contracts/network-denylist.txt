@@ -1,0 +1,9 @@
+# Host regexes (one per line) joined with | for egress smoke tests.
+# Prefer full-host anchors so substrings do not over-match.
+# Comments and blank lines ignored.
+(^|\.)mixpanel\.com$
+(^|\.)api\.mixpanel\.com$
+(^|\.)x\.ai$
+(^|\.)storage\.googleapis\.com$
+(^|\.)sentry\.io$
+(^|\.)ingest\.sentry\.io$

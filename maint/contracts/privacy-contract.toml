@@ -1,0 +1,94 @@
+# Privacy contracts — single source of truth for local + CI verification.
+# Commands run from repository root. Fail-closed: any non-zero exit fails verify.
+#
+# Groups:
+#   privacy      — unit/integration privacy hard-off checks (default CI)
+#   supply-chain — cargo-audit (dedicated job; needs cargo-audit installed)
+#   egress       — release binary network smoke (expensive)
+schema = 1
+
+[[contract]]
+id = "version-lib"
+group = "privacy"
+command = ["cargo", "test", "-p", "xai-grok-version", "--lib"]
+
+[[contract]]
+id = "privacy-build-enabled"
+group = "privacy"
+command = [
+  "cargo", "test", "-p", "xai-grok-version", "--lib",
+  "privacy_build_locks_research_and_retention_policy",
+]
+
+[[contract]]
+id = "mixpanel-lib"
+group = "privacy"
+command = ["cargo", "test", "-p", "xai-mixpanel", "--lib"]
+
+[[contract]]
+id = "telemetry-lib"
+group = "privacy"
+command = [
+  "cargo", "test", "-p", "xai-grok-telemetry", "--lib", "default_is_privacy",
+]
+
+[[contract]]
+id = "updater-product-build"
+group = "privacy"
+command = ["cargo", "test", "-p", "xai-grok-update"]
+
+[[contract]]
+id = "updater-privacy-filters"
+group = "privacy"
+command = [
+  "cargo", "test", "-p", "xai-grok-update", "--lib", "privacy",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "updater-env-cannot-disable"
+group = "privacy"
+command = [
+  "cargo", "test", "-p", "xai-grok-update", "--lib", "env_cannot_disable",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "updater-installer-integration"
+group = "privacy"
+# Requires feature + env; targets integration binaries only (not lib tests).
+env = { GORK_TEST_ALLOW_UPDATE = "1" }
+command = [
+  "cargo", "test", "-p", "xai-grok-update",
+  "--features", "updater-integration-tests",
+  "--test", "test_install_internal",
+  "--test", "test_blitz_cancel",
+  "--test", "test_check_status_regression",
+  "--test", "test_concurrent_convergence",
+  "--test", "test_downgrade_matrix",
+]
+
+[[contract]]
+id = "telemetry-resolvers"
+group = "privacy"
+command = [
+  "cargo", "test", "-p", "xai-grok-shell", "--test", "privacy_resolvers",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "installer-chokepoint-static"
+group = "privacy"
+command = ["bash", "maint/scripts/check_installer_chokepoint.sh"]
+
+[[contract]]
+id = "cargo-audit"
+group = "supply-chain"
+command = ["cargo", "audit"]
+
+[[contract]]
+id = "release-egress-smoke"
+group = "egress"
+# Expensive: builds release binary if missing. Skip with --skip-expensive.
+expensive = true
+command = ["./scripts/privacy_egress_check.sh"]

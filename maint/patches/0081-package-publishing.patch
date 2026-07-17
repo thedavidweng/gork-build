@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:27 -0700
+Subject: [PATCH] package-publishing: npm package metadata
+
+Gork-Patch-Id: package-publishing
+Gork-Invariant: npm-community-packages
+Gork-Risk: medium
+---
+ .../npm/grok-darwin-arm64/README.md           | 10 ++-
+ .../npm/grok-darwin-arm64/package.json        |  4 +-
+ .../npm/grok-darwin-x64/README.md             | 10 ++-
+ .../npm/grok-darwin-x64/package.json          |  4 +-
+ .../npm/grok-linux-arm64/README.md            | 10 ++-
+ .../npm/grok-linux-arm64/package.json         |  4 +-
+ .../npm/grok-linux-x64/README.md              | 10 ++-
+ .../npm/grok-linux-x64/package.json           |  4 +-
+ .../npm/grok-win32-arm64/README.md            | 10 ++-
+ .../npm/grok-win32-arm64/package.json         |  4 +-
+ .../npm/grok-win32-x64/README.md              | 10 ++-
+ .../npm/grok-win32-x64/package.json           |  4 +-
+ .../codegen/xai-grok-pager/npm/grok/README.md | 67 +++++++------------
+ .../codegen/xai-grok-pager/npm/grok/bin/grok  | 12 ++--
+ .../npm/grok/bin/postinstall.js               | 18 ++---
+ .../xai-grok-pager/npm/grok/package.json      | 17 ++---
+ .../scripts/assemble-platform-packages.js     |  2 +-
+ 17 files changed, 86 insertions(+), 114 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
+index b8cbeaf5506095bb68f37cca5302c87fdb4f8594..b67043e186b1afe0c975d2fad221e4e1b501c433 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-darwin-arm64
++# @gork-build/gork-darwin-arm64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on darwin-arm64.
++Platform binary optional dependency for [`@gork-build/gork`](https://www.npmjs.com/package/@gork-build/gork).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @gork-build/gork
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json
+index 56d67d4ca207e394319ba25afadb2dd2210e3d92..416bb4e937abe35c93250023a899cae4980640ea 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-darwin-arm64",
++    "name": "@gork-build/gork-darwin-arm64",
+     "version": "0.2.0-dev",
+-    "description": "darwin-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "darwin-arm64 binary for @gork-build/gork. Do not install directly; install @gork-build/gork instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md
+index 3d235b7ded4de0bf74ed7a98cea06c1e7fc84c58..3b2141836574c1e6ff9918cbf6c8a689d96dd7aa 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-darwin-x64
++# @gork-build/gork-darwin-x64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on darwin-x64.
++Platform binary optional dependency for [`@gork-build/gork`](https://www.npmjs.com/package/@gork-build/gork).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @gork-build/gork
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json
+index 5a000f9cc34142754ac52a1796a2fa445b85e07c..15e704a0325fc148d8632bf0a69a079620af2504 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-darwin-x64",
++    "name": "@gork-build/gork-darwin-x64",
+     "version": "0.2.0-dev",
+-    "description": "darwin-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "darwin-x64 binary for @gork-build/gork. Do not install directly; install @gork-build/gork instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md
+index 14834a94785852348ce6a756d692b3b9175bd30d..4c32180e9360ce5c95219a6fa12b0f516f93e8a2 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-linux-arm64
++# @gork-build/gork-linux-arm64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on linux-arm64.
++Platform binary optional dependency for [`@gork-build/gork`](https://www.npmjs.com/package/@gork-build/gork).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @gork-build/gork
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json
+index 6faaa6aac0fc95424654df255a03ef00803a1059..c502776a75a2fbda4f45b3b57fa4ab1b0e5f0fe3 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-linux-arm64",
++    "name": "@gork-build/gork-linux-arm64",
+     "version": "0.2.0-dev",
+-    "description": "linux-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "linux-arm64 binary for @gork-build/gork. Do not install directly; install @gork-build/gork instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md
+index 7acfdeed4a06a640c91cb44bc010cff990b5c9dc..abdd45c560ece231d8adfb1030bd3e9887a7c82a 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-linux-x64
++# @gork-build/gork-linux-x64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on linux-x64.
++Platform binary optional dependency for [`@gork-build/gork`](https://www.npmjs.com/package/@gork-build/gork).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @gork-build/gork
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json
+index 35c2d0fb4414732c6e14cce5f55459f130a82a9f..8846deecb2302b45bd8315774ae330c2456aadcf 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-linux-x64",
++    "name": "@gork-build/gork-linux-x64",
+     "version": "0.2.0-dev",
+-    "description": "linux-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "linux-x64 binary for @gork-build/gork. Do not install directly; install @gork-build/gork instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md
+index 02c15d2b3845ce56e44bb72d878215ea2467faf7..f4a61cc6211d2bf02e6b5185fb599861b42e4141 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-win32-arm64
++# @gork-build/gork-win32-arm64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on win32-arm64.
++Platform binary optional dependency for [`@gork-build/gork`](https://www.npmjs.com/package/@gork-build/gork).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @gork-build/gork
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json
+index e00fcb3cf2308ce7d994ba2d17507c42223fc417..d1314c7dae85c21fd0a3c35581c09f7ecbc9c835 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-win32-arm64",
++    "name": "@gork-build/gork-win32-arm64",
+     "version": "0.2.0-dev",
+-    "description": "win32-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "win32-arm64 binary for @gork-build/gork. Do not install directly; install @gork-build/gork instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md
+index ef0c4a4dc0e3537055e9b12985900fa2c2ef164e..9104e4f17ea7e6984eca6de919fedeac51acd4b7 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-win32-x64
++# @gork-build/gork-win32-x64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on win32-x64.
++Platform binary optional dependency for [`@gork-build/gork`](https://www.npmjs.com/package/@gork-build/gork).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @gork-build/gork
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json
+index 3e07dbc7958cb1db883763c80fa281d0caf27ddf..8dc90c15888fe5875d4f9346440785d1ce2781d8 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-win32-x64",
++    "name": "@gork-build/gork-win32-x64",
+     "version": "0.2.0-dev",
+-    "description": "win32-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "win32-x64 binary for @gork-build/gork. Do not install directly; install @gork-build/gork instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/README.md b/crates/codegen/xai-grok-pager/npm/grok/README.md
+index b70910e6f298d3964133f3ec6bb9594d9c03119e..022c6c8ae78f2bc5787729df00782a5e90777bea 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok/README.md
+@@ -1,61 +1,44 @@
+-# Grok
++# Gork Build (`@gork-build/gork`)
+ 
+-Bring Grok into your terminal. Fast, flicker-free CLI built for plans, subagents, and parallel work.
++Community VSCodium-style distribution of Grok Build — **vendor telemetry and
++branding removed**.
+ 
+-**[Homepage](https://x.ai/cli)** | **[Documentation](https://docs.x.ai/build/overview)**
++**[Repository](https://github.com/thedavidweng/gork-build)** ·
++**[Privacy](https://github.com/thedavidweng/gork-build/blob/main/PRIVACY.md)** ·
++**[Wire analysis (why)](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547)**
+ 
+-## Install
+-
+-```bash
+-curl -fsSL https://x.ai/cli/install.sh | bash
+-```
+-
+-Or install with npm:
+-
+-```bash
+-npm i -g @xai-official/grok
+-```
++Upstream credit: based on [xai-org/grok-build](https://github.com/xai-org/grok-build)
++(Apache-2.0). Not affiliated with SpaceXAI / xAI.
+ 
+-## Get Started
+-
+-```bash
+-# Launch the interactive TUI
+-grok
+-
+-# Run a single task
+-grok -p "Explain this codebase"
+-```
++## Install
+ 
+-On first launch, Grok opens your browser to authenticate. For CI or headless environments, use an API key from [console.x.ai](https://console.x.ai):
++Prefer building from source for the latest privacy hard-offs:
+ 
+ ```bash
+-export XAI_API_KEY="xai-..."
++git clone https://github.com/thedavidweng/gork-build.git
++cd gork-build
++cargo build -p xai-grok-pager-bin --release
++# → target/release/gork
+ ```
+ 
+-## Update
++npm packages (when published) install as:
+ 
+ ```bash
+-grok update
++npm i -g @gork-build/gork
++gork
+ ```
+ 
+-Or if installed via npm:
++## Get started
+ 
+ ```bash
+-npm i -g @xai-official/grok@latest
++gork                    # interactive TUI
++gork -p "Explain this"  # one-shot
+ ```
+ 
+-## Supported Platforms
+-
+-| Platform | Architecture |
+-|---|---|
+-| macOS | Apple Silicon (arm64) |
+-| Linux | x86_64, arm64 |
+-| Windows | x86_64 |
+-
+-## Documentation
+-
+-For full documentation including configuration, MCP servers, custom models, headless mode, agent mode, and more, visit [docs.x.ai/build/overview](https://docs.x.ai/build/overview).
++Authenticate with your Grok / xAI account (or `XAI_API_KEY`) — model inference
++still uses the Grok API. Research uploads and product analytics stay off in
++this build.
+ 
+-## Feedback
++## License
+ 
+-Run `/feedback` inside Grok to report issues or send feedback directly.
++Apache-2.0 — see the repository `LICENSE` and `NOTICE`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/bin/grok b/crates/codegen/xai-grok-pager/npm/grok/bin/grok
+index c033ab622dda5c1920ac93faa3fbd262c655135b..dcd54d9207f142fee10e898a34ecac8073c67e9a 100755
+--- a/crates/codegen/xai-grok-pager/npm/grok/bin/grok
++++ b/crates/codegen/xai-grok-pager/npm/grok/bin/grok
+@@ -7,18 +7,18 @@
+ //
+ // Binary location strategy (in priority order):
+ //   1. ~/.grok/bin/grok        — canonical versioned symlink (postinstall.js)
+-//   2. @xai-official/grok-<platform>/bin/grok[.exe]      — decompressed sibling
+-//   3. @xai-official/grok-<platform>/bin/grok[.exe].br   — brotli-compressed
++//   2. @gork-build/gork-<platform>/bin/grok[.exe]      — decompressed sibling
++//   3. @gork-build/gork-<platform>/bin/grok[.exe].br   — brotli-compressed
+ //
+ // Per-platform binaries are shipped brotli-compressed to stay well under
+-// npm's ~200 MB tarball ceiling. See sibling packages @xai-official/grok-*.
++// npm's ~200 MB tarball ceiling. See sibling packages @gork-build/gork-*.
+ const { spawn } = require('child_process');
+ const path = require('path');
+ const fs = require('fs');
+ const os = require('os');
+ const zlib = require('zlib');
+ 
+-const pkgName = '@xai-official/grok';
++const pkgName = '@gork-build/gork';
+ const IS_WINDOWS = process.platform === 'win32';
+ const EXE = IS_WINDOWS ? '.exe' : '';
+ const BIN_NAME = `grok${EXE}`;
+@@ -33,7 +33,7 @@ function readLocalVersion() {
+ // matching optional dependency wasn't installed (unsupported platform, or
+ // npm refused to install optionalDependencies).
+ function resolvePlatformPackageDir() {
+-    const platformPkg = `@xai-official/grok-${process.platform}-${process.arch}`;
++    const platformPkg = `@gork-build/gork-${process.platform}-${process.arch}`;
+     try {
+         return path.dirname(require.resolve(`${platformPkg}/package.json`));
+     } catch {
+@@ -97,7 +97,7 @@ function resolveBinary() {
+     const platformDir = resolvePlatformPackageDir();
+     if (!platformDir) {
+         console.error(`${pkgName}: no platform binary installed for ${process.platform}-${process.arch}.`);
+-        console.error(`  Expected sibling package @xai-official/grok-${process.platform}-${process.arch}.`);
++        console.error(`  Expected sibling package @gork-build/gork-${process.platform}-${process.arch}.`);
+         console.error(`  This usually means npm skipped optionalDependencies (e.g. --no-optional)`);
+         console.error(`  or the platform is not supported.`);
+         process.exit(1);
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js b/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
+index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93ac8967510 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
++++ b/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env node
+ // Runs once after npm install/update. Reads the grok binary from the
+-// matching per-platform optional dependency (@xai-official/grok-<platform>)
++// matching per-platform optional dependency (@gork-build/gork-<platform>)
+ // and installs it to ~/.grok/bin/ using versioned filenames:
+ //
+ //   Unix:    grok-<version>  +  grok  (symlink)
+@@ -28,7 +28,7 @@ const SUPPORTED = new Set([
+     'win32-arm64',
+ ]);
+ if (!SUPPORTED.has(key)) {
+-    console.error(`@xai-official/grok: unsupported platform ${key}`);
++    console.error(`@gork-build/gork: unsupported platform ${key}`);
+     process.exit(0);
+ }
+ 
+@@ -37,7 +37,7 @@ if (!SUPPORTED.has(key)) {
+ // other five are silently skipped. If the matching one is missing, npm was
+ // likely invoked with --no-optional or the platform is unsupported.
+ function resolvePlatformPackageDir() {
+-    const platformPkg = `@xai-official/grok-${key}`;
++    const platformPkg = `@gork-build/gork-${key}`;
+     try {
+         return path.dirname(require.resolve(`${platformPkg}/package.json`));
+     } catch {
+@@ -48,7 +48,7 @@ function resolvePlatformPackageDir() {
+ let version;
+ try { version = require('../package.json').version; } catch {}
+ if (!version) {
+-    console.error('@xai-official/grok: unable to determine version');
++    console.error('@gork-build/gork: unable to determine version');
+     process.exit(0);
+ }
+ 
+@@ -75,7 +75,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
+     } else if (fs.existsSync(rawPath)) {
+         vendoredBinPath = rawPath;
+     } else {
+-        console.error(`@xai-official/grok: missing binary at ${brPath}`);
++        console.error(`@gork-build/gork: missing binary at ${brPath}`);
+         return false;
+     }
+ 
+@@ -115,7 +115,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
+                     throw copyErr;
+                 }
+             } catch (e2) {
+-                console.error(`@xai-official/grok: failed to update ${canonicalPath}: ${e2.message}`);
++                console.error(`@gork-build/gork: failed to update ${canonicalPath}: ${e2.message}`);
+                 console.error('Close all running grok processes and try again.');
+                 return false;
+             }
+@@ -165,9 +165,9 @@ function cleanupOldVersions(binName) {
+ 
+ const platformDir = resolvePlatformPackageDir();
+ if (!platformDir) {
+-    console.error(`@xai-official/grok: platform package @xai-official/grok-${key} not installed.`);
++    console.error(`@gork-build/gork: platform package @gork-build/gork-${key} not installed.`);
+     console.error('  This usually means npm was invoked with --no-optional, or the install failed.');
+-    console.error('  Try: npm install -g @xai-official/grok');
++    console.error('  Try: npm install -g @gork-build/gork');
+     process.exit(0);
+ }
+ 
+@@ -188,7 +188,7 @@ const npmRegistry = process.env.GROK_NPM_REGISTRY
+     || (() => {
+         try {
+             const resolved = execSync(
+-                'npm config get @xai-official:registry',
++                'npm config get @gork-build:registry',
+                 { encoding: 'utf8', timeout: 5000 }
+             ).trim();
+             if (resolved && resolved !== 'undefined') return resolved;
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/package.json b/crates/codegen/xai-grok-pager/npm/grok/package.json
+index 37708dc74c60607ea27abc922ac612dd86e03aae..b5cdcd18e5da52dd8346ac183824acec16a26bf7 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok/package.json
+@@ -1,9 +1,10 @@
+ {
+-    "name": "@xai-official/grok",
++    "name": "@gork-build/gork",
+     "version": "0.1.220-alpha.4",
+-    "description": "Bring Grok into your terminal",
++    "description": "Gork Build \u2014 community VSCodium-style Grok Build (no vendor telemetry)",
+     "license": "Apache-2.0",
+     "bin": {
++        "gork": "bin/grok",
+         "grok": "bin/grok"
+     },
+     "files": [
+@@ -31,11 +32,11 @@
+         "@iarna/toml": "^3.0.0"
+     },
+     "optionalDependencies": {
+-        "@xai-official/grok-darwin-arm64": "0.1.220-alpha.4",
+-        "@xai-official/grok-darwin-x64": "0.1.220-alpha.4",
+-        "@xai-official/grok-linux-arm64": "0.1.220-alpha.4",
+-        "@xai-official/grok-linux-x64": "0.1.220-alpha.4",
+-        "@xai-official/grok-win32-arm64": "0.1.220-alpha.4",
+-        "@xai-official/grok-win32-x64": "0.1.220-alpha.4"
++        "@gork-build/gork-darwin-arm64": "0.1.220-alpha.4",
++        "@gork-build/gork-darwin-x64": "0.1.220-alpha.4",
++        "@gork-build/gork-linux-arm64": "0.1.220-alpha.4",
++        "@gork-build/gork-linux-x64": "0.1.220-alpha.4",
++        "@gork-build/gork-win32-arm64": "0.1.220-alpha.4",
++        "@gork-build/gork-win32-x64": "0.1.220-alpha.4"
+     }
+ }
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js b/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js
+index f64800f9e92b786f7b0c666ed873ab95a42e50f0..dcfa846321cedde3496f237bd25b44e94a1d9000 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js
++++ b/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js
+@@ -6,7 +6,7 @@
+ //   2. Stamps the sub-package's version to match the meta package
+ //
+ // Each per-platform package is its own npm publish target. The meta package
+-// (`@xai-official/grok`) lists all six as `optionalDependencies` pinned to
++// (`@gork-build/gork`) lists all six as `optionalDependencies` pinned to
+ // the same version; npm installs only the one matching the host's
+ // `os` + `cpu` filters.
+ //
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
+prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
+prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
+prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
+prerequisite-patch-id: de6f7bc6cb2bcbdee7e27accc7b6209ee61047cc
+-- 
+2.50.1 (Apple Git-155)
+

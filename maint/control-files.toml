@@ -1,0 +1,16 @@
+# Files restored onto every sync branch after applying patches.
+# Paths are relative to the repository root (or under maint/control/ as templates).
+schema = 1
+
+# Live paths that must exist on the control tree and be copied to sync branches.
+paths = [
+  "maint",
+  ".github/workflows/gork-privacy.yml",
+  ".github/workflows/patch-roundtrip.yml",
+  ".github/workflows/upstream-watch.yml",
+  ".github/workflows/upstream-replay.yml",
+]
+
+# Optional templates under maint/control/ that overwrite/create the live paths above
+# after apply (same relative layout under maint/control/).
+template_root = "maint/control"

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:25 -0700
+Subject: [PATCH] privacy-core: PRIVACY_BUILD and product identity
+
+Gork-Patch-Id: privacy-core
+Gork-Invariant: privacy-build-enabled
+Gork-Risk: critical
+---
+ crates/codegen/xai-grok-version/Cargo.toml |  2 +-
+ crates/codegen/xai-grok-version/src/lib.rs | 56 +++++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-version/Cargo.toml b/crates/codegen/xai-grok-version/Cargo.toml
+index 16c9dc15e73b650f37efcc5d526432e413d2787d..199d9b3e0272bd94543f65f90251d3c8d755eef9 100644
+--- a/crates/codegen/xai-grok-version/Cargo.toml
++++ b/crates/codegen/xai-grok-version/Cargo.toml
+@@ -3,7 +3,7 @@ license = "Apache-2.0"
+ name = "xai-grok-version"
+ version = "0.2.0-dev"
+ edition.workspace = true
+-description = "Lockstepped grok CLI version."
++description = "Lockstepped Gork Build CLI version and privacy-build constants."
+ 
+ [dependencies]
+ semver = { workspace = true }
+diff --git a/crates/codegen/xai-grok-version/src/lib.rs b/crates/codegen/xai-grok-version/src/lib.rs
+index 29fdfc1e64ea1df96f0ca3e1afe78c9ac37843bd..73744a1122c68e51f12cea19e92da12bf1d90e1d 100644
+--- a/crates/codegen/xai-grok-version/src/lib.rs
++++ b/crates/codegen/xai-grok-version/src/lib.rs
+@@ -1,7 +1,41 @@
+-//! Installed grok CLI version, lockstepped with shipping binaries.
++//! Installed Gork Build CLI version, lockstepped with shipping binaries.
++//!
++//! **Gork Build** is a community privacy fork of xAI Grok Build (same role as
++//! VSCodium vs VS Code): same codebase, no product telemetry, no research
++//! trace uploads, no xAI branding. Model inference still uses the user's
++//! credentials against the Grok API — that is the only network path required
++//! for the agent to work.
+ 
+ use semver::Version;
+ 
++/// Compile-time privacy fork switch. Always `true` in Gork Build.
++/// Upstream Grok Build would set this to `false`.
++pub const PRIVACY_BUILD: bool = true;
++
++/// User-facing product name for this fork.
++pub const PRODUCT_NAME: &str = "Gork Build";
++
++/// Preferred CLI binary / command name for this fork.
++pub const PRODUCT_CLI: &str = "gork";
++
++/// One-line positioning (README, `--version` help, welcome copy).
++pub const PRODUCT_TAGLINE: &str =
++    "VSCodium-style community build of Grok Build — vendor telemetry removed";
++
++/// `true` when research telemetry, Mixpanel, GCS session traces, and similar
++/// non-inference uploads must stay off. Always true while [`PRIVACY_BUILD`].
++#[inline]
++pub fn research_data_collection_forbidden() -> bool {
++    PRIVACY_BUILD
++}
++
++/// `true` when coding-data retention is locked to **opt-out** (no UI/API path
++/// may opt the account into sharing/training retention).
++#[inline]
++pub fn coding_data_retention_locked_opt_out() -> bool {
++    PRIVACY_BUILD
++}
++
+ pub const TEST_VERSION_ENV: &str = "GROK_TEST_VERSION";
+ 
+ pub const VERSION: &str = match option_env!("GROK_VERSION") {
+@@ -44,6 +78,26 @@ pub fn display_version_with_commit(version_with_commit: &str, channel_label: &st
+ mod tests {
+     use super::*;
+ 
++    /// Gork Build privacy policy constants — compile-time hard-offs that
++    /// resolvers and updaters consult. These must stay true for this fork.
++    #[test]
++    fn privacy_build_locks_research_and_retention_policy() {
++        assert!(
++            PRIVACY_BUILD,
++            "Gork Build must ship with PRIVACY_BUILD=true"
++        );
++        assert!(
++            research_data_collection_forbidden(),
++            "research_data_collection_forbidden must follow PRIVACY_BUILD"
++        );
++        assert!(
++            coding_data_retention_locked_opt_out(),
++            "coding data retention must be locked opt-out under PRIVACY_BUILD"
++        );
++        assert_eq!(PRODUCT_CLI, "gork");
++        assert_eq!(PRODUCT_NAME, "Gork Build");
++    }
++
+     /// Display formatting invariant matrix — verifies label appending
+     /// works correctly across all label states (alpha, stable, empty).
+     #[test]
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:25 -0700
+Subject: [PATCH] telemetry-hard-off: Mixpanel and product telemetry no-ops
+
+Gork-Patch-Id: telemetry-hard-off
+Gork-Invariant: product-telemetry-disabled
+Gork-Risk: critical
+---
+ crates/codegen/xai-grok-telemetry/Cargo.toml  |  4 +-
+ .../codegen/xai-grok-telemetry/src/client.rs  | 12 ++--
+ .../codegen/xai-grok-telemetry/src/config.rs  | 44 +++++++-------
+ .../codegen/xai-grok-telemetry/src/sentry.rs  | 11 ++--
+ crates/codegen/xai-mixpanel/src/lib.rs        | 57 ++++++-------------
+ 5 files changed, 49 insertions(+), 79 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-telemetry/Cargo.toml b/crates/codegen/xai-grok-telemetry/Cargo.toml
+index 04b543c2d1fc62866d3dfe733d2f2862c72b4fd4..6d0fa1e856b45eb31fb04014f1b0e0b19ada2d9b 100644
+--- a/crates/codegen/xai-grok-telemetry/Cargo.toml
++++ b/crates/codegen/xai-grok-telemetry/Cargo.toml
+@@ -3,8 +3,8 @@ license = "Apache-2.0"
+ name = "xai-grok-telemetry"
+ version = "0.1.0"
+ edition.workspace = true
+-description = "Telemetry engine: product events + Mixpanel emission + Sentry error reporting for Grok Build sessions"
+-authors = ["xAI"]
++description = "Telemetry engine for Gork Build (product analytics hard-off; optional user Sentry via SENTRY_DSN)"
++authors = ["Gork Build contributors"]
+ 
+ [features]
+ default = []
+diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
+index c2cd3a72f3080afbe36ebaa1b1f3c54ab8b85e7c..880958e316e088ec445537d7b599bcea7e08bff7 100644
+--- a/crates/codegen/xai-grok-telemetry/src/client.rs
++++ b/crates/codegen/xai-grok-telemetry/src/client.rs
+@@ -75,14 +75,10 @@ impl TelemetryClient {
+         subscription_tier: Option<String>,
+         http_client: reqwest::Client,
+     ) -> Self {
+-        let mixpanel = if config.mixpanel_enabled {
+-            config
+-                .mixpanel_token
+-                .as_ref()
+-                .map(|token| Arc::new(Mixpanel::new(token.as_str())))
+-        } else {
+-            None
+-        };
++        // Gork Build: never construct a Mixpanel client. `Mixpanel::{track,engage}`
++        // are also no-ops as a second line of defense.
++        let _ = (config.mixpanel_enabled, config.mixpanel_token.as_ref());
++        let mixpanel: Option<Arc<Mixpanel>> = None;
+         let deployment_id = deployment_key
+             .filter(|s| !s.is_empty())
+             .map(|k| deployment_id_from_key(&k));
+diff --git a/crates/codegen/xai-grok-telemetry/src/config.rs b/crates/codegen/xai-grok-telemetry/src/config.rs
+index b99c7c80c45c5332b4e14e7bf881cacd610c3ec4..e9d5abc8c77a3f7371c5baec6a017494cbe11e96 100644
+--- a/crates/codegen/xai-grok-telemetry/src/config.rs
++++ b/crates/codegen/xai-grok-telemetry/src/config.rs
+@@ -127,23 +127,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
+ }
+ impl Default for TelemetryConfig {
+     fn default() -> Self {
+-        let (baked_url, baked_key, baked_token, baked_enabled) = internal_defaults();
+-        let build_url = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
+-        let build_key = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
+-        let build_token = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
+-        let mixpanel_enabled = baked_enabled || build_token.is_some();
+-        let (events_url, events_api_key, mixpanel_token) = (
+-            build_url.or(baked_url),
+-            build_key.or(baked_key),
+-            build_token.or(baked_token),
+-        );
++        // Gork Build: no baked or build-time product-telemetry endpoints.
++        // External OTEL (customer collector) remains opt-in via config/env.
++        let _ = internal_defaults();
++        let _ = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
++        let _ = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
++        let _ = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
+         Self {
+-            enabled: None,
+-            events_url,
+-            events_api_key,
+-            mixpanel_token,
+-            mixpanel_enabled,
+-            trace_upload: None,
++            enabled: Some(false),
++            events_url: None,
++            events_api_key: None,
++            mixpanel_token: None,
++            mixpanel_enabled: false,
++            trace_upload: Some(false),
+             otel_enabled: None,
+             otel_metrics_exporter: None,
+             otel_logs_exporter: None,
+@@ -224,14 +220,14 @@ mod tests {
+         assert_eq!(build_env_default(Some(" key ")), Some("key".to_owned()));
+     }
+     #[test]
+-    fn default_is_build_env_layer_when_feature_off() {
++    fn default_is_privacy_hard_off() {
++        // Gork Build: product telemetry endpoints are never baked in.
+         let cfg = TelemetryConfig::default();
+-        let url = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
+-        let key = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
+-        let token = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
+-        assert_eq!(cfg.mixpanel_enabled, token.is_some());
+-        assert_eq!(cfg.events_url, url);
+-        assert_eq!(cfg.events_api_key, key);
+-        assert_eq!(cfg.mixpanel_token, token);
++        assert!(!cfg.mixpanel_enabled);
++        assert_eq!(cfg.events_url, None);
++        assert_eq!(cfg.events_api_key, None);
++        assert_eq!(cfg.mixpanel_token, None);
++        assert_eq!(cfg.trace_upload, Some(false));
++        assert_eq!(cfg.enabled, Some(false));
+     }
+ }
+diff --git a/crates/codegen/xai-grok-telemetry/src/sentry.rs b/crates/codegen/xai-grok-telemetry/src/sentry.rs
+index 74a83a2eb5948c130aa9105805c8d1b5614004ca..250c01e2d3763bcbb88310053495cdd29904e412 100644
+--- a/crates/codegen/xai-grok-telemetry/src/sentry.rs
++++ b/crates/codegen/xai-grok-telemetry/src/sentry.rs
+@@ -32,14 +32,17 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
+ pub fn init(config: Config) -> ClientInitGuard {
+     let config = CONFIG.get_or_init(|| config);
+ 
++    // Gork Build: Sentry is off unless the user explicitly sets SENTRY_DSN at
++    // runtime *and* passes disabled=false. Built-in / compile-time DSNs are
++    // ignored so xAI crash reporting cannot ship by default.
+     if config.disabled {
+         return sentry::init(ClientOptions::default());
+     }
+ 
+-    let dsn = std::env::var("SENTRY_DSN")
+-        .ok()
+-        .or_else(|| option_env!("SENTRY_DSN").map(|s| s.to_string()))
+-        .unwrap_or_default();
++    let dsn = std::env::var("SENTRY_DSN").unwrap_or_default();
++    if dsn.is_empty() {
++        return sentry::init(ClientOptions::default());
++    }
+ 
+     let scrubber = Scrubber::from_env();
+ 
+diff --git a/crates/codegen/xai-mixpanel/src/lib.rs b/crates/codegen/xai-mixpanel/src/lib.rs
+index 94a1a836706b674827af4fcde1c61bfab17505d1..437e3634849f2e8ec7b473111b2e36c5d8033536 100644
+--- a/crates/codegen/xai-mixpanel/src/lib.rs
++++ b/crates/codegen/xai-mixpanel/src/lib.rs
+@@ -5,7 +5,6 @@
+ //!
+ //! Only the `track` API is implemented since that's all we use.
+ 
+-use base64::Engine;
+ use std::collections::HashMap;
+ 
+ /// Mixpanel client for sending track events.
+@@ -44,6 +43,10 @@ impl Mixpanel {
+     /// Scrub property string values in place, then inject the project
+     /// token. Split out from [`Self::track`] so the scrub-then-inject
+     /// ordering is testable.
++    ///
++    /// Not called by [`Self::track`] in Gork Build (track is a hard no-op),
++    /// but kept + unit-tested so a future re-enable cannot drop scrub order.
++    #[allow(dead_code)] // intentionally unused by privacy no-op track path
+     fn prepare_properties(
+         &self,
+         mut properties: HashMap<String, serde_json::Value>,
+@@ -57,58 +60,30 @@ impl Mixpanel {
+ 
+     /// Track an event. Properties should include `distinct_id`. The
+     /// project `token` is injected after scrubbing, so it isn't redacted.
++    ///
++    /// **Gork Build:** always a no-op — product analytics never leave the host.
+     pub async fn track(
+         &self,
+-        event: &str,
+-        properties: Option<HashMap<String, serde_json::Value>>,
++        _event: &str,
++        _properties: Option<HashMap<String, serde_json::Value>>,
+     ) -> Result<(), Error> {
+-        let props = self.prepare_properties(properties.unwrap_or_default());
+-
+-        let payload = serde_json::json!([{
+-            "event": event,
+-            "properties": props,
+-        }]);
+-
+-        let json_bytes = serde_json::to_vec(&payload)?;
+-        let encoded = base64::engine::general_purpose::STANDARD.encode(&json_bytes);
+-
+-        self.client
+-            .post("https://api.mixpanel.com/track")
+-            .form(&[("data", &encoded)])
+-            .send()
+-            .await?;
+-
++        // Privacy fork: drop all Mixpanel track calls. Token/client remain so
++        // construction sites compile, but nothing is transmitted.
++        let _ = (&self.token, &self.client);
+         Ok(())
+     }
+ 
+     /// Create or update a user profile via Mixpanel's Engage API.
+     /// String values in `set` are scrubbed for secrets before sending.
+     /// The project `token` is injected automatically.
++    ///
++    /// **Gork Build:** always a no-op.
+     pub async fn engage(
+         &self,
+-        distinct_id: &str,
+-        set: HashMap<String, serde_json::Value>,
++        _distinct_id: &str,
++        _set: HashMap<String, serde_json::Value>,
+     ) -> Result<(), Error> {
+-        let mut scrubbed = set;
+-        for v in scrubbed.values_mut() {
+-            xai_grok_secrets::redact_json_string_values(v);
+-        }
+-
+-        let payload = serde_json::json!([{
+-            "$token": self.token,
+-            "$distinct_id": distinct_id,
+-            "$set": scrubbed,
+-        }]);
+-
+-        let json_bytes = serde_json::to_vec(&payload)?;
+-        let encoded = base64::engine::general_purpose::STANDARD.encode(&json_bytes);
+-
+-        self.client
+-            .post("https://api.mixpanel.com/engage")
+-            .form(&[("data", &encoded)])
+-            .send()
+-            .await?;
+-
++        let _ = (&self.token, &self.client);
+         Ok(())
+     }
+ }
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+-- 
+2.50.1 (Apple Git-155)
+
