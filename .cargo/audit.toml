@@ -1,0 +1,31 @@
+# cargo-audit configuration for Gork Build.
+#
+# CI treats audit as a **hard gate**: any vulnerability *not* listed here fails
+# the job. This is "block new unignored vulns", not "tree is clean".
+#
+# Config path: `.cargo/audit.toml` (cargo-audit project discovery).
+# See: https://docs.rs/cargo-audit/latest/cargo_audit/
+
+[advisories]
+ignore = [
+    # --- RUSTSEC-2023-0071 (rsa, Marvin Attack) ---
+    # Package: rsa (no fixed upgrade on crates.io as of 2026-07).
+    # Dependency chain: rsa ← jsonwebtoken / sigstore-* (via xai-grok-shell graph).
+    # Why ignore: RustSec marks no patched version; only full stack migration
+    #   away from `rsa` crate removes the finding.
+    # Remove when: jsonwebtoken/sigstore (or our fork pins) drop `rsa`, or
+    #   RUSTSEC-2023-0071 gains a fixed release we can lock to.
+    "RUSTSEC-2023-0071",
+
+    # --- RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml DoS) ---
+    # Package: quick-xml < 0.41.0
+    # Dependency chain:
+    #   quick-xml ^0.38 ← xai-grok-tools (direct)
+    #   quick-xml ^0.39 ← pdf_oxide ← xai-grok-tools
+    # Why ignore: fix requires >=0.41; cannot cargo-update without bumping
+    #   xai-grok-tools / pdf_oxide API major pins (coordinated change).
+    # Remove when: xai-grok-tools + pdf_oxide accept quick-xml >=0.41 and
+    #   Cargo.lock is refreshed accordingly. Track: follow-up dep-bump PR.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
