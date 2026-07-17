@@ -1230,7 +1230,14 @@ impl AppView {
                 .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
     }
     /// Welcome privacy banner visibility gates.
+    ///
+    /// Gork Build: never shown. The banner exists upstream to advertise the
+    /// coding-data-retention opt-in, which this build locks to opt-out — a
+    /// remote `privacy_notice_rollout` flag must not surface a dead opt-in.
     pub fn privacy_banner_should_show(&self) -> bool {
+        if xai_grok_version::coding_data_retention_locked_opt_out() {
+            return false;
+        }
         if self.screen_mode.is_minimal() {
             return false;
         }
