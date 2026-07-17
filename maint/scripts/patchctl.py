@@ -1081,28 +1081,54 @@ def cmd_lint(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             err(f"history checks failed: {exc}")
 
-    # Replay patches+overlays and compare to current HEAD product tree.
-    # This catches unexported product edits after patch_tip / control commits.
+    # Replay patches+overlays and compare product trees.
+    #
+    # Default target is always current HEAD (minus control paths) so that
+    # unexported product edits after product_tip still fail CI:
+    #
+    #   product_tip → control → direct Rust privacy edit  # must fail
+    #
+    # When lock.product_tip is set and differs from HEAD, also verify the
+    # recorded product_tip still rebuilds (lock integrity). Explicit
+    # --compare-to overrides both and runs a single check.
     if not args.skip_roundtrip:
         head = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
-        product = (
-            getattr(args, "compare_to", None)
-            or lock.product_tip
-            or head
-        )
-        rc = cmd_roundtrip(
-            argparse.Namespace(
-                expected=lock.patch_tip,
-                compare_to=product,
-                lock_from=None,
-                base=None,
+        explicit = getattr(args, "compare_to", None)
+        targets: list[tuple[str, str]] = []
+        if explicit:
+            targets.append(("compare-to", explicit))
+        else:
+            # Primary: current HEAD product tree (drift detection)
+            targets.append(("HEAD", head))
+            # Secondary: recorded product_tip when it is a distinct ref
+            if lock.product_tip:
+                try:
+                    pt = git(
+                        ["rev-parse", lock.product_tip], cwd=root, capture=True
+                    ).stdout.strip()
+                    if pt != head:
+                        targets.append(("lock.product_tip", pt))
+                except SystemExit:
+                    err(
+                        f"lock.product_tip {lock.product_tip[:12]} is not "
+                        "resolvable in this clone"
+                    )
+
+        for label, target in targets:
+            print(f"lint roundtrip vs {label} ({target[:12]})")
+            rc = cmd_roundtrip(
+                argparse.Namespace(
+                    expected=lock.patch_tip,
+                    compare_to=target,
+                    lock_from=None,
+                    base=None,
+                )
             )
-        )
-        if rc != 0:
-            err(
-                f"roundtrip vs product tree failed (exit {rc}); "
-                "product code may have drifted past patch_tip without re-export"
-            )
+            if rc != 0:
+                err(
+                    f"roundtrip vs {label} failed (exit {rc}); "
+                    "export/finalize product tree or revert unexported edits"
+                )
 
     if errors:
         print(f"lint failed: {len(errors)} error(s)", file=sys.stderr)
@@ -1420,7 +1446,9 @@ def build_parser() -> argparse.ArgumentParser:
     ln.add_argument(
         "--compare-to",
         default=None,
-        help="Product tree for roundtrip (default: lock.product_tip or HEAD)",
+        help="Override product tree for a single roundtrip comparison. "
+        "Default: HEAD (drift detection), and also lock.product_tip when set "
+        "and different from HEAD.",
     )
     ln.set_defaults(func=cmd_lint)
 
