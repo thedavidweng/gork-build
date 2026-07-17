@@ -1,0 +1,236 @@
+# Gork privacy CI — independent of upstream's eventual CI.
+# Single source of truth for privacy contracts: maint/contracts/privacy-contract.toml
+name: Gork privacy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: gork-privacy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.92.0"
+
+# Pin third-party actions to full commit SHAs (supply-chain).
+# checkout@v7.0.0, rust-toolchain@master, rust-cache@v2.9.1,
+# upload-artifact@v7.0.1, download-artifact@v7.0.0
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: clippy
+          cache-targets: "true"
+
+      - name: Clippy privacy-critical crates
+        run: |
+          cargo clippy --no-deps \
+            -p xai-grok-version \
+            -p xai-mixpanel \
+            -p xai-grok-telemetry \
+            -p xai-grok-update \
+            --lib \
+            -- -D warnings
+
+      - name: Clippy gork binary crate
+        run: |
+          cargo clippy --no-deps \
+            -p xai-grok-pager-bin \
+            --bins \
+            -- -D warnings
+
+  patch-lint:
+    name: Patch queue lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: patchctl lint (static)
+        run: python3 maint/scripts/patchctl.py lint --skip-roundtrip
+
+  privacy-contracts:
+    name: Privacy contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: privacy-tests
+          cache-targets: "true"
+
+      - name: Privacy contracts (no supply-chain / no egress)
+        # cargo-audit lives in the dedicated cargo-audit job (installs the tool).
+        # egress lives in privacy-egress (needs release binary).
+        run: |
+          python3 maint/scripts/patchctl.py verify \
+            --skip-expensive \
+            --exclude-group supply-chain \
+            --exclude-group egress
+
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit (via contract)
+        run: python3 maint/scripts/patchctl.py verify --only cargo-audit
+
+  build-gork:
+    name: Build gork
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: build-gork
+          cache-targets: "true"
+
+      - name: Build gork (release)
+        run: cargo build -p xai-grok-pager-bin --release
+
+      - name: Smoke gork CLI
+        run: |
+          set -euo pipefail
+          BIN=target/release/gork
+          test -x "$BIN"
+          "$BIN" --version
+          HELP=$("$BIN" --help)
+          echo "$HELP" | head -20
+          echo "$HELP" | grep -q 'Gork Build TUI'
+          echo "$HELP" | grep -q 'Usage: gork'
+          echo "smoke ok"
+
+      - name: Upload gork binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gork-linux-x86_64
+          path: target/release/gork
+          if-no-files-found: error
+          retention-days: 14
+
+  privacy-egress:
+    name: Privacy egress capture
+    needs: [build-gork]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download gork binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: gork-linux-x86_64
+          path: target/release
+
+      - name: Egress contract
+        run: |
+          set -euo pipefail
+          chmod +x target/release/gork scripts/privacy_egress_check.sh
+          export PRIVACY_EGRESS_WORKDIR="${RUNNER_TEMP}/gork-privacy-egress"
+          mkdir -p "$PRIVACY_EGRESS_WORKDIR"
+          GORK_BIN=target/release/gork \
+            python3 maint/scripts/patchctl.py verify --only release-egress-smoke
+
+      - name: Upload egress host log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privacy-egress-hosts
+          path: ${{ runner.temp }}/gork-privacy-egress/**
+          if-no-files-found: ignore
+          retention-days: 14

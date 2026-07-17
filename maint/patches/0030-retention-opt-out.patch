@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:26 -0700
+Subject: [PATCH] retention-opt-out: lock coding-data retention to opt-out
+
+Gork-Patch-Id: retention-opt-out
+Gork-Invariant: retention-locked-opt-out
+Gork-Risk: critical
+---
+ .../xai-grok-pager/src/settings/defs.rs       | 36 ++++-----
+ .../xai-grok-pager/src/settings/registry.rs   | 23 +++---
+ .../src/slash/commands/privacy.rs             | 18 +++--
+ .../xai-grok-pager/tests/settings_e2e.rs      | 31 +++-----
+ .../xai-grok-shell/src/auth/manager.rs        | 19 ++++-
+ .../xai-grok-shell/src/auth/manager_tests.rs  | 78 +++++++------------
+ .../codegen/xai-grok-shell/src/auth/model.rs  | 15 +++-
+ .../xai-grok-shell/src/extensions/privacy.rs  | 21 ++++-
+ 8 files changed, 119 insertions(+), 122 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager/src/settings/defs.rs b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+index 63443570680a68b4af391b6220ec88afed57b0f7..eed5dceac0f1f1b22de356d6da3a0cecb2a0b160 100644
+--- a/crates/codegen/xai-grok-pager/src/settings/defs.rs
++++ b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+@@ -130,18 +130,11 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
+ // can fail. Commit on Enter only.
+ // ---------------------------------------------------------------------------
+ 
+-const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[
+-    EnumChoice {
+-        canonical: "opt-in",
+-        display: "Opt in",
+-        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
+-    },
+-    EnumChoice {
+-        canonical: "opt-out",
+-        display: "Opt out",
+-        description: "Do not retain coding session data. Code requests will not be used for training.",
+-    },
+-];
++const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[EnumChoice {
++    canonical: "opt-out",
++    display: "Opt out (locked)",
++    description: "Gork Build locks coding data retention to opt-out. Opt-in is not available.",
++}];
+ 
+ // ---------------------------------------------------------------------------
+ // Plan-mode catalog.
+@@ -1045,16 +1038,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
+             restart_required: false,
+             hidden_in_minimal: false,
+         },
+-        // SHELL-owned. Persisted in auth metadata (not config.toml).
+-        // Reads from `PagerLocalSnapshot.coding_data_sharing_opt_out`.
+-        // Default "opt-in" matches `AuthEntry::coding_data_retention_opt_out = false`.
+-        // ZDR / non-admin guards are enforced at dispatch time.
++        // SHELL-owned. Gork Build: locked to opt-out (single choice).
+         SettingMeta {
+             key: "coding_data_sharing",
+             category: SettingCategory::Privacy,
+             owner: SettingOwner::Shell,
+-            label: "Coding data sharing",
+-            description: "Controls whether SpaceXAI may retain and train on coding session data.",
++            label: "Coding data retention",
++            description: "Locked to opt-out in Gork Build. Opt-in is not offered.",
+             keywords: &[
+                 "privacy",
+                 "data",
+@@ -1063,11 +1053,10 @@ pub fn default_settings() -> Vec<SettingMeta> {
+                 "retention",
+                 "telemetry",
+                 "training",
+-                "opt-in",
+                 "opt-out",
+             ],
+             kind: SettingKind::Enum {
+-                default: "opt-in",
++                default: "opt-out",
+                 choices: CODING_DATA_SHARING_CHOICES,
+                 supports_preview: false,
+             },
+@@ -1221,12 +1210,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
+             category: SettingCategory::Advanced,
+             owner: SettingOwner::Shell,
+             label: "Auto-update",
+-            description: "Automatically download and install pager updates on startup. \
+-                          Restart required.",
++            description: "Unused in Gork Build. Vendor (x.ai) auto-update is hard-disabled so \
++                          this fork is never overwritten by official Grok Build installers. \
++                          Update by rebuilding from the gork-build repository.",
+             keywords: &[
+                 "auto", "update", "updates", "upgrade", "version", "install", "channel",
+             ],
+-            kind: SettingKind::Bool { default: true },
++            kind: SettingKind::Bool { default: false },
+             restart_required: true,
+             hidden_in_minimal: false,
+         },
+diff --git a/crates/codegen/xai-grok-pager/src/settings/registry.rs b/crates/codegen/xai-grok-pager/src/settings/registry.rs
+index dd7c798a54b128f7dd79f588a1f6fb7fbac2ccf1..6900b82d9fcb3e0ec91f1fb8ad3ec021af718273 100644
+--- a/crates/codegen/xai-grok-pager/src/settings/registry.rs
++++ b/crates/codegen/xai-grok-pager/src/settings/registry.rs
+@@ -257,7 +257,8 @@ pub struct PagerLocalSnapshot {
+     pub plan_mode_active: bool,
+     /// `[cli].show_tips` mirror. `None` = no TOML override → default `true`.
+     pub show_tips: Option<bool>,
+-    /// `[cli].auto_update` mirror. `None` = no TOML override → default `true`.
++    /// `[cli].auto_update` mirror. `None` = no TOML override → default `false`
++    /// in Gork Build (no silent x.ai channel updates).
+     pub auto_update: Option<bool>,
+     /// Process-wide vim-mode scrollback flag. Mirrors
+     /// `appearance::cache::load_vim_mode()` at snapshot time.
+@@ -289,7 +290,8 @@ impl Default for PagerLocalSnapshot {
+             auto_mode: false,
+             current_model_name: None,
+             available_models: Vec::new(),
+-            coding_data_sharing_opt_out: false,
++            // Gork Build: privacy by default.
++            coding_data_sharing_opt_out: true,
+             plan_mode_active: false,
+             show_tips: None,
+             auto_update: None,
+@@ -638,7 +640,7 @@ pub fn current_value_for(
+         )),
+         // CLI batch: snapshot mirrors; `None` → effective default `true`.
+         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
+-        "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
++        "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(false))),
+         // fork_secondary_model: baseline value folds to empty string.
+         "fork_secondary_model" => Some(SettingValue::String({
+             let baseline = xai_grok_shell::models::default_model();
+@@ -831,15 +833,12 @@ mod tests {
+                         "max_thoughts_width default drifts from UiConfig::default()",
+                     );
+                 }
+-                // coding_data_sharing: no UiConfig field; default pinned
+-                // against auth metadata (opt_out=false → "opt-in").
++                // coding_data_sharing: Gork Build privacy default is opt-out.
+                 ("coding_data_sharing", SettingKind::Enum { default, .. }) => {
+-                    let expected = "opt-in";
++                    let expected = "opt-out";
+                     assert_eq!(
+                         *default, expected,
+-                        "coding_data_sharing registry default must be 'opt-in' — \
+-                         the on-disk source of truth is `AuthEntry::coding_data_retention_opt_out: \
+-                         bool` (defaults to `false`, i.e. user has NOT opted out)",
++                        "coding_data_sharing registry default must be 'opt-out' in Gork Build",
+                     );
+                 }
+                 // CLI batch: fields live on CliConfig, not UiConfig.
+@@ -849,9 +848,9 @@ mod tests {
+                 }
+                 ("auto_update", SettingKind::Bool { default }) => {
+                     assert!(
+-                        *default,
+-                        "auto_update registry default must be true \
+-                         (matches auto_update.rs's `.unwrap_or(true)`)"
++                        !*default,
++                        "auto_update registry default must be false in Gork Build \
++                         (no silent x.ai channel updates)"
+                     );
+                 }
+                 // vim_mode: Option<bool>; None → false.
+diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs b/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
+index d0dceb35ad33327cae0dc39702bfddc3510730b6..460b752c5441a77689dd38c1474911003145ea93 100644
+--- a/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
++++ b/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
+@@ -7,8 +7,8 @@ use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
+ ///
+ /// Usage:
+ /// - `/privacy`             show current status
+-/// - `/privacy opt-in`      opt in to coding data sharing
+-/// - `/privacy opt-out`     opt out of coding data sharing
++/// - `/privacy opt-out`     confirm opt-out (always the locked mode in Gork Build)
++/// - `/privacy opt-in`      rejected in Gork Build (opt-out is the only mode)
+ ///
+ /// Case-insensitive. Only unambiguous aliases are accepted (e.g. `in`,
+ /// `share`, `out`, `private`) — generic toggles like `on`/`off` are
+@@ -21,11 +21,11 @@ impl SlashCommand for PrivacyCommand {
+     }
+ 
+     fn description(&self) -> &str {
+-        "Show or toggle privacy & data retention status"
++        "Show privacy status (coding data retention is locked to opt-out)"
+     }
+ 
+     fn usage(&self) -> &str {
+-        "/privacy [opt-in|opt-out]"
++        "/privacy"
+     }
+ 
+     fn takes_args(&self) -> bool {
+@@ -38,10 +38,16 @@ impl SlashCommand for PrivacyCommand {
+             return CommandResult::Action(Action::ShowPrivacyInfo);
+         }
+         match parse_privacy_arg(arg) {
++            Some(true) if xai_grok_version::coding_data_retention_locked_opt_out() => {
++                CommandResult::Error(
++                    "Gork Build locks coding data retention to opt-out; `/privacy opt-in` is not available."
++                        .into(),
++                )
++            }
+             Some(opted_in) => CommandResult::Action(Action::SetCodingDataSharing { opted_in }),
+             None => CommandResult::Error(format!(
+-                "Unknown argument `{arg}`. Valid options: opt-in (aliases: in, share) | \
+-                 opt-out (aliases: out, private)."
++                "Unknown argument `{arg}`. In Gork Build, use `/privacy` to view status \
++                 (retention is locked to opt-out)."
+             )),
+         }
+     }
+diff --git a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
+index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c9ce9b311 100644
+--- a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
++++ b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
+@@ -1712,14 +1712,14 @@ fn defaults_round_trip_through_registry() {
+             "scroll_lines" => SettingValue::Int(3),
+             "invert_scroll" => SettingValue::Bool(false),
+             "display_refresh_auto_cadence" => SettingValue::Bool(false),
+-            "coding_data_sharing" => SettingValue::Enum("opt-in"),
++            "coding_data_sharing" => SettingValue::Enum("opt-out"),
+             "default_selected_permission" => SettingValue::Enum("always_allow_all_sessions"),
+             "hunk_tracker_mode" => SettingValue::Enum("agent_only"),
+             "voice_capture_mode" => SettingValue::Enum("hold"),
+             "voice_stt_language" => SettingValue::Enum("en"),
+             "plan_mode" => SettingValue::Enum("off"),
+             "show_tips" => SettingValue::Bool(true),
+-            "auto_update" => SettingValue::Bool(true),
++            "auto_update" => SettingValue::Bool(false),
+             "fork_secondary_model" => SettingValue::String(String::new()),
+             "show_thinking_blocks" => SettingValue::Bool(true),
+             "prompt_suggestions" => SettingValue::Bool(true),
+@@ -4451,8 +4451,8 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
+             assert_eq!(*key, "coding_data_sharing");
+             assert_eq!(
+                 original_value,
+-                &SettingValue::Enum("opt-in"),
+-                "default snapshot opt_out=false → original 'opt-in'"
++                &SettingValue::Enum("opt-out"),
++                "Gork Build default snapshot opt_out=true → original 'opt-out'"
+             );
+         }
+         other => panic!("expected PickingEnum mode, got {other:?}"),
+@@ -4595,7 +4595,7 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
+     }
+ }
+ 
+-/// Exactly 2 canonical choices: {opt-in, opt-out}.
++/// Gork Build: only opt-out (locked).
+ #[test]
+ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
+     let reg = SettingsRegistry::defaults();
+@@ -4605,19 +4605,9 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
+         _ => panic!("coding_data_sharing must be Enum"),
+     };
+     assert_eq!(
+-        canonicals.len(),
+-        2,
+-        "coding_data_sharing catalog must be exactly {{opt-in, opt-out}} — adding a \
+-         choice requires updating the action_for_enum_commit arm in \
+-         views/settings_modal.rs AND the action_for_reset arm in dispatch.rs",
+-    );
+-    assert!(
+-        canonicals.contains(&"opt-in"),
+-        "coding_data_sharing must include 'opt-in' canonical"
+-    );
+-    assert!(
+-        canonicals.contains(&"opt-out"),
+-        "coding_data_sharing must include 'opt-out' canonical"
++        canonicals,
++        vec!["opt-out"],
++        "Gork Build locks coding_data_sharing to a single opt-out choice",
+     );
+ }
+ 
+@@ -5993,14 +5983,13 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
+     use xai_grok_pager::settings::current_value_for;
+     let ui = UiConfig::default();
+     let pager = PagerLocalSnapshot::default();
+-    for (key, expected) in [("show_tips", true), ("auto_update", true)] {
++    for (key, expected) in [("show_tips", true), ("auto_update", false)] {
+         let value = current_value_for(key, &ui, &pager)
+             .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
+         assert_eq!(
+             value,
+             SettingValue::Bool(expected),
+-            "PR 13: `{key}` defaults to {expected} (matches the consumer's \
+-             .unwrap_or(...) at the original read site)",
++            "PR 13: `{key}` defaults to {expected} (Gork Build: auto_update off)",
+         );
+     }
+ }
+diff --git a/crates/codegen/xai-grok-shell/src/auth/manager.rs b/crates/codegen/xai-grok-shell/src/auth/manager.rs
+index aa5b1c46e8606ddf9f2bc4f25d210eec363a8ca3..ce6f83dfa8e13bc6a67b000af01baa4d75ddd32c 100644
+--- a/crates/codegen/xai-grok-shell/src/auth/manager.rs
++++ b/crates/codegen/xai-grok-shell/src/auth/manager.rs
+@@ -716,10 +716,16 @@ impl AuthManager {
+     /// [`Self::current_or_expired`] because neither flag changes on token
+     /// expiry and `current()` returns `None` during the refresh window.
+     ///
+-    /// Fail-open: no credential ⇒ `false` (not disabled). Collection paths
+-    /// that must not act on unknown privacy state should use the fail-closed
+-    /// [`Self::allows_data_collection`] instead.
++    /// Gork Build: always `true` (research uploads hard-off).
++    ///
++    /// Fail-open only in non-privacy builds: no credential ⇒ `false` (not
++    /// disabled). Collection paths that must not act on unknown privacy
++    /// state should use the fail-closed [`Self::allows_data_collection`]
++    /// instead.
+     pub(crate) fn is_data_collection_disabled(&self) -> bool {
++        if xai_grok_version::research_data_collection_forbidden() {
++            return true;
++        }
+         self.current_or_expired()
+             .is_some_and(|a| a.is_data_collection_disabled())
+     }
+@@ -729,7 +735,12 @@ impl AuthManager {
+     /// cleared auth (e.g. after a mid-session `/logout`) counts as
+     /// disabled — nothing may leave the machine while the privacy state is
+     /// unknown.
++    ///
++    /// Gork Build: always `false`.
+     pub(crate) fn allows_data_collection(&self) -> bool {
++        if xai_grok_version::research_data_collection_forbidden() {
++            return false;
++        }
+         self.current_or_expired()
+             .is_some_and(|a| !a.is_data_collection_disabled())
+     }
+@@ -1318,7 +1329,7 @@ impl AuthManager {
+             }
+             TokenType::LegacySession => {
+                 // Deliberate side effect: re-read auth.json under the
+-                // assumption that a sibling process (`grok login` from
++                // assumption that a sibling process (`gork login` from
+                 // another shell, the desktop app, etc.) may have refreshed
+                 // the on-disk credentials. `pick_up_sibling_token` only
+                 // mutates inner when the disk holds a *different valid*
+diff --git a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
+index db11e1651d0eec1a8c4d0522047fb95ba656cae7..c48ad382c3ce8482b0f93bd905b02b4f71c37477 100644
+--- a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
+@@ -443,68 +443,54 @@ fn clear_does_not_remove_legacy_scope() {
+ 
+ #[test]
+ fn is_data_collection_disabled_matrix() {
+-    // (team_blocked_reasons, coding_data_retention_opt_out, expected)
+-    let cases: &[(&[&str], bool, bool)] = &[
+-        // ZDR team alone
+-        (&["BLOCKED_REASON_NO_LOGS"], false, true),
+-        (&["BLOCKED_REASON_NO_LOGS_MODERATED"], false, true),
+-        // Opt-out alone
+-        (&[], true, true),
+-        // Both
+-        (&["BLOCKED_REASON_NO_LOGS"], true, true),
+-        // Neither
+-        (&[], false, false),
+-        // Unrelated blocked reasons
++    // Gork Build: research collection is always disabled, independent of
++    // ZDR / opt-out flags (those still matter for server-side retention).
++    let cases: &[(&[&str], bool)] = &[
++        (&["BLOCKED_REASON_NO_LOGS"], false),
++        (&["BLOCKED_REASON_NO_LOGS_MODERATED"], false),
++        (&[], true),
++        (&["BLOCKED_REASON_NO_LOGS"], true),
++        (&[], false),
+         (
+             &["BLOCKED_REASON_BILLING", "BLOCKED_REASON_SUSPENDED"],
+             false,
+-            false,
+-        ),
+-        (&["BLOCKED_REASON_BILLING"], true, true),
+-        // ZDR mixed with other reasons
+-        (
+-            &["BLOCKED_REASON_BILLING", "BLOCKED_REASON_NO_LOGS"],
+-            false,
+-            true,
+         ),
++        (&["BLOCKED_REASON_BILLING"], true),
++        (&["BLOCKED_REASON_BILLING", "BLOCKED_REASON_NO_LOGS"], false),
+     ];
+-    for (reasons, opt_out, expected) in cases {
++    for (reasons, opt_out) in cases {
+         let auth = GrokAuth {
+             team_blocked_reasons: reasons.iter().map(|s| (*s).into()).collect(),
+             coding_data_retention_opt_out: *opt_out,
+             ..GrokAuth::test_default()
+         };
+-        assert_eq!(
++        assert!(
+             auth.is_data_collection_disabled(),
+-            *expected,
+-            "reasons={reasons:?} opt_out={opt_out} expected={expected}",
++            "Gork Build: reasons={reasons:?} opt_out={opt_out} must disable collection",
+         );
+     }
+ }
+ 
+-/// Fail-direction contract of the two `AuthManager` collection predicates:
+-/// `is_data_collection_disabled` fails open on missing credentials (legacy
+-/// semantics shared by telemetry/sync gates), `allows_data_collection` fails
+-/// closed (nothing may leave the machine while privacy state is unknown,
+-/// e.g. after a mid-session `/logout`).
++/// Gork Build: both collection predicates permanently suppress research
++/// uploads, including with no credential and with a "normal" user.
+ #[test]
+ fn manager_collection_predicates_fail_directions() {
+     let dir = tempfile::tempdir().unwrap();
+     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+ 
+-    // No credential: disabled=false (fail-open), allows=false (fail-closed).
+-    assert!(!mgr.is_data_collection_disabled());
++    assert!(mgr.is_data_collection_disabled());
+     assert!(
+         !mgr.allows_data_collection(),
+-        "missing credential must fail closed for collection"
++        "Gork Build: missing credential must not allow collection"
+     );
+ 
+-    // Normal user: both predicates allow collection.
+     mgr.hot_swap(GrokAuth::test_default());
+-    assert!(!mgr.is_data_collection_disabled());
+-    assert!(mgr.allows_data_collection());
++    assert!(mgr.is_data_collection_disabled());
++    assert!(
++        !mgr.allows_data_collection(),
++        "Gork Build: normal user must not allow research collection"
++    );
+ 
+-    // Opted-out user: both predicates suppress collection.
+     mgr.hot_swap(GrokAuth {
+         coding_data_retention_opt_out: true,
+         ..GrokAuth::test_default()
+@@ -512,15 +498,10 @@ fn manager_collection_predicates_fail_directions() {
+     assert!(mgr.is_data_collection_disabled());
+     assert!(!mgr.allows_data_collection());
+ 
+-    // Mid-session `/logout`: the fail-closed predicate flips back to
+-    // "no collection" even after a previously permissive credential.
+     mgr.hot_swap(GrokAuth::test_default());
+-    assert!(mgr.allows_data_collection(), "precondition");
+     mgr.clear_in_memory();
+-    assert!(
+-        !mgr.allows_data_collection(),
+-        "cleared credentials must close the collection gate"
+-    );
++    assert!(!mgr.allows_data_collection());
++    assert!(mgr.is_data_collection_disabled());
+ }
+ 
+ // -- token_suffix ----------------------------------------------------------------
+@@ -1101,7 +1082,7 @@ async fn auth_returns_expired_api_key_consistently_with_current() {
+ 
+     // Async path: must NOT clone the stale key for downstream
+     // consumers. Surface `TokenExpiredNoRefresh` so callers can
+-    // funnel the user back through `grok login`.
++    // funnel the user back through `gork login`.
+     let err = mgr.auth().await.unwrap_err();
+     assert!(
+         matches!(err, AuthError::TokenExpiredNoRefresh),
+@@ -1485,11 +1466,11 @@ async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_i
+     );
+     assert!(mgr.permanent_failure().is_some());
+ 
+-    // User runs `grok logout` which calls clear().
++    // User runs `gork logout` which calls clear().
+     mgr.clear().unwrap();
+ 
+     // The diagnostic the user now sees on the next request should be
+-    // "Not logged in. Run `grok login`.", not the stale invalid_grant.
++    // "Not logged in. Run `gork login`.", not the stale invalid_grant.
+     let err = mgr.auth().await.unwrap_err();
+     assert!(
+         matches!(err, AuthError::NotLoggedIn),
+@@ -2904,9 +2885,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
+     assert_eq!(auth.principal_type.as_deref(), Some("Team"));
+     assert_eq!(auth.principal_id.as_deref(), Some("team-1"));
+     assert!(auth.is_zdr_team());
++    // Gork Build forces opt-out even when /user omits the field.
+     assert!(
+-        !auth.coding_data_retention_opt_out,
+-        "absent field stays unchanged"
++        auth.coding_data_retention_opt_out,
++        "privacy build locks coding_data_retention_opt_out"
+     );
+ }
+ 
+diff --git a/crates/codegen/xai-grok-shell/src/auth/model.rs b/crates/codegen/xai-grok-shell/src/auth/model.rs
+index 3b8741cd16302aa0b2c13f0c0aaff35d3d1a1bc1..0e10545b8098b6d223b77473b5ce936581e3a0c2 100644
+--- a/crates/codegen/xai-grok-shell/src/auth/model.rs
++++ b/crates/codegen/xai-grok-shell/src/auth/model.rs
+@@ -10,7 +10,7 @@ const DEFAULT_EARLY_INVALIDATION_SECS: u64 = 300; // 5 minutes
+ /// Legacy auth.json scope key. Fallback for old devbox auth files.
+ pub(super) const LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
+ 
+-/// auth.json scope key for plain API key auth (desktop login, `grok login --api-key`).
++/// auth.json scope key for plain API key auth (desktop login, `gork login --api-key`).
+ pub const API_KEY_SCOPE: &str = "xai::api_key";
+ 
+ const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
+@@ -28,7 +28,7 @@ pub enum AuthMode {
+     Oidc,
+     /// External auth provider binary
+     External,
+-    /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
++    /// Plain API key (e.g. from grok-desktop login or `gork login --api-key`)
+     ApiKey,
+ }
+ 
+@@ -162,7 +162,13 @@ impl GrokAuth {
+     /// retention. Use this for trace-upload and research-data gates.
+     /// Product analytics (`telemetry_enabled`) and user-facing sync
+     /// features should use `is_zdr_team()` directly.
++    ///
++    /// Gork Build ([`xai_grok_version::PRIVACY_BUILD`]) always returns `true`:
++    /// research data never leaves the machine regardless of account flags.
+     pub fn is_data_collection_disabled(&self) -> bool {
++        if xai_grok_version::research_data_collection_forbidden() {
++            return true;
++        }
+         self.is_zdr_team() || self.coding_data_retention_opt_out
+     }
+ 
+@@ -205,7 +211,8 @@ impl Default for GrokAuth {
+             organization_role: None,
+             user_blocked_reason: None,
+             team_blocked_reasons: vec![],
+-            coding_data_retention_opt_out: false,
++            // Gork Build: privacy by default.
++            coding_data_retention_opt_out: xai_grok_version::PRIVACY_BUILD,
+             has_grok_code_access: None,
+             refresh_token: None,
+             expires_at: None,
+@@ -286,7 +293,7 @@ pub(crate) fn token_suffix(t: &str) -> &str {
+ 
+ /// Look up auth from the store by scope key.
+ ///
+-/// Legacy `WebLogin` tokens (from the pre-OIDC `grok login --legacy`
++/// Legacy `WebLogin` tokens (from the pre-OIDC `gork login --legacy`
+ /// flow) are skipped — they are validated via a per-request DB lookup
+ /// server-side which fails at high volume.  Skipping them here forces
+ /// affected users to re-authenticate via OIDC on next launch.
+diff --git a/crates/codegen/xai-grok-shell/src/extensions/privacy.rs b/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
+index 9161dc76ce6d63b395a12dedac080ce065fc6815..b332a5729ef2e5bdcc70ab177a75876239a750c9 100644
+--- a/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
++++ b/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
+@@ -26,10 +26,23 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+ 
+     let params: Params = parse_params(args)?;
+ 
++    // Gork Build: coding-data retention is locked to opt-out.
++    if xai_grok_version::coding_data_retention_locked_opt_out()
++        && !params.coding_data_retention_opt_out
++    {
++        return Err(acp::Error::invalid_params()
++            .data("Gork Build locks coding data retention to opt-out; opt-in is not available."));
++    }
++    let opt_out = if xai_grok_version::coding_data_retention_locked_opt_out() {
++        true
++    } else {
++        params.coding_data_retention_opt_out
++    };
++
+     let auth = agent.auth_manager.auth().await.map_err(|e| {
+         tracing::warn!(error = %e, "privacy: auth resolution failed");
+         acp::Error::auth_required()
+-            .data("Authentication required. Run `grok login` to re-authenticate.")
++            .data("Authentication required. Run `gork login` to re-authenticate.")
+     })?;
+ 
+     let proxy_url = agent.cfg.borrow().endpoints.proxy_url();
+@@ -37,7 +50,7 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+     let token_header = agent.auth_manager.grok_com_config().token_header.clone();
+ 
+     let body = serde_json::json!({
+-        "codingDataRetentionOptOut": params.coding_data_retention_opt_out,
++        "codingDataRetentionOptOut": opt_out,
+     });
+ 
+     let provider: std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider> = std::sync::Arc::new(
+@@ -82,10 +95,10 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+     // background GET /user enrichment that may read stale ACL state
+     // and overwrite the opt-out flag back to its previous value.
+     let mut updated = auth.clone();
+-    updated.coding_data_retention_opt_out = params.coding_data_retention_opt_out;
++    updated.coding_data_retention_opt_out = opt_out;
+     let _ = agent.auth_manager.save_without_enrichment(updated).await;
+ 
+     to_raw_response(&serde_json::json!({
+-        "codingDataRetentionOptOut": params.coding_data_retention_opt_out,
++        "codingDataRetentionOptOut": opt_out,
+     }))
+ }
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
+-- 
+2.50.1 (Apple Git-155)
+

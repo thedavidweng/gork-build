@@ -1,0 +1,74 @@
+# Functional privacy patch queue. Order is apply order.
+# file names under maint/patches/ must match series.
+schema = 1
+
+[[patch]]
+id = "privacy-core"
+file = "0001-privacy-core.patch"
+critical = true
+contracts = ["privacy-build-enabled", "version-lib"]
+
+[[patch]]
+id = "telemetry-hard-off"
+file = "0010-telemetry-hard-off.patch"
+critical = true
+contracts = ["mixpanel-lib", "telemetry-lib", "telemetry-resolvers"]
+
+[[patch]]
+id = "research-upload-hard-off"
+file = "0020-research-upload-hard-off.patch"
+critical = true
+contracts = ["telemetry-resolvers"]
+
+[[patch]]
+id = "retention-opt-out"
+file = "0030-retention-opt-out.patch"
+critical = true
+contracts = ["privacy-build-enabled"]
+
+[[patch]]
+id = "vendor-updater-hard-off"
+file = "0040-vendor-updater-hard-off.patch"
+critical = true
+contracts = [
+  "updater-product-build",
+  "updater-privacy-filters",
+  "installer-chokepoint-static",
+]
+
+[[patch]]
+id = "privacy-contract-tests"
+file = "0050-privacy-contract-tests.patch"
+critical = true
+contracts = ["telemetry-resolvers", "updater-product-build"]
+
+[[patch]]
+id = "egress-guard"
+file = "0060-egress-guard.patch"
+critical = true
+contracts = ["release-egress-smoke"]
+
+[[patch]]
+id = "supply-chain-policy"
+file = "0070-supply-chain-policy.patch"
+critical = true
+contracts = ["cargo-audit"]
+
+# Trailing non-critical: may be skipped on upstream conflict (draft PR still opens).
+[[patch]]
+id = "product-identity"
+file = "0080-product-identity.patch"
+critical = false
+contracts = []
+
+[[patch]]
+id = "package-publishing"
+file = "0081-package-publishing.patch"
+critical = false
+contracts = []
+
+[[patch]]
+id = "branding-docs"
+file = "0082-branding-docs.patch"
+critical = false
+contracts = []

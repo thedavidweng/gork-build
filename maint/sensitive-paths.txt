@@ -1,0 +1,18 @@
+# Paths that warrant security review when upstream changes them.
+# One git pathspec per line. Comments and blank lines ignored.
+crates/**/telemetry/**
+crates/**/upload/**
+crates/**/update/**
+crates/**/auth/**
+crates/**/remote/**
+crates/**/http/**
+crates/**/mixpanel/**
+crates/codegen/xai-mixpanel/**
+crates/codegen/xai-grok-telemetry/**
+crates/codegen/xai-grok-update/**
+crates/codegen/xai-grok-version/**
+crates/codegen/xai-grok-shell/src/upload/**
+crates/codegen/xai-grok-shell/src/auth/**
+crates/codegen/xai-grok-shell/src/remote/**
+crates/codegen/xai-grok-shell/src/extensions/privacy.rs
+crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs

@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:26 -0700
+Subject: [PATCH] egress-guard: release binary network egress smoke
+
+Gork-Patch-Id: egress-guard
+Gork-Invariant: egress-denylist-enforced
+Gork-Risk: critical
+---
+ scripts/privacy_egress_check.sh | 151 +++++++++++++++++++++++++++++++
+ scripts/privacy_egress_proxy.py | 156 ++++++++++++++++++++++++++++++++
+ 2 files changed, 307 insertions(+)
+ create mode 100755 scripts/privacy_egress_check.sh
+ create mode 100755 scripts/privacy_egress_proxy.py
+
+diff --git a/scripts/privacy_egress_check.sh b/scripts/privacy_egress_check.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..820af1d02138ae86879a66008ba4471443827d58
+--- /dev/null
++++ b/scripts/privacy_egress_check.sh
+@@ -0,0 +1,151 @@
++#!/usr/bin/env bash
++# Privacy egress check: run release `gork` through a local CONNECT proxy and
++# fail if denylisted destinations appear in the host log.
++#
++# Does not require MITM / TLS interception — only CONNECT hostnames are recorded.
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++cd "$ROOT"
++
++BIN="${GORK_BIN:-target/release/gork}"
++if [[ ! -x "$BIN" ]]; then
++  echo "Building release gork..."
++  cargo build -p xai-grok-pager-bin --release
++  BIN=target/release/gork
++fi
++
++BASE_TMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
++WORKDIR="${PRIVACY_EGRESS_WORKDIR:-$(mktemp -d "${BASE_TMP}/gork-privacy-egress.XXXXXX")}"
++mkdir -p "$WORKDIR"
++LOG="$WORKDIR/hosts.txt"
++PROXY_PORT="${PRIVACY_EGRESS_PORT:-18080}"
++LISTEN="127.0.0.1:${PROXY_PORT}"
++echo "$WORKDIR" >"$WORKDIR/workdir.path"
++
++# Destinations that must never appear during a privacy-hard-off smoke session.
++# Single source of truth: maint/contracts/network-denylist.txt
++DENYLIST_FILE="${PRIVACY_DENYLIST_FILE:-$ROOT/maint/contracts/network-denylist.txt}"
++if [[ ! -f "$DENYLIST_FILE" ]]; then
++  echo "FAIL: missing network denylist: $DENYLIST_FILE"
++  exit 1
++fi
++DENY_REGEX="$(
++  grep -vE '^[[:space:]]*(#|$)' "$DENYLIST_FILE" | paste -sd'|' - || true
++)"
++if [[ -z "$DENY_REGEX" ]]; then
++  echo "FAIL: empty network denylist: $DENYLIST_FILE"
++  exit 1
++fi
++
++python3 "$ROOT/scripts/privacy_egress_proxy.py" --listen "$LISTEN" --log "$LOG" &
++PROXY_PID=$!
++cleanup() {
++  kill "$PROXY_PID" 2>/dev/null || true
++  wait "$PROXY_PID" 2>/dev/null || true
++}
++trap cleanup EXIT
++
++# --- Readiness: proxy process alive AND accepts TCP ---
++READY=0
++for _ in $(seq 1 50); do
++  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
++    echo "FAIL: privacy egress proxy process exited during startup (pid=$PROXY_PID)"
++    exit 1
++  fi
++  if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',${PROXY_PORT}),0.2); s.close()" 2>/dev/null; then
++    READY=1
++    break
++  fi
++  sleep 0.1
++done
++if [[ "$READY" -ne 1 ]]; then
++  echo "FAIL: privacy egress proxy did not become ready on ${LISTEN}"
++  exit 1
++fi
++echo "proxy ready on ${LISTEN} (pid=$PROXY_PID)"
++
++# --- Positive control: CONNECT a sentinel host so the log must gain a line ---
++# (CONNECT is logged before the upstream connect attempt; failure is OK.)
++python3 - <<PY
++import socket
++s = socket.create_connection(("127.0.0.1", ${PROXY_PORT}), 2)
++req = (
++    b"CONNECT positive-control.test:443 HTTP/1.1\r\n"
++    b"Host: positive-control.test:443\r\n"
++    b"\r\n"
++)
++s.sendall(req)
++try:
++    s.recv(256)
++except OSError:
++    pass
++s.close()
++print("positive control CONNECT sent")
++PY
++
++if [[ ! -s "$LOG" ]] || ! grep -Fiq 'positive-control.test' "$LOG"; then
++  echo "FAIL: positive control did not record positive-control.test (proxy not capturing)"
++  echo "log contents:"; cat "$LOG" || true
++  exit 1
++fi
++echo "positive control recorded host; clearing log before gork smoke"
++: >"$LOG"
++
++export HTTP_PROXY="http://${LISTEN}"
++export HTTPS_PROXY="http://${LISTEN}"
++export ALL_PROXY="http://${LISTEN}"
++export http_proxy="$HTTP_PROXY"
++export https_proxy="$HTTPS_PROXY"
++export NO_PROXY=""
++export no_proxy=""
++
++export GROK_HOME="$WORKDIR/grok-home"
++mkdir -p "$GROK_HOME"
++export GROK_TELEMETRY_ENABLED=1
++export GROK_TELEMETRY_TRACE_UPLOAD=1
++
++echo "==> gork --version"
++"$BIN" --version
++
++echo "==> gork --help (smoke)"
++"$BIN" --help >/dev/null
++
++echo "==> gork update (must refuse vendor install without dialing x.ai)"
++set +e
++UPDATE_OUT="$("$BIN" update 2>&1)"
++UPDATE_EC=$?
++set -e
++echo "$UPDATE_OUT" | head -40
++if echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available'; then
++  echo "update path reported privacy/manual messaging (ok)"
++elif [[ "$UPDATE_EC" -ne 0 ]]; then
++  echo "update exited non-zero (ok for privacy build)"
++else
++  echo "FAIL: gork update exited 0 without privacy refusal message"
++  exit 1
++fi
++
++if ! kill -0 "$PROXY_PID" 2>/dev/null; then
++  echo "FAIL: proxy died during gork smoke"
++  exit 1
++fi
++
++sleep 1
++
++echo "==> Host log after gork:"
++if [[ -s "$LOG" ]]; then
++  sort -u "$LOG" | tee "$WORKDIR/hosts.unique.txt"
++else
++  echo "(empty — no CONNECT/HTTP destinations after positive control clear)"
++  : >"$WORKDIR/hosts.unique.txt"
++fi
++
++if grep -Ei "$DENY_REGEX" "$WORKDIR/hosts.unique.txt" >/dev/null 2>&1; then
++  echo "FAIL: denylisted destination(s) observed:"
++  grep -Ei "$DENY_REGEX" "$WORKDIR/hosts.unique.txt" || true
++  exit 1
++fi
++
++echo "PASS: no denylisted privacy/vendor destinations in egress log"
++echo "WORKDIR=$WORKDIR"
+diff --git a/scripts/privacy_egress_proxy.py b/scripts/privacy_egress_proxy.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..3ffd22ba7de2fb028b11999428235fffbc99be57
+--- /dev/null
++++ b/scripts/privacy_egress_proxy.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""Minimal HTTP CONNECT proxy that records destination hosts.
++
++Used by Gork Build privacy CI: run the release binary through this proxy and
++assert no denylisted destinations appear. HTTPS traffic is not decrypted —
++only CONNECT hostnames are logged (sufficient for egress inventory checks).
++
++Usage:
++  python3 scripts/privacy_egress_proxy.py --listen 127.0.0.1:18080 --log /tmp/hosts.txt
++"""
++
++from __future__ import annotations
++
++import argparse
++import select
++import socket
++import socketserver
++import sys
++import threading
++from typing import Optional
++
++
++class HostLog:
++    def __init__(self, path: str) -> None:
++        self._path = path
++        self._lock = threading.Lock()
++        open(path, "w", encoding="utf-8").close()
++
++    def add(self, host: str) -> None:
++        host = host.strip().lower()
++        if not host:
++            return
++        with self._lock:
++            with open(self._path, "a", encoding="utf-8") as f:
++                f.write(host + "\n")
++
++
++class ProxyHandler(socketserver.BaseRequestHandler):
++    log: HostLog  # set on server class
++
++    def handle(self) -> None:
++        self.request.settimeout(30.0)
++        try:
++            data = self._recv_headers()
++        except OSError:
++            return
++        if not data:
++            return
++        first = data.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
++        parts = first.split()
++        if len(parts) < 2:
++            return
++        method, target = parts[0].upper(), parts[1]
++        if method == "CONNECT":
++            hostport = target
++            host = hostport.split(":")[0]
++            self.log.add(host)
++            try:
++                remote = self._connect(hostport)
++            except OSError:
++                self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
++                return
++            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
++            self._pipe(self.request, remote)
++            return
++
++        # Plain HTTP: parse Host header for logging
++        host = self._host_from_headers(data) or "unknown"
++        self.log.add(host.split(":")[0])
++        # Best-effort forward for HTTP (rarely used by the CLI).
++        try:
++            remote = self._connect(host if ":" in host else f"{host}:80")
++            remote.sendall(data)
++            self._pipe(self.request, remote)
++        except OSError:
++            pass
++
++    def _recv_headers(self) -> bytes:
++        buf = b""
++        while b"\r\n\r\n" not in buf and len(buf) < 65536:
++            chunk = self.request.recv(4096)
++            if not chunk:
++                break
++            buf += chunk
++        return buf
++
++    @staticmethod
++    def _host_from_headers(data: bytes) -> Optional[str]:
++        for line in data.split(b"\r\n"):
++            if line.lower().startswith(b"host:"):
++                return line.split(b":", 1)[1].strip().decode("latin-1", errors="replace")
++        return None
++
++    @staticmethod
++    def _connect(hostport: str) -> socket.socket:
++        if ":" in hostport:
++            host, port_s = hostport.rsplit(":", 1)
++            port = int(port_s)
++        else:
++            host, port = hostport, 443
++        remote = socket.create_connection((host, port), timeout=15)
++        remote.settimeout(30.0)
++        return remote
++
++    @staticmethod
++    def _pipe(a: socket.socket, b: socket.socket) -> None:
++        sockets = [a, b]
++        try:
++            while True:
++                r, _, _ = select.select(sockets, [], [], 30.0)
++                if not r:
++                    break
++                for s in r:
++                    other = b if s is a else a
++                    try:
++                        data = s.recv(8192)
++                    except OSError:
++                        return
++                    if not data:
++                        return
++                    try:
++                        other.sendall(data)
++                    except OSError:
++                        return
++        finally:
++            for s in (a, b):
++                try:
++                    s.close()
++                except OSError:
++                    pass
++
++
++class ThreadingTCPServer(socketserver.ThreadingTCPServer):
++    allow_reuse_address = True
++    daemon_threads = True
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--listen", default="127.0.0.1:18080")
++    ap.add_argument("--log", required=True, help="Append-only host log path")
++    args = ap.parse_args()
++    host, port_s = args.listen.rsplit(":", 1)
++    port = int(port_s)
++    ProxyHandler.log = HostLog(args.log)
++    with ThreadingTCPServer((host, port), ProxyHandler) as srv:
++        print(f"privacy_egress_proxy listening on {host}:{port}, log={args.log}", flush=True)
++        try:
++            srv.serve_forever()
++        except KeyboardInterrupt:
++            pass
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
+prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
+prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+-- 
+2.50.1 (Apple Git-155)
+

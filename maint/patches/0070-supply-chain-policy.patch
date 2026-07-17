@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:26 -0700
+Subject: [PATCH] supply-chain-policy: cargo audit hard gate
+
+Gork-Patch-Id: supply-chain-policy
+Gork-Invariant: cargo-audit-policy
+Gork-Risk: critical
+---
+ .cargo/audit.toml | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+ create mode 100644 .cargo/audit.toml
+
+diff --git a/.cargo/audit.toml b/.cargo/audit.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..66bfd5ef4a7150978405ef619df18ef03537f93b
+--- /dev/null
++++ b/.cargo/audit.toml
+@@ -0,0 +1,31 @@
++# cargo-audit configuration for Gork Build.
++#
++# CI treats audit as a **hard gate**: any vulnerability *not* listed here fails
++# the job. This is "block new unignored vulns", not "tree is clean".
++#
++# Config path: `.cargo/audit.toml` (cargo-audit project discovery).
++# See: https://docs.rs/cargo-audit/latest/cargo_audit/
++
++[advisories]
++ignore = [
++    # --- RUSTSEC-2023-0071 (rsa, Marvin Attack) ---
++    # Package: rsa (no fixed upgrade on crates.io as of 2026-07).
++    # Dependency chain: rsa ← jsonwebtoken / sigstore-* (via xai-grok-shell graph).
++    # Why ignore: RustSec marks no patched version; only full stack migration
++    #   away from `rsa` crate removes the finding.
++    # Remove when: jsonwebtoken/sigstore (or our fork pins) drop `rsa`, or
++    #   RUSTSEC-2023-0071 gains a fixed release we can lock to.
++    "RUSTSEC-2023-0071",
++
++    # --- RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml DoS) ---
++    # Package: quick-xml < 0.41.0
++    # Dependency chain:
++    #   quick-xml ^0.38 ← xai-grok-tools (direct)
++    #   quick-xml ^0.39 ← pdf_oxide ← xai-grok-tools
++    # Why ignore: fix requires >=0.41; cannot cargo-update without bumping
++    #   xai-grok-tools / pdf_oxide API major pins (coordinated change).
++    # Remove when: xai-grok-tools + pdf_oxide accept quick-xml >=0.41 and
++    #   Cargo.lock is refreshed accordingly. Track: follow-up dep-bump PR.
++    "RUSTSEC-2026-0194",
++    "RUSTSEC-2026-0195",
++]
+
+base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
+prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
+prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
+prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
+-- 
+2.50.1 (Apple Git-155)
+
