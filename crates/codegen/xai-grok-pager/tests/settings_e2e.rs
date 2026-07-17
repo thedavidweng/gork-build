@@ -1974,7 +1974,7 @@ fn defaults_round_trip_through_registry() {
             "voice_stt_language" => SettingValue::Enum("en"),
             "plan_mode" => SettingValue::Enum("off"),
             "show_tips" => SettingValue::Bool(true),
-            "auto_update" => SettingValue::Bool(true),
+            "auto_update" => SettingValue::Bool(false),
             "fork_secondary_model" => SettingValue::String(String::new()),
             "show_thinking_blocks" => SettingValue::Bool(true),
             "prompt_suggestions" => SettingValue::Bool(true),
@@ -4700,7 +4700,7 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
             assert_eq!(
                 original_value,
                 &SettingValue::Enum("opt-out"),
-                "default snapshot opt_out=true → original 'opt-out'"
+                "Gork Build default snapshot opt_out=true → original 'opt-out'"
             );
         }
         other => panic!("expected PickingEnum mode, got {other:?}"),
@@ -4862,7 +4862,7 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
     }
 }
 
-/// Exactly 2 canonical choices: {opt-in, opt-out}.
+/// Gork Build: only opt-out (locked).
 #[test]
 fn pr9_coding_data_sharing_choices_use_canonical_strings() {
     let reg = SettingsRegistry::defaults();
@@ -4872,19 +4872,9 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
         _ => panic!("coding_data_sharing must be Enum"),
     };
     assert_eq!(
-        canonicals.len(),
-        2,
-        "coding_data_sharing catalog must be exactly {{opt-in, opt-out}} — adding a \
-         choice requires updating the action_for_enum_commit arm in \
-         views/settings_modal.rs AND the action_for_reset arm in dispatch.rs",
-    );
-    assert!(
-        canonicals.contains(&"opt-in"),
-        "coding_data_sharing must include 'opt-in' canonical"
-    );
-    assert!(
-        canonicals.contains(&"opt-out"),
-        "coding_data_sharing must include 'opt-out' canonical"
+        canonicals,
+        vec!["opt-out"],
+        "Gork Build locks coding_data_sharing to a single opt-out choice",
     );
 }
 
@@ -6427,14 +6417,13 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
     use xai_grok_pager::settings::current_value_for;
     let ui = UiConfig::default();
     let pager = PagerLocalSnapshot::default();
-    for (key, expected) in [("show_tips", true), ("auto_update", true)] {
+    for (key, expected) in [("show_tips", true), ("auto_update", false)] {
         let value = current_value_for(key, &ui, &pager)
             .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
         assert_eq!(
             value,
             SettingValue::Bool(expected),
-            "PR 13: `{key}` defaults to {expected} (matches the consumer's \
-             .unwrap_or(...) at the original read site)",
+            "PR 13: `{key}` defaults to {expected} (Gork Build: auto_update off)",
         );
     }
 }
