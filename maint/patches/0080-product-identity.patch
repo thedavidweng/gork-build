@@ -12,11 +12,11 @@ Gork-Risk: medium
  2 files changed, 13 insertions(+), 8 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
-index b875052ed2e583baa5e11a43e8c91775b1583ebe..0113339d05adfa0e7650705062371751f385c2bd 100644
+index a1020025635f3b39d430363ca2eca26be615b482..292972f5e7944d53cf2806d6222918f3e93b41eb 100644
 --- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
 @@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
- version = "0.1.220-alpha.4"
+ version = "0.2.101"
  edition.workspace = true
  license = "Apache-2.0"
 -authors = ["xAI"]
@@ -42,7 +42,7 @@ index b875052ed2e583baa5e11a43e8c91775b1583ebe..0113339d05adfa0e7650705062371751
  name = "xai-grok-pager"
  path = "src/main.rs"
 diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
-index c951785470a48621eab32aef6961642302426ed7..281f8ff6cbdf541537384f35ea558d3a44d5dcae 100644
+index de17b9af8045de1377129cc2b127c94ddfec5f9a..15c6cec7aadf3aaadbcce41d960424ca043a01d4 100644
 --- a/crates/codegen/xai-grok-pager-bin/src/main.rs
 +++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
 @@ -3,7 +3,8 @@
@@ -56,8 +56,8 @@ index c951785470a48621eab32aef6961642302426ed7..281f8ff6cbdf541537384f35ea558d3a
  #[cfg(all(feature = "jemalloc", unix))]
  #[global_allocator]
 
-base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
-prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
 prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca

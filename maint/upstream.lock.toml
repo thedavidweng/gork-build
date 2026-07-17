@@ -2,10 +2,10 @@
 schema = 1
 
 repository = "https://github.com/xai-org/grok-build.git"
-commit = "c1b5909ec707c069f1d21a93917af044e71da0d7"
-source_rev = ""
-version = "0.2.0-dev"
+commit = "8adf9013a0929e5c7f1d4e849492d2387837a28d"
+source_rev = "2ec0f0c8488842da03a71eeee3c61154957ca919"
+version = "0.2.101"
 
 patchset_revision = 1
-patch_tip = "8a931b9a5b905eb39521f08e006c0f1b3c2e7e4a"
-product_tip = "bf03f569649fbd670ce74f0f8db7a28e98a710b6"
+patch_tip = "e365908509d0820ec8f8e51eda57ef0cbae60ee4"
+product_tip = "eb2f7cdf9338b828fb13d9a5f6170d43b0ca1282"
