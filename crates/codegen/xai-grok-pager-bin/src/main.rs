@@ -3,7 +3,8 @@
     unused_variables,
     unused_mut,
     unreachable_code,
-    dead_code
+    dead_code,
+    clippy::possible_missing_else
 )]
 #[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
@@ -1870,7 +1871,8 @@ fn install_heap_profile_hooks() {
 }
 fn version_text(channel_label: &str) -> String {
     format!(
-        "grok {}\n",
+        "{} {}\n",
+        xai_grok_version::PRODUCT_CLI,
         xai_grok_version::display_version_with_commit(
             xai_grok_version::full_version(),
             channel_label,
@@ -2785,7 +2787,7 @@ mod tests {
             let mut output = Vec::new();
             write_version(&mut output, label).unwrap();
             let output = String::from_utf8(output).unwrap();
-            assert!(output.starts_with("grok "));
+            assert!(output.starts_with(&format!("{} ", xai_grok_version::PRODUCT_CLI)));
             assert!(output.contains(env!("VERSION_WITH_COMMIT")));
             assert!(output.ends_with(expected_suffix), "{output:?}");
         }
