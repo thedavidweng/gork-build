@@ -7,18 +7,18 @@
 //
 // Binary location strategy (in priority order):
 //   1. ~/.grok/bin/grok        — canonical versioned symlink (postinstall.js)
-//   2. @xai-official/grok-<platform>/bin/grok[.exe]      — decompressed sibling
-//   3. @xai-official/grok-<platform>/bin/grok[.exe].br   — brotli-compressed
+//   2. @gork-build/gork-<platform>/bin/grok[.exe]      — decompressed sibling
+//   3. @gork-build/gork-<platform>/bin/grok[.exe].br   — brotli-compressed
 //
 // Per-platform binaries are shipped brotli-compressed to stay well under
-// npm's ~200 MB tarball ceiling. See sibling packages @xai-official/grok-*.
+// npm's ~200 MB tarball ceiling. See sibling packages @gork-build/gork-*.
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const zlib = require('zlib');
 
-const pkgName = '@xai-official/grok';
+const pkgName = '@gork-build/gork';
 const IS_WINDOWS = process.platform === 'win32';
 const EXE = IS_WINDOWS ? '.exe' : '';
 const BIN_NAME = `grok${EXE}`;
@@ -33,7 +33,7 @@ function readLocalVersion() {
 // matching optional dependency wasn't installed (unsupported platform, or
 // npm refused to install optionalDependencies).
 function resolvePlatformPackageDir() {
-    const platformPkg = `@xai-official/grok-${process.platform}-${process.arch}`;
+    const platformPkg = `@gork-build/gork-${process.platform}-${process.arch}`;
     try {
         return path.dirname(require.resolve(`${platformPkg}/package.json`));
     } catch {
@@ -97,7 +97,7 @@ function resolveBinary() {
     const platformDir = resolvePlatformPackageDir();
     if (!platformDir) {
         console.error(`${pkgName}: no platform binary installed for ${process.platform}-${process.arch}.`);
-        console.error(`  Expected sibling package @xai-official/grok-${process.platform}-${process.arch}.`);
+        console.error(`  Expected sibling package @gork-build/gork-${process.platform}-${process.arch}.`);
         console.error(`  This usually means npm skipped optionalDependencies (e.g. --no-optional)`);
         console.error(`  or the platform is not supported.`);
         process.exit(1);

@@ -1,61 +1,44 @@
-# Grok
+# Gork Build (`@gork-build/gork`)
 
-Bring Grok into your terminal. Fast, flicker-free CLI built for plans, subagents, and parallel work.
+Community VSCodium-style distribution of Grok Build — **vendor telemetry and
+branding removed**.
 
-**[Homepage](https://x.ai/cli)** | **[Documentation](https://docs.x.ai/build/overview)**
+**[Repository](https://github.com/thedavidweng/gork-build)** ·
+**[Privacy](https://github.com/thedavidweng/gork-build/blob/main/PRIVACY.md)** ·
+**[Wire analysis (why)](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547)**
+
+Upstream credit: based on [xai-org/grok-build](https://github.com/xai-org/grok-build)
+(Apache-2.0). Not affiliated with SpaceXAI / xAI.
 
 ## Install
 
-```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
-```
-
-Or install with npm:
+Prefer building from source for the latest privacy hard-offs:
 
 ```bash
-npm i -g @xai-official/grok
+git clone https://github.com/thedavidweng/gork-build.git
+cd gork-build
+cargo build -p xai-grok-pager-bin --release
+# → target/release/gork
 ```
 
-## Get Started
+npm packages (when published) install as:
 
 ```bash
-# Launch the interactive TUI
-grok
-
-# Run a single task
-grok -p "Explain this codebase"
+npm i -g @gork-build/gork
+gork
 ```
 
-On first launch, Grok opens your browser to authenticate. For CI or headless environments, use an API key from [console.x.ai](https://console.x.ai):
+## Get started
 
 ```bash
-export XAI_API_KEY="xai-..."
+gork                    # interactive TUI
+gork -p "Explain this"  # one-shot
 ```
 
-## Update
+Authenticate with your Grok / xAI account (or `XAI_API_KEY`) — model inference
+still uses the Grok API. Research uploads and product analytics stay off in
+this build.
 
-```bash
-grok update
-```
+## License
 
-Or if installed via npm:
-
-```bash
-npm i -g @xai-official/grok@latest
-```
-
-## Supported Platforms
-
-| Platform | Architecture |
-|---|---|
-| macOS | Apple Silicon (arm64) |
-| Linux | x86_64, arm64 |
-| Windows | x86_64 |
-
-## Documentation
-
-For full documentation including configuration, MCP servers, custom models, headless mode, agent mode, and more, visit [docs.x.ai/build/overview](https://docs.x.ai/build/overview).
-
-## Feedback
-
-Run `/feedback` inside Grok to report issues or send feedback directly.
+Apache-2.0 — see the repository `LICENSE` and `NOTICE`.
