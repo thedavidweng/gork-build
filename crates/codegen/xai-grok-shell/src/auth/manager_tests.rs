@@ -443,68 +443,54 @@ fn clear_does_not_remove_legacy_scope() {
 
 #[test]
 fn is_data_collection_disabled_matrix() {
-    // (team_blocked_reasons, coding_data_retention_opt_out, expected)
-    let cases: &[(&[&str], bool, bool)] = &[
-        // ZDR team alone
-        (&["BLOCKED_REASON_NO_LOGS"], false, true),
-        (&["BLOCKED_REASON_NO_LOGS_MODERATED"], false, true),
-        // Opt-out alone
-        (&[], true, true),
-        // Both
-        (&["BLOCKED_REASON_NO_LOGS"], true, true),
-        // Neither
-        (&[], false, false),
-        // Unrelated blocked reasons
+    // Gork Build: research collection is always disabled, independent of
+    // ZDR / opt-out flags (those still matter for server-side retention).
+    let cases: &[(&[&str], bool)] = &[
+        (&["BLOCKED_REASON_NO_LOGS"], false),
+        (&["BLOCKED_REASON_NO_LOGS_MODERATED"], false),
+        (&[], true),
+        (&["BLOCKED_REASON_NO_LOGS"], true),
+        (&[], false),
         (
             &["BLOCKED_REASON_BILLING", "BLOCKED_REASON_SUSPENDED"],
             false,
-            false,
         ),
-        (&["BLOCKED_REASON_BILLING"], true, true),
-        // ZDR mixed with other reasons
-        (
-            &["BLOCKED_REASON_BILLING", "BLOCKED_REASON_NO_LOGS"],
-            false,
-            true,
-        ),
+        (&["BLOCKED_REASON_BILLING"], true),
+        (&["BLOCKED_REASON_BILLING", "BLOCKED_REASON_NO_LOGS"], false),
     ];
-    for (reasons, opt_out, expected) in cases {
+    for (reasons, opt_out) in cases {
         let auth = GrokAuth {
             team_blocked_reasons: reasons.iter().map(|s| (*s).into()).collect(),
             coding_data_retention_opt_out: *opt_out,
             ..GrokAuth::test_default()
         };
-        assert_eq!(
+        assert!(
             auth.is_data_collection_disabled(),
-            *expected,
-            "reasons={reasons:?} opt_out={opt_out} expected={expected}",
+            "Gork Build: reasons={reasons:?} opt_out={opt_out} must disable collection",
         );
     }
 }
 
-/// Fail-direction contract of the two `AuthManager` collection predicates:
-/// `is_data_collection_disabled` fails open on missing credentials (legacy
-/// semantics shared by telemetry/sync gates), `allows_data_collection` fails
-/// closed (nothing may leave the machine while privacy state is unknown,
-/// e.g. after a mid-session `/logout`).
+/// Gork Build: both collection predicates permanently suppress research
+/// uploads, including with no credential and with a "normal" user.
 #[test]
 fn manager_collection_predicates_fail_directions() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
 
-    // No credential: disabled=false (fail-open), allows=false (fail-closed).
-    assert!(!mgr.is_data_collection_disabled());
+    assert!(mgr.is_data_collection_disabled());
     assert!(
         !mgr.allows_data_collection(),
-        "missing credential must fail closed for collection"
+        "Gork Build: missing credential must not allow collection"
     );
 
-    // Normal user: both predicates allow collection.
     mgr.hot_swap(GrokAuth::test_default());
-    assert!(!mgr.is_data_collection_disabled());
-    assert!(mgr.allows_data_collection());
+    assert!(mgr.is_data_collection_disabled());
+    assert!(
+        !mgr.allows_data_collection(),
+        "Gork Build: normal user must not allow research collection"
+    );
 
-    // Opted-out user: both predicates suppress collection.
     mgr.hot_swap(GrokAuth {
         coding_data_retention_opt_out: true,
         ..GrokAuth::test_default()
@@ -512,15 +498,10 @@ fn manager_collection_predicates_fail_directions() {
     assert!(mgr.is_data_collection_disabled());
     assert!(!mgr.allows_data_collection());
 
-    // Mid-session `/logout`: the fail-closed predicate flips back to
-    // "no collection" even after a previously permissive credential.
     mgr.hot_swap(GrokAuth::test_default());
-    assert!(mgr.allows_data_collection(), "precondition");
     mgr.clear_in_memory();
-    assert!(
-        !mgr.allows_data_collection(),
-        "cleared credentials must close the collection gate"
-    );
+    assert!(!mgr.allows_data_collection());
+    assert!(mgr.is_data_collection_disabled());
 }
 
 // -- token_suffix ----------------------------------------------------------------
@@ -1101,7 +1082,7 @@ async fn auth_returns_expired_api_key_consistently_with_current() {
 
     // Async path: must NOT clone the stale key for downstream
     // consumers. Surface `TokenExpiredNoRefresh` so callers can
-    // funnel the user back through `grok login`.
+    // funnel the user back through `gork login`.
     let err = mgr.auth().await.unwrap_err();
     assert!(
         matches!(err, AuthError::TokenExpiredNoRefresh),
@@ -1485,11 +1466,11 @@ async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_i
     );
     assert!(mgr.permanent_failure().is_some());
 
-    // User runs `grok logout` which calls clear().
+    // User runs `gork logout` which calls clear().
     mgr.clear().unwrap();
 
     // The diagnostic the user now sees on the next request should be
-    // "Not logged in. Run `grok login`.", not the stale invalid_grant.
+    // "Not logged in. Run `gork login`.", not the stale invalid_grant.
     let err = mgr.auth().await.unwrap_err();
     assert!(
         matches!(err, AuthError::NotLoggedIn),
@@ -2904,9 +2885,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
     assert_eq!(auth.principal_type.as_deref(), Some("Team"));
     assert_eq!(auth.principal_id.as_deref(), Some("team-1"));
     assert!(auth.is_zdr_team());
+    // Gork Build forces opt-out even when /user omits the field.
     assert!(
-        !auth.coding_data_retention_opt_out,
-        "absent field stays unchanged"
+        auth.coding_data_retention_opt_out,
+        "privacy build locks coding_data_retention_opt_out"
     );
 }
 

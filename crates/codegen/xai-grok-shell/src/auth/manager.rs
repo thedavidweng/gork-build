@@ -716,10 +716,16 @@ impl AuthManager {
     /// [`Self::current_or_expired`] because neither flag changes on token
     /// expiry and `current()` returns `None` during the refresh window.
     ///
-    /// Fail-open: no credential ⇒ `false` (not disabled). Collection paths
-    /// that must not act on unknown privacy state should use the fail-closed
-    /// [`Self::allows_data_collection`] instead.
+    /// Gork Build: always `true` (research uploads hard-off).
+    ///
+    /// Fail-open only in non-privacy builds: no credential ⇒ `false` (not
+    /// disabled). Collection paths that must not act on unknown privacy
+    /// state should use the fail-closed [`Self::allows_data_collection`]
+    /// instead.
     pub(crate) fn is_data_collection_disabled(&self) -> bool {
+        if xai_grok_version::research_data_collection_forbidden() {
+            return true;
+        }
         self.current_or_expired()
             .is_some_and(|a| a.is_data_collection_disabled())
     }
@@ -729,7 +735,12 @@ impl AuthManager {
     /// cleared auth (e.g. after a mid-session `/logout`) counts as
     /// disabled — nothing may leave the machine while the privacy state is
     /// unknown.
+    ///
+    /// Gork Build: always `false`.
     pub(crate) fn allows_data_collection(&self) -> bool {
+        if xai_grok_version::research_data_collection_forbidden() {
+            return false;
+        }
         self.current_or_expired()
             .is_some_and(|a| !a.is_data_collection_disabled())
     }
@@ -1318,7 +1329,7 @@ impl AuthManager {
             }
             TokenType::LegacySession => {
                 // Deliberate side effect: re-read auth.json under the
-                // assumption that a sibling process (`grok login` from
+                // assumption that a sibling process (`gork login` from
                 // another shell, the desktop app, etc.) may have refreshed
                 // the on-disk credentials. `pick_up_sibling_token` only
                 // mutates inner when the disk holds a *different valid*
