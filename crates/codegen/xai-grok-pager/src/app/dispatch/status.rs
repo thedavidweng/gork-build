@@ -74,26 +74,21 @@ pub(super) fn dispatch_show_session_info(app: &mut AppView) -> Vec<Effect> {
 pub(super) fn dispatch_show_privacy_info(app: &mut AppView) -> Vec<Effect> {
     let mut lines = Vec::new();
 
+    lines.push("  Product: Gork Build (privacy fork of Grok Build)");
+    lines.push("  Client research uploads: disabled (hard-off)");
+    lines.push("  Product analytics (Mixpanel / events): disabled");
+    lines.push("  Coding data retention: opt-out only (locked in this build)");
+    lines.push("  Model inference: required (files the agent reads go to the model API)");
+    lines.push("");
+
     if app.is_zdr {
-        // Enterprise ZDR -- the team has disabled retention entirely.
-        lines.push("  Zero Data Retention: enabled");
-        lines.push("  Your data is not retained or used for training (ZDR enabled).");
-    } else if app.coding_data_retention_opt_out {
-        // Coding data sharing opted out -- matches desktop's "Privacy mode" state.
-        lines.push("  Privacy: privacy mode");
-        lines.push("  Your code data will not be trained on or used to improve the product.");
-        lines.push("");
-        lines.push("  Use /privacy opt-in to share data and help improve the product.");
+        lines.push("  Account: Enterprise Zero Data Retention");
     } else {
-        // Coding data sharing opted in -- matches desktop's "Share data" state.
-        lines.push("  Privacy: share data");
-        lines.push("  Usage and code data may be used by SpaceXAI to improve the product.");
-        lines.push("");
-        lines.push("  Use /privacy opt-out to enable privacy mode.");
+        lines.push("  Account: privacy mode (coding data retention opted out)");
     }
 
     lines.push("");
-    lines.push("  Learn more: https://x.ai/legal");
+    lines.push("  Docs: https://github.com/thedavidweng/gork-build");
     let text = lines.join("\n");
     push_system_to_any_agent(app, &text);
     vec![]
@@ -107,6 +102,14 @@ pub(super) fn set_coding_data_sharing_inner(app: &mut AppView, opted_in: bool) {
 /// Set coding-data-sharing preference. SHELL-owned, auth-metadata-backed
 /// (persists via ACP ext-request, NOT `~/.grok/config.toml`).
 pub(super) fn set_coding_data_sharing(app: &mut AppView, opted_in: bool) -> Vec<Effect> {
+    // ── Guard 0: Gork Build locks retention to opt-out ────────────────
+    if xai_grok_version::coding_data_retention_locked_opt_out() && opted_in {
+        app.show_toast("\u{2717} Gork Build locks coding data retention to opt-out");
+        // Keep local state on opt-out even if UI/server was stale.
+        set_coding_data_sharing_inner(app, false);
+        refresh_open_settings_modals(app);
+        return vec![];
+    }
     // ── Guard 1: Enterprise ZDR ──────────────────────────────────────
     if app.is_zdr {
         app.show_toast("\u{2717} Cannot change: Zero Data Retention enabled");

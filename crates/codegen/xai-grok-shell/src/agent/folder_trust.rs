@@ -226,7 +226,7 @@ pub(crate) fn record_for_test(cwd: &Path, allowed: bool) {
 /// `allow_prompt` must be `true` ONLY where a blocking stdin y/N read is safe —
 /// i.e. agent `initialize` for the launch directory, before the TUI takes over
 /// the terminal. Every other call site (per-session cwd, leader-served sessions
-/// whose cwd differs from the launch dir, `grok mcp doctor`) passes `false`, so
+/// whose cwd differs from the launch dir, `gork mcp doctor`) passes `false`, so
 /// an unresolved interactive-but-untrusted workspace resolves **fail-closed**
 /// (untrusted, no prompt) — only the launch dir is ever prompted for.
 pub fn resolve_and_record(cwd: &Path, remote: Option<&RemoteSettings>, allow_prompt: bool) -> bool {
@@ -290,7 +290,7 @@ pub fn resolve_launch_dir_trust(cwd: &Path, remote: Option<&RemoteSettings>) -> 
 /// - A cached **grant** (`Some(true)`) is durable and short-circuits — neither
 ///   `store_trusted` nor `recompute` runs.
 /// - A cached **untrusted** verdict (`Some(false)`) is re-checked via
-///   `store_trusted`: a `grok --trust` grant issued AFTER this workspace was
+///   `store_trusted`: a `gork --trust` grant issued AFTER this workspace was
 ///   first resolved writes the store, so honor it on the next session without a
 ///   restart. Without this re-read a long-lived leader would mask the grant.
 /// - An **unrecorded** key (`None`) does a full `recompute`, which reports
@@ -389,7 +389,7 @@ fn compute_from_inputs(
 /// merged server list when the workspace is untrusted.
 ///
 /// SINGLE SOURCE OF TRUTH for "project-scoped MCP names" across ALL gate sites
-/// (session merge, the session-less agent pool, `grok mcp doctor`). It MUST
+/// (session merge, the session-less agent pool, `gork mcp doctor`). It MUST
 /// enumerate every project MCP source the loaders read; adding a new repo-local
 /// MCP source without extending this fn silently re-opens the gate (guarded by
 /// `project_scoped_mcp_names_cover_every_source`).
@@ -1340,7 +1340,7 @@ mod tests {
         let key = workspace_key(tmp.path());
         record(&key, false);
         assert!(!project_scope_allowed(tmp.path()));
-        // Simulate a `grok --trust` grant landing in the store after the
+        // Simulate a `gork --trust` grant landing in the store after the
         // untrusted verdict was cached: the re-read sees trusted, so the next
         // resolve upgrades the cache without a process restart.
         let allowed = resolve_and_record_inner(

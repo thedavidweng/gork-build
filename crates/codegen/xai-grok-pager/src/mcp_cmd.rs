@@ -1,4 +1,4 @@
-//! `grok mcp` — manage MCP server configurations from the command line.
+//! `gork mcp` — manage MCP server configurations from the command line.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,7 +166,7 @@ fn run_list(json: bool) -> Result<()> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if servers.is_empty() {
-        println!("No MCP servers configured. Run `grok mcp add --help` to get started.");
+        println!("No MCP servers configured. Run `gork mcp add --help` to get started.");
     } else {
         for (name, (config, scope)) in &servers {
             let transport = match &config.transport {
@@ -291,7 +291,7 @@ fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
         McpTransport::Stdio => {
             let Some(command) = source else {
                 bail!(
-                    "A command is required for stdio servers. Usage: grok mcp add <name> -- <command> [args...]"
+                    "A command is required for stdio servers. Usage: gork mcp add <name> -- <command> [args...]"
                 );
             };
             if !args.header.is_empty() {
@@ -349,7 +349,7 @@ fn resolve_add(args: &AddArgs) -> Result<ResolvedAdd> {
             };
             let Some(url) = source else {
                 bail!(
-                    "A URL is required for {label} servers. Usage: grok mcp add --transport {label} <name> <url>"
+                    "A URL is required for {label} servers. Usage: gork mcp add --transport {label} <name> <url>"
                 );
             };
             if !url.starts_with("http://") && !url.starts_with("https://") {

@@ -245,7 +245,10 @@ pub(super) fn apply_user_info_enrichment(disk: &mut GrokAuth, user_info: UserInf
     if let Some(reasons) = user_info.team_blocked_reasons {
         disk.team_blocked_reasons = reasons;
     }
-    if let Some(opt_out) = user_info.coding_data_retention_opt_out {
+    if xai_grok_version::coding_data_retention_locked_opt_out() {
+        // Gork Build: ignore server opt-in; always lock local state to opt-out.
+        disk.coding_data_retention_opt_out = true;
+    } else if let Some(opt_out) = user_info.coding_data_retention_opt_out {
         disk.coding_data_retention_opt_out = opt_out;
     }
     if let Some(ref email) = user_info.email

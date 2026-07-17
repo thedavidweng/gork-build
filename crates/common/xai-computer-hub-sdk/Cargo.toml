@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-computer-hub-sdk"
 version = "0.1.0"
 edition.workspace = true
-description = "SDK for the xAI Computer Hub: connection pool, transparent reconnect, tool harness, and tool-server runtime."
+description = "SDK for the Computer Hub: connection pool, transparent reconnect, tool harness, and tool-server runtime."
 
 [features]
 metrics = ["dep:prometheus"]

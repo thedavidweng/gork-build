@@ -1,4 +1,4 @@
-//! `grok inspect` — configuration introspection.
+//! `gork inspect` — configuration introspection.
 //!
 //! Shows everything Grok discovers in the current directory: project
 //! instructions, permissions, hooks, skills, agents, plugins, MCP servers,
@@ -265,7 +265,7 @@ pub struct ConfigSources {
     pub layers: Vec<ConfigLayer>,
 }
 
-/// A single config layer entry for `grok inspect`.
+/// A single config layer entry for `gork inspect`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigLayer {
@@ -958,7 +958,7 @@ fn list_lsp_servers(
     // Folder-trust gate (display-only): inspect never spawns servers, but mark the
     // repo-local (project-scoped) entries a session would skip in an untrusted
     // clone so the listing matches the live gate. `remote = None` mirrors
-    // `grok mcp doctor` (no loaded RemoteSettings in a standalone command).
+    // `gork mcp doctor` (no loaded RemoteSettings in a standalone command).
     crate::agent::folder_trust::resolve_and_record(cwd, None, false);
     let project_allowed = crate::agent::folder_trust::project_scope_allowed(cwd);
 
@@ -1424,7 +1424,7 @@ fn print_human(r: &InspectReport) {
     if r.mcp_servers.is_empty() {
         println!();
         println!("  MCP Servers (0)");
-        println!("  {TREE} (none) \u{2014} see `grok mcp add --help`");
+        println!("  {TREE} (none) \u{2014} see `gork mcp add --help`");
     } else {
         print_columns(
             "MCP Servers",

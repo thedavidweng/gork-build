@@ -253,7 +253,7 @@ async fn handle_session_delete(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtR
         agent.is_writeback_storage() && agent.current_auth().is_some_and(|a| !a.is_zdr_team());
 
     // Shared delete: remote-first, then local disk + FTS eviction.
-    // Mirrored by the `grok sessions delete <id>` CLI path.
+    // Mirrored by the `gork sessions delete <id>` CLI path.
     crate::session::persistence::delete_session_history(
         &req.session_id,
         req.cwd.as_deref(),

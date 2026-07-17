@@ -330,9 +330,9 @@ fn restore_prior_bytes(auth_file: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub fn read_token_by_scope(grok_home: &Path, scope: &str) -> anyhow::Result<String> {
     let path = grok_home.join("auth.json");
     let store =
-        read_auth_json(&path).map_err(|_| anyhow::anyhow!("Not logged in. Run `grok login`."))?;
+        read_auth_json(&path).map_err(|_| anyhow::anyhow!("Not logged in. Run `gork login`."))?;
     lookup_auth(&store, scope).map(|a| a.key).ok_or_else(|| {
-        anyhow::anyhow!("Your auth token is invalid. Run `grok login` to re-authenticate.")
+        anyhow::anyhow!("Your auth token is invalid. Run `gork login` to re-authenticate.")
     })
 }
 

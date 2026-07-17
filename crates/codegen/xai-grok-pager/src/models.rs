@@ -1,4 +1,4 @@
-//! `grok models` subcommand.
+//! `gork models` subcommand.
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;

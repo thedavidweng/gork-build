@@ -874,7 +874,7 @@ fn walk_toml(
     }
 }
 /// The `[skills]` table from an effective config, shared by the reload
-/// dispatch and `grok inspect`.
+/// dispatch and `gork inspect`.
 pub(crate) use crate::config::reloader::parse_skills_config;
 /// Effective config: layers + campaign overlay (remote cache + `GROK_CAMPAIGNS_OVERRIDE`).
 pub use crate::util::config::load_effective_config;

@@ -544,7 +544,7 @@ fn first_threshold_from_env() -> u64 {
 ///
 /// The trace file is created lazily on the first event; the first sample is
 /// taken after one full interval, so short-lived CLI invocations
-/// (`grok --version`, `grok trace …`) leave no files behind.
+/// (`gork --version`, `gork trace …`) leave no files behind.
 pub fn start(dir: PathBuf) {
     if !enabled_by_env() {
         return;

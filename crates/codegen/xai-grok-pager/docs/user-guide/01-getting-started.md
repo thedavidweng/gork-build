@@ -1,82 +1,86 @@
 # Getting Started
 
-Grok Build is a terminal-based AI coding assistant from SpaceXAI. It runs as a TUI (Terminal User Interface) that understands your codebase, executes shell commands, edits files, searches the web, and manages tasks.
+**Gork Build** is a terminal-based AI coding assistant — a community
+distribution of Grok Build with vendor telemetry and branding removed. It runs
+as a TUI (Terminal User Interface) that understands your codebase, executes
+shell commands, edits files, searches the web, and manages tasks.
 
-You can use it interactively as a full-screen TUI, run it headlessly for scripting and CI/CD, or integrate it into editors via the Agent Client Protocol (ACP).
+You can use it interactively as a full-screen TUI, run it headlessly for
+scripting and CI/CD, or integrate it into editors via the Agent Client Protocol
+(ACP).
+
+> Gork Build is not affiliated with SpaceXAI / xAI. Upstream source:
+> [xai-org/grok-build](https://github.com/xai-org/grok-build).
 
 ---
 
 ## Installation
 
-Install the latest stable release (macOS, Linux, or Windows via Git Bash):
+### Build from source (recommended for Gork Build)
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
+git clone https://github.com/thedavidweng/gork-build.git
+cd gork-build
+cargo build -p xai-grok-pager-bin --release
+# binary: target/release/gork
+install -m 755 target/release/gork ~/.local/bin/gork   # or copy onto your PATH
 ```
 
-Install a specific version:
+Verify:
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash -s 0.1.42
+gork --version
 ```
 
-On **Windows (PowerShell)**, use the native PowerShell installer:
+### Upstream binary installer (optional)
 
-```powershell
-irm https://x.ai/cli/install.ps1 | iex
-```
-
-Install a specific version:
-
-```powershell
-$env:GROK_VERSION="0.1.42"; irm https://x.ai/cli/install.ps1 | iex
-```
-
-The PowerShell installer automatically adds `%USERPROFILE%\.grok\bin` to your User PATH. Alternatively, install via [Git for Windows](https://gitforwindows.org/) (Git Bash) or MSYS2 using the bash script above. WSL users get the Linux binary automatically.
-
-Verify the installation:
+The official Grok Build installers from x.ai install the **vendor** binary, not
+this community build. Prefer building Gork Build from this repository. If you
+still need the upstream binary for comparison:
 
 ```bash
-grok --version
-```
-
-Update to the latest version at any time:
-
-```bash
-grok update
+curl -fsSL https://x.ai/cli/install.sh | bash          # macOS / Linux / Git Bash
+irm https://x.ai/cli/install.ps1 | iex                 # Windows PowerShell
 ```
 
 ---
 
 ## First Launch
 
-Start Grok by running:
+Start Gork Build by running:
 
 ```bash
-grok
+gork
 ```
 
-On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.grok/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
+On first launch, the TUI opens your browser to authenticate with grok.com (or
+your configured OIDC issuer). After you sign in, credentials are stored in
+`~/.grok/auth.json` and refreshed automatically when possible.
 
-If you prefer API key authentication (e.g., for CI/CD or environments without a browser), set the `XAI_API_KEY` environment variable instead:
+If you prefer API key authentication (e.g., for CI/CD or environments without a
+browser), set the `XAI_API_KEY` environment variable instead:
 
 ```bash
 export XAI_API_KEY="xai-..."
-grok
+gork
 ```
 
-See [Authentication](02-authentication.md) for the full set of auth options including OIDC, external auth providers, and device code flow.
+See [Authentication](02-authentication.md) for the full set of auth options
+including OIDC, external auth providers, and device code flow.
 
 ---
 
 ## Basic Interaction
 
-Once authenticated, Grok presents a full-screen TUI with two main areas:
+Once authenticated, Gork Build presents a full-screen TUI with two main areas:
 
-- **Scrollback** -- the conversation history showing your prompts, Grok's responses, tool calls, file edits, and more.
+- **Scrollback** -- the conversation history showing your prompts, model
+  responses, tool calls, file edits, and more.
 - **Prompt** -- the input area at the bottom where you type messages.
 
-Type a message and press `Enter` to send it. Grok reads files, runs commands, and edits code as needed. Each tool run streams into the scrollback in real time.
+Type a message and press `Enter` to send it. The agent reads files, runs
+commands, and edits code as needed. Each tool run streams into the scrollback
+in real time.
 
 Press `Tab` to move focus between the prompt and the scrollback. While a turn is running, `Ctrl+C` cancels it (or clears a non-empty draft first); `Esc` is a no-op mid-turn. Idle, press `Esc` twice within 800ms to clear a non-empty prompt, or (with an empty prompt and conversation messages) to open rewind — see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape). With the scrollback focused, use the arrow keys to select entries and to collapse or expand them. To navigate with `j`/`k` and fold with `h`/`l` instead, enable Vim mode.
 

@@ -2518,11 +2518,16 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
     );
 }
 #[tokio::test]
-async fn data_collection_enabled_for_normal_user() {
+async fn data_collection_disabled_for_normal_user_in_privacy_build() {
+    // Gork Build: research data collection is hard-off for every account.
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
     assert!(
-        !agent.is_data_collection_disabled(),
-        "normal user must have data collection enabled"
+        agent.is_data_collection_disabled(),
+        "Gork Build must disable research data collection for all users"
+    );
+    assert!(
+        agent.trace_upload_config_snapshot().is_none(),
+        "trace uploads must be disabled in the privacy build"
     );
 }
 #[tokio::test]
@@ -2579,7 +2584,7 @@ async fn data_collection_disabled_for_zdr_plus_opt_out() {
     );
 }
 #[tokio::test]
-async fn data_collection_enabled_for_non_zdr_team_with_unrelated_blocks() {
+async fn data_collection_disabled_even_for_non_zdr_team_blocks_in_privacy_build() {
     let agent = build_agent_with_auth(crate::auth::GrokAuth {
         team_blocked_reasons: vec![
             "BLOCKED_REASON_BILLING".into(),
@@ -2588,8 +2593,8 @@ async fn data_collection_enabled_for_non_zdr_team_with_unrelated_blocks() {
         ..crate::auth::GrokAuth::test_default()
     });
     assert!(
-        !agent.is_data_collection_disabled(),
-        "non-ZDR blocked reasons must not disable data collection"
+        agent.is_data_collection_disabled(),
+        "Gork Build disables collection regardless of team block reasons"
     );
 }
 /// Enable trace uploads via config so only the auth-level privacy gate
@@ -2642,19 +2647,21 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
     );
 }
 #[tokio::test]
-async fn diagnostic_upload_sent_for_normal_user() {
+async fn diagnostic_upload_blocked_for_normal_user_in_privacy_build() {
     let (stub_url, count) = spawn_counting_storage_stub().await;
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
     enable_trace_upload_config(&agent);
     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
-    let uploader = agent
-        .diagnostic_upload_config()
-        .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
-    assert!(
-        count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-        "positive control: diagnostics upload reaches the proxy for a \
-         normal user"
+    // Privacy build: trace_upload resolver is hard-false, so the diagnostic
+    // uploader is not even wired — or if config still constructs a closure,
+    // invocation must not hit the network.
+    if let Some(uploader) = agent.diagnostic_upload_config() {
+        uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
+    }
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "Gork Build: diagnostics upload must not leave the machine"
     );
 }
 /// The diagnostics privacy gate fails closed: with no credential in the
