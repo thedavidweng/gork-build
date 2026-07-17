@@ -811,130 +811,38 @@ fn privacy_banner_ready_app() -> AppView {
     app
 }
 
+/// Gork Build: retention is locked to opt-out, so the upstream opt-in
+/// banner must never show — not even when the remote `privacy_notice_rollout`
+/// flag is on and every upstream gate would pass.
 #[test]
-fn privacy_banner_should_show_respects_gates() {
-    let mut app = privacy_banner_ready_app();
-    assert!(app.privacy_banner_should_show());
-
-    app.coding_data_retention_opt_out = false;
-    assert!(!app.privacy_banner_should_show(), "already opted in");
-    app.coding_data_retention_opt_out = true;
-
-    app.is_zdr = true;
-    assert!(!app.privacy_banner_should_show(), "enterprise ZDR");
-    app.is_zdr = false;
-
-    app.privacy_banner_acked = Some("2099-01-01T00:00:00Z".into());
+fn privacy_banner_never_shows_in_gork_build() {
+    let app = privacy_banner_ready_app();
     assert!(
         !app.privacy_banner_should_show(),
-        "recently acked, no reshow"
-    );
-
-    app.privacy_banner_reshow_days = Some(30);
-    app.privacy_banner_acked = Some("2020-01-01T00:00:00Z".into());
-    assert!(
-        app.privacy_banner_should_show(),
-        "acked long ago + reshow_days"
-    );
-
-    app.privacy_notice_rollout = false;
-    assert!(!app.privacy_banner_should_show(), "rollout off");
-}
-
-/// Accept success: ACP confirmation acks the banner.
-#[test]
-fn privacy_banner_accept_success_acks() {
-    let mut app = privacy_banner_ready_app();
-    let effects = dispatch(Action::PrivacyBannerAccept, &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        &effects[0],
-        Effect::SetCodingDataSharing { opted_in: true, .. }
-    ));
-    assert!(app.privacy_banner_accept_inflight);
-    assert!(!app.coding_data_retention_opt_out);
-    assert!(app.privacy_banner_acked.is_none());
-
-    let ack_effects = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
-            agent_id: AgentId(0),
-            opted_in: true,
-        }),
-        &mut app,
-    );
-    assert!(!app.privacy_banner_accept_inflight);
-    assert!(app.privacy_banner_acked.is_some());
-    assert!(
-        ack_effects
-            .iter()
-            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
-        "success must persist ack: {ack_effects:?}"
+        "Gork Build must never surface the retention opt-in banner"
     );
 }
 
-/// Accept failure: no ack; welcome toast carries the error.
+/// Accept and Customize are inert: no effects, no opt-in, no ack.
 #[test]
-fn privacy_banner_accept_failure_no_ack_sets_welcome_toast() {
+fn privacy_banner_accept_and_customize_are_inert_in_gork_build() {
     let mut app = privacy_banner_ready_app();
-    let effects = dispatch(Action::PrivacyBannerAccept, &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(app.privacy_banner_accept_inflight);
 
-    let fail_effects = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
-            agent_id: AgentId(0),
-            error: "server error".into(),
-            rollback_to_opted_in: false,
-        }),
-        &mut app,
-    );
-    assert!(fail_effects.is_empty());
+    let effects = dispatch(Action::PrivacyBannerAccept, &mut app);
+    assert!(effects.is_empty(), "Accept must emit nothing: {effects:?}");
     assert!(!app.privacy_banner_accept_inflight);
-    assert!(app.privacy_banner_acked.is_none());
     assert!(
         app.coding_data_retention_opt_out,
-        "rollback restores opt-out"
+        "Accept must not opt the user in"
     );
-    let toast = app
-        .welcome_toast
-        .as_ref()
-        .map(|(m, _)| m.as_str())
-        .unwrap_or("");
-    assert!(
-        toast.contains("coding data sharing"),
-        "welcome toast on Accept failure: {toast}"
-    );
-    assert!(toast.contains("server error"), "error in toast: {toast}");
-}
-
-/// Customize while an Accept ACP call is inflight must be a no-op: an
-/// eager ack would survive the Accept-failure rollback and hide the
-/// banner forever.
-#[test]
-fn privacy_banner_customize_noop_while_accept_inflight() {
-    let mut app = privacy_banner_ready_app();
-    let _ = dispatch(Action::PrivacyBannerAccept, &mut app);
-    assert!(app.privacy_banner_accept_inflight);
+    assert!(app.privacy_banner_acked.is_none());
 
     let effects = dispatch(Action::PrivacyBannerCustomize, &mut app);
     assert!(
         effects.is_empty(),
-        "customize during inflight accept must be a no-op: {effects:?}"
+        "Customize must emit nothing: {effects:?}"
     );
-    assert!(app.privacy_banner_acked.is_none(), "no ack while inflight");
-
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
-            agent_id: AgentId(0),
-            error: "server error".into(),
-            rollback_to_opted_in: false,
-        }),
-        &mut app,
-    );
-    assert!(
-        app.privacy_banner_should_show(),
-        "failed Accept must keep the banner even after a raced Customize"
-    );
+    assert!(app.privacy_banner_acked.is_none());
 }
 
 #[test]
