@@ -2054,7 +2054,8 @@ impl Config {
     pub fn is_two_pass_compaction_enabled(&self) -> bool {
         self.resolve_two_pass_compaction().value
     }
-    pub(crate) fn resolve_telemetry_mode(&self) -> Resolved<TelemetryMode> {
+    /// Resolve effective product telemetry mode (Gork Build: always Disabled).
+    pub fn resolve_telemetry_mode(&self) -> Resolved<TelemetryMode> {
         // Gork Build: product telemetry is permanently off (remote/env cannot
         // re-enable Mixpanel / events / research metrics).
         if xai_grok_version::research_data_collection_forbidden() {
@@ -2081,7 +2082,8 @@ impl Config {
         }
         Resolved::new(TelemetryMode::Disabled, ConfigSource::Default)
     }
-    pub(crate) fn resolve_trace_upload(&self) -> Resolved<bool> {
+    /// Resolve whether session/repo research trace upload is enabled (Gork Build: always false).
+    pub fn resolve_trace_upload(&self) -> Resolved<bool> {
         // Gork Build: never upload session/repo traces to GCS (or anywhere).
         if xai_grok_version::research_data_collection_forbidden() {
             return Resolved::new(false, ConfigSource::Default);
@@ -8106,6 +8108,19 @@ reasoning_effort = "low"
     #[test]
     #[serial]
     fn resolve_trace_upload_explicit_config_wins_over_telemetry_off() {
+        // Under Gork Build privacy, hard-off short-circuits before config/env.
+        if xai_grok_version::research_data_collection_forbidden() {
+            unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
+            unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
+            let mut cfg = Config::default();
+            cfg.features.telemetry = Some(TelemetryMode::Disabled);
+            cfg.telemetry.trace_upload = Some(true);
+            assert!(
+                !cfg.resolve_trace_upload().value,
+                "privacy hard-off must win over explicit trace_upload=true"
+            );
+            return;
+        }
         unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
         unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
         let mut cfg = Config::default();
@@ -8136,19 +8151,46 @@ reasoning_effort = "low"
         });
         let d = cfg.trace_upload_decision_debug();
         assert_eq!(d["trace_upload"], serde_json::json!(false));
+        // Privacy short-circuit reports default; non-privacy also forces false
+        // when telemetry is off despite remote flag.
         assert_eq!(d["trace_upload_source"], serde_json::json!("default"));
         assert_eq!(d["telemetry_mode"], serde_json::json!("false"));
         assert_eq!(d["in_remote_trace_upload_enabled"], serde_json::json!(true));
         assert_eq!(d["has_remote_settings"], serde_json::json!(true));
         cfg.telemetry.trace_upload = Some(true);
         let d = cfg.trace_upload_decision_debug();
-        assert_eq!(d["trace_upload"], serde_json::json!(true));
-        assert_eq!(d["trace_upload_source"], serde_json::json!("config"));
-        assert_eq!(d["in_cfg_telemetry_trace_upload"], serde_json::json!(true));
+        if xai_grok_version::research_data_collection_forbidden() {
+            assert_eq!(
+                d["trace_upload"],
+                serde_json::json!(false),
+                "privacy hard-off must keep debug decision false"
+            );
+        } else {
+            assert_eq!(d["trace_upload"], serde_json::json!(true));
+            assert_eq!(d["trace_upload_source"], serde_json::json!("config"));
+            assert_eq!(d["in_cfg_telemetry_trace_upload"], serde_json::json!(true));
+        }
     }
     #[test]
     #[serial]
     fn resolve_trace_upload_honors_config_when_telemetry_on() {
+        // Under Gork Build privacy, the hard-off short-circuit wins first.
+        // Non-privacy (upstream) semantics: explicit false config wins; when
+        // telemetry is fully enabled and trace_upload is unset, default is on.
+        if xai_grok_version::research_data_collection_forbidden() {
+            unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
+            unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
+            let mut cfg = Config::default();
+            cfg.features.telemetry = Some(TelemetryMode::Enabled);
+            cfg.telemetry.trace_upload = Some(false);
+            assert!(!cfg.resolve_trace_upload().value);
+            cfg.telemetry.trace_upload = None;
+            assert!(
+                !cfg.resolve_trace_upload().value,
+                "privacy hard-off: cannot default-on trace upload"
+            );
+            return;
+        }
         unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
         unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
         let mut cfg = Config::default();
@@ -8161,6 +8203,76 @@ reasoning_effort = "low"
         let r = cfg.resolve_trace_upload();
         assert!(r.value, "defaults on when telemetry fully enabled");
     }
+
+    /// Criterion 2: privacy build hard-offs cannot be re-enabled via env, config,
+    /// requirements pin, or remote settings. Drives the real resolvers.
+    #[test]
+    #[serial]
+    fn privacy_build_telemetry_mode_ignores_env_config_and_remote() {
+        assert!(
+            xai_grok_version::research_data_collection_forbidden(),
+            "this fork must lock research collection off"
+        );
+        // SAFETY: #[serial]
+        unsafe {
+            std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
+        }
+        let mut cfg = Config::default();
+        cfg.features.telemetry = Some(TelemetryMode::Enabled);
+        cfg.requirements.telemetry.pin(
+            TelemetryMode::Enabled,
+            crate::config::RequirementSource::Unknown,
+        );
+        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+            telemetry_enabled: Some(true),
+            telemetry_mode: Some("enabled".into()),
+            ..Default::default()
+        });
+        let r = cfg.resolve_telemetry_mode();
+        assert!(
+            r.value.is_disabled(),
+            "privacy hard-off must win over env/config/remote: {:?}",
+            r
+        );
+        unsafe {
+            std::env::remove_var("GROK_TELEMETRY_ENABLED");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn privacy_build_trace_upload_ignores_env_config_and_remote() {
+        assert!(xai_grok_version::research_data_collection_forbidden());
+        // SAFETY: #[serial]
+        unsafe {
+            std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
+            std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "1");
+        }
+        let mut cfg = Config::default();
+        cfg.features.telemetry = Some(TelemetryMode::Enabled);
+        cfg.telemetry.trace_upload = Some(true);
+        cfg.requirements
+            .trace_upload
+            .pin(true, crate::config::RequirementSource::Unknown);
+        cfg.remote_settings = Some(crate::util::config::RemoteSettings {
+            telemetry_enabled: Some(true),
+            telemetry_mode: Some("enabled".into()),
+            trace_upload_enabled: Some(true),
+            ..Default::default()
+        });
+        let r = cfg.resolve_trace_upload();
+        assert!(
+            !r.value,
+            "privacy hard-off must win over env/config/remote for trace upload: {:?}",
+            r
+        );
+        assert!(!cfg.is_trace_upload_enabled());
+        unsafe {
+            std::env::remove_var("GROK_TELEMETRY_ENABLED");
+            std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD");
+        }
+    }
+
     #[test]
     #[serial]
     fn resolve_goal_defaults_to_true_when_unset() {

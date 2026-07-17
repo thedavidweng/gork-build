@@ -78,6 +78,26 @@ pub fn display_version_with_commit(version_with_commit: &str, channel_label: &st
 mod tests {
     use super::*;
 
+    /// Gork Build privacy policy constants — compile-time hard-offs that
+    /// resolvers and updaters consult. These must stay true for this fork.
+    #[test]
+    fn privacy_build_locks_research_and_retention_policy() {
+        assert!(
+            PRIVACY_BUILD,
+            "Gork Build must ship with PRIVACY_BUILD=true"
+        );
+        assert!(
+            research_data_collection_forbidden(),
+            "research_data_collection_forbidden must follow PRIVACY_BUILD"
+        );
+        assert!(
+            coding_data_retention_locked_opt_out(),
+            "coding data retention must be locked opt-out under PRIVACY_BUILD"
+        );
+        assert_eq!(PRODUCT_CLI, "gork");
+        assert_eq!(PRODUCT_NAME, "Gork Build");
+    }
+
     /// Display formatting invariant matrix — verifies label appending
     /// works correctly across all label states (alpha, stable, empty).
     #[test]

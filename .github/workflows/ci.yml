@@ -11,7 +11,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -95,7 +94,8 @@ jobs:
   test-privacy:
     name: Privacy tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Full update suite + feature-enabled installer tests can be slow.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -118,13 +118,75 @@ jobs:
 
       - name: Test privacy-critical crates
         run: |
-          # Keep this list to crates that compile cleanly as lib tests in the
-          # open-source snapshot. Full xai-grok-shell --lib currently fails
-          # upstream (missing test helpers / partial monorepo cut).
+          # Crates that compile cleanly as lib tests in the open-source
+          # snapshot. Full xai-grok-shell --lib currently fails upstream
+          # (missing test helpers / partial monorepo cut) — so we filter to
+          # privacy resolver tests that do compile when the crate builds.
           cargo test -p xai-grok-version --lib
           cargo test -p xai-mixpanel --lib
           cargo test -p xai-grok-telemetry --lib default_is_privacy
-          cargo test -p xai-grok-update --lib test_reinstall_hint -- --nocapture
+          # Default product build: full update crate suite (lib + integration
+          # tests that do NOT require installer mocks). Installer-mechanic
+          # tests are behind `updater-integration-tests` and compile empty
+          # without the feature.
+          cargo test -p xai-grok-update
+          # Focused privacy filters (also covered above; keep for clarity).
+          cargo test -p xai-grok-update --lib privacy -- --nocapture
+          cargo test -p xai-grok-update --lib env_cannot_disable -- --nocapture
+          # Installer mechanics against local mocks (feature + env required).
+          # IMPORTANT: cargo's `--tests` also runs library unit tests. With the
+          # feature compiled in and GORK_TEST_ALLOW_UPDATE=1 in the process
+          # env, privacy unit tests that assert "gate stays on" would fail.
+          # Target only the installer integration test binaries by name.
+          GORK_TEST_ALLOW_UPDATE=1 cargo test -p xai-grok-update \
+            --features updater-integration-tests \
+            --test test_install_internal \
+            --test test_blitz_cancel \
+            --test test_check_status_regression \
+            --test test_concurrent_convergence \
+            --test test_downgrade_matrix
+          # Telemetry / trace resolvers: env/config/remote cannot re-enable.
+          cargo test -p xai-grok-shell --test privacy_resolvers -- --nocapture
+
+      - name: Static install chokepoint inventory
+        run: |
+          set -euo pipefail
+          # Product install entry must gate on vendor_auto_update_forbidden.
+          grep -n 'vendor_auto_update_forbidden' \
+            crates/codegen/xai-grok-update/src/auto_update.rs \
+            crates/codegen/xai-grok-update/src/minimum_version.rs
+          # run_install_script must contain the privacy early return.
+          grep -n 'if vendor_auto_update_forbidden' \
+            crates/codegen/xai-grok-update/src/auto_update.rs
+          # Default internal bases must still be the vendor CDN (so the gate
+          # is what blocks them — not a silent empty list).
+          grep -n 'https://x.ai/cli' crates/codegen/xai-grok-update/src/version.rs
+
+  # Optional supply-chain scan (advisory DB; non-blocking until the fork
+  # pins deny.toml / allowlists for the full monorepo graph).
+  cargo-audit:
+    name: cargo audit (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit 2>&1 | tee cargo-audit.log || true
+      - name: Upload audit log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-audit-log
+          path: cargo-audit.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ── Build ─────────────────────────────────────────────────────────────────
   build-gork:

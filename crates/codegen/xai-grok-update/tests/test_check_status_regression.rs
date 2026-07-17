@@ -1,3 +1,7 @@
+#![cfg(feature = "updater-integration-tests")]
+// Requires: cargo test -p xai-grok-update --features updater-integration-tests
+// + GORK_TEST_ALLOW_UPDATE=1 (set by tests/common).
+
 //! End-to-end regression tests for `check_update_status` that lock in the
 //! exact JSON shape produced by `grok update --check --json` for the failure
 //! modes that real users have hit in the wild.

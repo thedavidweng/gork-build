@@ -11,7 +11,14 @@ Background (why the hard-offs exist):
 
 These are compile-time / resolver-level hard-offs. Remote settings, env vars,
 and config files **cannot** re-enable them while
-`xai_grok_version::PRIVACY_BUILD == true`.
+`xai_grok_version::PRIVACY_BUILD == true` (including product telemetry
+env vars such as `GROK_TELEMETRY_*` and vendor update settings).
+
+**Installer integration tests only:** the optional Cargo feature
+`updater-integration-tests` (never enabled by `cargo run` / product builds)
+plus `GORK_TEST_ALLOW_UPDATE=1` can relax the vendor-update gate so local
+mock download suites work. That feature is not part of any product binary;
+ordinary debug and release builds have no runtime escape hatch.
 
 1. **Research / trace uploads** — `resolve_trace_upload()` always returns
    `false`. `get_trace_context` never builds an upload method for GCS session
@@ -23,9 +30,15 @@ and config files **cannot** re-enable them while
    no-ops if anything still calls them.
 4. **Repo change packaging** — `[repo_changes_dedup] enabled` defaults to
    `false`.
-5. **Vendor auto-update** — hard-disabled. Gork Build never runs
-   `x.ai/cli/install.*`; that channel would replace this fork with official
-   Grok Build. Update by rebuilding from this repository.
+5. **Vendor auto-update** — hard-disabled. Gork Build never installs from
+   x.ai update channels (`x.ai/cli/install.*`); that path would replace this
+   fork with official Grok Build. Policy is enforced at the bottom-level
+   chokepoint `run_install_script` (and every caller of it). Leader hourly
+   update and minimum-version enforcement also **fail closed** under the
+   privacy build — they refuse vendor install rather than overwrite the binary.
+   Update by rebuilding from this repository or community releases.
+   Product binaries (debug or release) cannot re-enable vendor install via
+   env; see the test-only Cargo feature note above.
 6. **Sentry** — no compile-time DSN; only an explicit runtime `SENTRY_DSN`
    can enable crash reporting.
 
@@ -44,12 +57,29 @@ That is inference context, not Gork Build research upload. Prefer not opening
 `.env` / key material in the session; secret redaction exists for some
 telemetry paths but is not a complete guarantee on the model path.
 
-The README claim
-“[no secrets send to xAI](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547)”
-refers to **not packaging research traces / whole-repo uploads / product
-analytics** that were shown to exfiltrate secrets in the wire analysis. It
-does **not** mean the model never sees file contents you ask the agent to
+Research / product-analytics hard-offs stop packaging of session traces,
+whole-repo research uploads, and Mixpanel-style events shown in the
+[wire analysis](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547).
+They do **not** mean the model never sees file contents you ask the agent to
 read — that is still how cloud coding works.
+
+## Network egress inventory
+
+Channels the binary *can* touch, and how Gork Build treats them:
+
+| Channel | Default in this build | Notes |
+|---------|----------------------|--------|
+| **Model API** (cli-chat-proxy / `/v1/responses` etc.) | On when you use the agent | Agent-selected context (prompts, tools, file contents read for the task) goes here — required for cloud coding |
+| **Auth** (OIDC / login) | On when you sign in | Credentials / tokens for your account |
+| **Remote settings / managed config** | May fetch when configured | Feature/config pull; cannot re-enable research or product telemetry hard-offs |
+| **Model catalog** | May fetch when listing models | Model metadata for the picker |
+| **Assets** (themes, announcements, static assets) | Optional / as needed | Non-secret presentation content |
+| **Feedback** | User-initiated only | Only if you explicitly submit feedback |
+| **External OTLP** | Off unless you configure an exporter | Product telemetry mode is hard-`Disabled`; custom OTLP is user opt-in |
+| **Sentry** | Off | Only if you set `SENTRY_DSN` |
+| **MCP / plugins** | Off until you enable | User-configured servers and marketplaces you add |
+| **Web search** | Off until you enable | Tool you turn on for the agent |
+| **Update metadata / install** | Vendor install **hard-off** | No `x.ai/cli` install scripts; `run_install_script` fail-closed; leader + minimum-version refuse vendor overwrite. Rebuild from source or community releases |
 
 ## Server-side retention
 

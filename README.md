@@ -10,11 +10,17 @@
   Gork Build (<code>gork</code>)
 </h1>
 
-**Gork Build: the VSCodium-style community build of Grok Build, [no secrets send to xAI](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547)**
+**Gork Build: the VSCodium-style community build of Grok Build — [research / product analytics hard-off](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547)**
 
 An independent, community-maintained distribution of
 [SpaceXAI Grok Build](https://github.com/xai-org/grok-build) with vendor
-telemetry and branding removed.
+telemetry hard-off and a community rebrand (compatibility identifiers such as
+`~/.grok`, `GROK_*`, and API hosts are retained).
+
+**Privacy note:** agent-selected model context (prompts, tool results, file
+contents the agent reads) still goes to the model API — that is how cloud
+coding works. Research uploads and product analytics are hard-off separately;
+they are not the same channel.
 
 [Building from source](#build-from-source) ·
 [Privacy](#privacy-guarantees-client) ·
@@ -29,7 +35,8 @@ telemetry and branding removed.
 
 This repository contains the Rust source for the `gork` CLI/TUI and agent
 runtime, forked from [`xai-org/grok-build`](https://github.com/xai-org/grok-build)
-with research telemetry hard-off and vendor branding removed.
+with research telemetry hard-off and a community rebrand (paths, env prefixes,
+and API hosts kept for compatibility).
 
 </div>
 
@@ -45,7 +52,7 @@ Comparison at a glance:
 | Mixpanel / product events | On by default in releases | **Hard-off** |
 | GCS research / session traces | Upload pipeline present | **Hard-off** |
 | Whole-repo research packaging | Present upstream | **Disabled** |
-| Auto-update | Yes | **No** |
+| Vendor auto-update | Yes (`x.ai/cli`) | **Hard-disabled** (rebuild / community releases) |
 | Coding-data retention | Opt-in available | **Opt-out only (locked)** |
 
 ---
@@ -62,17 +69,16 @@ including secrets in files the agent read. Upstream open-sourced the harness;
 - No client-side research / trace / session-state uploads to GCS
 - Remote feature flags **cannot** re-enable those paths
 - Coding-data retention is **opt-out only** (no opt-in path)
-- No vendor auto-update: Gork Build never runs `x.ai/cli/install.*` (that
-  would replace your binary with official Grok Build)
+- Vendor auto-update is **hard-disabled**: Gork Build never installs from
+  x.ai update channels (`x.ai/cli/install.*`); that path would replace this
+  fork with official Grok Build. Update by rebuilding from source or installing
+  community releases from **this** project.
 
 **What still leaves the machine:** whatever the agent must send to the Grok
 **model API** to work (prompts + tool results for files it actually reads).
-That is required for a cloud coding agent. Gork Build does not add extra
-research packaging on top.
-
-**How to update Gork Build:** pull this repository and rebuild (or install a
-release from **this** project when published). There is no shared update
-channel with upstream.
+That is required for a cloud coding agent and is separate from the research /
+product-analytics hard-offs. Gork Build does not add extra research packaging
+on top.
 
 ## Build from source
 
@@ -98,7 +104,7 @@ upstream does — model access still goes through the Grok API.
 | `POST …/v1/storage` research traces | **Never enabled** (`resolve_trace_upload` → false) |
 | Mixpanel / product events | **No-op / never constructed** |
 | Sentry | Only if you set `SENTRY_DSN` yourself |
-| Vendor auto-update (`x.ai/cli/install.*`) | **Never** (would overwrite the fork) |
+| Vendor auto-update (`x.ai/cli/install.*`) | **Hard-disabled** — rebuild from source / community releases |
 | `is_data_collection_disabled` | Always **true** in this build |
 
 See [`PRIVACY.md`](PRIVACY.md) for details and residual risks.
@@ -115,8 +121,9 @@ trace_upload = false
 mixpanel_enabled = false
 ```
 
-`[cli] auto_update` is ignored for vendor channels: this build will not fetch
-or run x.ai installers even if the key is set to `true`.
+`[cli] auto_update` cannot re-enable vendor channels: this build never installs
+from x.ai (enforced at the install chokepoint). Rebuild from source or use
+community releases.
 
 ## Documentation
 
