@@ -177,6 +177,18 @@ def git_resolvable(root: Path, rev: str) -> bool:
     return proc.returncode == 0
 
 
+def git_is_ancestor(root: Path, maybe_ancestor: str, rev: str) -> bool:
+    if not maybe_ancestor or not rev:
+        return False
+    proc = git(
+        ["merge-base", "--is-ancestor", maybe_ancestor, rev],
+        cwd=root,
+        check=False,
+        capture=True,
+    )
+    return proc.returncode == 0
+
+
 @dataclass
 class UpstreamLock:
     schema: int
@@ -1103,36 +1115,44 @@ def cmd_lint(args: argparse.Namespace) -> int:
         else:
             head = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
             explicit = getattr(args, "compare_to", None)
-            targets: list[tuple[str, str]] = []
-            if explicit:
-                targets.append(("compare-to", explicit))
-            else:
-                targets.append(("HEAD", head))
-                if lock.product_tip and git_resolvable(root, lock.product_tip):
-                    pt = git(
-                        ["rev-parse", lock.product_tip], cwd=root, capture=True
-                    ).stdout.strip()
-                    if pt != head:
-                        targets.append(("lock.product_tip", pt))
-                elif lock.product_tip:
-                    print(
-                        f"lint note: lock.product_tip {lock.product_tip[:12]} "
-                        "not in clone; skipping recorded product_tip check"
-                    )
+            # Decide which product trees to compare:
+            # - Explicit --compare-to: only that target.
+            # - Authoring/sync (product_tip ancestor of HEAD): HEAD (drift) +
+            #   product_tip when distinct.
+            # - Control-plane-only (product_tip missing or not ancestor of
+            #   HEAD): do not compare to main's product tree; require clean
+            #   apply, and product_tip rebuild if the tip is resolvable.
+            product_tip_sha = ""
+            if lock.product_tip and git_resolvable(root, lock.product_tip):
+                product_tip_sha = git(
+                    ["rev-parse", lock.product_tip], cwd=root, capture=True
+                ).stdout.strip()
 
-            # On control-plane-only branches, HEAD is the pre-patch product
-            # history (e.g. main) while series rebuilds from lock.commit.
-            # Tree equality is only meaningful when product_tip is in-clone
-            # (authoring/sync) or when an explicit --compare-to is given.
-            # Otherwise require a clean apply only.
-            product_tip_ok = bool(
-                lock.product_tip and git_resolvable(root, lock.product_tip)
-            )
-            if not explicit and not product_tip_ok:
+            if explicit:
+                compare_targets = [("compare-to", explicit)]
+            elif product_tip_sha and git_is_ancestor(
+                root, product_tip_sha, head
+            ):
+                compare_targets = [("HEAD", head)]
+                if product_tip_sha != head:
+                    compare_targets.append(
+                        ("lock.product_tip", product_tip_sha)
+                    )
+            elif product_tip_sha:
+                print(
+                    "lint note: product_tip is not an ancestor of HEAD "
+                    "(control-plane or foreign history) — comparing only "
+                    "to product_tip, not HEAD"
+                )
+                compare_targets = [("lock.product_tip", product_tip_sha)]
+            else:
                 print(
                     "lint note: product_tip not in clone — verifying clean "
-                    "series apply only (no HEAD tree equality)"
+                    "series apply only (no product tree equality)"
                 )
+                compare_targets = []
+
+            if not compare_targets:
                 rc = cmd_roundtrip(
                     argparse.Namespace(
                         expected=lock.patch_tip,
@@ -1145,7 +1165,7 @@ def cmd_lint(args: argparse.Namespace) -> int:
                 if rc != 0:
                     err(f"series apply failed on lock.commit (exit {rc})")
             else:
-                for label, target in targets:
+                for label, target in compare_targets:
                     print(f"lint roundtrip vs {label} ({target[:12]})")
                     rc = cmd_roundtrip(
                         argparse.Namespace(
