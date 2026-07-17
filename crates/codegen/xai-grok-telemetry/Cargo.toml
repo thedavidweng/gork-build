@@ -3,8 +3,8 @@ license = "Apache-2.0"
 name = "xai-grok-telemetry"
 version = "0.1.0"
 edition.workspace = true
-description = "Telemetry engine: product events + Mixpanel emission + Sentry error reporting for Grok Build sessions"
-authors = ["xAI"]
+description = "Telemetry engine for Gork Build (product analytics hard-off; optional user Sentry via SENTRY_DSN)"
+authors = ["Gork Build contributors"]
 
 [features]
 default = []
