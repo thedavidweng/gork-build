@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Runs once after npm install/update. Reads the grok binary from the
-// matching per-platform optional dependency (@xai-official/grok-<platform>)
+// matching per-platform optional dependency (@gork-build/gork-<platform>)
 // and installs it to ~/.grok/bin/ using versioned filenames:
 //
 //   Unix:    grok-<version>  +  grok  (symlink)
@@ -28,7 +28,7 @@ const SUPPORTED = new Set([
     'win32-arm64',
 ]);
 if (!SUPPORTED.has(key)) {
-    console.error(`@xai-official/grok: unsupported platform ${key}`);
+    console.error(`@gork-build/gork: unsupported platform ${key}`);
     process.exit(0);
 }
 
@@ -37,7 +37,7 @@ if (!SUPPORTED.has(key)) {
 // other five are silently skipped. If the matching one is missing, npm was
 // likely invoked with --no-optional or the platform is unsupported.
 function resolvePlatformPackageDir() {
-    const platformPkg = `@xai-official/grok-${key}`;
+    const platformPkg = `@gork-build/gork-${key}`;
     try {
         return path.dirname(require.resolve(`${platformPkg}/package.json`));
     } catch {
@@ -48,7 +48,7 @@ function resolvePlatformPackageDir() {
 let version;
 try { version = require('../package.json').version; } catch {}
 if (!version) {
-    console.error('@xai-official/grok: unable to determine version');
+    console.error('@gork-build/gork: unable to determine version');
     process.exit(0);
 }
 
@@ -75,7 +75,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
     } else if (fs.existsSync(rawPath)) {
         vendoredBinPath = rawPath;
     } else {
-        console.error(`@xai-official/grok: missing binary at ${brPath}`);
+        console.error(`@gork-build/gork: missing binary at ${brPath}`);
         return false;
     }
 
@@ -115,7 +115,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
                     throw copyErr;
                 }
             } catch (e2) {
-                console.error(`@xai-official/grok: failed to update ${canonicalPath}: ${e2.message}`);
+                console.error(`@gork-build/gork: failed to update ${canonicalPath}: ${e2.message}`);
                 console.error('Close all running grok processes and try again.');
                 return false;
             }
@@ -165,9 +165,9 @@ function cleanupOldVersions(binName) {
 
 const platformDir = resolvePlatformPackageDir();
 if (!platformDir) {
-    console.error(`@xai-official/grok: platform package @xai-official/grok-${key} not installed.`);
+    console.error(`@gork-build/gork: platform package @gork-build/gork-${key} not installed.`);
     console.error('  This usually means npm was invoked with --no-optional, or the install failed.');
-    console.error('  Try: npm install -g @xai-official/grok');
+    console.error('  Try: npm install -g @gork-build/gork');
     process.exit(0);
 }
 
@@ -188,7 +188,7 @@ const npmRegistry = process.env.GROK_NPM_REGISTRY
     || (() => {
         try {
             const resolved = execSync(
-                'npm config get @xai-official:registry',
+                'npm config get @gork-build:registry',
                 { encoding: 'utf8', timeout: 5000 }
             ).trim();
             if (resolved && resolved !== 'undefined') return resolved;
