@@ -259,7 +259,7 @@ fn upsell_non_max_unified_shows_buy_credits() {
     assert_eq!(q.options[1].label, "Buy more credits");
     assert_eq!(
         q.options[1].description,
-        "Purchase credits to keep using Grok Build"
+        "Purchase credits to keep using Gork Build"
     );
 }
 
@@ -1016,7 +1016,7 @@ fn free_usage_upsell_shows_two_options_with_exact_labels() {
         ),
         (
             "Upgrade to SuperGrok Heavy",
-            "Get the most out of Grok Build. Highest usage limits.",
+            "Get the most out of Gork Build. Highest usage limits.",
             Some(UPSELL_URL_UPGRADE),
         ),
     ];

@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-tool-types"
 version = "0.1.0"
 edition.workspace = true
-description = "Canonical tool-description types for the xAI platform"
+description = "Canonical tool-description types for the agent tool platform"
 
 [features]
 # Enables `BuiltinSubagent::render_prompt` (MiniJinja rendering of the
