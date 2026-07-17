@@ -58,18 +58,25 @@ fn fix_zsh_root_prompt_positional(script: &str) -> String {
             out.push_str(line);
             out.push('\n');
         });
+    // The curcontext pattern embeds the command name clap generated the
+    // script under — Gork Build ships as PRODUCT_CLI ("gork"), so the
+    // pattern must be built from it, not hard-coded to "grok".
+    let cli = xai_grok_version::PRODUCT_CLI;
     for (from, to) in [
         (
-            r#"words=($line[2] "${words[@]}")"#,
-            r#"words=($line[1] "${words[@]}")"#,
+            format!(r#"words=($line[2] "${{words[@]}}")"#),
+            format!(r#"words=($line[1] "${{words[@]}}")"#),
         ),
         (
-            r#"curcontext="${curcontext%:*:*}:grok-command-$line[2]:""#,
-            r#"curcontext="${curcontext%:*:*}:grok-command-$line[1]:""#,
+            format!(r#"curcontext="${{curcontext%:*:*}}:{cli}-command-$line[2]:""#),
+            format!(r#"curcontext="${{curcontext%:*:*}}:{cli}-command-$line[1]:""#),
         ),
-        (r#"case $line[2] in"#, r#"case $line[1] in"#),
+        (
+            "case $line[2] in".to_string(),
+            "case $line[1] in".to_string(),
+        ),
     ] {
-        out = out.replacen(from, to, 1);
+        out = out.replacen(&from, &to, 1);
     }
     out
 }
@@ -103,6 +110,7 @@ mod tests {
         );
 
         let fixed = fix_zsh_root_prompt_positional(&raw);
+        let cli = xai_grok_version::PRODUCT_CLI;
         assert!(
             !fixed.contains("::prompt"),
             "prompt positional must not appear in the emitted zsh script"
@@ -112,15 +120,20 @@ mod tests {
             "root dispatch must be shifted to $line[1]"
         );
         assert!(
-            fixed.contains(r#"curcontext="${curcontext%:*:*}:grok-command-$line[1]:""#),
+            fixed.contains(&format!(
+                r#"curcontext="${{curcontext%:*:*}}:{cli}-command-$line[1]:""#
+            )),
             "root dispatch context must use $line[1]"
         );
         // Subcommand dispatch blocks (already on $line[1]) must survive.
         assert!(
-            fixed.contains("grok-worktree-command-$line[1]"),
+            fixed.contains(&format!("{cli}-worktree-command-$line[1]")),
             "nested subcommand dispatch must be untouched"
         );
         // The subcommand list itself must still be offered at the root.
-        assert!(fixed.contains("_grok_commands"), "root command list intact");
+        assert!(
+            fixed.contains(&format!("_{cli}_commands")),
+            "root command list intact"
+        );
     }
 }
