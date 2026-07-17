@@ -32,14 +32,17 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 pub fn init(config: Config) -> ClientInitGuard {
     let config = CONFIG.get_or_init(|| config);
 
+    // Gork Build: Sentry is off unless the user explicitly sets SENTRY_DSN at
+    // runtime *and* passes disabled=false. Built-in / compile-time DSNs are
+    // ignored so xAI crash reporting cannot ship by default.
     if config.disabled {
         return sentry::init(ClientOptions::default());
     }
 
-    let dsn = std::env::var("SENTRY_DSN")
-        .ok()
-        .or_else(|| option_env!("SENTRY_DSN").map(|s| s.to_string()))
-        .unwrap_or_default();
+    let dsn = std::env::var("SENTRY_DSN").unwrap_or_default();
+    if dsn.is_empty() {
+        return sentry::init(ClientOptions::default());
+    }
 
     let scrubber = Scrubber::from_env();
 
