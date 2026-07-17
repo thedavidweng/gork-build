@@ -3836,10 +3836,10 @@ pub async fn connect_local_workspace(
 /// 2. `<grok_home>/workspace`, where `<grok_home>` honours `$GROK_HOME` and
 ///    otherwise falls back to `~/.grok` (see [`xai_grok_config::grok_home`]).
 pub fn resolve_workspace_home() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("GROK_WORKSPACE_HOME") {
-        if !p.trim().is_empty() {
-            return std::path::PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("GROK_WORKSPACE_HOME")
+        && !p.trim().is_empty()
+    {
+        return std::path::PathBuf::from(p);
     }
     xai_grok_config::grok_home().join("workspace")
 }

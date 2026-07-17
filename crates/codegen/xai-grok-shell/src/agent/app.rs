@@ -303,7 +303,7 @@ pub async fn run_stdio_agent(
         xai_file_utils::queue::DEFAULT_MAX_AGE,
     );
 
-    // Log the client that launched us (set by grok-desktop when spawning `grok agent stdio`).
+    // Log the client that launched us (set by grok-desktop when spawning `gork agent stdio`).
     // This appears early in unified.jsonl and is extremely useful for auth diagnostics.
     if let Ok(version) = std::env::var("GROK_CLIENT_VERSION") {
         crate::unified_log::info(
@@ -375,7 +375,7 @@ pub async fn run_stdio_agent(
             auth_manager.start_proactive_refresh(tokio_util::sync::CancellationToken::new());
             // Pause refreshes across system sleep so an OIDC refresh can't straddle a
             // suspend (which can revoke the refresh token and force re-login).
-            // `grok agent stdio` is a local/interactive entrypoint (spawned by
+            // `gork agent stdio` is a local/interactive entrypoint (spawned by
             // grok-desktop), so it needs the gate like the leader and pager paths;
             // no-op where the OS listener is unavailable.
             auth_manager.start_system_power_listener();
@@ -431,8 +431,8 @@ async fn run_headless_inner(
 ) -> anyhow::Result<()> {
     register_fs_watch_runtime();
     xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
-    // `grok agent [headless]` serves non-TUI automation; stamp proxy requests
-    // as headless. IDE-facing `grok agent stdio` stays interactive.
+    // `gork agent [headless]` serves non-TUI automation; stamp proxy requests
+    // as headless. IDE-facing `gork agent stdio` stays interactive.
     crate::http::set_process_client_mode_headless();
 
     use crate::agent::relay::spawn_relay_connection_with_callback;
@@ -440,7 +440,7 @@ async fn run_headless_inner(
 
     // Headless's only transport is the relay (no IPC fallback), so a session is required.
     const HEADLESS_NO_SESSION: &str = "Headless mode requires a grok.com session. \
-        Run `grok login` to sign in, or use `grok agent stdio` for API-key access.";
+        Run `gork login` to sign in, or use `gork agent stdio` for API-key access.";
 
     // Clean up orphaned upload queue temp files from previous sessions (best-effort).
     // Uses DEFAULT_MAX_AGE to stay in sync with the upload queue's retry policy.
@@ -461,7 +461,7 @@ async fn run_headless_inner(
             None if auth_manager.is_expired() => {
                 anyhow::bail!("Session expired. Please run 'grok login' to re-authenticate.")
             }
-            None => anyhow::bail!("No cached credentials found. Run `grok login`."),
+            None => anyhow::bail!("No cached credentials found. Run `gork login`."),
         }
     } else if reauthenticate {
         let auth_manager = Arc::new(AuthManager::new(&grok_home::grok_home(), ctx.clone()));
@@ -815,7 +815,7 @@ fn relay_config_for_session(
 /// returning the slot where the [`RelayHandle`](crate::agent::relay::RelayHandle)
 /// is parked once the connection task is running.
 ///
-/// * `relay_on_demand == false` (default — explicit `grok agent leader`
+/// * `relay_on_demand == false` (default — explicit `gork agent leader`
 ///   invocation: devbox / systemd / nohup): connect **eagerly**, right now.
 ///   A bare leader has no local IPC clients; remote prompts arrive *through*
 ///   the relay, so it must be up before any demand signal could ever exist.
@@ -1355,7 +1355,7 @@ pub async fn run_leader(
             });
 
             // Start (or arm) the grok.com relay. Eager by default — a bare
-            // `grok agent leader` (devbox / systemd) has no local IPC clients
+            // `gork agent leader` (devbox / systemd) has no local IPC clients
             // and receives remote prompts *through* the relay, so it must
             // connect unconditionally. Leaders auto-spawned by interactive
             // clients pass `relay_on_demand` and defer the WebSocket until the
@@ -1822,7 +1822,7 @@ mod tests {
     }
 
     /// Regression test for the bare-leader relay gating bug: a bare
-    /// `grok agent leader` (devbox/systemd — no local IPC clients,
+    /// `gork agent leader` (devbox/systemd — no local IPC clients,
     /// `relay_on_demand == false`) must connect the grok.com relay eagerly.
     /// Remote prompts arrive *through* the relay, so on such a leader no
     /// headless-registration demand signal can ever fire; gating the relay on
@@ -1845,7 +1845,7 @@ mod tests {
             .run_until(async {
                 let slot = spawn_leader_relay(
                     config,
-                    false, // eager: explicit `grok agent leader` invocation
+                    false, // eager: explicit `gork agent leader` invocation
                     demand_rx,
                     ws_to_agent_tx,
                     agent_to_ws_tx.clone(),

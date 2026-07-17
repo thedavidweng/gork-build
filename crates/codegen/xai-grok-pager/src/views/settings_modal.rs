@@ -8079,7 +8079,7 @@ mod tests {
             category: SettingCategory::Privacy,
             owner: SettingOwner::Shared,
             label: "Coding data sharing",
-            description: "Controls whether SpaceXAI may retain and train on coding data.",
+            description: "Controls whether the account may retain coding data for training.",
             keywords: &["test"],
             kind: SettingKind::Enum {
                 default: "opt-out",
@@ -8087,7 +8087,7 @@ mod tests {
                     EnumChoice {
                         canonical: "opt-in",
                         display: "Opt in",
-                        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
+                        description: "Allow account retention of coding session data for training and product improvement.",
                     },
                     EnumChoice {
                         canonical: "opt-out",
@@ -8141,7 +8141,7 @@ mod tests {
             category: SettingCategory::Privacy,
             owner: SettingOwner::Shared,
             label: "Coding data sharing",
-            description: "Controls whether SpaceXAI may retain and train on coding data.",
+            description: "Controls whether the account may retain coding data for training.",
             keywords: &["test"],
             kind: SettingKind::Enum {
                 default: "opt-out",
@@ -8149,7 +8149,7 @@ mod tests {
                     EnumChoice {
                         canonical: "opt-in",
                         display: "Opt in",
-                        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
+                        description: "Allow account retention of coding session data for training and product improvement.",
                     },
                     EnumChoice {
                         canonical: "opt-out",
@@ -8211,7 +8211,7 @@ mod tests {
             "choice 0 line 1 must contain the `·` separator, got: {r3:?}"
         );
         assert!(
-            r3.contains("Allow SpaceXAI"),
+            r3.contains("Allow account retention"),
             "choice 0 line 1 must start the description, got: {r3:?}"
         );
 
@@ -8253,7 +8253,7 @@ mod tests {
         );
         for word in [
             "Allow",
-            "SpaceXAI",
+            "account",
             "retain",
             "session",
             "training",
@@ -8426,7 +8426,7 @@ mod tests {
             category: SettingCategory::Privacy,
             owner: SettingOwner::Shared,
             label: "Coding data sharing",
-            description: "Controls whether SpaceXAI may retain coding data.",
+            description: "Controls whether the account may retain coding data.",
             keywords: &["test"],
             kind: SettingKind::Enum {
                 default: "opt-in",
@@ -8434,7 +8434,7 @@ mod tests {
                     EnumChoice {
                         canonical: "opt-in",
                         display: "Opt in",
-                        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
+                        description: "Allow account retention of coding session data for training and product improvement.",
                     },
                     EnumChoice {
                         canonical: "opt-out",

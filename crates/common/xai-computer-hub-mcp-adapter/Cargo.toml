@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-computer-hub-mcp-adapter"
 version = "0.1.0"
 edition.workspace = true
-description = "Bridge between MCP servers and the xAI Computer Hub, registering MCP-discovered tools as native hub tools."
+description = "Bridge between MCP servers and the Computer Hub, registering MCP-discovered tools as native hub tools."
 
 [features]
 metrics = ["dep:prometheus"]

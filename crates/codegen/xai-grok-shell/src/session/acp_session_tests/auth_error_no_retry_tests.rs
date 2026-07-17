@@ -399,11 +399,11 @@ async fn legacy_auth_hint_on_404_model_not_found() {
             );
             assert!(
                 msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
+                "hint must mention `gork logout`, got: {msg}"
             );
             assert!(
                 msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
+                "hint must mention `gork login`, got: {msg}"
             );
             assert!(
                 msg.contains("Version:"),
@@ -468,11 +468,11 @@ async fn legacy_auth_hint_on_401_unauthorized() {
             );
             assert!(
                 msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
+                "hint must mention `gork logout`, got: {msg}"
             );
             assert!(
                 msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
+                "hint must mention `gork login`, got: {msg}"
             );
         })
         .await;

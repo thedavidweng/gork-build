@@ -1269,12 +1269,18 @@ pub(crate) fn set_terminal_title(title: &str) {
 /// terminate the OSC early and let the remainder inject arbitrary escape
 /// sequences into the terminal.
 fn terminal_title_string(title: &str) -> String {
+    let cli = xai_grok_version::PRODUCT_CLI;
     let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
     if sanitized.is_empty() {
-        "grok".into()
+        cli.into()
     } else {
-        let truncated: String = sanitized.chars().take(80 - 6).collect();
-        format!("{} - grok", truncated)
+        // Reserve room for " - {cli}" suffix (space-dash-space + cli name).
+        let suffix_len = 3 + cli.len();
+        let truncated: String = sanitized
+            .chars()
+            .take(80_usize.saturating_sub(suffix_len))
+            .collect();
+        format!("{truncated} - {cli}")
     }
 }
 fn set_panic_hook(mode: ScreenMode) {
@@ -1315,13 +1321,14 @@ mod tests {
     }
     #[test]
     fn terminal_title_strips_control_characters() {
+        let cli = xai_grok_version::PRODUCT_CLI;
         assert_eq!(
             terminal_title_string("evil\x07\x1b]52;c;payload\x07title"),
-            "evil]52;c;payloadtitle - grok"
+            format!("evil]52;c;payloadtitle - {cli}")
         );
-        assert_eq!(terminal_title_string("\x07\x1b\x00"), "grok");
-        assert_eq!(terminal_title_string(""), "grok");
-        assert_eq!(terminal_title_string("My chat"), "My chat - grok");
+        assert_eq!(terminal_title_string("\x07\x1b\x00"), cli);
+        assert_eq!(terminal_title_string(""), cli);
+        assert_eq!(terminal_title_string("My chat"), format!("My chat - {cli}"));
     }
     #[test]
     fn hunk_tracker_mode_nothing_set_is_none() {
@@ -1689,24 +1696,25 @@ mod tests {
         assert!(!args.no_alt_screen);
     }
     #[test]
-    fn cli_command_name_is_grok() {
+    fn cli_command_name_is_gork() {
         use clap::CommandFactory;
-        assert_eq!(PagerArgs::command().get_name(), "grok");
+        assert_eq!(
+            PagerArgs::command().get_name(),
+            xai_grok_version::PRODUCT_CLI
+        );
     }
     #[test]
     fn cli_help_output_header() {
         use clap::CommandFactory;
         let help = PagerArgs::command().render_long_help().to_string();
         let first_5: Vec<&str> = help.lines().take(5).collect();
+        let usage = format!(
+            "Usage: {} [OPTIONS] [PROMPT] [COMMAND]",
+            xai_grok_version::PRODUCT_CLI
+        );
         assert_eq!(
             first_5,
-            vec![
-                "Grok Build TUI",
-                "",
-                "Usage: grok [OPTIONS] [PROMPT] [COMMAND]",
-                "",
-                "Arguments:",
-            ]
+            vec!["Gork Build TUI", "", usage.as_str(), "", "Arguments:",]
         );
         assert!(help.find("Arguments:\n").unwrap() < help.find("Options:\n").unwrap());
         assert!(help.find("Options:\n").unwrap() < help.find("Commands:\n").unwrap());

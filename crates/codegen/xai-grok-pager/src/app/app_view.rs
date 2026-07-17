@@ -653,7 +653,7 @@ pub struct AppView {
     /// dashboard); deny wins over all other visibility gates.
     pub tier_restricted_commands: Vec<String>,
     /// Whether the pager is connected via a leader (leader mode). The Agent
-    /// Dashboard entry points (`/dashboard`, `Ctrl+\`, `grok dashboard`, the
+    /// Dashboard entry points (`/dashboard`, `Ctrl+\`, `gork dashboard`, the
     /// startup hook) are only meaningful when a leader is coordinating a
     /// fleet of sessions, so they are gated on this flag. Set in
     /// `event_loop::run` from `connection.leader_status_rx.is_some()`;
@@ -1116,7 +1116,12 @@ impl AppView {
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
-        self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
+        self.coding_data_retention_opt_out =
+            if xai_grok_version::coding_data_retention_locked_opt_out() {
+                true
+            } else {
+                meta.coding_data_retention_opt_out
+            };
         self.gate = meta.gate.clone();
         if was_gated && self.gate.is_none() {
             self.paywall_check_started = None;
@@ -1288,7 +1293,7 @@ impl AppView {
             team_name: None,
             is_zdr: false,
             team_role: None,
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: true,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
@@ -5113,7 +5118,7 @@ pub(crate) mod tests {
             team_name: None,
             is_zdr: false,
             team_role: None,
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: true,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
@@ -6506,7 +6511,7 @@ pub(crate) mod tests {
     fn apply_auth_meta_clears_gate_on_subscription() {
         let mut app = test_app();
         app.gate = Some(xai_grok_shell::auth::GateInfo {
-            message: "Subscribe to use Grok Build".into(),
+            message: "Subscribe to use Gork Build".into(),
             url: Some("https://grok.com/supergrok?referrer=grok-build".into()),
             label: None,
         });
