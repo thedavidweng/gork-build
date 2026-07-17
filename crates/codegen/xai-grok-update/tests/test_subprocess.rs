@@ -217,7 +217,8 @@ async fn install_npm_calls_npm_with_version_arg() {
     assert_eq!(log.len(), 1, "exactly one npm invocation");
     let args = &log[0];
     assert!(args.contains("i -g"), "args: {args}");
-    assert!(args.contains("@xai-official/grok@0.1.181"), "args: {args}");
+    // Gork Build privacy fork installs the community package name.
+    assert!(args.contains("@gork-build/gork@0.1.181"), "args: {args}");
 }
 
 #[tokio::test]
@@ -228,7 +229,7 @@ async fn install_npm_falls_back_to_dist_tag_on_no_target() {
     install_npm_for_test(None, "stable", None).unwrap();
     let log = g.args_log();
     assert!(
-        log[0].contains("@xai-official/grok@latest"),
+        log[0].contains("@gork-build/gork@latest"),
         "stable channel uses @latest dist-tag: {}",
         log[0]
     );
@@ -242,7 +243,7 @@ async fn install_npm_falls_back_to_alpha_dist_tag_on_alpha_channel() {
     install_npm_for_test(None, "alpha", None).unwrap();
     let log = g.args_log();
     assert!(
-        log[0].contains("@xai-official/grok@alpha"),
+        log[0].contains("@gork-build/gork@alpha"),
         "alpha channel uses @alpha dist-tag: {}",
         log[0]
     );
