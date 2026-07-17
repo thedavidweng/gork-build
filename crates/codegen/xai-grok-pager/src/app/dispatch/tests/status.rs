@@ -67,7 +67,11 @@ fn show_privacy_info_zdr() {
     let effects = dispatch(Action::ShowPrivacyInfo, &mut app);
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
+    assert!(text.contains("Gork Build"));
     assert!(text.contains("Zero Data Retention"));
+    assert!(
+        text.contains("research uploads: disabled") || text.contains("Client research uploads")
+    );
     assert!(
         text.contains("Other settings (not changed by /privacy)"),
         "must list other settings knobs: {text}",
@@ -78,8 +82,7 @@ fn show_privacy_info_zdr() {
     );
 }
 
-/// `/privacy` info-print uses the desktop-aligned "privacy mode" /
-/// "share data" labels from the user's intentional rewrite.
+/// Gork Build `/privacy` always advertises the hard client privacy posture.
 #[test]
 fn show_privacy_info_opted_out() {
     let mut app = test_app_with_agent();
@@ -88,10 +91,12 @@ fn show_privacy_info_opted_out() {
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
     assert!(
-        text.contains("Privacy: privacy mode"),
-        "info-print must use 'Privacy: privacy mode' (desktop-aligned label): {text}",
+        text.contains("Gork Build") && text.contains("privacy mode"),
+        "info-print must mention Gork Build privacy mode: {text}",
     );
-    assert!(text.contains("/privacy opt-in"));
+    // Gork Build: `/privacy opt-in` is not offered, so the info text must
+    // not advertise it — but the passive config knobs are still listed.
+    assert!(!text.contains("/privacy opt-in"));
     assert!(
         text.contains("Other settings (not changed by /privacy)")
             && text.contains("GROK_TELEMETRY_ENABLED")
@@ -102,43 +107,28 @@ fn show_privacy_info_opted_out() {
 }
 
 #[test]
-fn show_privacy_info_opted_in() {
+fn show_privacy_info_always_locked_opt_out_copy() {
     let mut app = test_app_with_agent();
+    // Even if app state is stale "opted in", copy describes locked opt-out.
     app.coding_data_retention_opt_out = false;
     let effects = dispatch(Action::ShowPrivacyInfo, &mut app);
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
     assert!(
-        text.contains("Privacy: share data"),
-        "info-print must use 'Privacy: share data' (desktop-aligned label): {text}",
+        text.contains("Gork Build") && text.contains("opt-out"),
+        "info-print must describe locked opt-out: {text}",
     );
-    assert!(text.contains("/privacy opt-out"));
 }
 
-/// The info-print uses desktop-aligned labels ("privacy mode" /
-/// "share data"). This test pins those labels to catch accidental
-/// regressions to the registry's "Opt in" / "Opt out" display
-/// strings.
 #[test]
-fn show_privacy_info_does_not_use_old_desktop_labels() {
-    // opted-out → "Privacy: privacy mode"
+fn show_privacy_info_mentions_privacy_mode() {
     let mut app = test_app_with_agent();
     app.coding_data_retention_opt_out = true;
     let _ = dispatch(Action::ShowPrivacyInfo, &mut app);
     let text = last_system_text(&app, AgentId(0));
     assert!(
-        text.contains("privacy mode"),
-        "[opted-out] info-print must contain 'privacy mode': {text:?}",
-    );
-
-    // opted-in → "Privacy: share data"
-    let mut app = test_app_with_agent();
-    app.coding_data_retention_opt_out = false;
-    let _ = dispatch(Action::ShowPrivacyInfo, &mut app);
-    let text = last_system_text(&app, AgentId(0));
-    assert!(
-        text.contains("share data"),
-        "[opted-in] info-print must contain 'share data': {text:?}",
+        text.contains("privacy mode") || text.contains("opt-out"),
+        "info-print must mention privacy/opt-out: {text:?}",
     );
 }
 
@@ -164,31 +154,21 @@ fn show_privacy_info_does_not_use_old_desktop_labels() {
 /// glyph** on the opt-in direction (privacy-degrading).
 #[test]
 fn set_coding_data_sharing_idempotent_opt_in() {
+    // Gork Build: the retention lock (Guard 0) fires before the idempotent
+    // path — an opt-in re-dispatch toasts the lock message and forces local
+    // state back to opted-out, even when the UI thought it was opted in.
     let mut app = test_app_with_agent();
-    app.coding_data_retention_opt_out = false; // currently opted-in
+    app.coding_data_retention_opt_out = false; // stale "opted-in" UI state
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
-    assert!(
-        effects.is_empty(),
-        "idempotent re-dispatch must NOT emit Effect"
-    );
+    assert!(effects.is_empty(), "locked opt-in must NOT emit Effect");
     let toast = read_toast(&app);
     assert!(
-        toast.contains("Opt in"),
-        "toast must show display name 'Opt in' (PR 9 R1, General-3 Issue 6): {toast}",
+        toast.contains("locks coding data retention"),
+        "toast must state the Gork Build retention lock: {toast}",
     );
     assert!(
-        !toast.contains("opt-in"),
-        "toast must NOT use snake-case canonical 'opt-in' — display name only: {toast}",
-    );
-    assert!(
-        toast.contains('\u{26A0}'),
-        "idempotent opt-in toast uses ⚠ destructive-warning glyph (PR 9 R1, \
-             General-3 Issue 5): {toast}",
-    );
-    // State unchanged.
-    assert!(
-        !app.coding_data_retention_opt_out,
-        "idempotent path must not mutate state",
+        app.coding_data_retention_opt_out,
+        "lock must restore local state to opted-out",
     );
 }
 
@@ -257,10 +237,12 @@ fn set_coding_data_sharing_blocked_by_zdr() {
 /// from a user the policy says shouldn't be touching this).
 #[test]
 fn set_coding_data_sharing_blocked_by_zdr_even_if_idempotent() {
+    // Opt-out direction so the Gork Build retention lock (Guard 0, opt-in
+    // only) does not shadow the ZDR guard under test.
     let mut app = test_app_with_agent();
     app.is_zdr = true;
-    app.coding_data_retention_opt_out = false;
-    let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+    app.coding_data_retention_opt_out = true;
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
     assert!(effects.is_empty());
     assert!(read_toast(&app).contains("Zero Data Retention"));
 }
@@ -551,37 +533,22 @@ fn coding_data_sharing_failed_refreshes_open_modal_snapshot() {
 /// a future PR that softens the wording silently degrades the
 /// safety affordance.
 #[test]
-fn set_coding_data_sharing_opt_in_renders_destructive_warning_toast() {
+fn set_coding_data_sharing_opt_in_rejected_when_locked() {
     let mut app = test_app_with_agent();
-    app.coding_data_retention_opt_out = true; // currently opted-out
+    app.coding_data_retention_opt_out = true;
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
-    assert_eq!(effects.len(), 1, "non-idempotent opt-in must emit Effect");
+    assert!(
+        effects.is_empty(),
+        "Gork Build must not emit ACP effect for opt-in"
+    );
+    assert!(
+        app.coding_data_retention_opt_out,
+        "local state stays opted-out"
+    );
     let toast = read_toast(&app);
     assert!(
-        toast.contains('\u{26A0}'),
-        "opt-in toast MUST use ⚠ glyph (PR 9 R1, General-3 Issue 5 — \
-             privacy-degrading transition deserves destructive-warning glyph): {toast}",
-    );
-    assert!(
-        !toast.contains('\u{2713}'),
-        "opt-in toast MUST NOT use the uniform ✓ glyph — that's the \
-             safe-default toast for opt-out: {toast}",
-    );
-    assert!(
-        toast.contains("Opt in"),
-        "destructive toast still uses display name 'Opt in': {toast}",
-    );
-    // Consequence text pinned: a future PR softening this loses
-    // the safety affordance.
-    assert!(
-        toast.contains("code samples"),
-        "destructive toast must spell out the consequence \
-             (mention 'code samples'): {toast}",
-    );
-    assert!(
-        toast.contains("training"),
-        "destructive toast must spell out the consequence \
-             (mention 'training'): {toast}",
+        toast.contains("locks") || toast.contains("opt-out"),
+        "must toast that opt-in is locked: {toast}"
     );
 }
 
@@ -620,13 +587,13 @@ fn set_coding_data_sharing_opt_out_renders_safe_default_toast() {
 #[test]
 fn coding_data_sharing_toast_format_uses_display_name() {
     let mut app = test_app_with_agent();
-    // Opt-in direction.
+    // Opt-in is locked — toast explains lock.
     app.coding_data_retention_opt_out = true;
     let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
     let opt_in_toast = read_toast(&app);
     assert!(
-        opt_in_toast.contains("Opt in"),
-        "opt-in toast uses display 'Opt in', not canonical 'opt-in': {opt_in_toast}",
+        opt_in_toast.contains("opt-out") || opt_in_toast.contains("locks"),
+        "locked opt-in must toast rejection: {opt_in_toast}",
     );
     // Clear and test opt-out direction.
     app.agents.get_mut(&AgentId(0)).unwrap().toast = None;
@@ -781,18 +748,19 @@ fn scrub_error_for_toast_unit() {
     );
 }
 
-/// Synthetic AgentId(0) when no agents (welcome banner Accept path).
+/// Gork Build: even on the agent-less welcome path, an opt-in dispatch is
+/// blocked by the retention lock — no effect, state stays opted out.
 #[test]
-fn set_coding_data_sharing_no_agents_still_emits_effect() {
+fn set_coding_data_sharing_no_agents_opt_in_stays_locked() {
     let mut app = test_app_with_agent();
     app.agents.clear();
     app.active_view = ActiveView::Welcome;
     app.coding_data_retention_opt_out = true;
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
-    assert_eq!(effects.len(), 1, "no-agent path must still emit Effect");
+    assert!(effects.is_empty(), "locked opt-in must NOT emit Effect");
     assert!(
-        !app.coding_data_retention_opt_out,
-        "optimistic opt-in must apply without agents",
+        app.coding_data_retention_opt_out,
+        "opt-in must not apply under the retention lock",
     );
 }
 

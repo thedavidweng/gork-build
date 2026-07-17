@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-tool-runtime"
 version = "0.1.0"
 edition.workspace = true
-description = "Unified Tool trait, dispatch trait, error taxonomy, notifications, and search index for the xAI Computer Hub"
+description = "Unified Tool trait, dispatch trait, error taxonomy, notifications, and search index for the Computer Hub"
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,4 +1,4 @@
-//! `grok mcp doctor` -- runtime health check for MCP servers.
+//! `gork mcp doctor` -- runtime health check for MCP servers.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -284,7 +284,7 @@ async fn try_discover_managed_servers() -> (ConfigSourceStatus, Vec<DiscoveredSe
 
     let token = match auth_manager.get_valid_token().await {
         Ok(key) => key,
-        Err(_) => return managed_skipped("auth expired — run `grok login`"),
+        Err(_) => return managed_skipped("auth expired — run `gork login`"),
     };
 
     let proxy_url = crate::agent::config::EndpointsConfig::from_effective_config().proxy_url();
@@ -551,13 +551,13 @@ pub async fn run_doctor(cwd: &Path, name_filter: Option<&str>) -> DoctorReport {
 
     let disabled_names = crate::util::config::disabled_mcp_server_names(cwd);
 
-    // Folder-trust gate: `grok mcp doctor` actually STARTS each server
+    // Folder-trust gate: `gork mcp doctor` actually STARTS each server
     // (`check_server_start`), so in an untrusted clone it would spawn the repo's
     // project-scoped servers. Resolve the doctor cwd once (no prompt), then skip
     // (do not start) any project-scoped server when untrusted. Reuses the same
     // name primitive as the session/agent-pool gates.
     //
-    // `remote = None` is intentional: standalone `grok mcp doctor` has no loaded
+    // `remote = None` is intentional: standalone `gork mcp doctor` has no loaded
     // `RemoteSettings`, so a remote-only org `folder_trust_enabled = false`
     // opt-out isn't seen here — gating conservatively (treating the feature as
     // enabled) is the deliberate fail-secure direction. Local env/user/managed
@@ -657,7 +657,7 @@ pub fn print_report(report: &DoctorReport) {
 
     if report.servers.is_empty() {
         println!("  No MCP servers configured.");
-        println!("  Run `grok mcp add --help` to get started.");
+        println!("  Run `gork mcp add --help` to get started.");
         println!();
         return;
     }
@@ -687,7 +687,7 @@ pub fn print_report(report: &DoctorReport) {
         report.healthy_count,
         report.failing_count,
         if report.failing_count > 0 {
-            " Run `grok mcp doctor --json` for full diagnostics."
+            " Run `gork mcp doctor --json` for full diagnostics."
         } else {
             ""
         }
