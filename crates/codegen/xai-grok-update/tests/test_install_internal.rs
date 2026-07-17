@@ -1,3 +1,7 @@
+#![cfg(feature = "updater-integration-tests")]
+// Requires: cargo test -p xai-grok-update --features updater-integration-tests
+// + GORK_TEST_ALLOW_UPDATE=1 (set by tests/common).
+
 //! End-to-end tests for `install_internal` — the GCS-bucket installer used
 //! when `installer = "internal"` is configured.
 //!

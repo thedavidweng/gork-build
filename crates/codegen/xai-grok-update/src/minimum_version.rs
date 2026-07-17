@@ -2,12 +2,14 @@
 //!
 //! When `cli.minimum_version` is set in any config layer, Grok refuses to
 //! start below that floor. With auto-update on, we install
-//! `max(latest, minimum)`; otherwise the user is asked to run `grok update`.
+//! `max(latest, minimum)`; otherwise the user is asked to run `gork update`.
 //!
 //! Set `GROK_TEST_VERSION` to manually exercise either path without producing
 //! a real out-of-date build.
 
-use crate::auto_update::{get_installer, run_install_script};
+use crate::auto_update::{
+    get_installer, run_install_script, vendor_auto_update_forbidden, vendor_update_blocked_message,
+};
 use crate::version::{
     UpdateConfig, fetch_latest_version, get_installed_grok_version, write_version_cache,
 };
@@ -23,7 +25,7 @@ enum MinimumVersionDecision {
 
 /// Outcome of a successful enforcement pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EnforcementOutcome {
+pub(crate) enum EnforcementOutcome {
     Allowed,
     /// New binary on disk; caller MUST restart — running process is still old.
     Upgraded,
@@ -36,7 +38,7 @@ enum EnforcementOutcome {
 pub(crate) enum MinimumVersionError {
     /// `source` chains via `Error::source()`; omitted from `Display`.
     #[error(
-        "The minimum version \"{value}\" in your Grok configuration \
+        "The minimum version \"{value}\" in your Gork Build configuration \
          isn't a valid version number. Update `cli.minimum_version` and try again."
     )]
     InvalidMinimum {
@@ -45,22 +47,24 @@ pub(crate) enum MinimumVersionError {
         source: semver::Error,
     },
     #[error(
-        "This version of Grok ({current}) is no longer supported. \
-         Run `grok update` to install version {minimum} or later."
+        "This version of Gork Build ({current}) is no longer supported. \
+         Rebuild from source for version {minimum} or later \
+         (vendor auto-update is disabled in this fork)."
     )]
     AutoUpdateDisabled { current: String, minimum: String },
     /// `npm` / `gh` / `internal` GCS — none detected.
     #[error(
-        "This version of Grok ({current}) is no longer supported. \
-         Run `grok update` to install version {minimum} or later."
+        "This version of Gork Build ({current}) is no longer supported. \
+         Rebuild from source for version {minimum} or later \
+         (vendor auto-update is disabled in this fork)."
     )]
     NoInstaller { current: String, minimum: String },
     /// `detail` is telemetry-only; omitted from `Display` to avoid stacking
     /// the installer's own action language.
     #[error(
-        "This version of Grok ({current}) is no longer supported, \
-         and the update to version {minimum} didn't complete.\n\n\
-         Run `grok update` to try again."
+        "This version of Gork Build ({current}) is no longer supported, \
+         and an update to version {minimum} didn't complete.\n\n\
+         Rebuild from source (vendor auto-update is disabled in this fork)."
     )]
     UpgradeFailed {
         current: String,
@@ -70,7 +74,7 @@ pub(crate) enum MinimumVersionError {
     /// Latest release is known but still below the floor (vs `NoReleaseFound`,
     /// which couldn't probe at all).
     #[error(
-        "This version of Grok ({current}) is no longer supported. \
+        "This version of Gork Build ({current}) is no longer supported. \
          Version {minimum} or later is required, but the most recent release is {latest}. \
          Contact your administrator."
     )]
@@ -81,17 +85,24 @@ pub(crate) enum MinimumVersionError {
     },
     /// Couldn't probe the registry — likely transient.
     #[error(
-        "This version of Grok ({current}) is no longer supported. \
+        "This version of Gork Build ({current}) is no longer supported. \
          Version {minimum} or later is required, but no release was found. \
          Check your network connection, or contact your administrator."
     )]
     NoReleaseFound { current: String, minimum: String },
-    /// `grok update --version X` requested a version below the floor.
+    /// `gork update --version X` requested a version below the floor.
     #[error(
-        "Cannot install Grok {target}: the configured minimum is {minimum}. \
-         Run `grok update` to install the latest allowed version."
+        "Cannot install Gork Build {target}: the configured minimum is {minimum}. \
+         Rebuild from source for the latest allowed version."
     )]
     TargetBelowFloor { target: String, minimum: String },
+    /// Privacy build: never auto-install from vendor channels to satisfy a floor.
+    #[error("{message}")]
+    VendorUpdateForbidden {
+        current: String,
+        minimum: String,
+        message: String,
+    },
 }
 
 /// Pure check against the configured floor. Empty / whitespace-only
@@ -133,7 +144,7 @@ fn evaluate_minimum_version(
 }
 
 /// Refuse an explicit install target below the configured floor.
-/// Used by `grok update --version X`.
+/// Used by `gork update --version X`.
 pub(crate) fn check_install_target(target: &str) -> Result<(), MinimumVersionError> {
     let floor = resolve_floor_or_error()?;
     check_install_target_inner(target, floor.as_deref())
@@ -154,7 +165,7 @@ fn check_install_target_inner(
 }
 
 /// `max(target, configured_floor)`; passthrough when no floor is set.
-/// Used by `grok update` to keep the install target at or above the pin.
+/// Used by `gork update` to keep the install target at or above the pin.
 pub(crate) fn apply_floor(target: &str) -> Result<String, MinimumVersionError> {
     let floor = resolve_floor_or_error()?;
     apply_floor_inner(target, floor.as_deref())
@@ -189,7 +200,9 @@ fn pick_target_version(latest: Option<&str>, minimum: &str) -> String {
 
 /// Call once at startup, before any user-facing UI. On `Ok(Upgraded)` the
 /// caller MUST restart. On `Err`, print and exit non-zero.
-async fn enforce_minimum_version(
+///
+/// `pub(crate)` so unit tests can drive the shipped enforcement path.
+pub(crate) async fn enforce_minimum_version(
     minimum_version: Option<&str>,
     update_config: &UpdateConfig,
 ) -> Result<EnforcementOutcome, MinimumVersionError> {
@@ -201,6 +214,22 @@ async fn enforce_minimum_version(
     };
 
     info!(%current, %minimum, "minimum_version: below floor; attempting auto-update");
+
+    // Privacy / Gork Build: never satisfy a remote or local floor by pulling
+    // vendor (x.ai) installers — that would replace this fork with official
+    // Grok Build. Fail closed with rebuild guidance instead.
+    if vendor_auto_update_forbidden() {
+        warn!(%current, %minimum, "minimum_version: vendor auto-update forbidden (privacy build)");
+        let message = format!(
+            "This version of Gork Build ({current}) is below the configured floor ({minimum}).\n\n{}",
+            vendor_update_blocked_message()
+        );
+        return Err(MinimumVersionError::VendorUpdateForbidden {
+            current,
+            minimum,
+            message,
+        });
+    }
 
     // `None` is "default on"; only explicit `false` opts out.
     let cfg = config::load_config().await;
@@ -219,7 +248,7 @@ async fn enforce_minimum_version(
 
     info!(%current, %target, installer, "minimum_version: installing upgrade");
     eprintln!(
-        "This version of Grok ({current}) is no longer supported. \
+        "This version of Gork Build ({current}) is no longer supported. \
          Updating to {target}…"
     );
 
@@ -281,7 +310,7 @@ pub async fn enforce_minimum_version_or_exit(update_config: &UpdateConfig) {
             // child process ever writes to a broken pipe. For now this
             // path is rare (only fires when the server pushes a minimum
             // version bump), so print a relaunch message instead.
-            eprintln!("Update installed. Run `grok` to start.");
+            eprintln!("Update installed. Run `gork` to start.");
             std::process::exit(0);
         }
         Err(e) => {
@@ -379,6 +408,70 @@ mod tests {
         match saved {
             Some(v) => unsafe { std::env::set_var("GROK_TEST_VERSION", v) },
             None => unsafe { std::env::remove_var("GROK_TEST_VERSION") },
+        }
+    }
+
+    /// Asserts that without the installer-test feature, env cannot open the
+    /// gate and minimum-version enforcement stays fail-closed.
+    #[cfg(not(feature = "updater-integration-tests"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn privacy_build_refuses_minimum_version_vendor_install() {
+        let ver_saved = std::env::var("GROK_TEST_VERSION").ok();
+        // SAFETY: #[serial]
+        unsafe {
+            // Even with GORK_TEST_ALLOW_UPDATE=1, product unit tests are not
+            // built with `updater-integration-tests`, so the gate stays on.
+            std::env::set_var("GORK_TEST_ALLOW_UPDATE", "1");
+            std::env::set_var("GROK_TEST_VERSION", "0.1.50");
+        }
+
+        assert!(
+            crate::auto_update::vendor_auto_update_forbidden(),
+            "privacy gate must stay on without updater-integration-tests feature"
+        );
+
+        let cfg = UpdateConfig {
+            proxy_base_url: "https://example.invalid/v1".into(),
+            auth_scope: "test".into(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".into(),
+            npm_registry: None,
+        };
+
+        let err = enforce_minimum_version(Some("9.9.9"), &cfg)
+            .await
+            .expect_err("must fail closed without vendor install");
+        match err {
+            MinimumVersionError::VendorUpdateForbidden {
+                current,
+                minimum,
+                message,
+            } => {
+                assert_eq!(current, "0.1.50");
+                assert_eq!(minimum, "9.9.9");
+                assert!(
+                    message.contains("never installs from vendor")
+                        || message.contains("x.ai")
+                        || message.contains("cargo build"),
+                    "message must guide rebuild, got: {message}"
+                );
+                assert!(
+                    !message.contains("curl -fsSL https://x.ai/cli"),
+                    "must not recommend vendor curl installer: {message}"
+                );
+            }
+            other => panic!("expected VendorUpdateForbidden, got {other:?}"),
+        }
+
+        // SAFETY: restore
+        unsafe {
+            std::env::remove_var("GORK_TEST_ALLOW_UPDATE");
+            match ver_saved {
+                Some(v) => std::env::set_var("GROK_TEST_VERSION", v),
+                None => std::env::remove_var("GROK_TEST_VERSION"),
+            }
         }
     }
 }
