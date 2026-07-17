@@ -1052,7 +1052,7 @@ pub async fn resolve_api_key(explicit: Option<&str>, grok_home: &Path) -> Result
         return Ok(key);
     }
     Err(anyhow!(
-        "no API key: pass --api-key, set XAI_API_KEY, or run `grok login` to populate \
+        "no API key: pass --api-key, set XAI_API_KEY, or run `gork login` to populate \
          <grok-home>/auth.json. An expired OIDC token is auto-refreshed when a refresh_token \
          is present; if not, re-login is required."
     ))
@@ -1096,7 +1096,7 @@ async fn non_interactive_auth_key(grok_home: &Path) -> Result<Option<String>> {
         }
         Err(AuthError::NotLoggedIn) => Ok(None),
         Err(e) => Err(anyhow!(
-            "auth.json refresh failed: {e}. Run `grok login` to re-authenticate, \
+            "auth.json refresh failed: {e}. Run `gork login` to re-authenticate, \
              or pass --api-key / set $XAI_API_KEY to bypass auth.json."
         )),
     }
@@ -2142,7 +2142,7 @@ mod tests {
     }
 
     /// Write an `auth.json` whose only entry is at the production
-    /// OIDC scope (the same scope `grok login` writes today and
+    /// OIDC scope (the same scope `gork login` writes today and
     /// `AuthManager` reads). `auth_mode: api_key` skips the refresh
     /// path entirely — useful for "plain key, no refresh wanted"
     /// fixtures.

@@ -1,0 +1,22 @@
+# Dependabot for Gork Build.
+#
+# Only github-actions: CI workflows are fork-owned surface area.
+# Cargo deps intentionally follow xai-org/grok-build — version bumps here
+# would drift the lockfile from upstream and make re-sync harder (VSCodium
+# model: track upstream tree; don't parallel-maintain their dependency set).
+# Security alerts remain enabled at the repo level; review critically and
+# prefer fixing via upstream sync when possible.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: build
+      include: scope

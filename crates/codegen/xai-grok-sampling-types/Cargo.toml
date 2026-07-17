@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-grok-sampling-types"
 version = "0.1.0"
 edition.workspace = true
-description = "Pure data types for the xAI sampling / chat-completion API layer"
+description = "Pure data types for the sampling / chat-completion API layer"
 
 [dependencies]
 async-openai = { workspace = true }

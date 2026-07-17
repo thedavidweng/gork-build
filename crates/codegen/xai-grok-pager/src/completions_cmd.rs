@@ -1,6 +1,6 @@
-//! `grok completions <shell>` — generate shell completion scripts.
+//! `gork completions <shell>` — generate shell completion scripts.
 //!
-//! Used by the installers and npm postinstall; must stay side-effect free
+//! Used by installers and postinstall; must stay side-effect free
 //! (no network, auth, tracing, or tokio).
 
 use clap::CommandFactory as _;
@@ -10,16 +10,15 @@ use crate::app::PagerArgs;
 
 /// Generate and print the completion script for the given shell.
 pub fn run(shell: Shell) {
-    // Ensure the script always uses the public "grok" name (matches historical
-    // behavior and what the installers + docs expect).
-    let mut cmd = PagerArgs::command().name("grok");
+    let cli = xai_grok_version::PRODUCT_CLI;
+    let mut cmd = PagerArgs::command().name(cli);
     if shell != Shell::Zsh {
-        generate(shell, &mut cmd, "grok", &mut std::io::stdout());
+        generate(shell, &mut cmd, cli, &mut std::io::stdout());
         return;
     }
     // zsh needs post-processing (see fix_zsh_root_prompt_positional).
     let mut buf = Vec::new();
-    generate(shell, &mut cmd, "grok", &mut buf);
+    generate(shell, &mut cmd, cli, &mut buf);
     match String::from_utf8(buf) {
         Ok(script) => print!("{}", fix_zsh_root_prompt_positional(&script)),
         // clap_complete output is generated from Rust strings, so this arm is
@@ -39,7 +38,7 @@ pub fn run(shell: Shell) {
 /// The generated root `_arguments` spec emits a `'::prompt …'` slot before
 /// the subcommand slot but dispatches subcommands with `case $line[2]`. zsh
 /// assigns the typed subcommand to the *prompt* slot (`$line[1]`), leaves
-/// `$line[2]` empty, and the dispatch falls through — so `grok worktree <TAB>`
+/// `$line[2]` empty, and the dispatch falls through — so `gork worktree <TAB>`
 /// re-offers every top-level command. (`hide = true` on the positional does
 /// not change the generated script.)
 ///
@@ -80,15 +79,20 @@ mod tests {
 
     /// Generate the zsh completion script exactly like `run` does.
     fn zsh_script() -> String {
-        let mut cmd = PagerArgs::command().name("grok");
+        let mut cmd = PagerArgs::command().name(xai_grok_version::PRODUCT_CLI);
         let mut buf = Vec::new();
-        generate(Shell::Zsh, &mut cmd, "grok", &mut buf);
+        generate(
+            Shell::Zsh,
+            &mut cmd,
+            xai_grok_version::PRODUCT_CLI,
+            &mut buf,
+        );
         String::from_utf8(buf).expect("completion script is UTF-8")
     }
 
     // The optional `[PROMPT]` positional (app/cli.rs) makes clap_complete emit
     // a `::prompt` slot before the subcommand slot and dispatch on `$line[2]`,
-    // so `grok worktree <TAB>` re-offered every top-level command (upstream
+    // so `gork worktree <TAB>` re-offered every top-level command (upstream
     // clap-rs/clap#6282).
     #[test]
     fn zsh_completions_drop_prompt_slot_and_dispatch_on_line_1() {

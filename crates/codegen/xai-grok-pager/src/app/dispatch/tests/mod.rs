@@ -150,7 +150,7 @@ fn test_app() -> AppView {
         team_name: None,
         is_zdr: false,
         team_role: None,
-        coding_data_retention_opt_out: false,
+        coding_data_retention_opt_out: true,
         show_tips: None,
         auto_update: None,
         ask_user_question_timeout_enabled: None,
