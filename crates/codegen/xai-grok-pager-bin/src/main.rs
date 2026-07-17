@@ -3,7 +3,8 @@
     unused_variables,
     unused_mut,
     unreachable_code,
-    dead_code
+    dead_code,
+    clippy::possible_missing_else
 )]
 #[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
