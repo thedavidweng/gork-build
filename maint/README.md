@@ -10,7 +10,7 @@ python maint/scripts/patchctl.py detect
 python maint/scripts/patchctl.py export --tip HEAD   # sets patch_tip to last *functional* commit
 python maint/scripts/patchctl.py apply --upstream <SHA>
 python maint/scripts/patchctl.py verify --skip-expensive
-python maint/scripts/patchctl.py lint                # static + roundtrip
+python maint/scripts/patchctl.py lint                # static + roundtrip vs HEAD (and product_tip)
 python maint/scripts/patchctl.py finalize-sync --upstream <SHA> --version X --source-rev Y
 python maint/scripts/patchctl.py roundtrip
 python maint/scripts/patchctl.py report --new <sha> --json
