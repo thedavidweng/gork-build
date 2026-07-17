@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-tool-protocol"
 version = "0.1.0"
 edition.workspace = true
-description = "Wire-protocol types for the xAI Computer Hub"
+description = "Wire-protocol types for the Computer Hub"
 
 [dependencies]
 xai-tool-types = { workspace = true }

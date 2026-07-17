@@ -172,7 +172,7 @@ async fn attempt_auth_recovery(
     context: &str,
 ) -> bool {
     let Some(ref am) = config.auth_manager else {
-        teprintln!("Authentication required. Run `grok login` to re-authenticate.");
+        teprintln!("Authentication required. Run `gork login` to re-authenticate.");
         cancel.cancel();
         return false;
     };
