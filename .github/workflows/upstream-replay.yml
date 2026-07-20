@@ -225,7 +225,7 @@ jobs:
           persist-credentials: true
 
       - name: Download replay artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: upstream-replay-${{ needs.replay-and-test.outputs.version }}-${{ needs.replay-and-test.outputs.sha }}
           path: artifacts
