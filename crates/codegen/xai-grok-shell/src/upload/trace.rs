@@ -931,15 +931,16 @@ pub(crate) async fn upload_unified_log(ctx: &PromptTraceContext, wait: UploadWai
     .await;
     let full_log_bytes =
         tokio::task::spawn_blocking(xai_grok_telemetry::unified_log::snapshot_log).await;
-    let email = ctx
+    let user_id = ctx
         .auth_manager
         .current_or_expired()
-        .and_then(|a| a.email)
+        .map(|a| a.user_id)
+        .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
     if let Ok(Some(full_bytes)) = full_log_bytes {
         crate::upload::gcs::upload_to_auth_diagnostics(
             &full_bytes,
-            &email,
+            &user_id,
             &ctx.gcs_config.upload_method,
             ctx.auth_manager.clone(),
         )

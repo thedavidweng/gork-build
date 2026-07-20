@@ -32,16 +32,6 @@ pub enum AuthMode {
     ApiKey,
 }
 
-impl AuthMode {
-    /// Whether this auth mode can access `supported_in_api: false` models.
-    pub fn is_session_auth(&self) -> bool {
-        match self {
-            Self::WebLogin | Self::Oidc => true,
-            Self::External | Self::ApiKey => false,
-        }
-    }
-}
-
 /// Wire value of `principal_type` for team OAuth principals (capitalized by
 /// the auth service). Single source for every comparison site.
 pub(crate) const TEAM_PRINCIPAL_TYPE: &str = "Team";
@@ -95,7 +85,10 @@ pub struct GrokAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
 
-    /// OIDC issuer URL that issued this token (needed for refresh via discovery).
+    /// Issuer URL that issued this token. For OIDC credentials it drives
+    /// refresh via discovery; for external-provider credentials it is the
+    /// provider's `issuer` claim. In both modes an x.ai issuer marks the
+    /// credential first-party (`is_xai_auth`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
 
@@ -130,21 +123,41 @@ impl GrokAuth {
             .num_seconds()
     }
 
-    /// `true` when the token comes from a first-party xAI account
-    /// (OIDC login against https://auth.x.ai or the local-dev equivalent).
+    /// `true` when the token comes from a first-party xAI account —
+    /// either an OIDC login against https://auth.x.ai (or the local-dev
+    /// equivalent), or an external auth provider that declared an xAI
+    /// issuer for its token.
+    ///
+    /// The issuer is a client-side hint, not a trust assertion: everything
+    /// it unlocks still authenticates the actual token server-side, and it
+    /// never influences endpoints.
     pub fn is_xai_auth(&self) -> bool {
         match self.auth_mode {
-            AuthMode::Oidc => self
+            AuthMode::Oidc | AuthMode::External => self
                 .oidc_issuer
                 .as_deref()
                 .is_some_and(is_xai_oauth2_issuer),
-            AuthMode::External | AuthMode::ApiKey | AuthMode::WebLogin => false,
+            AuthMode::ApiKey | AuthMode::WebLogin => false,
         }
     }
 
     /// `true` when this auth can access grok.com managed MCP connectors.
     pub fn is_managed_mcp_eligible(&self) -> bool {
         self.is_xai_auth() || self.auth_mode == AuthMode::WebLogin
+    }
+
+    /// Whether this credential can access `supported_in_api: false` models.
+    ///
+    /// Session logins (WebLogin, OIDC — including enterprise issuers) always
+    /// qualify; external-provider credentials qualify only when first-party
+    /// (`is_xai_auth`), matching the built-in devbox login they replace.
+    /// Plain API keys never do.
+    pub fn is_session_auth(&self) -> bool {
+        match self.auth_mode {
+            AuthMode::WebLogin | AuthMode::Oidc => true,
+            AuthMode::External => self.is_xai_auth(),
+            AuthMode::ApiKey => false,
+        }
     }
 
     pub fn is_team_principal(&self) -> bool {
@@ -369,6 +382,51 @@ mod tests {
             oidc_issuer: None,
             oidc_client_id: None,
         }
+    }
+
+    #[test]
+    fn is_xai_auth_matrix() {
+        use crate::auth::XAI_OAUTH2_ISSUER;
+        let with_issuer = |mode: AuthMode, issuer: Option<&str>| GrokAuth {
+            oidc_issuer: issuer.map(str::to_owned),
+            ..make_auth(mode)
+        };
+
+        // Only Oidc/External qualify, and only with an x.ai issuer.
+        assert!(with_issuer(AuthMode::Oidc, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+        assert!(with_issuer(AuthMode::External, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+        assert!(!with_issuer(AuthMode::Oidc, None).is_xai_auth());
+        assert!(!with_issuer(AuthMode::External, None).is_xai_auth());
+        assert!(!with_issuer(AuthMode::Oidc, Some("https://idp.acme.example")).is_xai_auth());
+        assert!(!with_issuer(AuthMode::External, Some("https://idp.acme.example")).is_xai_auth());
+
+        // ApiKey / WebLogin stay false even with an x.ai issuer set.
+        assert!(!with_issuer(AuthMode::ApiKey, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+        assert!(!with_issuer(AuthMode::WebLogin, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+    }
+
+    #[test]
+    fn is_session_auth_requires_first_party_for_external() {
+        use crate::auth::XAI_OAUTH2_ISSUER;
+        let with_issuer = |mode: AuthMode, issuer: Option<&str>| GrokAuth {
+            oidc_issuer: issuer.map(str::to_owned),
+            ..make_auth(mode)
+        };
+
+        // Session logins qualify regardless of issuer (incl. enterprise OIDC).
+        assert!(with_issuer(AuthMode::WebLogin, None).is_session_auth());
+        assert!(with_issuer(AuthMode::Oidc, None).is_session_auth());
+        assert!(with_issuer(AuthMode::Oidc, Some("https://idp.acme.example")).is_session_auth());
+
+        // External qualifies only when first-party (devbox-login parity).
+        assert!(with_issuer(AuthMode::External, Some(XAI_OAUTH2_ISSUER)).is_session_auth());
+        assert!(!with_issuer(AuthMode::External, None).is_session_auth());
+        assert!(
+            !with_issuer(AuthMode::External, Some("https://idp.acme.example")).is_session_auth()
+        );
+
+        // Plain API keys never do.
+        assert!(!with_issuer(AuthMode::ApiKey, Some(XAI_OAUTH2_ISSUER)).is_session_auth());
     }
 
     #[test]

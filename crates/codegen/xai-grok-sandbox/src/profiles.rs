@@ -140,18 +140,11 @@ pub fn load_sandbox_config(workspace: &Path) -> SandboxConfig {
     config
 }
 
-/// Warn when project config attempts to redefine a user-defined custom profile.
-/// Called once during process startup, separately from config loading because the
-/// enforcement path reads the merged config more than once.
-pub fn warn_sandbox_profile_conflicts(workspace: &Path) {
-    let global_path = grok_home().join("sandbox.toml");
-    let project_path = workspace.join(".grok").join("sandbox.toml");
-    let global = load_config_file(&global_path).unwrap_or_default();
-    let project = load_config_file(&project_path).unwrap_or_default();
-
-    for name in mismatched_profile_names(&global, &project) {
-        warn_profile_conflict(&name, &global_path, &project_path);
-    }
+pub fn sandbox_profile_conflicts(workspace: &Path) -> Vec<String> {
+    let global = load_config_file(&grok_home().join("sandbox.toml")).unwrap_or_default();
+    let project =
+        load_config_file(&workspace.join(".grok").join("sandbox.toml")).unwrap_or_default();
+    mismatched_profile_names(&global, &project)
 }
 
 fn mismatched_profile_names(global: &SandboxConfig, project: &SandboxConfig) -> Vec<String> {
@@ -169,14 +162,6 @@ fn mismatched_profile_names(global: &SandboxConfig, project: &SandboxConfig) -> 
         .collect();
     names.sort_unstable();
     names
-}
-
-fn warn_profile_conflict(name: &str, global_path: &Path, project_path: &Path) {
-    eprintln!(
-        "warning: project sandbox profile '{name}' in '{}' conflicts with a different user profile in '{}'; the project definition is ignored",
-        project_path.display(),
-        global_path.display()
-    );
 }
 
 /// Merge project profiles into `config`. Names already defined globally are
@@ -632,50 +617,30 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_profile_names_only_reports_different_conflicts() {
-        let global: SandboxConfig = toml::from_str(
-            r#"
-[profiles.same]
-extends = "workspace"
-restrict_network = false
+    fn mismatched_profile_names_reports_only_changed_custom_profiles() {
+        let profile = |restrict_network| ProfileConfig {
+            extends: Some("workspace".to_string()),
+            restrict_network: Some(restrict_network),
+            read_only: vec![],
+            read_write: vec![],
+            deny: vec![],
+        };
+        let global = SandboxConfig {
+            profiles: HashMap::from([
+                ("dev".to_string(), profile(false)),
+                ("same".to_string(), profile(false)),
+            ]),
+        };
+        let project = SandboxConfig {
+            profiles: HashMap::from([
+                ("dev".to_string(), profile(true)),
+                ("same".to_string(), profile(false)),
+                ("project-only".to_string(), profile(true)),
+                ("devbox".to_string(), profile(true)),
+            ]),
+        };
 
-[profiles.changed]
-extends = "workspace"
-restrict_network = false
-
-[profiles.user_only]
-extends = "strict"
-
-[profiles.devbox]
-extends = "workspace"
-restrict_network = false
-"#,
-        )
-        .unwrap();
-        let project: SandboxConfig = toml::from_str(
-            r#"
-[profiles.same]
-extends = "workspace"
-restrict_network = false
-
-[profiles.changed]
-extends = "workspace"
-restrict_network = true
-
-[profiles.project_only]
-extends = "devbox"
-
-[profiles.devbox]
-extends = "strict"
-restrict_network = true
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            mismatched_profile_names(&global, &project),
-            vec!["changed".to_string()]
-        );
+        assert_eq!(mismatched_profile_names(&global, &project), vec!["dev"]);
     }
 
     #[test]

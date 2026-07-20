@@ -36,7 +36,7 @@ pub use logging::SandboxLogger;
 #[cfg(all(feature = "enforce", unix))]
 use nono::Sandbox;
 pub use profiles::{
-    ProfileName, SandboxConfig, SandboxProfile, load_sandbox_config, warn_sandbox_profile_conflicts,
+    ProfileName, SandboxConfig, SandboxProfile, load_sandbox_config, sandbox_profile_conflicts,
 };
 use std::path::Path;
 #[cfg(any(target_os = "linux", all(feature = "enforce", test)))]

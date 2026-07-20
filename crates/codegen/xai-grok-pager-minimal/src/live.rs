@@ -71,7 +71,12 @@ pub(super) fn prompt_style(
 /// Draw the pinned live region (tail + status + prompt) into the inline viewport.
 pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
     let force_todos = minimal_api::minimal_show_todos(app);
-    let auth_hint = crate::auth::minimal_auth_hint(&app.auth_state);
+    let auth_hint = crate::auth::minimal_auth_hint(
+        &app.auth_state,
+        &app.trust_state,
+        app.has_access(),
+        app.is_zdr_blocked(),
+    );
     let pending_hint = minimal_pending_hint(&app.pending_action);
     let transcript_hint = if minimal_api::minimal_ctrl_o_opens_transcript(app) {
         "ctrl+o transcript"
@@ -343,6 +348,7 @@ fn live_tail_renderer<'a>(
 /// Starts at the shared [`super::commit::scan_frontier`] stop point so it renders
 /// exactly the entries [`tail_height`] measured (the viewport was sized to that —
 /// any disagreement makes the prompt jump on commit).
+#[allow(clippy::too_many_arguments)]
 fn draw_tail(
     buf: &mut Buffer,
     area: Rect,
@@ -527,16 +533,22 @@ fn render_minimal_status(
         minimal_api::held_queue_top_sendable(agent),
     );
 }
-/// Render the idle status hint (`minimal · /help`) shown when no turn is active
-/// and nothing is being watched. Transparent background, matching the rest of
-/// the live region.
+/// Idle status: `minimal · [/fullscreen to go back ·] /help` (+ auto-set note).
 fn render_idle_hint(buf: &mut Buffer, area: Rect, theme: &Theme) {
     let style = theme.dim().bg(Color::Reset);
     buf.set_style(area, style);
-    let hint = if xai_grok_pager::app::minimal_auto_set_for_mouse_leak() {
-        "minimal · auto-set on JetBrains/Windows due to JetBrains mouse reporting issues · /help"
-    } else {
-        "minimal · /help"
+    let auto = xai_grok_pager::app::minimal_auto_set_for_mouse_leak();
+    let switch_back = xai_grok_pager::app::minimal_show_switch_back_to_fullscreen();
+    let hint = match (auto, switch_back) {
+        (true, true) => {
+            "minimal · auto-set on JetBrains/Windows due to JetBrains mouse reporting issues \
+             · /fullscreen to go back · /help"
+        }
+        (true, false) => {
+            "minimal · auto-set on JetBrains/Windows due to JetBrains mouse reporting issues · /help"
+        }
+        (false, true) => "minimal · /fullscreen to go back · /help",
+        (false, false) => "minimal · /help",
     };
     buf.set_span(area.x, area.y, &Span::styled(hint, style), area.width);
 }
@@ -744,10 +756,25 @@ mod tests {
                 .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol().to_string()))
                 .collect()
         };
+        xai_grok_pager::app::set_minimal_show_switch_back_to_fullscreen_for_test(false);
         let a = agent();
         let mut buf = Buffer::empty(area);
         render_minimal_status(&mut buf, area, &a, &None, None, &theme);
-        assert!(read(&buf).contains("/help"), "idle hint: {:?}", read(&buf));
+        let idle = read(&buf);
+        assert!(idle.contains("/help"), "idle hint: {idle:?}");
+        assert!(
+            !idle.contains("/fullscreen"),
+            "cold start must not show switch-back: {idle:?}"
+        );
+        xai_grok_pager::app::set_minimal_show_switch_back_to_fullscreen_for_test(true);
+        let mut buf = Buffer::empty(area);
+        render_minimal_status(&mut buf, area, &a, &None, None, &theme);
+        let switched = read(&buf);
+        assert!(
+            switched.contains("/fullscreen to go back"),
+            "relaunch into minimal must show switch-back: {switched:?}"
+        );
+        xai_grok_pager::app::set_minimal_show_switch_back_to_fullscreen_for_test(false);
         let mut a = agent();
         a.session.state = AgentState::TurnRunning;
         let mut buf = Buffer::empty(area);

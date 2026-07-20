@@ -114,8 +114,6 @@ tar = { workspace = true }
 workspace = true
 
 [features]
-default-bazel = [
-    "serde",
-    ]
+default-bazel = ["serde"]
 default = ["serde"]
 serde = []

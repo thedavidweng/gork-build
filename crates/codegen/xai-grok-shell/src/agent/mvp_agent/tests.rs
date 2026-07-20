@@ -2597,12 +2597,46 @@ async fn data_collection_disabled_even_for_non_zdr_team_blocks_in_privacy_build(
         "Gork Build disables collection regardless of team block reasons"
     );
 }
+fn enable_product_telemetry(agent: &MvpAgent) {
+    agent.cfg.borrow_mut().features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
+}
 /// Enable trace uploads via config so only the auth-level privacy gate
 /// can disable collection in the tests below.
 fn enable_trace_upload_config(agent: &MvpAgent) {
     let mut cfg = agent.cfg.borrow_mut();
     cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
     cfg.telemetry.trace_upload = Some(true);
+}
+#[tokio::test]
+async fn product_analytics_enabled_for_normal_user_with_telemetry_on() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    enable_product_telemetry(&agent);
+    assert!(agent.product_analytics_enabled());
+}
+#[tokio::test]
+async fn product_analytics_enabled_despite_coding_retention_opt_out() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+        coding_data_retention_opt_out: true,
+        ..crate::auth::GrokAuth::test_default()
+    });
+    enable_product_telemetry(&agent);
+    assert!(agent.is_data_collection_disabled());
+    assert!(agent.product_analytics_enabled());
+}
+#[tokio::test]
+async fn product_analytics_disabled_for_zdr_team() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+        team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
+        ..crate::auth::GrokAuth::test_default()
+    });
+    enable_product_telemetry(&agent);
+    assert!(!agent.product_analytics_enabled());
+}
+#[tokio::test]
+async fn product_analytics_disabled_when_telemetry_off() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    agent.cfg.borrow_mut().features.telemetry = Some(crate::agent::config::TelemetryMode::Disabled);
+    assert!(!agent.product_analytics_enabled());
 }
 /// Counting HTTP stub: any request increments the counter and gets a
 /// storage-proxy-shaped 200 so the client does not retry.
@@ -2639,7 +2673,7 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -2652,16 +2686,14 @@ async fn diagnostic_upload_blocked_for_normal_user_in_privacy_build() {
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
     enable_trace_upload_config(&agent);
     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
-    // Privacy build: trace_upload resolver is hard-false, so the diagnostic
-    // uploader is not even wired — or if config still constructs a closure,
-    // invocation must not hit the network.
-    if let Some(uploader) = agent.diagnostic_upload_config() {
-        uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
-    }
-    assert_eq!(
-        count.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "Gork Build: diagnostics upload must not leave the machine"
+    let uploader = agent
+        .diagnostic_upload_config()
+        .expect("uploader is wired whenever trace upload config is on");
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
+    assert!(
+        count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "positive control: diagnostics upload reaches the proxy for a \
+         normal user"
     );
 }
 /// The diagnostics privacy gate fails closed: with no credential in the
@@ -2676,7 +2708,7 @@ async fn diagnostic_upload_skipped_without_credentials() {
     let uploader = agent
         .diagnostic_upload_config()
         .expect("uploader is wired whenever trace upload config is on");
-    uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -2702,7 +2734,7 @@ async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() 
         cfg.telemetry.trace_upload = Some(false);
     }
     agent.sync_collection_config_gate();
-    uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -2878,6 +2910,55 @@ fn chat_session_spawn_options_matches_thin_profile() {
         opts.persistence.is_noop(),
         "K10 thin profile must use PersistenceHandle::noop()"
     );
+}
+/// `remove_session` releases the workspace binding and drains the
+/// per-session side maps. Test agents default to `workspace_ops = None`,
+/// so no other test reaches the release.
+#[tokio::test]
+async fn remove_session_releases_workspace_binding_and_side_maps() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("test-session-workspace-release");
+    let ops = xai_grok_workspace::WorkspaceOps::for_test();
+    let toolset =
+        std::sync::Arc::new(xai_grok_tools::registry::types::FinalizedToolset::empty_for_test());
+    let toolset_weak = std::sync::Arc::downgrade(&toolset);
+    ops.bind_local_session(
+        sid.0.as_ref(),
+        std::env::temp_dir(),
+        xai_hunk_tracker::HunkTrackerHandle::noop(),
+        toolset,
+        None,
+    )
+    .expect("bind_local_session must succeed");
+    assert!(toolset_weak.upgrade().is_some());
+    *agent.workspace_ops.borrow_mut() = Some(ops);
+    agent.model_unavailable_sessions.borrow_mut().insert(
+        sid.0.to_string(),
+        acp::ModelId::new(std::sync::Arc::from("gone-model")),
+    );
+    agent
+        .session_turn_numbers
+        .borrow_mut()
+        .insert(sid.clone(), 3);
+    let (_permission_tx, permission_rx) =
+        tokio::sync::mpsc::unbounded_channel::<xai_grok_workspace::permission::PermissionEvent>();
+    agent
+        .permission_event_receivers
+        .borrow_mut()
+        .insert(sid.clone(), permission_rx);
+    agent.remove_session(&sid);
+    assert!(
+        toolset_weak.upgrade().is_none(),
+        "the workspace binding must release the toolset"
+    );
+    assert!(
+        !agent
+            .model_unavailable_sessions
+            .borrow()
+            .contains_key(sid.0.as_ref())
+    );
+    assert!(!agent.session_turn_numbers.borrow().contains_key(&sid));
+    assert!(!agent.permission_event_receivers.borrow().contains_key(&sid));
 }
 /// Without a bridge, `ext_method` falls through to the unchanged local
 /// dispatch (`rewind::handle`), which reports the missing session — proving

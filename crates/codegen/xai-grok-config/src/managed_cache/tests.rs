@@ -1010,3 +1010,140 @@ fn gate_retries_once_on_a_compromised_verdict() {
     assert!(refused);
     assert_eq!(evals, 1);
 }
+
+/// The offline purge detector: fires only on a marker-recorded TEAM switch, returning the
+/// evicted principal; a key-scoped marker means the key owns the machine's policy, so a
+/// team mismatch (even with live config unreadable/blipping) must never confirm.
+#[test]
+fn confirmed_team_switch_scopes_to_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    // No marker → no switch (first run / signed-out).
+    assert_eq!(confirmed_team_switch_at(home, "team-b"), None);
+
+    // Team marker A → B confirms and reports the evicted principal; same team doesn't.
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: None,
+            fail_closed: true,
+        },
+    );
+    assert_eq!(
+        confirmed_team_switch_at(home, "team-b").as_deref(),
+        Some("team-a")
+    );
+    assert_eq!(confirmed_team_switch_at(home, "team-a"), None);
+
+    // Key-scoped marker (dk-synced): a differing team NEVER confirms — the regression
+    // shape is a dk machine with a team user signed in and config resolution blipping.
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("dk-deployment-1"),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: Some("fp-1"),
+            fail_closed: true,
+        },
+    );
+    assert_eq!(confirmed_team_switch_at(home, "team-b"), None);
+}
+
+/// Blank identity values normalize to `None` at the marker WRITE, so no reader can
+/// treat "unknown" as a distinct tenant (the detectors' blank guards stay as
+/// defense in depth).
+#[test]
+fn marker_write_normalizes_blank_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("   "),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: Some(""),
+            fail_closed: true,
+        },
+    );
+    let cache = read_managed_config_cache(home).expect("marker written");
+    assert_eq!(
+        cache.principal, None,
+        "blank principal must not be recorded"
+    );
+    assert_eq!(
+        cache.key_fingerprint, None,
+        "blank fingerprint must not be recorded"
+    );
+    // And a blank-recorded marker can't confirm a switch.
+    assert_eq!(confirmed_team_switch_at(home, "team-b"), None);
+}
+
+/// Identity values are stored TRIMMED at the marker write, so a marker can never
+/// differ from a live value by surrounding whitespace alone.
+#[test]
+fn marker_write_trims_identity_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("  team-a  "),
+            had_managed_config: true,
+            had_requirements: true,
+            key_fingerprint: Some(" fp-1 "),
+            fail_closed: false,
+        },
+    );
+    let cache = read_managed_config_cache(home).expect("marker written");
+    assert_eq!(cache.principal.as_deref(), Some("team-a"));
+    assert_eq!(cache.key_fingerprint.as_deref(), Some("fp-1"));
+}
+
+/// The one home of the blank + trim rules ([`known`] + `confirmed_switch`): both sides
+/// known and differing on their trimmed forms, else `None`.
+#[test]
+fn confirmed_switch_requires_two_known_differing_sides() {
+    assert_eq!(confirmed_switch(Some("a"), Some("b")), Some("a"));
+    assert_eq!(confirmed_switch(Some("a"), Some("a")), None);
+    assert_eq!(confirmed_switch(Some(" "), Some("b")), None);
+    assert_eq!(confirmed_switch(Some("a"), Some("")), None);
+    assert_eq!(confirmed_switch(None, Some("b")), None);
+    assert_eq!(confirmed_switch(Some("a"), None), None);
+    assert_eq!(confirmed_switch(None, None), None);
+    // Whitespace is not identity: a marker written untrimmed by an older build must
+    // not read as a tenant switch against the same (trimmed) value...
+    assert_eq!(confirmed_switch(Some("team-a "), Some("team-a")), None);
+    assert_eq!(confirmed_switch(Some("team-a"), Some("team-a ")), None);
+    // ...while genuinely different trimmed values still switch (the recorded value
+    // is returned verbatim for logging).
+    assert_eq!(
+        confirmed_switch(Some(" team-a "), Some("team-b")),
+        Some(" team-a ")
+    );
+}
+
+/// Staleness identity compare is trim-aware (sibling of marker write normalize).
+#[test]
+fn cache_identity_mismatch_ignores_whitespace_only_diffs() {
+    let cache = ManagedConfigCache {
+        principal: Some("team-a".into()),
+        ..Default::default()
+    };
+    assert!(
+        !cache_identity_mismatch(&cache, &team(" team-a ")),
+        "whitespace-only team id diff must not hard-stale"
+    );
+    assert!(
+        cache_identity_mismatch(&cache, &team("team-b")),
+        "a real team switch must still mismatch"
+    );
+    // One-sided known still mismatches (first install / cleared marker fields).
+    let empty = ManagedConfigCache::default();
+    assert!(cache_identity_mismatch(&empty, &team("team-a")));
+}

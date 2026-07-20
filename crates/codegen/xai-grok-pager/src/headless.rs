@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use tokio_util::sync::CancellationToken;
 
 use agent_client_protocol as acp;
-use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, acp_send};
+use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, acp_send};
 use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
@@ -1223,19 +1223,18 @@ pub async fn run_single_turn(
                 prompt_result = Some(res);
                 prompt_done_at = Some(Instant::now());
                 if !options.wait_for_background {
-                    // Drain notifications already queued ahead of the response.
-                    while let Ok(msg) = acp_rx.try_recv() {
-                        handle_headless_acp_message(
-                            msg.boxed(),
-                            &mut emitter,
-                            t_prompt,
-                            &mut ttf_logged,
-                            options.yolo,
-                            options.output_format,
-                            &mut pending_bg,
-                            &mut completed_before_bg,
-                        );
-                    }
+                    drain_acp_with_grace(
+                        &mut acp_rx,
+                        Duration::from_millis(750),
+                        &mut emitter,
+                        t_prompt,
+                        &mut ttf_logged,
+                        options.yolo,
+                        options.output_format,
+                        &mut pending_bg,
+                        &mut completed_before_bg,
+                    )
+                    .await;
                     break;
                 }
                 // With wait_for_background: keep draining ACP for task_completed.
@@ -1460,6 +1459,58 @@ fn track_background_lifecycle(
 }
 
 // ── ACP client message handling (select arm + pre-exit drain) ────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_acp_with_grace(
+    acp_rx: &mut AcpClientRx,
+    grace: Duration,
+    emitter: &mut HeadlessEmitter,
+    t_prompt: Instant,
+    ttf_logged: &mut bool,
+    yolo: bool,
+    output_format: OutputFormat,
+    pending_bg: &mut HashSet<String>,
+    completed_before_bg: &mut HashSet<String>,
+) {
+    let deadline = Instant::now() + grace;
+    loop {
+        while let Ok(msg) = acp_rx.try_recv() {
+            handle_headless_acp_message(
+                msg.boxed(),
+                emitter,
+                t_prompt,
+                ttf_logged,
+                yolo,
+                output_format,
+                pending_bg,
+                completed_before_bg,
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            msg = acp_rx.recv() => {
+                let Some(msg) = msg else { break; };
+                handle_headless_acp_message(
+                    msg.boxed(),
+                    emitter,
+                    t_prompt,
+                    ttf_logged,
+                    yolo,
+                    output_format,
+                    pending_bg,
+                    completed_before_bg,
+                );
+            }
+            _ = tokio::time::sleep(remaining) => {
+                break;
+            }
+        }
+    }
+}
 
 /// Process one inbound ACP client message. Used by both `acp_rx.recv()` and
 /// `try_recv()` so buffered `task_backgrounded` is not dropped when

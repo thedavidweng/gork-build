@@ -142,39 +142,27 @@ impl ManagedConfigResponse {
     }
 }
 
-/// Result of [`apply_fetched`].
+/// Result of applying a fetched managed-config response.
 pub(super) enum ApplyOutcome {
-    /// Persisted the policy (`wrote` = at least one artifact written or removed), or
-    /// skipped under lock contention / a vanished credential (`wrote` = false); the
-    /// marker should be recorded either way. `signed_deployment_id` is the VERIFIED
-    /// payload's `deployment_id` (`None` when unsigned) — stronger than the body's,
-    /// which is omitted on the signed-empty response.
-    Applied {
-        wrote: bool,
-        signed_deployment_id: Option<String>,
-    },
-    /// Verification is active and the envelope did not verify — nothing was persisted.
-    /// The marker must NOT be recorded: it would claim a body that was never written.
+    /// Locked, persisted policy, recorded marker. `wrote` = ≥1 artifact written or removed.
+    Applied { wrote: bool },
+    /// Nothing persisted/marked: lock held by another process, or credential vanished mid-fetch.
+    Skipped,
+    /// Envelope failed verification — nothing persisted or marked.
     SignatureRejected,
 }
 
 impl ApplyOutcome {
     pub(super) fn wrote(&self) -> bool {
-        matches!(self, Self::Applied { wrote: true, .. })
+        matches!(self, Self::Applied { wrote: true })
+    }
+
+    pub(super) fn skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
     }
 
     pub(super) fn signature_rejected(&self) -> bool {
         matches!(self, Self::SignatureRejected)
-    }
-
-    pub(super) fn signed_deployment_id(&self) -> Option<&str> {
-        match self {
-            Self::Applied {
-                signed_deployment_id,
-                ..
-            } => signed_deployment_id.as_deref(),
-            Self::SignatureRejected => None,
-        }
     }
 }
 

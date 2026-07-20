@@ -1085,6 +1085,28 @@ mod tests {
         // recover on 401 (the gate `for_session` doesn't check this).
         mgr.hot_swap(oidc_session("no-rt", None));
         assert!(expired_refreshable_session(&mgr).is_none());
+
+        // An expired first-party *external* credential with a refresh token
+        // is likewise recoverable — 401 recovery re-runs the provider binary
+        // (the refresh token is a recoverability marker, not a grant input).
+        mgr.hot_swap(GrokAuth {
+            auth_mode: AuthMode::External,
+            expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            ..oidc_session("expired-external", Some("rt"))
+        });
+        assert_eq!(
+            expired_refreshable_session(&mgr).map(|a| a.key),
+            Some("expired-external".to_string())
+        );
+
+        // Third-party external (no x.ai issuer) stays excluded.
+        mgr.hot_swap(GrokAuth {
+            oidc_issuer: None,
+            auth_mode: AuthMode::External,
+            expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            ..oidc_session("expired-external-3p", Some("rt"))
+        });
+        assert!(expired_refreshable_session(&mgr).is_none());
     }
 
     #[cfg(unix)]
@@ -1567,6 +1589,33 @@ mod tests {
         let cfg = GrokComConfig::default();
         assert!(is_cached_credential_compatible(
             &oidc_auth(XAI_OAUTH2_ISSUER),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn external_cred_compatibility_follows_issuer() {
+        let cfg = GrokComConfig::default();
+
+        // A first-party external credential (provider emitted the issuer) is
+        // reused by interactive login like an OIDC session instead of
+        // re-running the provider.
+        assert!(is_cached_credential_compatible(
+            &GrokAuth {
+                auth_mode: AuthMode::External,
+                ..oidc_auth(XAI_OAUTH2_ISSUER)
+            },
+            &cfg,
+        ));
+
+        // Without an issuer (bare-token providers), external credentials stay
+        // incompatible and interactive login starts fresh, as before.
+        assert!(!is_cached_credential_compatible(
+            &GrokAuth {
+                auth_mode: AuthMode::External,
+                oidc_issuer: None,
+                ..legacy_auth()
+            },
             &cfg,
         ));
     }

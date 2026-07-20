@@ -7,10 +7,13 @@ pub mod groups;
 mod layout;
 mod nav;
 mod selection;
+mod timeline;
 mod types;
 pub mod verb_group;
 
+pub(crate) use layout::ScrollAnchor;
 pub use layout::compute_paint_window;
+pub use timeline::TimelineEntry;
 pub use types::*;
 
 use layout::LayoutCache;
@@ -178,8 +181,8 @@ pub struct ScrollbackState {
     expanded_groups: HashSet<EntryId>,
 
     // Link map
-    /// Monotonically increasing counter, bumped on scroll, viewport, or
-    /// content changes. Used by `VisibleLinkMap::is_stale()` to skip rebuilds.
+    /// Monotonically increasing counter, bumped when visible link positions or
+    /// policy inputs change. Used by `VisibleLinkMap::is_stale()` to skip rebuilds.
     generation: u64,
 
     /// Bumped only when entries are added/removed or an entry's content changes
@@ -252,7 +255,7 @@ impl ScrollbackState {
         self.cwd.as_deref()
     }
 
-    /// Update session cwd; invalidates entry paint caches when it changes.
+    /// Update session cwd; invalidates cwd-dependent paint, layout, and link maps.
     pub fn set_cwd(&mut self, cwd: Option<std::path::PathBuf>) {
         if self.cwd == cwd {
             return;
@@ -264,6 +267,7 @@ impl ScrollbackState {
         self.dirty_heights = self.entries.keys().copied().collect();
         self.layout_cache = None;
         self.gaps_may_be_dirty = true;
+        self.bump_generation();
     }
 
     /// Create an empty state that continues this one's identity: same
@@ -499,8 +503,8 @@ impl ScrollbackState {
 
     // Link map generation
 
-    /// Current link-map generation. Incremented whenever content, scroll,
-    /// or viewport changes invalidate the visible link positions.
+    /// Current link-map generation. Incremented when positions or link-policy
+    /// inputs change and invalidate the visible link map.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -1321,6 +1325,18 @@ impl ScrollbackState {
     /// Get the index of an entry by its ID. O(1) average via IndexMap.
     pub fn index_of_id(&self, id: EntryId) -> Option<usize> {
         self.entries.get_index_of(&id)
+    }
+
+    /// Capture a width-stable bookmark of the viewport-top content, to re-pin
+    /// it after a resize/re-wrap (the `/jump` capture-and-restore). `None` when
+    /// there's no layout to anchor to.
+    pub(crate) fn capture_scroll_bookmark(&self) -> Option<ScrollAnchor> {
+        self.capture_scroll_anchor()
+    }
+
+    /// Re-pin the viewport to a bookmark from [`Self::capture_scroll_bookmark`].
+    pub(crate) fn restore_scroll_bookmark(&mut self, bookmark: ScrollAnchor) {
+        self.restore_scroll_anchor(bookmark);
     }
 
     /// Mark an entry as finished (no longer running).

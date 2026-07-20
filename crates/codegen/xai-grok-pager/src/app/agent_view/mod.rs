@@ -151,6 +151,7 @@ use std::time::Instant;
 mod cta;
 mod input;
 mod interactions;
+mod jump;
 mod links;
 mod media;
 mod modals;
@@ -474,8 +475,13 @@ pub(super) fn app_should_open_link_on_click_with(
     if !native_plain_url_open {
         return true;
     }
+    let Some(url) = crate::render::osc8::resolve_link_target(&link.target)
+        .and_then(|resolved| resolved.osc8_url)
+    else {
+        return true;
+    };
     if !crate::app::link_opener::is_safe_to_open(
-        &link.url,
+        &url,
         crate::terminal::hyperlinks::SchemeFilter::Standard,
     ) {
         return true;
@@ -999,9 +1005,9 @@ pub struct AgentView {
     pub last_btw_area: Rect,
     /// Pending plain scrollback click that should dispatch on mouse-up if no drag starts.
     pub pending_scrollback_click: Option<(u16, u16)>,
-    /// Pending link click: (col, row, url). Set on Down(Left) when a link is hit,
+    /// Pending link click: (col, row, target). Set on Down(Left) when a link is hit,
     /// consumed on Up(Left) at the same position, cleared on drag.
-    pub pending_link_click: Option<(u16, u16, String)>,
+    pub pending_link_click: Option<(u16, u16, crate::render::osc8::LinkTarget)>,
     /// Absolute paths of media generated in this transcript, used to resolve the
     /// short relative paths the model prints (`images/1.jpg`) to clickable
     /// links. Rebuilt from scrollback only when its generation changes.
@@ -1307,6 +1313,18 @@ pub struct AgentView {
     /// Set only when the rewind flow emits `Effect::RewindExecute` while the
     /// inline editor is open (see `stash_inline_resubmit_if_editing`).
     pub(crate) pending_inline_resubmit: Option<String>,
+    /// `/jump` picker overlay (pure client-side turn navigation).
+    pub(crate) jump_state: Option<crate::views::jump::JumpState>,
+    /// Timeline sidebar rail geometry for the current frame (`None` =
+    /// hidden). Set by the renderer, consumed by mouse hit-testing.
+    pub(crate) timeline_rail: Option<crate::views::timeline::TimelineRail>,
+    /// Rail part under the mouse — drives hover styling + the tick
+    /// preview popup.
+    pub(crate) timeline_hover: Option<crate::views::timeline::TimelineHit>,
+    /// Cached tick-hover preview `(turn_idx, text)`. Filled when hover
+    /// lands on a tick; borrowed during render so streaming redraws don't
+    /// rescan/allocate the prompt every frame.
+    pub(crate) timeline_hover_preview: Option<(usize, String)>,
     /// Running agent definition for this session (`x.ai/session/info` `agentName`).
     pub session_agent_name: Option<String>,
     /// Map of child session IDs to subagent metadata. Populated on
@@ -2097,7 +2115,7 @@ fn collect_citation_links(
                 for url in &ws.citations {
                     links.push(VisibleLink {
                         rects: vec![block_geom.content_area],
-                        url: Arc::from(url.as_str()),
+                        target: crate::render::osc8::LinkTarget::Url(Arc::from(url.as_str())),
                         id: None,
                     });
                 }
@@ -2106,7 +2124,7 @@ fn collect_citation_links(
                 if !wf.url.is_empty() {
                     links.push(VisibleLink {
                         rects: vec![block_geom.content_area],
-                        url: Arc::from(wf.url.as_str()),
+                        target: crate::render::osc8::LinkTarget::Url(Arc::from(wf.url.as_str())),
                         id: None,
                     });
                 }
@@ -3120,7 +3138,7 @@ pub(super) mod test_fixtures {
 /// the lazy Mermaid glue (which needs a session dir) can be exercised from the
 /// `mermaid_worker` test module without duplicating the large `AgentSession`
 /// literal.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_agent_view(session_id: Option<&str>, cwd: std::path::PathBuf) -> AgentView {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     AgentView::new(

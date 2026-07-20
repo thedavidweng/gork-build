@@ -578,7 +578,7 @@ pub(super) fn dispatch_open_supergrok_url(app: &mut AppView) -> Vec<Effect> {
     // being correctly configured. If the URL already specifies a
     // referrer it's left alone.
     let url = crate::app::link_opener::ensure_query_param(url, "referrer", "grok-build");
-    crate::app::link_opener::open_url(&url);
+    super::ctx::open_url_or_show(app, &url);
     vec![]
 }
 

@@ -227,6 +227,8 @@ pub struct RemoteSettings {
     /// When `Some(true)`, capture workspace files for non-git project dirs (client default: off).
     #[serde(default)]
     pub non_git_workspace_capture: Option<bool>,
+    #[serde(default)]
+    pub persistent_local_shell: Option<bool>,
     /// Release channel: `"stable"` or `"alpha"`.
     /// Fallback when no local `[cli] channel` or `--alpha`/`--stable` flag is set.
     #[serde(default)]
@@ -666,11 +668,13 @@ pub struct RemoteSettings {
     #[serde(default)]
     pub group_tool_verbs: Option<bool>,
     /// Whether the TUI shows Edit tool calls as a collapsed one-line `+N/-M`
-    /// diffstat summary by default (expand for the diff). `None` defers to
-    /// local config / env / default (`false`); `Some(false)` is a remote kill
+    /// diffstat summary by default and merges back-to-back edits to the same
+    /// file into one row (expand for the diffs). `None` defers to local
+    /// config / env / default (`false`); `Some(false)` is a remote kill
     /// switch. Resolved via `resolve_collapsed_edit_blocks` (requirements >
     /// env > user > managed > remote > default false). Explicit pager.toml
-    /// `[scrollback.blocks.edit]` shape keys override the flag client-side.
+    /// `[scrollback.blocks.edit]` shape keys override the flag's fold shape
+    /// client-side; merging always follows the flag.
     #[serde(default)]
     pub collapsed_edit_blocks: Option<bool>,
     /// Display-refresh probe + auto-cadence. See [`DisplayRefreshSettings`].

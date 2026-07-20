@@ -1,6 +1,6 @@
 [package]
 name = "xai-grok-pager"
-version = "0.1.220-alpha.4"
+version = "0.2.101"
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["Gork Build contributors"]
@@ -161,7 +161,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # Enable the render crate's test-only helpers for the pager's test build.
-xai-grok-pager-render = { path = "../xai-grok-pager-render", features = [] }
+xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
 pretty_assertions = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
@@ -195,13 +195,43 @@ harness = false
 name = "edit_highlight"
 harness = false
 
-# Integration testing.
+# PTY integration tests are split into coherent scheduling families. The test
+# modules remain under tests/pty_e2e/; these roots only define which cases share
+# one Cargo/Bazel process. All cases stay #[ignore]d for ordinary Cargo runs.
 [[test]]
-name = "pty_e2e"
-path = "tests/pty_e2e/mod.rs"
+name = "pty_e2e_smoke"
+path = "tests/pty_e2e_smoke.rs"
 
-# Leader-mode PTY e2e — split from pty_e2e so multi-process cluster bring-up
-# never contends with the main PTY pool (the LEADER_TIMEOUT flake root).
+[[test]]
+name = "pty_e2e_queue"
+path = "tests/pty_e2e_queue.rs"
+
+[[test]]
+name = "pty_e2e_scroll_selection"
+path = "tests/pty_e2e_scroll_selection.rs"
+
+[[test]]
+name = "pty_e2e_minimal"
+path = "tests/pty_e2e_minimal.rs"
+
+[[test]]
+name = "pty_e2e_config_ui"
+path = "tests/pty_e2e_config_ui.rs"
+
+[[test]]
+name = "pty_e2e_shell_tools"
+path = "tests/pty_e2e_shell_tools.rs"
+
+[[test]]
+name = "pty_e2e_persistence"
+path = "tests/pty_e2e_persistence.rs"
+
+[[test]]
+name = "pty_e2e_clipboard"
+path = "tests/pty_e2e_clipboard.rs"
+
+# Leader-mode PTY e2e — split from ordinary PTY families so multi-process
+# cluster bring-up never contends with their bounded pools.
 [[test]]
 name = "leader_pty_e2e"
 path = "tests/leader_pty_e2e/mod.rs"
@@ -243,6 +273,7 @@ default = ["jemalloc", "sandbox-enforce"]
 default-bazel = [
     "jemalloc",
     "sandbox-enforce",
+    "test-support",
     ]
 # No-op on this crate: the actual `#[global_allocator]` (and the
 # `tikv-jemallocator` dep) live on the composition-root binary
@@ -252,3 +283,7 @@ default-bazel = [
 jemalloc = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 release-dist = []
+# Exposes test-only view-model constructors/setters (e.g. `test_agent_view`,
+# `AgentSession::set_yolo_mode_for_test`) to sibling crates' test builds — used
+# by `xai-grok-pager-minimal`'s unit tests. Never enabled in production builds.
+test-support = ["xai-grok-pager-render/test-support"]

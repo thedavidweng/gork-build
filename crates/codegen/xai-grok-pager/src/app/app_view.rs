@@ -868,6 +868,8 @@ pub struct AppView {
     pub yolo_policy_block: Option<&'static str>,
     /// One-shot notice that a launch `--yolo` was pinned off; shown on the first agent view.
     pub yolo_launch_block_notice: Option<&'static str>,
+    /// One-shot switch-back toast after a screen-mode re-exec.
+    pub screen_mode_switch_hint: Option<&'static str>,
     /// Require explicit plan approval via the plan viewer UI even in
     /// always-approve (YOLO) mode. Loaded from `[ui] require_plan_approval`
     /// in config.toml at startup.
@@ -1152,8 +1154,13 @@ impl AppView {
             self.show_resolved_model = show;
         }
     }
+    /// Force voice on for API-key sessions when only a remote rule left it off.
+    /// Requirement / env / config pins still win.
     pub(crate) fn ensure_voice_for_api_key(&mut self) {
-        if self.is_api_key_auth && !self.voice_mode_enabled {
+        if !self.is_api_key_auth || self.voice_mode_enabled {
+            return;
+        }
+        if crate::app::resolve_voice_mode_live(None, false) {
             self.apply_voice_mode_enabled(true);
         }
     }
@@ -1260,6 +1267,7 @@ impl AppView {
             auto_mode_gate: xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
             yolo_policy_block: None,
             yolo_launch_block_notice: None,
+            screen_mode_switch_hint: None,
             require_plan_approval: false,
             plan_mode: false,
             subagents: false,
@@ -1377,16 +1385,25 @@ impl AppView {
     pub fn voice_can_start_pipeline(&self) -> bool {
         self.voice_mode_enabled && xai_grok_voice::AUDIO_SUPPORTED
     }
-    /// Sync voice availability into the execution gate and every slash surface
-    /// (so `/voice` is hidden/shown in lockstep). Callers resolve the gate via
-    /// [`crate::app::resolve_voice_mode_enabled`] (env > remote > default on);
-    /// `false` is a kill switch. Mirrors `apply_session_recap_available` for
-    /// `/recap`.
+    /// Sync voice availability into slash surfaces, cheatsheet, and settings.
+    /// Mirrors `apply_session_recap_available` for `/recap`.
     pub fn apply_voice_mode_enabled(&mut self, enabled: bool) {
         self.voice_mode_enabled = enabled;
         crate::app::VOICE_MODE_ENABLED.store(enabled, std::sync::atomic::Ordering::Release);
         for agent in self.agents.values_mut() {
             agent.set_voice_mode_available(enabled);
+            match agent.active_modal.as_mut() {
+                Some(crate::views::modal::ActiveModal::Settings { state }) => {
+                    state.rebuild_rows();
+                }
+                Some(crate::views::modal::ActiveModal::ResetSettingsConfirm {
+                    settings_state,
+                    ..
+                }) => {
+                    settings_state.rebuild_rows();
+                }
+                _ => {}
+            }
         }
         self.welcome_prompt.set_voice_visible(enabled);
         if let Some(dashboard) = self.dashboard.as_mut() {
@@ -5085,6 +5102,7 @@ pub(crate) mod tests {
             auto_mode_gate: true,
             yolo_policy_block: None,
             yolo_launch_block_notice: None,
+            screen_mode_switch_hint: None,
             require_plan_approval: false,
             plan_mode: false,
             subagents: false,
@@ -5640,7 +5658,8 @@ pub(crate) mod tests {
                 screen_row: 2,
                 col_start: 0,
                 col_end: 10,
-                url: Arc::from("https://example.com"),
+                target: crate::render::osc8::LinkTarget::Url(Arc::from("https://example.com")),
+                presentation: crate::render::osc8::LinkPresentation::Opaque,
                 id: Some(1),
             });
             agent.visible_link_map.rebuild(1, &overlay, vec![]);

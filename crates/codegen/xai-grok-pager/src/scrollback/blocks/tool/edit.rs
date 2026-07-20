@@ -181,9 +181,14 @@ fn render_diff_hunks_core(
         if i > 0 && !lines.is_empty() && !config.hunk_separator.is_empty() {
             // Add separator between hunks (no background)
             let indent = if config.indent { INDENT } else { "" };
+            let sep_text = match hunk_gap_lines(&hunks[i - 1], hunk) {
+                Some(1) => format!("{} 1 unchanged line", config.hunk_separator),
+                Some(n) => format!("{} {n} unchanged lines", config.hunk_separator),
+                None => config.hunk_separator.clone(),
+            };
             let sep_line = Line::from(vec![
                 Span::raw(indent),
-                Span::styled(config.hunk_separator.clone(), theme.muted()),
+                Span::styled(sep_text, theme.muted()),
             ]);
             lines.push(DiffLineOutput {
                 line: sep_line,
@@ -228,6 +233,22 @@ fn render_diff_hunks_core(
     }
 
     lines
+}
+
+/// Unchanged new-file lines hidden between two hunks, when computable.
+///
+/// Uses the `ln` of the new-file lines (Equal/Insert) bordering the gap.
+/// `None` — a hunk with no new-file lines, or a non-positive gap — keeps the
+/// bare separator. Non-monotonic `ln` happens on coalesced multi-call blocks
+/// whose later edit landed above an earlier one (each call's hunks are
+/// numbered against its own file snapshot), so a count would be wrong there.
+fn hunk_gap_lines(prev: &DiffHunk, next: &DiffHunk) -> Option<usize> {
+    let prev_last = prev.iter().rev().find(|l| l.tag != ChangeTag::Delete)?.ln;
+    let next_first = next.iter().find(|l| l.tag != ChangeTag::Delete)?.ln;
+    next_first
+        .checked_sub(prev_last)
+        .and_then(|d| d.checked_sub(1))
+        .filter(|n| *n > 0)
 }
 
 /// Expanded (tabs → spaces) text for Equal/Insert hunk lines, keyed by 1-based ln.
@@ -831,6 +852,7 @@ impl EditToolCallBlock {
     }
 
     /// Header line: path painted for `surface` (Collapsed / Expanded / Fullscreen).
+    #[allow(clippy::too_many_arguments)]
     fn header_line(
         &self,
         theme: &Theme,
@@ -916,9 +938,8 @@ impl EditToolCallBlock {
         Line::from(spans)
     }
 
-    /// Absolute `file://` for OSC8 regardless of painted path surface.
-    fn path_link_url(&self, cwd: Option<&Path>) -> Option<Arc<str>> {
-        crate::render::osc8::tool_path_file_url(&self.path, cwd)
+    fn path_link_target(&self, cwd: Option<&Path>) -> Option<crate::render::osc8::LinkTarget> {
+        crate::render::osc8::tool_path_file_target(&self.path, cwd)
     }
 
     /// Render this block's hunks for its current highlight phase — the single
@@ -1130,7 +1151,7 @@ impl EditToolCallBlock {
             edit_cfg.effective_line_summary(crate::appearance::cache::load_collapsed_edit_blocks());
 
         let cwd = ctx.cwd.as_deref();
-        let link_url = self.path_link_url(cwd);
+        let link_target = self.path_link_target(cwd);
 
         match ctx.mode {
             DisplayMode::Collapsed => {
@@ -1157,7 +1178,7 @@ impl EditToolCallBlock {
                         selection_range: Some(TOOL_HEADER_RANGE),
                         // Copy the painted path span (basename when collapsed).
                         content: line,
-                        link_url,
+                        link_target,
                         ..Default::default()
                     }],
                 })
@@ -1210,7 +1231,7 @@ impl EditToolCallBlock {
                         selection_text: line.selection_text,
                         joiner: line.joiner,
                         content: line.content,
-                        link_url: if has_path { link_url.clone() } else { None },
+                        link_target: if has_path { link_target.clone() } else { None },
                         ..Default::default()
                     });
                 }
@@ -1634,13 +1655,23 @@ mod tests {
     }
 
     #[test]
-    fn header_link_url_is_absolute_file_url_for_all_surfaces() {
+    fn header_link_target_is_absolute_file_for_all_surfaces() {
         let abs = "/Users/me/project/src/foo.rs";
         let cwd = Path::new("/Users/me/project");
         let block = EditToolCallBlock::new(abs, vec![]);
-        let url = block.path_link_url(Some(cwd)).expect("file url");
-        assert!(url.starts_with("file://"), "got {url}");
-        assert!(url.contains("foo.rs"), "got {url}");
+        let target = block.path_link_target(Some(cwd)).expect("file target");
+        assert_eq!(
+            target,
+            crate::render::osc8::LinkTarget::File(Arc::from(Path::new(abs)))
+        );
+        assert_eq!(
+            crate::render::osc8::resolve_link_target(&target)
+                .unwrap()
+                .osc8_url
+                .unwrap()
+                .as_ref(),
+            "file:///Users/me/project/src/foo.rs"
+        );
 
         let mut ctx = test_ctx();
         ctx.cwd = Some(cwd.to_path_buf());
@@ -1650,7 +1681,7 @@ mod tests {
             collapsed.lines[0].content.spans[1].content.as_ref(),
             "foo.rs"
         );
-        assert_eq!(collapsed.lines[0].link_url.as_deref(), Some(url.as_ref()));
+        assert_eq!(collapsed.lines[0].link_target.as_ref(), Some(&target));
 
         ctx.mode = DisplayMode::Expanded;
         let expanded = block.output(&ctx);
@@ -1658,7 +1689,7 @@ mod tests {
             expanded.lines[0].content.spans[1].content.as_ref(),
             "src/foo.rs"
         );
-        assert_eq!(expanded.lines[0].link_url.as_deref(), Some(url.as_ref()));
+        assert_eq!(expanded.lines[0].link_target.as_ref(), Some(&target));
     }
 
     #[test]
@@ -1960,9 +1991,69 @@ mod tests {
         let path = Path::new("test.txt");
         let outputs = render_diff_hunks_highlighted(&[hunk1, hunk2], path, &theme, 80, &config);
 
+        // Lines 2..=9 sit between the hunks: computable gap of 8.
         assert_eq!(outputs.len(), 3);
-        assert_eq!(line_to_string(&outputs[1].line), "  …");
+        assert!(outputs[1].is_separator);
+        assert_eq!(line_to_string(&outputs[1].line), "  … 8 unchanged lines");
         assert_eq!(outputs[1].background, None);
+    }
+
+    #[test]
+    fn hunk_separator_singular_gap() {
+        let hunk1 = vec![DiffLine {
+            text: "line1\n".into(),
+            lo: 1,
+            ln: 1,
+            tag: ChangeTag::Equal,
+        }];
+        let hunk2 = vec![DiffLine {
+            text: "line3\n".into(),
+            lo: 3,
+            ln: 3,
+            tag: ChangeTag::Equal,
+        }];
+
+        let theme = Theme::current();
+        let config = DiffRenderConfig::default();
+        let path = Path::new("test.txt");
+        let outputs = render_diff_hunks_highlighted(&[hunk1, hunk2], path, &theme, 80, &config);
+
+        assert_eq!(line_to_string(&outputs[1].line), "  … 1 unchanged line");
+    }
+
+    #[test]
+    fn hunk_separator_bare_for_non_monotonic_or_adjacent() {
+        let mk = |ln: usize| {
+            vec![DiffLine {
+                text: format!("line{ln}\n"),
+                lo: ln,
+                ln,
+                tag: ChangeTag::Equal,
+            }]
+        };
+        let theme = Theme::current();
+        let config = DiffRenderConfig::default();
+        let path = Path::new("test.txt");
+
+        // Non-monotonic ln (a coalesced later edit above an earlier one):
+        // never render a negative/zero count, keep the bare separator.
+        let outputs = render_diff_hunks_highlighted(&[mk(20), mk(4)], path, &theme, 80, &config);
+        assert_eq!(line_to_string(&outputs[1].line), "  …");
+
+        // Adjacent hunks (no hidden lines) keep the bare separator too.
+        let outputs = render_diff_hunks_highlighted(&[mk(5), mk(6)], path, &theme, 80, &config);
+        assert_eq!(line_to_string(&outputs[1].line), "  …");
+
+        // A hunk with no new-file lines (pure deletion) is not computable.
+        let pure_delete = vec![DiffLine {
+            text: "gone\n".into(),
+            lo: 9,
+            ln: 9,
+            tag: ChangeTag::Delete,
+        }];
+        let outputs =
+            render_diff_hunks_highlighted(&[mk(5), pure_delete], path, &theme, 80, &config);
+        assert_eq!(line_to_string(&outputs[1].line), "  …");
     }
 
     #[test]
@@ -2077,6 +2168,71 @@ mod tests {
         let path = Path::new("test.txt");
         let outputs = render_diff_hunks_highlighted(&[hunk1, hunk2], path, &theme, 80, &config);
         insta::assert_snapshot!("diff_multiple_hunks", diff_outputs_to_string(&outputs));
+    }
+
+    #[test]
+    fn snapshot_diff_merged_hunks_gap_markers() {
+        // Shape of a coalesced block: hunks from consecutive same-file edits
+        // appended in completion order, monotonically increasing, so every
+        // separator carries a computable gap count.
+        let hunk1 = vec![
+            DiffLine {
+                text: "fn one() {\n".into(),
+                lo: 3,
+                ln: 3,
+                tag: ChangeTag::Equal,
+            },
+            DiffLine {
+                text: "old_one();\n".into(),
+                lo: 4,
+                ln: 0,
+                tag: ChangeTag::Delete,
+            },
+            DiffLine {
+                text: "new_one();\n".into(),
+                lo: 0,
+                ln: 4,
+                tag: ChangeTag::Insert,
+            },
+        ];
+        let hunk2 = vec![
+            DiffLine {
+                text: "ctx_two();\n".into(),
+                lo: 12,
+                ln: 12,
+                tag: ChangeTag::Equal,
+            },
+            DiffLine {
+                text: "add_two();\n".into(),
+                lo: 0,
+                ln: 13,
+                tag: ChangeTag::Insert,
+            },
+        ];
+        let hunk3 = vec![
+            DiffLine {
+                text: "ctx_three();\n".into(),
+                lo: 19,
+                ln: 20,
+                tag: ChangeTag::Equal,
+            },
+            DiffLine {
+                text: "add_three();\n".into(),
+                lo: 0,
+                ln: 21,
+                tag: ChangeTag::Insert,
+            },
+        ];
+
+        let theme = Theme::current();
+        let config = DiffRenderConfig::default();
+        let path = Path::new("test.txt");
+        let outputs =
+            render_diff_hunks_highlighted(&[hunk1, hunk2, hunk3], path, &theme, 80, &config);
+        insta::assert_snapshot!(
+            "diff_merged_hunks_gap_markers",
+            diff_outputs_to_string(&outputs)
+        );
     }
 
     // --- dual_line_numbers = true snapshots ---

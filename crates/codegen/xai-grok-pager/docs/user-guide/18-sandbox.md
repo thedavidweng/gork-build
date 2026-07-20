@@ -75,7 +75,7 @@ grok --sandbox project
 
 A custom profile can't reuse a built-in name. `--sandbox devbox` always runs the built-in `devbox` profile, shadowing any `[profiles.devbox]` you define.
 
-When the global and per-project files define the same custom profile name, the user-level definition takes precedence and the project definition is ignored. Grok warns at startup if those two definitions differ. Identical duplicate definitions do not produce a warning.
+When the global and per-project files define the same custom profile name, the user-level definition takes precedence and the project definition is ignored. If those two definitions differ, Grok warns about the conflict at startup — on the welcome screen in the TUI, and on stderr for headless runs. Identical duplicate definitions do not produce a warning.
 
 ### Custom Profile Fields
 

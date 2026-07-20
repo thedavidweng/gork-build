@@ -43,10 +43,10 @@ impl AgentView {
             return InputOutcome::Action(Action::FocusPrompt);
         }
         if key!(Enter).matches(key)
-            && let Some(url) = self.highlighted_link_url().map(String::from)
+            && let Some(target) = self.highlighted_link_target().cloned()
         {
             self.highlighted_link_idx = None;
-            return InputOutcome::Action(Action::OpenUrl(url));
+            return InputOutcome::Action(Action::OpenLink(target));
         }
         if key!(Enter).matches(key)
             && !self.scrollback.is_selected_group_header()
@@ -515,6 +515,12 @@ impl AgentView {
             }
             return;
         }
+        self.dismiss_jump_picker_if_suppressed();
+        if let Some(ref mut js) = self.jump_state {
+            crate::views::jump::move_cursor(js, lines.signum());
+            self.sync_jump_preview();
+            return;
+        }
         if let Some(ref mut viewer) = self.line_viewer {
             if let Some(area) = viewer.last_popup_area
                 && area.contains((col, row).into())
@@ -596,10 +602,11 @@ impl AgentView {
                     modifiers: crossterm::event::KeyModifiers::NONE,
                 };
                 let _ = self.prompt.handle_mouse(&event);
-            } else if let Some((scroll_top, scroll_bottom)) = self.question_scroll_region {
-                if row >= scroll_top && row < scroll_bottom {
-                    self.apply_question_scroll(lines);
-                }
+            } else if let Some((scroll_top, scroll_bottom)) = self.question_scroll_region
+                && row >= scroll_top
+                && row < scroll_bottom
+            {
+                self.apply_question_scroll(lines);
             }
             return;
         }

@@ -41,7 +41,7 @@ Gork-Risk: medium
  .../src/app/dispatch/tests/status.rs          |   84 +-
  .../xai-grok-pager/src/app/event_loop.rs      |    4 +-
  crates/codegen/xai-grok-pager/src/app/mod.rs  |   40 +-
- .../src/app/screen_mode_relaunch.rs           |   12 +-
+ .../src/app/screen_mode_relaunch.rs           |    8 +-
  .../xai-grok-pager/src/completions_cmd.rs     |   26 +-
  crates/codegen/xai-grok-pager/src/headless.rs |   10 +-
  crates/codegen/xai-grok-pager/src/lib.rs      |    2 +-
@@ -57,7 +57,6 @@ Gork-Risk: medium
  .../src/slash/commands/expand.rs              |    2 +-
  .../xai-grok-pager/src/slash/commands/mod.rs  |    2 -
  .../codegen/xai-grok-pager/src/trace_cmd.rs   |    2 +-
- .../src/views/settings_modal.rs               |   16 +-
  .../src/views/welcome/hero_box.rs             |    2 +-
  .../xai-grok-pager/src/views/welcome/mod.rs   |    8 +-
  .../src/wrap_clipboard_image.rs               |    4 +-
@@ -71,7 +70,7 @@ Gork-Risk: medium
  .../src/agent/config_model_override_parse.rs  |    4 +-
  .../xai-grok-shell/src/agent/folder_trust.rs  |    8 +-
  .../src/agent/mvp_agent/acp_agent.rs          |   10 +-
- .../src/agent/mvp_agent/tests.rs              |   37 +-
+ .../src/agent/mvp_agent/tests.rs              |   19 +-
  .../codegen/xai-grok-shell/src/agent/relay.rs |    2 +-
  .../codegen/xai-grok-shell/src/auth/config.rs |    4 +-
  .../src/auth/devbox_login_stub.rs             |    4 +-
@@ -93,7 +92,7 @@ Gork-Risk: medium
  .../codegen/xai-grok-shell/src/leader/mod.rs  |    6 +-
  .../xai-grok-shell/src/leader/protocol.rs     |    6 +-
  .../xai-grok-shell/src/leader/server.rs       |    2 +-
- .../xai-grok-shell/src/managed_config.rs      |   28 +-
+ .../xai-grok-shell/src/managed_config.rs      |   26 +-
  .../src/managed_config/response.rs            |    2 +-
  .../codegen/xai-grok-shell/src/mcp_doctor.rs  |   12 +-
  crates/codegen/xai-grok-shell/src/plugin.rs   |   14 +-
@@ -109,8 +108,6 @@ Gork-Risk: medium
  .../src/trace_classifier/mod.rs               |    6 +-
  .../src/util/grok_auth_credentials.rs         |    2 +-
  .../xai-grok-workspace-types/Cargo.toml       |    2 +-
- .../codegen/xai-grok-workspace/src/handle.rs  |    8 +-
- .../src/session/checkpoint.rs                 |    3 +-
  crates/codegen/xai-ratatui-inline/Cargo.toml  |    2 +-
  .../common/xai-computer-hub-core/Cargo.toml   |    2 +-
  .../xai-computer-hub-mcp-adapter/Cargo.toml   |    2 +-
@@ -118,7 +115,7 @@ Gork-Risk: medium
  crates/common/xai-tool-protocol/Cargo.toml    |    2 +-
  crates/common/xai-tool-runtime/Cargo.toml     |    2 +-
  crates/common/xai-tool-types/Cargo.toml       |    2 +-
- 111 files changed, 572 insertions(+), 2994 deletions(-)
+ 108 files changed, 546 insertions(+), 2969 deletions(-)
  create mode 100644 .github/ISSUE_TEMPLATE/bug_report.md
  create mode 100644 .github/ISSUE_TEMPLATE/feature_request.md
  create mode 100644 .github/dependabot.yml
@@ -312,7 +309,7 @@ index 940b600f4395b0bb3f90e72f73668ca22eadcef6..31d8bf4440e3f96aa452472abebff0da
  [dependencies]
  rmcp = { version = "2.1", features = [
 diff --git a/crates/codegen/xai-grok-pager-minimal/Cargo.toml b/crates/codegen/xai-grok-pager-minimal/Cargo.toml
-index 11a360e85d07f307d451547c23cad6589a82cacb..92b6aa13a5879d60a5674f45f7af02388017006d 100644
+index dcda4dc53189828c930266d937418fb83d63b75e..90443a4d45c86f41f7784d5bf2ea576286a60658 100644
 --- a/crates/codegen/xai-grok-pager-minimal/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager-minimal/Cargo.toml
 @@ -3,7 +3,7 @@ name = "xai-grok-pager-minimal"
@@ -338,11 +335,11 @@ index 7a4e27066fc1b9e5adf36e3dbed594c75ec5e4bb..ecc7c3d9e1f9b8293801d05d846e9e83
  publish = false
  
 diff --git a/crates/codegen/xai-grok-pager/Cargo.toml b/crates/codegen/xai-grok-pager/Cargo.toml
-index 1f0b56e699f6d92366349c6080fdc30779d31f88..0a1adc42f1bf467c90a6e278868f77446baefe3c 100644
+index 2584c2c25fd1b93a1061536baf72e0c54760f1fe..21475e0d60585deaeb33889578bcbd531b58842b 100644
 --- a/crates/codegen/xai-grok-pager/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager/Cargo.toml
 @@ -3,7 +3,7 @@ name = "xai-grok-pager"
- version = "0.1.220-alpha.4"
+ version = "0.2.101"
  edition.workspace = true
  license = "Apache-2.0"
 -authors = ["xAI"]
@@ -494,7 +491,7 @@ index ed547626978101320744164a3943cfc2137a0c4f..475be329ca3d501ae37e19a35b698624
  Press `Tab` to move focus between the prompt and the scrollback. While a turn is running, `Ctrl+C` cancels it (or clears a non-empty draft first); `Esc` is a no-op mid-turn. Idle, press `Esc` twice within 800ms to clear a non-empty prompt, or (with an empty prompt and conversation messages) to open rewind — see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape). With the scrollback focused, use the arrow keys to select entries and to collapse or expand them. To navigate with `j`/`k` and fold with `h`/`l` instead, enable Vim mode.
  
 diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md b/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
-index d90a10e1644a5c4f8f08bf4018f3e6b840260742..029ede9313ddb9b183d50473e92946830b33d86d 100644
+index a6c84d5b90f814187bc2694f9cea93309e219913..b44df4417a00b0c9377a2ec466dffb89be657b12 100644
 --- a/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
 +++ b/crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md
 @@ -22,11 +22,11 @@ To switch accounts or resolve an authentication problem, run:
@@ -511,7 +508,7 @@ index d90a10e1644a5c4f8f08bf4018f3e6b840260742..029ede9313ddb9b183d50473e9294683
  | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
  
  To sign out, run `grok logout`. It takes no flags and clears your cached credentials.
-@@ -246,7 +246,7 @@ When more than one login flow is configured, Grok populates the session token fr
+@@ -255,7 +255,7 @@ When more than one login flow is configured, Grok populates the session token fr
  
  1. **External auth provider** (`auth_provider_command`)
  2. **Enterprise OIDC** -- when OIDC is configured, through `[grok_com_config.oidc]` in `config.toml` or the `GROK_OIDC_ISSUER` and `GROK_OIDC_CLIENT_ID` environment variables
@@ -651,10 +648,10 @@ index b646ff8608ed9d06d9f74ad512160e2bcb5fdda0..90ffe510fe7d1f05e460ae0a4eb12a83
              },
              &mut session,
 diff --git a/crates/codegen/xai-grok-pager/src/app/actions.rs b/crates/codegen/xai-grok-pager/src/app/actions.rs
-index ffba192d00f5c10a6f9eb4018f39381a0fbf5e3b..048dbfe31aa6781af285bb021c3fa590e9b7bc51 100644
+index 3b2cf0c20ea13ba0499b7a334e004bf52fb446e1..a04b15f6a2aeb64dad841534cf203eb15eb96731 100644
 --- a/crates/codegen/xai-grok-pager/src/app/actions.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/actions.rs
-@@ -321,7 +321,7 @@ pub enum Action {
+@@ -322,7 +322,7 @@ pub enum Action {
      /// duration. The dispatch handler renders + writes the file and arms
      /// `AppView::pending_pager_path`; the event loop does the suspend/restore.
      OpenTranscriptPager,
@@ -663,7 +660,7 @@ index ffba192d00f5c10a6f9eb4018f39381a0fbf5e3b..048dbfe31aa6781af285bb021c3fa590
      /// folded block (collapsed reasoning / truncated tool output) into native
      /// scrollback, fully expanded, below the conversation (design decision K10).
      /// Bound to `Ctrl+E` and the `/expand` command. No-op outside minimal mode
-@@ -737,7 +737,7 @@ pub enum Action {
+@@ -742,7 +742,7 @@ pub enum Action {
      },
      /// Persist the memory modal fullscreen preference to config.toml.
      PersistMemoryFullscreen(bool),
@@ -673,7 +670,7 @@ index ffba192d00f5c10a6f9eb4018f39381a0fbf5e3b..048dbfe31aa6781af285bb021c3fa590
      /// Close the dashboard, returning to the previous `ActiveView`.
      ExitDashboard,
 diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-index f04f61dc9bee8864f2005983aba34f5b0a32ec3a..cea8f47539d9691372fa5ec641c180e7e58759d1 100644
+index 4abb1204f0d5f686d97bbd46e794b405384d6642..ef311b13b0263957211f42850d54840a54a6dbd5 100644
 --- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
 @@ -653,7 +653,7 @@ pub struct AppView {
@@ -685,7 +682,7 @@ index f04f61dc9bee8864f2005983aba34f5b0a32ec3a..cea8f47539d9691372fa5ec641c180e7
      /// startup hook) are only meaningful when a leader is coordinating a
      /// fleet of sessions, so they are gated on this flag. Set in
      /// `event_loop::run` from `connection.leader_status_rx.is_some()`;
-@@ -1116,7 +1116,12 @@ impl AppView {
+@@ -1118,7 +1118,12 @@ impl AppView {
          self.team_name = meta.team_name.clone();
          self.is_zdr = meta.is_zdr;
          self.team_role = meta.team_role.clone();
@@ -699,7 +696,7 @@ index f04f61dc9bee8864f2005983aba34f5b0a32ec3a..cea8f47539d9691372fa5ec641c180e7
          self.gate = meta.gate.clone();
          if was_gated && self.gate.is_none() {
              self.paywall_check_started = None;
-@@ -1288,7 +1293,7 @@ impl AppView {
+@@ -1296,7 +1301,7 @@ impl AppView {
              team_name: None,
              is_zdr: false,
              team_role: None,
@@ -708,7 +705,7 @@ index f04f61dc9bee8864f2005983aba34f5b0a32ec3a..cea8f47539d9691372fa5ec641c180e7
              show_tips: None,
              auto_update: None,
              ask_user_question_timeout_enabled: None,
-@@ -5113,7 +5118,7 @@ pub(crate) mod tests {
+@@ -5131,7 +5136,7 @@ pub(crate) mod tests {
              team_name: None,
              is_zdr: false,
              team_role: None,
@@ -717,7 +714,7 @@ index f04f61dc9bee8864f2005983aba34f5b0a32ec3a..cea8f47539d9691372fa5ec641c180e7
              show_tips: None,
              auto_update: None,
              ask_user_question_timeout_enabled: None,
-@@ -6506,7 +6511,7 @@ pub(crate) mod tests {
+@@ -6525,7 +6530,7 @@ pub(crate) mod tests {
      fn apply_auth_meta_clears_gate_on_subscription() {
          let mut app = test_app();
          app.gate = Some(xai_grok_shell::auth::GateInfo {
@@ -727,19 +724,19 @@ index f04f61dc9bee8864f2005983aba34f5b0a32ec3a..cea8f47539d9691372fa5ec641c180e7
              label: None,
          });
 diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
-index fbb4fe7f612c00414a841752bf01b7b00fa913c4..43922404c6aebd65e1f43ccb8e506c2979f828bd 100644
+index e2ed796bcade857916a27d71e68c612993fa2f3f..ce7878691a8025a16e3ddb630d84175b45918bde 100644
 --- a/crates/codegen/xai-grok-pager/src/app/cli.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
-@@ -151,7 +151,7 @@ pub struct WrapArgs {
+@@ -153,7 +153,7 @@ pub struct WrapArgs {
      )]
      pub command: Vec<String>,
  }
--/// Targets a running leader process by PID (used by `grok workspace`).
-+/// Targets a running leader process by PID (used by `gork workspace`).
+-/// Targets a running leader process by PID (used by `grok leader` / `grok workspace`).
++/// Targets a running leader process by PID (used by `gork leader` / `gork workspace`).
  #[derive(Debug, clap::Args, Clone, Default)]
  pub struct LeaderTargetArgs {
-     /// Leader process ID.
-@@ -382,9 +382,9 @@ fn version_with_channel() -> &'static str {
+     /// Leader process ID from `grok leader list`.
+@@ -408,9 +408,9 @@ fn version_with_channel() -> &'static str {
  }
  #[derive(Debug, Clone, Parser)]
  #[command(
@@ -751,7 +748,7 @@ index fbb4fe7f612c00414a841752bf01b7b00fa913c4..43922404c6aebd65e1f43ccb8e506c29
      disable_version_flag = true,
      next_display_order = None,
      help_template = "\
-@@ -620,7 +620,7 @@ pub struct PagerArgs {
+@@ -646,7 +646,7 @@ pub struct PagerArgs {
      pub self_verify: bool,
      /// Exit as soon as the first agent turn ends, without waiting for pending
      /// background bash/monitor tasks or background subagents (headless only).
@@ -760,7 +757,7 @@ index fbb4fe7f612c00414a841752bf01b7b00fa913c4..43922404c6aebd65e1f43ccb8e506c29
      /// so eval harnesses see full task completion. Use this for fast scripts that
      /// only need the first turn's text. Does not wait for server-side auto-wake
      /// output or persistent monitors (those hit the timeout).
-@@ -712,7 +712,7 @@ pub struct PagerArgs {
+@@ -736,7 +736,7 @@ pub struct PagerArgs {
      /// Run standalone even when leader mode is configured.
      #[arg(long, conflicts_with = "leader", hide = true)]
      pub no_leader: bool,
@@ -769,7 +766,7 @@ index fbb4fe7f612c00414a841752bf01b7b00fa913c4..43922404c6aebd65e1f43ccb8e506c29
      #[arg(
          value_name = "PROMPT",
          conflicts_with_all = &["single",
-@@ -748,14 +748,21 @@ pub enum ResumeTarget {
+@@ -772,14 +772,21 @@ pub enum ResumeTarget {
  impl PagerArgs {
      /// Parse CLI arguments and apply `--cwd` if provided.
      pub fn parse_and_apply_cwd() -> anyhow::Result<Self> {
@@ -793,7 +790,7 @@ index fbb4fe7f612c00414a841752bf01b7b00fa913c4..43922404c6aebd65e1f43ccb8e506c29
              .to_owned();
          let mut args = Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)));
          if let Some(socket) = args.leader_socket.take() {
-@@ -868,7 +875,7 @@ impl PagerArgs {
+@@ -892,7 +899,7 @@ impl PagerArgs {
      /// The initial interactive prompt from the positional argument, trimmed.
      ///
      /// Returns `None` when no positional prompt was given or it is only
@@ -803,7 +800,7 @@ index fbb4fe7f612c00414a841752bf01b7b00fa913c4..43922404c6aebd65e1f43ccb8e506c29
      pub fn initial_prompt(&self) -> Option<&str> {
          self.prompt
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/billing.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/billing.rs
-index 6706aee4f2b1bf15112a2bf497e101159c657f26..e9fa9f9313f81fc0cc9d21e57574cfcd82d4053a 100644
+index d04601f31567d94c8a54af644a3f69fc5b9c5949..ad07870b48eff206dcc439706d09ae5ed6cec8ec 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/billing.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/billing.rs
 @@ -112,7 +112,7 @@ pub(crate) fn acp_error_is_free_usage_exhausted(err: &agent_client_protocol::Err
@@ -971,10 +968,10 @@ index c5c3c87b5729423d5b3f82ae90b8d07bf4d55088..cd59fe0179a69288f5ca08687b822e38
  #[test]
  fn dashboard_open_works_without_leader() {
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs
-index 61b9734eb3e825a5d660b132c184c94cb4c9026a..515c335d956cbd92c87cc418fea193b604602177 100644
+index 5e436b4a5e870a82abcf4fe0eab8cc2a40ba755a..79c38829d28852ee3c2988baf75a6354ad99e620 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/mod.rs
-@@ -148,7 +148,7 @@ fn test_app() -> AppView {
+@@ -150,7 +150,7 @@ fn test_app() -> AppView {
          team_name: None,
          is_zdr: false,
          team_role: None,
@@ -1132,10 +1129,10 @@ index 09995aabbc8023bb46ceba282dec150c63345ccf..de738c4cfe3caa43ab85bb0b66410438
      // Clear and test opt-out direction.
      app.agents.get_mut(&AgentId(0)).unwrap().toast = None;
 diff --git a/crates/codegen/xai-grok-pager/src/app/event_loop.rs b/crates/codegen/xai-grok-pager/src/app/event_loop.rs
-index d83f961ee3af09032353c47eff1992a21a679d19..7ce380cf717662dfc9922e4e07f8baaaea25d7af 100644
+index e093cd63c9da1659546696d551764a19cf50c045..d5db74d0c57e78849e2dc35e20c4d1e1b4416f62 100644
 --- a/crates/codegen/xai-grok-pager/src/app/event_loop.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/event_loop.rs
-@@ -1329,7 +1329,7 @@ pub(crate) async fn run(
+@@ -1353,7 +1353,7 @@ pub(crate) async fn run(
          app.draw(terminal);
      }
  
@@ -1144,7 +1141,7 @@ index d83f961ee3af09032353c47eff1992a21a679d19..7ce380cf717662dfc9922e4e07f8baaa
      // already authenticated, hand it to the shared dispatcher helper (same
      // `NewSession`/`SendPrompt` path the welcome screen uses). ZDR-blocked
      // accounts cannot start a session, so drop the prompt — this mirrors the
-@@ -1347,7 +1347,7 @@ pub(crate) async fn run(
+@@ -1371,7 +1371,7 @@ pub(crate) async fn run(
          }
      }
  
@@ -1154,10 +1151,10 @@ index d83f961ee3af09032353c47eff1992a21a679d19..7ce380cf717662dfc9922e4e07f8baaa
      // so we don't have to thread a flag through every arg struct.
      if std::env::var("GROK_OPEN_DASHBOARD_AT_STARTUP").as_deref() == Ok("1") {
 diff --git a/crates/codegen/xai-grok-pager/src/app/mod.rs b/crates/codegen/xai-grok-pager/src/app/mod.rs
-index 03110c3b8ea921fc2ee38b73ba16b85aeb8572ce..adcef476c024653f284ab7b0b9b225ce57eb278a 100644
+index 9b1f5008d95b1f159cf7f8c9bffa960a58b5252a..444cccfb6386a63afffdd3be4537f6c403a75b53 100644
 --- a/crates/codegen/xai-grok-pager/src/app/mod.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/mod.rs
-@@ -1269,12 +1269,18 @@ pub(crate) fn set_terminal_title(title: &str) {
+@@ -1302,12 +1302,18 @@ pub(crate) fn set_terminal_title(title: &str) {
  /// terminate the OSC early and let the remainder inject arbitrary escape
  /// sequences into the terminal.
  fn terminal_title_string(title: &str) -> String {
@@ -1179,7 +1176,7 @@ index 03110c3b8ea921fc2ee38b73ba16b85aeb8572ce..adcef476c024653f284ab7b0b9b225ce
      }
  }
  fn set_panic_hook(mode: ScreenMode) {
-@@ -1315,13 +1321,14 @@ mod tests {
+@@ -1348,13 +1354,14 @@ mod tests {
      }
      #[test]
      fn terminal_title_strips_control_characters() {
@@ -1198,7 +1195,7 @@ index 03110c3b8ea921fc2ee38b73ba16b85aeb8572ce..adcef476c024653f284ab7b0b9b225ce
      }
      #[test]
      fn hunk_tracker_mode_nothing_set_is_none() {
-@@ -1689,24 +1696,25 @@ mod tests {
+@@ -1722,24 +1729,25 @@ mod tests {
          assert!(!args.no_alt_screen);
      }
      #[test]
@@ -1234,7 +1231,7 @@ index 03110c3b8ea921fc2ee38b73ba16b85aeb8572ce..adcef476c024653f284ab7b0b9b225ce
          assert!(help.find("Arguments:\n").unwrap() < help.find("Options:\n").unwrap());
          assert!(help.find("Options:\n").unwrap() < help.find("Commands:\n").unwrap());
 diff --git a/crates/codegen/xai-grok-pager/src/app/screen_mode_relaunch.rs b/crates/codegen/xai-grok-pager/src/app/screen_mode_relaunch.rs
-index 6767f4adbf0398ef5e25bd0d68597a16ac29b870..18f0baa35530c5c52add401465d834b268161c40 100644
+index 2bc15899f2d0e06cd018409e64976be172632ef3..2259644168fc25e1530e73ac86bebcf5dbbf6266 100644
 --- a/crates/codegen/xai-grok-pager/src/app/screen_mode_relaunch.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/screen_mode_relaunch.rs
 @@ -71,7 +71,7 @@ fn flag_takes_value(flag: &str) -> bool {
@@ -1255,18 +1252,7 @@ index 6767f4adbf0398ef5e25bd0d68597a16ac29b870..18f0baa35530c5c52add401465d834b2
          // on resume. Clap positionals never start with `-`. Values for earlier
          // flags were already consumed above, so any remaining bare word here is
          // the prompt.
-@@ -208,8 +208,8 @@ pub(crate) fn screen_mode_env_value(want_minimal: bool) -> &'static str {
- /// Shell command a user can paste when auto re-exec fails.
- ///
- /// Includes [`GROK_SCREEN_MODE_ENV`] so the resume hits the same override path
--/// as a successful `exec` — plain `grok --resume <id>` (or even
--/// `grok --minimal --resume <id>`) is not enough after `/fullscreen` when
-+/// as a successful `exec` — plain `gork --resume <id>` (or even
-+/// `gork --minimal --resume <id>`) is not enough after `/fullscreen` when
- /// config/CLI would pick minimal or inline alt-screen policy. The explicit
- /// `--minimal`/`--fullscreen` flag is included too so following the hint also
- /// persists the sticky `[ui] screen_mode` preference, exactly like a
-@@ -627,7 +627,7 @@ mod tests {
+@@ -624,7 +624,7 @@ mod tests {
  
      #[test]
      fn double_dash_and_following_positionals_dropped() {
@@ -1275,7 +1261,7 @@ index 6767f4adbf0398ef5e25bd0d68597a16ac29b870..18f0baa35530c5c52add401465d834b2
          // prompt. The separator itself must go too, or the appended
          // `--resume <id>` would be parsed as positional prompt words.
          let out = build_screen_mode_relaunch_args(
-@@ -720,7 +720,7 @@ mod tests {
+@@ -717,7 +717,7 @@ mod tests {
  
      #[test]
      fn resume_without_value_then_flag_is_not_eaten() {
@@ -1352,7 +1338,7 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8f6edbd88f69af1b473334a3e9ea64ba
      #[test]
      fn zsh_completions_drop_prompt_slot_and_dispatch_on_line_1() {
 diff --git a/crates/codegen/xai-grok-pager/src/headless.rs b/crates/codegen/xai-grok-pager/src/headless.rs
-index b8023e1db13899ac76834aab5feacca105cd780c..527b28c0ff7b46a398e5622417ba75da1c63d09e 100644
+index 4af6912454ccf72bd8ecf62abd4ff2c2f852edb4..9e32fad7bada81bf53cfdff31754aa5d76f99c76 100644
 --- a/crates/codegen/xai-grok-pager/src/headless.rs
 +++ b/crates/codegen/xai-grok-pager/src/headless.rs
 @@ -1,4 +1,4 @@
@@ -1893,10 +1879,10 @@ index 57d96b5108ea169e8177773c433a2ed5bc04e2db..863105eebfc62a1b137a4acfa1454601
  //! and large tool output truncated (design decision K9). Committed terminal text
  //! can't be mutated, so "expanding" one is an honest re-print of the same block
 diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
-index f9525748fe85aa191b4ffe5215f4589c0fa01445..0bd80500de033b6e217090654d01a81df2f2ff44 100644
+index 2148ecdd64b8b654bf697c6a1c74c35f5396b8c7..bbe627954dc4a8cb29962615f5be8d9bb9f062a6 100644
 --- a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
 +++ b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
-@@ -77,7 +77,6 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
+@@ -79,7 +79,6 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
          Arc::new(docs::DocsCommand),
          Arc::new(home::HomeCommand),
          Arc::new(new::NewCommand),
@@ -1904,7 +1890,7 @@ index f9525748fe85aa191b4ffe5215f4589c0fa01445..0bd80500de033b6e217090654d01a81d
          Arc::new(fork::ForkCommand),
          Arc::new(compact::CompactCommand),
          Arc::new(copy::CopyCommand),
-@@ -115,7 +114,6 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
+@@ -117,7 +116,6 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
          Arc::new(mcps::McpsCommand),
          Arc::new(btw::BtwCommand),
          Arc::new(recap::RecapCommand),
@@ -1925,82 +1911,6 @@ index d54ad94e5ca9fae86fe4cd42519c93a1e6a09673..411139c2449f8b40684d19f8a0fedafd
                   See {} for upload overrides.",
                  crate::util::display_user_grok_path("docs/user-guide")
              );
-diff --git a/crates/codegen/xai-grok-pager/src/views/settings_modal.rs b/crates/codegen/xai-grok-pager/src/views/settings_modal.rs
-index 3cc556db8ffac71b786f6834e2b19daab6c19367..22c6ba3eb658e17f0e464def947ee822ff6783ed 100644
---- a/crates/codegen/xai-grok-pager/src/views/settings_modal.rs
-+++ b/crates/codegen/xai-grok-pager/src/views/settings_modal.rs
-@@ -8079,7 +8079,7 @@ mod tests {
-             category: SettingCategory::Privacy,
-             owner: SettingOwner::Shared,
-             label: "Coding data sharing",
--            description: "Controls whether SpaceXAI may retain and train on coding data.",
-+            description: "Controls whether the account may retain coding data for training.",
-             keywords: &["test"],
-             kind: SettingKind::Enum {
-                 default: "opt-out",
-@@ -8087,7 +8087,7 @@ mod tests {
-                     EnumChoice {
-                         canonical: "opt-in",
-                         display: "Opt in",
--                        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
-+                        description: "Allow account retention of coding session data for training and product improvement.",
-                     },
-                     EnumChoice {
-                         canonical: "opt-out",
-@@ -8141,7 +8141,7 @@ mod tests {
-             category: SettingCategory::Privacy,
-             owner: SettingOwner::Shared,
-             label: "Coding data sharing",
--            description: "Controls whether SpaceXAI may retain and train on coding data.",
-+            description: "Controls whether the account may retain coding data for training.",
-             keywords: &["test"],
-             kind: SettingKind::Enum {
-                 default: "opt-out",
-@@ -8149,7 +8149,7 @@ mod tests {
-                     EnumChoice {
-                         canonical: "opt-in",
-                         display: "Opt in",
--                        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
-+                        description: "Allow account retention of coding session data for training and product improvement.",
-                     },
-                     EnumChoice {
-                         canonical: "opt-out",
-@@ -8211,7 +8211,7 @@ mod tests {
-             "choice 0 line 1 must contain the `·` separator, got: {r3:?}"
-         );
-         assert!(
--            r3.contains("Allow SpaceXAI"),
-+            r3.contains("Allow account retention"),
-             "choice 0 line 1 must start the description, got: {r3:?}"
-         );
- 
-@@ -8253,7 +8253,7 @@ mod tests {
-         );
-         for word in [
-             "Allow",
--            "SpaceXAI",
-+            "account",
-             "retain",
-             "session",
-             "training",
-@@ -8426,7 +8426,7 @@ mod tests {
-             category: SettingCategory::Privacy,
-             owner: SettingOwner::Shared,
-             label: "Coding data sharing",
--            description: "Controls whether SpaceXAI may retain coding data.",
-+            description: "Controls whether the account may retain coding data.",
-             keywords: &["test"],
-             kind: SettingKind::Enum {
-                 default: "opt-in",
-@@ -8434,7 +8434,7 @@ mod tests {
-                     EnumChoice {
-                         canonical: "opt-in",
-                         display: "Opt in",
--                        description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
-+                        description: "Allow account retention of coding session data for training and product improvement.",
-                     },
-                     EnumChoice {
-                         canonical: "opt-out",
 diff --git a/crates/codegen/xai-grok-pager/src/views/welcome/hero_box.rs b/crates/codegen/xai-grok-pager/src/views/welcome/hero_box.rs
 index 527ab7cf5e001dfb3cacf5f6d80c404b28ec3938..42b3a295b7a35bcf8243e5d167934899c8a5cef4 100644
 --- a/crates/codegen/xai-grok-pager/src/views/welcome/hero_box.rs
@@ -4980,10 +4890,10 @@ index 818d18f487ec0dc7d49cf1984141bd04e4178b8e..23f08a4caab1c0d4958db6513d1df37a
          // resolve upgrades the cache without a process restart.
          let allowed = resolve_and_record_inner(
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs
-index 78a861262107363003d2d6926299072724ac2d7e..c4ea66ceacd8da2b8f6919ae17f3fc3b2f2d3015 100644
+index 567dbc863c6e182540d53cb995b39ec6d05095af..abbcac8e6888889c1842296045774b5aab195fc5 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs
-@@ -3214,7 +3214,7 @@ impl acp::Agent for MvpAgent {
+@@ -3213,7 +3213,7 @@ impl acp::Agent for MvpAgent {
                  crate::extensions::auth_gate::require_xai_auth(
                      &self.auth_manager,
                      "Authentication required",
@@ -4992,7 +4902,7 @@ index 78a861262107363003d2d6926299072724ac2d7e..c4ea66ceacd8da2b8f6919ae17f3fc3b
                  )?;
                  let params: serde_json::Value = serde_json::from_str(args.params.get())
                      .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
-@@ -3246,7 +3246,7 @@ impl acp::Agent for MvpAgent {
+@@ -3245,7 +3245,7 @@ impl acp::Agent for MvpAgent {
                  crate::extensions::auth_gate::require_xai_auth(
                      &self.auth_manager,
                      "Authentication required",
@@ -5001,7 +4911,7 @@ index 78a861262107363003d2d6926299072724ac2d7e..c4ea66ceacd8da2b8f6919ae17f3fc3b
                  )?;
                  let sandbox_client = crate::remote::SandboxClient::new(
                      self.cli_chat_proxy_base_url(),
-@@ -3269,7 +3269,7 @@ impl acp::Agent for MvpAgent {
+@@ -3268,7 +3268,7 @@ impl acp::Agent for MvpAgent {
                  crate::extensions::auth_gate::require_xai_auth(
                      &self.auth_manager,
                      "Authentication required",
@@ -5010,7 +4920,7 @@ index 78a861262107363003d2d6926299072724ac2d7e..c4ea66ceacd8da2b8f6919ae17f3fc3b
                  )?;
                  let params: serde_json::Value = serde_json::from_str(args.params.get())
                      .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
-@@ -3324,7 +3324,7 @@ impl acp::Agent for MvpAgent {
+@@ -3323,7 +3323,7 @@ impl acp::Agent for MvpAgent {
                  crate::extensions::auth_gate::require_xai_auth(
                      &self.auth_manager,
                      "Authentication required",
@@ -5019,7 +4929,7 @@ index 78a861262107363003d2d6926299072724ac2d7e..c4ea66ceacd8da2b8f6919ae17f3fc3b
                  )?;
                  let params: serde_json::Value = serde_json::from_str(args.params.get())
                      .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
-@@ -3382,7 +3382,7 @@ impl acp::Agent for MvpAgent {
+@@ -3381,7 +3381,7 @@ impl acp::Agent for MvpAgent {
                  crate::extensions::auth_gate::require_xai_auth(
                      &self.auth_manager,
                      "Authentication required",
@@ -5029,7 +4939,7 @@ index 78a861262107363003d2d6926299072724ac2d7e..c4ea66ceacd8da2b8f6919ae17f3fc3b
                  let params: serde_json::Value = serde_json::from_str(args.params.get())
                      .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
 diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs
-index 9c6e92123b7197b042270040388d249d3973970e..1ed951c142555f37e37e592cbcf916e6f80e867b 100644
+index 3ffc02389317eadccd56f72ac76d70feab7ecffe..52e67606cb5cb52695ad63999209c7f41b107a30 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/tests.rs
 @@ -2518,11 +2518,16 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
@@ -5071,8 +4981,8 @@ index 9c6e92123b7197b042270040388d249d3973970e..1ed951c142555f37e37e592cbcf916e6
 +        "Gork Build disables collection regardless of team block reasons"
      );
  }
- /// Enable trace uploads via config so only the auth-level privacy gate
-@@ -2642,19 +2647,21 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
+ fn enable_product_telemetry(agent: &MvpAgent) {
+@@ -2676,7 +2681,7 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
      );
  }
  #[tokio::test]
@@ -5081,33 +4991,11 @@ index 9c6e92123b7197b042270040388d249d3973970e..1ed951c142555f37e37e592cbcf916e6
      let (stub_url, count) = spawn_counting_storage_stub().await;
      let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
      enable_trace_upload_config(&agent);
-     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
--    let uploader = agent
--        .diagnostic_upload_config()
--        .expect("uploader is wired whenever trace upload config is on");
--    uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
--    assert!(
--        count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
--        "positive control: diagnostics upload reaches the proxy for a \
--         normal user"
-+    // Privacy build: trace_upload resolver is hard-false, so the diagnostic
-+    // uploader is not even wired — or if config still constructs a closure,
-+    // invocation must not hit the network.
-+    if let Some(uploader) = agent.diagnostic_upload_config() {
-+        uploader(b"log".to_vec(), "tok".into(), "user@example.com".into()).await;
-+    }
-+    assert_eq!(
-+        count.load(std::sync::atomic::Ordering::SeqCst),
-+        0,
-+        "Gork Build: diagnostics upload must not leave the machine"
-     );
- }
- /// The diagnostics privacy gate fails closed: with no credential in the
 diff --git a/crates/codegen/xai-grok-shell/src/agent/relay.rs b/crates/codegen/xai-grok-shell/src/agent/relay.rs
-index 05f39ed48e29586fbaca9f02c6fa77e5e5fa05af..3f3a905755c7bddcc2f584c210a2b626196feeae 100644
+index af6fa0bd2416600fc1273ae106e2545d0b00449f..cbfa1df2ca7e318adc9e6d43576d92d73893eea2 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/relay.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/relay.rs
-@@ -171,7 +171,7 @@ async fn attempt_auth_recovery(
+@@ -172,7 +172,7 @@ async fn attempt_auth_recovery(
      context: &str,
  ) -> bool {
      let Some(ref am) = config.auth_manager else {
@@ -5117,10 +5005,10 @@ index 05f39ed48e29586fbaca9f02c6fa77e5e5fa05af..3f3a905755c7bddcc2f584c210a2b626
          return false;
      };
 diff --git a/crates/codegen/xai-grok-shell/src/auth/config.rs b/crates/codegen/xai-grok-shell/src/auth/config.rs
-index 4c7bf526926a60d1ba5280d9c3d2edcb7a14d0f9..d7f0991ee7b648712f488734108e782474c9fa81 100644
+index ed773b5c5162251517a410a0cfe9408ee586626b..953fee09b9fb64166997408e9dceaefb88857ed5 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/config.rs
-@@ -185,7 +185,7 @@ pub fn xai_oauth2_issuer() -> &'static str {
+@@ -189,7 +189,7 @@ pub fn xai_oauth2_issuer() -> &'static str {
  pub fn is_xai_oauth2_issuer(issuer: &str) -> bool {
      issuer == XAI_OAUTH2_ISSUER || issuer == XAI_OAUTH2_LOCAL_ISSUER
  }
@@ -5129,7 +5017,7 @@ index 4c7bf526926a60d1ba5280d9c3d2edcb7a14d0f9..d7f0991ee7b648712f488734108e7824
  /// Matches the key format produced by the original `accounts.x.ai` relay auth.
  pub const LEGACY_AUTH_SCOPE: &str = "https://accounts.x.ai/sign-in";
  impl GrokComConfig {
-@@ -204,7 +204,7 @@ impl GrokComConfig {
+@@ -208,7 +208,7 @@ impl GrokComConfig {
      }
      /// When `preferred_method = api_key`, automatic OIDC paths (devbox mint,
      /// interactive browser login, external auth provider) must not run — the
@@ -5246,7 +5134,7 @@ index efd9ace66a1a496897e0e7ce1b997f7deeaea067..7c92fc200098329eccd29c7931b9548a
          }
      }
 diff --git a/crates/codegen/xai-grok-shell/src/auth/flow.rs b/crates/codegen/xai-grok-shell/src/auth/flow.rs
-index 201855b33213e30455eac6af208a5750e57dae9b..fbab7d058480160717e52fb43426653684ccc01d 100644
+index 724dc08ef63fb71eb3e447534688f823bcb0b0f8..aeed9321f8a6beb0b998362ac44e2e602e3cddfc 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/flow.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/flow.rs
 @@ -583,7 +583,7 @@ async fn run_auth_flow_inner(
@@ -5303,7 +5191,7 @@ index 201855b33213e30455eac6af208a5750e57dae9b..fbab7d058480160717e52fb434266536
  /// the result to stderr.
  pub fn run_cli_logout(config: &crate::agent::config::Config) -> anyhow::Result<()> {
      let grok_home = grok_home::grok_home();
-@@ -1359,7 +1359,7 @@ mod tests {
+@@ -1381,7 +1381,7 @@ mod tests {
  
      #[tokio::test]
      async fn enterprise_oidc_never_uses_device_flow() {
@@ -5312,7 +5200,7 @@ index 201855b33213e30455eac6af208a5750e57dae9b..fbab7d058480160717e52fb434266536
          // even when --device-auth forces device (which would otherwise be true).
          // ForceDevice short-circuits the remote settings fetch, so this stays hermetic.
          let cfg = GrokComConfig {
-@@ -1839,7 +1839,7 @@ mod tests {
+@@ -1888,7 +1888,7 @@ mod tests {
          assert_eq!(extract("some opaque output"), "some opaque output");
      }
  
@@ -5373,10 +5261,10 @@ index 79861e0c7ebeebcadc370c6d23279cbf95b834ea..941e97e4228f993cab563ba1a3a19740
  pub enum AuthStatus {
      ApiKey,
 diff --git a/crates/codegen/xai-grok-shell/src/config/mod.rs b/crates/codegen/xai-grok-shell/src/config/mod.rs
-index fa580ab8d8588b6e62ea52bf6cafe7e6c9e8ee85..007e9a52597801001a50cccd7cc4adf11f81d078 100644
+index d4203ee25b3b8528b85dbe0fb8681a4cb77b1b93..72065f028fcf6d552c7a62dd989d1ffe07d95f54 100644
 --- a/crates/codegen/xai-grok-shell/src/config/mod.rs
 +++ b/crates/codegen/xai-grok-shell/src/config/mod.rs
-@@ -874,7 +874,7 @@ fn walk_toml(
+@@ -875,7 +875,7 @@ fn walk_toml(
      }
  }
  /// The `[skills]` table from an effective config, shared by the reload
@@ -5588,10 +5476,10 @@ index b67ba445aa4ac498a80c91d7fe62620350aedae1..f5ec19b109226eaea0cad8933a2748bc
      RelaunchForUpdate {
          to_version: String,
 diff --git a/crates/codegen/xai-grok-shell/src/leader/server.rs b/crates/codegen/xai-grok-shell/src/leader/server.rs
-index 5369b31705bda2e4c05066772906ad1948dae8fb..449b4a271e45f869c7c5e3545097051c97c97eec 100644
+index 31b30f14c440ac97cb58db3d269613e597d973f3..e75914732902248998c25e27ef801ce00ba14b18 100644
 --- a/crates/codegen/xai-grok-shell/src/leader/server.rs
 +++ b/crates/codegen/xai-grok-shell/src/leader/server.rs
-@@ -2413,7 +2413,7 @@ mod tests {
+@@ -2412,7 +2412,7 @@ mod tests {
      /// Relay demand gate (relay-on-demand): Stdio registrations must NOT
      /// signal relay demand — a leader serving only interactive clients (TUI
      /// dashboard, IDE) keeps the grok.com relay off. The first Headless
@@ -5601,10 +5489,10 @@ index 5369b31705bda2e4c05066772906ad1948dae8fb..449b4a271e45f869c7c5e3545097051c
      #[tokio::test]
      async fn relay_demand_signals_only_on_headless_registration() {
 diff --git a/crates/codegen/xai-grok-shell/src/managed_config.rs b/crates/codegen/xai-grok-shell/src/managed_config.rs
-index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1bcabdd1c 100644
+index 76167185fce3aa9a814023cf2dcba64ed616681b..e6f1dea11ea33ea92e1f23a061889c2ab1c221f7 100644
 --- a/crates/codegen/xai-grok-shell/src/managed_config.rs
 +++ b/crates/codegen/xai-grok-shell/src/managed_config.rs
-@@ -131,7 +131,7 @@ pub fn clear_orphan() {
+@@ -152,7 +152,7 @@ pub fn clear_orphan() {
  }
  
  /// Best-effort cross-process lock serializing apply/remove of the managed-config
@@ -5613,7 +5501,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  /// caller skips and retries next cycle.
  fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
      use fs2::FileExt;
-@@ -149,7 +149,7 @@ fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
+@@ -170,7 +170,7 @@ fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
  /// Retry budget for a sync, pairing the attempt count with a wall-clock cap.
  #[derive(Clone, Copy)]
  enum SyncBudget {
@@ -5622,16 +5510,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
      Standard,
      /// Post-login sync; capped because login latency is user-visible.
      Login,
-@@ -434,7 +434,7 @@ struct SyncOutcome {
-     wrote: bool,
-     /// The server returned non-empty config for the consulted principal — true
-     /// even when a concurrent writer held the lock and our write was skipped, so
--    /// `grok setup` doesn't misreport a lock skip as "no config".
-+    /// `gork setup` doesn't misreport a lock skip as "no config".
-     served: bool,
-     /// Which credential was consulted, so callers word team-vs-deployment
-     /// messages by what actually served, not just what's configured.
-@@ -529,7 +529,7 @@ enum FetchedConfig {
+@@ -519,7 +519,7 @@ enum FetchedConfig {
  
  /// Fetches the configuration for the current principal without touching disk:
  /// the deployment key first, then a signed-in team. The installing sync and the
@@ -5640,7 +5519,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  async fn fetch_for_principal(
      budget: SyncBudget,
      team_override: Option<GrokAuth>,
-@@ -739,7 +739,7 @@ pub enum ManagedConfigSync {
+@@ -709,7 +709,7 @@ pub enum ManagedConfigSync {
      Failed,
  }
  
@@ -5649,7 +5528,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  /// orphaned files, then fetch the new principal's config immediately rather than
  /// waiting for the background tick. `authenticated` pins the just-logged-in
  /// principal (`None` = on-disk team). Latency-bounded by [`SyncBudget::Login`];
-@@ -789,7 +789,7 @@ pub async fn post_login_sync(authenticated: Option<GrokAuth>) -> ManagedConfigSy
+@@ -759,7 +759,7 @@ pub async fn post_login_sync(authenticated: Option<GrokAuth>) -> ManagedConfigSy
      }
  }
  
@@ -5658,16 +5537,16 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  pub fn has_principal() -> bool {
      resolve_deployment_key().is_some() || read_active_team_auth().is_some()
  }
-@@ -899,7 +899,7 @@ network access: reconnect and start again. If you can't reconnect, contact your
- /// policy can't be established gets no unmanaged session. With no signing key it reads the user-writable
- /// marker (a local user can disarm it by editing one field); non-forgeable enforcement is the trust-rooted
- /// layers (root-owned path, MDM, signed cache). No client env disables it; recovery stays open (reconnect /
--/// `grok setup`); ceasing to serve `fail_closed` rolls back.
-+/// `gork setup`); ceasing to serve `fail_closed` rolls back.
+@@ -870,7 +870,7 @@ network access: reconnect and start again. If you can't reconnect, contact your
+ /// Fail-closed session-start gate for managed principals. On a confirmed offline team
+ /// switch, first purges the prior team's artifacts ([`purge_prior_tenant_on_identity_change`]).
+ /// Without a signing key the user-writable marker is best-effort; root/MDM/signed cache
+-/// are the non-forgeable layers. Recovery: reconnect / `grok setup`; ceasing to serve
++/// are the non-forgeable layers. Recovery: reconnect / `gork setup`; ceasing to serve
+ /// `fail_closed` rolls back.
  pub fn managed_policy_gate() -> Result<(), String> {
-     // Skip under the lib unit-test build only: `bootstrap` reaches this without a staged
-     // `GROK_HOME` and would flake on the dev machine's real marker/auth. The pure decision
-@@ -953,7 +953,7 @@ fn managed_policy_gate_decision(
+     // Lib unit tests skip: bootstrap would hit the host's real marker/auth. Pure decision
+@@ -930,7 +930,7 @@ fn managed_policy_gate_decision(
      Ok(())
  }
  
@@ -5676,7 +5555,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  /// and exit codes stay out of the library.
  #[derive(Debug)]
  pub enum SetupOutcome {
-@@ -965,9 +965,9 @@ pub enum SetupOutcome {
+@@ -945,9 +945,9 @@ pub enum SetupOutcome {
      Failed(ManagedConfigError),
  }
  
@@ -5688,7 +5567,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  #[derive(Debug, serde::Serialize)]
  #[serde(rename_all = "camelCase")]
  pub struct SetupReport {
-@@ -978,13 +978,13 @@ pub struct SetupReport {
+@@ -958,13 +958,13 @@ pub struct SetupReport {
      pub configured: bool,
      pub deployment_id: Option<String>,
      pub team_id: Option<String>,
@@ -5704,7 +5583,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  /// no artifacts, no signature sidecar, no sync marker.
  pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
      let (source, body) = match fetch_for_principal(SyncBudget::Standard, None).await? {
-@@ -992,7 +992,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
+@@ -972,7 +972,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
          FetchedConfig::Team { body, .. } => (Some("teamOauth"), body),
          FetchedConfig::NoPrincipal => (None, ManagedConfigResponse::default()),
      };
@@ -5713,7 +5592,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
      // is reported as an error, not printed as installable config.
      if source.is_some()
          && xai_grok_config::signed_policy::verification_active()
-@@ -1012,7 +1012,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
+@@ -992,7 +992,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
      })
  }
  
@@ -5723,7 +5602,7 @@ index 08408547725be3a88c568838b481b1a32865586c..a32af39512d4872c7ddd22f4bd7ce7f1
  pub async fn run_setup() -> SetupOutcome {
      match sync_with_budget(SyncBudget::Standard, None).await {
 diff --git a/crates/codegen/xai-grok-shell/src/managed_config/response.rs b/crates/codegen/xai-grok-shell/src/managed_config/response.rs
-index 46577bf3ba0a08bcee0c0b1ed2a114c324ae5edf..f701ad58f9fbf8147103d85952c91561be19ab7f 100644
+index 462be7767d491c1c4e1a542705fab9b17e74e17c..cc06166ad07bc397a7793aee5a635f9cdb1deb26 100644
 --- a/crates/codegen/xai-grok-shell/src/managed_config/response.rs
 +++ b/crates/codegen/xai-grok-shell/src/managed_config/response.rs
 @@ -42,7 +42,7 @@ pub enum ManagedConfigError {
@@ -6067,39 +5946,6 @@ index bc5938a0cd3928a71e919966ec7de99f5e54df21..3f192f7c7ff057573486611ac5ea625d
  
  [dependencies]
  base64 = { workspace = true }
-diff --git a/crates/codegen/xai-grok-workspace/src/handle.rs b/crates/codegen/xai-grok-workspace/src/handle.rs
-index d470972a075bc71105093e9ea8dd0b4dd01f1cb0..9e0234d27e90a3c5c818eeb2304dd16c80cec173 100644
---- a/crates/codegen/xai-grok-workspace/src/handle.rs
-+++ b/crates/codegen/xai-grok-workspace/src/handle.rs
-@@ -3836,10 +3836,10 @@ pub async fn connect_local_workspace(
- /// 2. `<grok_home>/workspace`, where `<grok_home>` honours `$GROK_HOME` and
- ///    otherwise falls back to `~/.grok` (see [`xai_grok_config::grok_home`]).
- pub fn resolve_workspace_home() -> std::path::PathBuf {
--    if let Ok(p) = std::env::var("GROK_WORKSPACE_HOME") {
--        if !p.trim().is_empty() {
--            return std::path::PathBuf::from(p);
--        }
-+    if let Ok(p) = std::env::var("GROK_WORKSPACE_HOME")
-+        && !p.trim().is_empty()
-+    {
-+        return std::path::PathBuf::from(p);
-     }
-     xai_grok_config::grok_home().join("workspace")
- }
-diff --git a/crates/codegen/xai-grok-workspace/src/session/checkpoint.rs b/crates/codegen/xai-grok-workspace/src/session/checkpoint.rs
-index 61f35fd3f919ac5e529ea4c4f366e8caabd2c221..73f02741cee95fc0cdecf68ce953e79297d80b80 100644
---- a/crates/codegen/xai-grok-workspace/src/session/checkpoint.rs
-+++ b/crates/codegen/xai-grok-workspace/src/session/checkpoint.rs
-@@ -267,8 +267,7 @@ impl WorkspaceHandle {
-                 self.shared
-                     .activity_tracker
-                     .turn_started(session_id, turn_number);
--                let handle = None;
--                handle
-+                None
-             }
-             TurnBoundary::End {
-                 prompt_index: Some(idx),
 diff --git a/crates/codegen/xai-ratatui-inline/Cargo.toml b/crates/codegen/xai-ratatui-inline/Cargo.toml
 index 3d9b2ae76c6f65ab541b850a2dc371e44d396ddc..dda5634a497a35012e11f99bf6b3beb43bf159de 100644
 --- a/crates/codegen/xai-ratatui-inline/Cargo.toml
@@ -6192,8 +6038,8 @@ index edb701854731297e746ae285bf44b13c8896b617..17fa56b91c57e29e342555b8c043922c
  [features]
  # Enables `BuiltinSubagent::render_prompt` (MiniJinja rendering of the
 
-base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
-prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
 prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
@@ -6201,8 +6047,11 @@ prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
-prerequisite-patch-id: de6f7bc6cb2bcbdee7e27accc7b6209ee61047cc
+prerequisite-patch-id: a000f6df974f25e40aa21215faf38fef93c7f02c
 prerequisite-patch-id: 7e9e23a5daadb804ad78accabceaab91674a1ae4
+prerequisite-patch-id: cda94d0ad4944e98d6e20425da88ed6a536538d0
+prerequisite-patch-id: 72a03796f6fae03ec572fed6a0cb7e726ba3a886
+prerequisite-patch-id: a0bad4b3394548135ecb956805c043fff393c7f0
 -- 
 2.50.1 (Apple Git-155)
 

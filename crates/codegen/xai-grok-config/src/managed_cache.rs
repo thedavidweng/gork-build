@@ -10,8 +10,9 @@ use std::path::Path;
 
 use crate::paths::user_grok_home;
 
-/// Sync marker; staleness keys on this, not mtimes.
-const MANAGED_CONFIG_CACHE_FILE: &str = "managed_config_cache.json";
+/// Sync marker; staleness keys on this, not mtimes. Public so removal code can name it
+/// apart from the policy artifacts (removed last).
+pub const MANAGED_CONFIG_CACHE_FILE: &str = "managed_config_cache.json";
 
 /// The on-disk marker: unsigned, detects only deletion / identity change, not
 /// in-place edits (see the module doc).
@@ -84,10 +85,11 @@ fn managed_deployment_id_at(home: &Path, key_fingerprint: &str) -> Option<String
     if cache.key_fingerprint.as_deref() != Some(key_fingerprint) {
         return None;
     }
-    cache.principal.filter(|p| !p.trim().is_empty())
+    normalize_identity(cache.principal.as_deref())
 }
 
-fn mark_managed_config_synced_at(home: &Path, marker: SyncMarker<'_>) {
+/// [`mark_managed_config_synced`] for an explicit `home` (apply-lock holder: same dir as lock).
+pub fn mark_managed_config_synced_at(home: &Path, marker: SyncMarker<'_>) {
     let SyncMarker {
         principal,
         had_managed_config,
@@ -101,11 +103,12 @@ fn mark_managed_config_synced_at(home: &Path, marker: SyncMarker<'_>) {
         .ok();
     let cache = ManagedConfigCache {
         synced_at,
-        principal: principal.map(str::to_owned),
-        // What THIS sync served, not on-disk presence — a confirmed switch already evicted any prior files.
+        // Blank → None: marker must never record "unknown" as a tenant.
+        principal: normalize_identity(principal),
+        // What THIS sync served (not on-disk); switch already evicted priors.
         had_managed_config,
         had_requirements,
-        key_fingerprint: key_fingerprint.map(str::to_owned),
+        key_fingerprint: normalize_identity(key_fingerprint),
         fail_closed,
     };
     match serde_json::to_string(&cache) {
@@ -146,21 +149,10 @@ fn read_managed_config_cache(home: &Path) -> Option<ManagedConfigCache> {
     }
 }
 
-/// A confirmed identity switch vs the marker — both sides of a dimension present and differing (team id or fingerprint).
-/// Callers evict prior artifacts on true; a missing marker / `None` / pre-upgrade never counts (first sync / signed-out / legacy never evict).
-/// A blank/whitespace value on either side of either dimension (principal or key fingerprint)
-/// is "unknown", not a distinct tenant — a malformed `auth.json` parse blip must not confirm a
-/// switch and shed a real tenant's policy.
-pub fn managed_config_identity_changed(
-    new_principal: Option<&str>,
-    new_key_fingerprint: Option<&str>,
-) -> bool {
-    user_grok_home().is_some_and(|home| {
-        managed_config_identity_changed_at(&home, new_principal, new_key_fingerprint)
-    })
-}
-
-fn managed_config_identity_changed_at(
+/// Confirmed identity switch vs the marker (both sides of a dimension known and differing).
+/// Missing marker / blank / pre-upgrade never counts. Callers evict prior artifacts on true.
+/// Takes the apply-lock holder's `home` (same dir as the lock).
+pub fn managed_config_identity_changed_at(
     home: &Path,
     new_principal: Option<&str>,
     new_key_fingerprint: Option<&str>,
@@ -168,41 +160,78 @@ fn managed_config_identity_changed_at(
     let Some(cache) = read_managed_config_cache(home) else {
         return false;
     };
-    let principal_changed = matches!(
-        (cache.principal.as_deref(), new_principal),
-        (Some(old), Some(new))
-            if !old.trim().is_empty() && !new.trim().is_empty() && old != new
-    );
-    let key_changed = matches!(
-        (cache.key_fingerprint.as_deref(), new_key_fingerprint),
-        (Some(old), Some(new))
-            if !old.trim().is_empty() && !new.trim().is_empty() && old != new
-    );
-    principal_changed || key_changed
+    confirmed_switch(cache.principal.as_deref(), new_principal).is_some()
+        || confirmed_switch(cache.key_fingerprint.as_deref(), new_key_fingerprint).is_some()
+}
+
+/// Present non-blank value, else `None` (blank/whitespace is "unknown", not a tenant). Untrimmed.
+fn known(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// [`known`] then trim — the one normalization for storing or deriving an identity
+/// (whitespace is not identity). Shared with the shell's identity derivation.
+pub fn normalize_identity(value: Option<&str>) -> Option<String> {
+    known(value).map(|v| v.trim().to_owned())
+}
+
+/// Both sides known and differing after trim (older markers may be untrimmed). Returns recorded value.
+fn confirmed_switch<'a>(recorded: Option<&'a str>, current: Option<&str>) -> Option<&'a str> {
+    match (known(recorded), known(current)) {
+        (Some(old), Some(new)) if old.trim() != new.trim() => Some(old),
+        _ => None,
+    }
+}
+
+/// Offline tenant-purge detector: confirmed team switch vs marker → evicted principal.
+/// Key-scoped markers never confirm (key owns the machine's policy, not the team).
+pub fn confirmed_team_switch(new_team_id: &str) -> Option<String> {
+    user_grok_home().and_then(|home| confirmed_team_switch_at(&home, new_team_id))
+}
+
+/// [`confirmed_team_switch`] for an explicit `home` (purge-lock holder: same dir as delete).
+pub fn confirmed_team_switch_at(home: &Path, new_team_id: &str) -> Option<String> {
+    let cache = read_managed_config_cache(home)?;
+    if known(cache.key_fingerprint.as_deref()).is_some() {
+        return None;
+    }
+    confirmed_switch(cache.principal.as_deref(), Some(new_team_id)).map(str::to_owned)
 }
 
 /// True when an artifact the marker recorded serving is now absent. Only served artifacts count, so a config-less
 /// principal (or legacy marker) isn't misread as stale. Detects deletion, not edits.
 fn cache_missing_required_artifact(cache: &ManagedConfigCache, home: &Path) -> bool {
-    (cache.had_requirements && !home.join("requirements.toml").exists())
-        || (cache.had_managed_config && !home.join("managed_config.toml").exists())
+    (cache.had_requirements && !home.join(crate::loader::REQUIREMENTS_FILENAME).exists())
+        || (cache.had_managed_config && !home.join(crate::loader::MANAGED_CONFIG_FILENAME).exists())
 }
 
 /// Whether the cached principal differs from the team serving now — the team dimension only.
 /// Deploy-key identity is verified by fingerprint ([`cache_key_fingerprint_mismatch`]); `None` never fires.
+/// Trim-aware (same rule as marker write): whitespace alone is not a mismatch.
 fn cache_identity_mismatch(cache: &ManagedConfigCache, identity: &ServingIdentity) -> bool {
     match identity {
-        ServingIdentity::Team(team_id) => cache.principal.as_deref() != Some(team_id.as_str()),
+        ServingIdentity::Team(team_id) => match (
+            known(cache.principal.as_deref()),
+            known(Some(team_id.as_str())),
+        ) {
+            // Both blank → no team to compare.
+            (None, None) => false,
+            // Both known → trim-compare.
+            (Some(a), Some(b)) => a.trim() != b.trim(),
+            // One-sided: treat as mismatch (first install / cleared principal field).
+            _ => true,
+        },
         ServingIdentity::DeploymentKey { .. } | ServingIdentity::None => false,
     }
 }
 
 /// Whether the configured deployment key differs from the cache's, by one-way fingerprint (never the raw key) —
 /// the only identity verifiable offline. A pre-upgrade marker (no fingerprint) never fires; only a *changed* key.
+/// Trim-aware; both sides must be known (unlike the team principal path).
 fn cache_key_fingerprint_mismatch(cache: &ManagedConfigCache, identity: &ServingIdentity) -> bool {
     match identity {
         ServingIdentity::DeploymentKey { fingerprint } => {
-            matches!(cache.key_fingerprint.as_deref(), Some(recorded) if recorded != fingerprint)
+            confirmed_switch(cache.key_fingerprint.as_deref(), Some(fingerprint.as_str())).is_some()
         }
         ServingIdentity::Team(_) | ServingIdentity::None => false,
     }

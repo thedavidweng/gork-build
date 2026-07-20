@@ -32,10 +32,10 @@ use super::{PagerArgs, PagerTerminal, acp_handler, dispatch, effects};
 pub(crate) struct TerminalState {
     pub is_control_mode: bool,
     pub screen_mode: super::ScreenMode,
-    /// This process was re-exec'd by `/minimal` (one-shot env override, already
-    /// consumed). Queues the minimal welcome card so the viewport re-anchors at
-    /// the top of the freshly cleared main screen.
+    /// One-shot `/minimal` re-exec (env override already consumed).
     pub relaunched_into_minimal: bool,
+    /// One-shot `/fullscreen` re-exec (env override already consumed).
+    pub relaunched_into_fullscreen: bool,
     /// Do NOT re-resolve via `theme::cache::resolve_initial_theme()` here:
     /// its OSC 11 fallback reads stdin and competes with the input reader.
     pub initial_theme: ThemeKind,
@@ -501,13 +501,13 @@ pub(crate) async fn run(
     // (`apply_app_scoped_gates` / `ensure_dashboard_state`); the welcome prompt
     // already exists, so inject here.
     app.welcome_prompt.set_screen_mode(term_state.screen_mode);
-    // Screen-mode relaunch into minimal (`/minimal` from fullscreen): queue the
-    // same top-of-screen welcome card `/new` uses so the first draw re-homes the
-    // viewport to row 0 and the resumed session starts cleanly under it. The
-    // `is_minimal` guard covers a Minimal→Inline probe downgrade in
-    // `init_terminal`, where the card must not be queued.
     if app.screen_mode.is_minimal() && term_state.relaunched_into_minimal {
         app.minimal_state.welcome_pending = true;
+    }
+    if term_state.relaunched_into_minimal && app.screen_mode.is_minimal() {
+        app.screen_mode_switch_hint = Some("Switched to minimal mode · /fullscreen to go back");
+    } else if term_state.relaunched_into_fullscreen && !app.screen_mode.is_minimal() {
+        app.screen_mode_switch_hint = Some("Switched to fullscreen mode · /minimal to go back");
     }
     let remote_permission_mode = remote_settings
         .as_ref()
@@ -607,14 +607,7 @@ pub(crate) async fn run(
     app.plugin_cta_enabled = xai_grok_config::env_bool("GROK_PLUGIN_CTA")
         .or_else(|| remote_settings.as_ref().and_then(|s| s.plugin_cta))
         .unwrap_or(false);
-    // Voice is GA-on by default. Remote `voice_mode_enabled: false` is a kill
-    // switch; `GROK_VOICE_MODE` overrides for local dev (env > remote > default on).
-    // Free/X Basic still hit SuperGrok upsell via tier gates (separate).
-    let voice_mode_enabled = crate::app::resolve_voice_mode_enabled(
-        xai_grok_config::env_bool("GROK_VOICE_MODE"),
-        remote_settings.as_ref().and_then(|s| s.voice_mode_enabled),
-    );
-    app.apply_voice_mode_enabled(voice_mode_enabled);
+    // Voice is applied after auth_meta so API-key detection is accurate.
     app.session_picker_grouped = std::env::var("GROK_SESSION_PICKER_GROUPED")
         .ok()
         .and_then(|v| match v.as_str() {
@@ -723,12 +716,22 @@ pub(crate) async fn run(
         app.is_api_key_auth = app.auth_methods.iter().any(|m| {
             m.id().0.as_ref() == xai_grok_shell::agent::auth_method::XAI_API_KEY_METHOD_ID
         });
-        // No AuthMeta on this path — hide `/usage` and enable voice for API keys.
+        // No AuthMeta on this path — hide `/usage` for API keys.
         if app.is_api_key_auth {
             app.usage_visible = false;
-            app.ensure_voice_for_api_key();
         }
     }
+
+    // After auth so API-key + managed policy resolve correctly.
+    let voice_mode_enabled = crate::app::resolve_voice_mode_live(
+        remote_settings.as_ref().and_then(|s| s.voice_mode_enabled),
+        app.is_api_key_auth,
+    );
+    if !voice_mode_enabled {
+        app.voice_reset();
+        app.voice_ui_active = false;
+    }
+    app.apply_voice_mode_enabled(voice_mode_enabled);
 
     // Fallback: prefetch may have gate info the shell's AuthMeta missed.
     // Errs on the side of blocking if stale.
@@ -778,7 +781,13 @@ pub(crate) async fn run(
             crate::notifications::load_notification_config(raw),
         );
         if let Some(table) = raw.as_table() {
-            app.voice_config = xai_grok_voice::VoiceConfig::from_config_table(table);
+            // Voice inherits the same resolved endpoints base as chat
+            // (config > GROK_XAI_API_BASE_URL env > default).
+            let endpoints_base =
+                xai_grok_shell::agent::config::EndpointsConfig::from_config_value(raw)
+                    .xai_api_base_url;
+            app.voice_config =
+                xai_grok_voice::VoiceConfig::from_config_table(table, Some(&endpoints_base));
         }
     }
     // Stamp request-identity headers so the STT handshake attributes voice usage
@@ -957,9 +966,12 @@ pub(crate) async fn run(
         let wayland_clipboard_warning = all_warnings
             .iter()
             .find(|w| w.category == crate::diagnostics::WarningCategory::WaylandNoDataControl);
+        let sandbox_profile_warning =
+            crate::diagnostics::sandbox_profile_conflict_warning(&app.cwd);
         app.startup_warnings = crate::diagnostics::assemble_startup_warnings(
             wezterm_warning.as_ref(),
             wayland_clipboard_warning,
+            sandbox_profile_warning.as_ref(),
             crate::diagnostics::summarize_warnings(&all_warnings)
                 .into_iter()
                 .collect(),
@@ -975,6 +987,7 @@ pub(crate) async fn run(
         app.last_known_terminal_rows,
     );
     initial_config.show_timestamps = crate::appearance::cache::load_timestamps();
+    initial_config.show_timeline = crate::appearance::cache::load_show_timeline();
     let tick_interval = initial_config.animation.tick_interval();
     crate::appearance::set_tab_width(initial_config.scrollback.display.tab_width);
     app.set_appearance(initial_config);
@@ -982,6 +995,17 @@ pub(crate) async fn run(
     // Seed app state from disk once at the I/O boundary so dispatch
     // stays sans-IO.
     app.current_ui = load_initial_ui_config();
+    // Field-tolerant: a whole-`UiConfig` default (malformed unrelated `[ui]`
+    // field) must not wipe a valid `show_timeline` or leave appearance /
+    // cache / `current_ui` disagreeing — `/timeline` and the rail all read
+    // the same canonical value after this sync + `prime` below.
+    let show_timeline = crate::appearance::cache::load_show_timeline();
+    app.current_ui.show_timeline = Some(show_timeline);
+    if app.appearance.show_timeline != show_timeline {
+        let mut config = app.appearance.clone();
+        config.show_timeline = show_timeline;
+        app.set_appearance(config);
+    }
     // Disk load replaces `current_ui`. Assign one policy-clamped resolved
     // launch mode unconditionally (CLI > TOML > remote > Ask) so disk Auto
     // cannot win over `--permission-mode ask`, and a policy-clamped remote
@@ -2007,6 +2031,7 @@ pub(crate) async fn run(
                 // `PromptWidget.compact`).
                 config.prompt.compact = app.appearance.prompt.compact;
                 config.show_timestamps = app.appearance.show_timestamps;
+                config.show_timeline = app.appearance.show_timeline;
                 tick_interval = config.animation.tick_interval();
                 crate::appearance::set_tab_width(config.scrollback.display.tab_width);
                 app.set_appearance(config);

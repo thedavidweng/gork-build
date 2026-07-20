@@ -58,8 +58,9 @@ pub struct RelayConfig {
 }
 impl RelayConfig {
     /// Session gate: builds only for a grok.com first-party session
-    /// (`is_xai_auth`: x.ai-issuer OIDC) with a non-empty bearer. BYOK/ApiKey,
-    /// External, enterprise (non-x.ai) OIDC, and deprecated WebLogin get `None`
+    /// (`is_xai_auth`: x.ai-issuer OIDC or external credential) with a
+    /// non-empty bearer. BYOK/ApiKey, non-x.ai issuers (enterprise OIDC,
+    /// third-party external providers), and deprecated WebLogin get `None`
     /// (relay-off; the leader still serves clients over IPC).
     pub(crate) fn for_session(
         session: &GrokAuth,
@@ -776,7 +777,7 @@ mod tests {
         }
     }
     #[test]
-    fn for_session_builds_only_for_xai_oidc() {
+    fn for_session_builds_only_for_xai_issuer() {
         use crate::auth::XAI_OAUTH2_ISSUER;
         let cfg = GrokComConfig::default();
         let builds = |a: &GrokAuth| RelayConfig::for_session(a, &cfg, None, None).is_some();
@@ -787,6 +788,13 @@ mod tests {
         };
         assert!(xai.is_xai_auth(), "precondition: is_xai_auth");
         assert!(builds(&xai));
+        let external_xai = GrokAuth {
+            auth_mode: AuthMode::External,
+            oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_string()),
+            ..test_auth("ext-bearer")
+        };
+        assert!(external_xai.is_xai_auth(), "precondition: is_xai_auth");
+        assert!(builds(&external_xai));
         assert!(!builds(&GrokAuth {
             key: String::new(),
             ..xai.clone()
@@ -805,6 +813,11 @@ mod tests {
         }));
         assert!(!builds(&GrokAuth {
             auth_mode: AuthMode::Oidc,
+            oidc_issuer: Some("https://login.acme-corp.example/oauth2".to_string()),
+            ..test_auth("k")
+        }));
+        assert!(!builds(&GrokAuth {
+            auth_mode: AuthMode::External,
             oidc_issuer: Some("https://login.acme-corp.example/oauth2".to_string()),
             ..test_auth("k")
         }));

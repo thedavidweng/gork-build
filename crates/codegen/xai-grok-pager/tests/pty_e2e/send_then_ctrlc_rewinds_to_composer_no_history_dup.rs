@@ -34,16 +34,13 @@ async fn send_then_ctrlc_rewinds_to_composer_no_history_dup() {
 
     // The optimistic "❯ " block committed (composer cleared) and the turn is
     // running but pre-first-token — the rewindable window.
-    let block_committed = wait_until(Duration::from_secs(30), || {
-        harness.update(Duration::from_millis(100));
-        block_lines_containing(&harness, REWIND_PROMPT) == 1
-            && !composer_holds(&harness, REWIND_PROMPT)
-    });
-    assert!(
-        block_committed,
-        "prompt block never committed\nscreen:\n{}",
-        harness.screen_contents()
-    );
+    harness
+        .wait_until(
+            "prompt block committed and composer cleared",
+            Duration::from_secs(30),
+            |h| block_lines_containing(h, REWIND_PROMPT) == 1 && !composer_holds(h, REWIND_PROMPT),
+        )
+        .expect("prompt block committed");
     harness
         .wait_for_text("Waiting for response", Duration::from_secs(25))
         .expect("turn running pre-first-token");
@@ -51,16 +48,14 @@ async fn send_then_ctrlc_rewinds_to_composer_no_history_dup() {
     harness.inject_keys(keys::CTRL_C).expect("Ctrl+C rewind");
 
     // Rewind: text back in the composer, scrollback block gone.
-    let rewound = wait_until(Duration::from_secs(25), || {
-        harness.update(Duration::from_millis(100));
-        composer_holds(&harness, REWIND_PROMPT)
-            && block_lines_containing(&harness, REWIND_PROMPT) == 0
-    });
-    assert!(
-        rewound,
-        "expected the prompt back in the composer with its scrollback block removed\nscreen:\n{}",
-        harness.screen_contents()
-    );
+    harness
+        .wait_until_stable(
+            "rewound prompt restored with its scrollback block removed",
+            Duration::from_secs(25),
+            Duration::from_millis(500),
+            |h| composer_holds(h, REWIND_PROMPT) && block_lines_containing(h, REWIND_PROMPT) == 0,
+        )
+        .expect("rewound prompt restored");
     // The rewind is silent — it looks like the prompt was never sent.
     assert!(
         !harness.contains_text("Turn cancelled by user"),

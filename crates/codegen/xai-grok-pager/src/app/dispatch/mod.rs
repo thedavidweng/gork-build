@@ -20,6 +20,7 @@ mod dashboard;
 mod dashboard_telemetry;
 mod import_claude;
 mod interject;
+mod jump;
 mod modes;
 mod notes;
 mod permissions;

@@ -55,9 +55,16 @@ fn matches_trusted_base_url(candidate: &str, trusted_base: &str) -> bool {
 }
 /// True for cli-chat-proxy URLs (production, plus local-dev hosts when the
 /// optional non-production feature is enabled). When that feature is on,
-/// runtime env overrides can extend this trust set.
+/// runtime env overrides can extend this trust set. Loopback is always
+/// accepted (unit tests and local mock servers on arbitrary ports).
 pub fn is_cli_chat_proxy_url(url: &str) -> bool {
     if matches_trusted_base_url(url, crate::env::PROD_CLI_CHAT_PROXY_BASE_URL) {
+        return true;
+    }
+    if let Ok(u) = reqwest::Url::parse(url)
+        && let Some(h) = u.host_str()
+        && (h == "localhost" || h == "127.0.0.1" || h == "::1")
+    {
         return true;
     }
     false

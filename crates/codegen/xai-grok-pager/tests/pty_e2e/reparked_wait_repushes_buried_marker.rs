@@ -26,7 +26,7 @@ const FINAL: &str = "REPARK_FINAL_ANSWER";
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn reparked_wait_repushes_buried_marker() {
     let content = ContentController::start().await.expect("start content");
     // Gates the background command both waits block on (released at the end).
@@ -284,7 +284,9 @@ async fn reparked_wait_repushes_buried_marker() {
             )
         });
 
-    wait_for_turn_idle(&mut harness);
+    harness
+        .wait_for_turn_idle(Duration::from_secs(15))
+        .expect("turn idle");
     assert!(
         !harness.contains_text("panicked"),
         "pager panicked\nscreen:\n{}",

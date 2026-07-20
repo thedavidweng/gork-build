@@ -253,6 +253,10 @@ impl AgentView {
             rewind_points: None,
             inline_edit: None,
             pending_inline_resubmit: None,
+            jump_state: None,
+            timeline_rail: None,
+            timeline_hover: None,
+            timeline_hover_preview: None,
             session_agent_name: None,
             subagent_sessions: HashMap::new(),
             subagent_views: HashMap::new(),
@@ -330,6 +334,7 @@ impl AgentView {
     /// recoverable until [`finish_session_reload`](Self::finish_session_reload)
     /// decides the outcome.
     pub(crate) fn begin_session_reload(&mut self, generation: u64) {
+        self.dismiss_jump_picker();
         if let Some(prev) = self.session_reload.take() {
             tracing::warn!(
                 generation,
@@ -423,10 +428,10 @@ impl AgentView {
     /// load's batch/replay bookkeeping — and defer its results. The window's
     /// pending re-init completion later no-ops (generation gone).
     pub(crate) fn abort_session_reload(&mut self) {
-        if let Some(reload) = self.session_reload.take() {
-            if self.apply_reload_outcome(reload, false) {
-                crate::memory_release::release_retained_memory_with("reload-abort");
-            }
+        if let Some(reload) = self.session_reload.take()
+            && self.apply_reload_outcome(reload, false)
+        {
+            crate::memory_release::release_retained_memory_with("reload-abort");
         }
     }
     /// Finalize the reload window opened for `generation`.

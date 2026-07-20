@@ -24,7 +24,19 @@ LISTEN="127.0.0.1:${PROXY_PORT}"
 echo "$WORKDIR" >"$WORKDIR/workdir.path"
 
 # Destinations that must never appear during a privacy-hard-off smoke session.
-DENY_REGEX='(mixpanel\.com|api\.mixpanel\.com|x\.ai|storage\.googleapis\.com|sentry\.io|ingest\.sentry\.io)'
+# Single source of truth: maint/contracts/network-denylist.txt
+DENYLIST_FILE="${PRIVACY_DENYLIST_FILE:-$ROOT/maint/contracts/network-denylist.txt}"
+if [[ ! -f "$DENYLIST_FILE" ]]; then
+  echo "FAIL: missing network denylist: $DENYLIST_FILE"
+  exit 1
+fi
+DENY_REGEX="$(
+  grep -vE '^[[:space:]]*(#|$)' "$DENYLIST_FILE" | paste -sd'|' - || true
+)"
+if [[ -z "$DENY_REGEX" ]]; then
+  echo "FAIL: empty network denylist: $DENYLIST_FILE"
+  exit 1
+fi
 
 python3 "$ROOT/scripts/privacy_egress_proxy.py" --listen "$LISTEN" --log "$LOG" &
 PROXY_PID=$!

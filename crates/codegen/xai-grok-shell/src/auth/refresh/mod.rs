@@ -13,6 +13,7 @@ use external_refresher::ExternalBinaryRefresher;
 pub(crate) use oidc_refresher::OidcRefresher;
 
 /// Callback for diagnostic log upload on auth refresh failure.
+/// Args: `(log_bytes, auth_token_suffix, user_id)` — path key is user id, never email.
 pub(crate) type DiagnosticUploader =
     Arc<dyn Fn(Vec<u8>, String, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 

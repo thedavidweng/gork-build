@@ -4,6 +4,7 @@
 //! injectable [`TmuxOptionQuery`] trait. Warnings are data-only; the engine
 //! returns `Vec<TerminalWarning>` for downstream banner rendering.
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::notifications::NotificationCondition;
@@ -49,6 +50,7 @@ pub enum WarningCategory {
     WaylandNoDataControl,
     /// Below truecolor: truecolor themes hidden. `/terminal-setup` only.
     LimitedColorSupport,
+    SandboxProfileConflict,
 }
 
 /// A structured startup warning carrying category, human-readable description,
@@ -330,6 +332,30 @@ pub fn wezterm_kitty_keyboard_warning(
     Some(warning)
 }
 
+pub fn sandbox_profile_conflict_warning(workspace: &Path) -> Option<TerminalWarning> {
+    sandbox_profile_conflict_warning_from(xai_grok_sandbox::sandbox_profile_conflicts(workspace))
+}
+
+fn sandbox_profile_conflict_warning_from(conflicts: Vec<String>) -> Option<TerminalWarning> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let profiles = conflicts
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(TerminalWarning {
+        category: WarningCategory::SandboxProfileConflict,
+        message: format!(
+            "Your project sandbox profile conflicts with user config.\nProfile: {profiles}\nProject config: .grok/sandbox.toml\nUser config: ~/.grok/sandbox.toml"
+        ),
+        fix: Some("Using the user profile instead.".to_string()),
+        config_path: None,
+        note: None,
+    })
+}
+
 /// Assemble the welcome-screen startup warning list.
 ///
 /// The WezTerm kitty-keyboard warning (when present) goes **first**: the
@@ -343,8 +369,19 @@ pub fn wezterm_kitty_keyboard_warning(
 pub fn assemble_startup_warnings(
     wezterm_warning: Option<&TerminalWarning>,
     wayland_clipboard_warning: Option<&TerminalWarning>,
+    sandbox_profile_warning: Option<&TerminalWarning>,
     mut summarized: Vec<crate::startup::StartupWarning>,
 ) -> Vec<crate::startup::StartupWarning> {
+    if let Some(w) = sandbox_profile_warning {
+        summarized.insert(
+            0,
+            crate::startup::StartupWarning {
+                severity: crate::startup::WarningSeverity::Warning,
+                message: w.message.clone(),
+                action: w.fix.clone(),
+            },
+        );
+    }
     if wayland_clipboard_warning.is_some() {
         summarized.insert(
             0,
@@ -1463,7 +1500,7 @@ mod tests {
         // The welcome screen renders only the first warning; the WezTerm
         // banner (broken local input) must displace clipboard advisories.
         let w = wezterm_kitty_keyboard_warning(&wezterm_ctx(), false, None).unwrap();
-        let out = assemble_startup_warnings(Some(&w), None, vec![clipboard_banner()]);
+        let out = assemble_startup_warnings(Some(&w), None, None, vec![clipboard_banner()]);
         assert_eq!(out.len(), 2);
         assert!(
             out[0].message.contains("WezTerm"),
@@ -1475,7 +1512,7 @@ mod tests {
 
     #[test]
     fn no_wezterm_warning_leaves_summarized_untouched() {
-        let out = assemble_startup_warnings(None, None, vec![clipboard_banner()]);
+        let out = assemble_startup_warnings(None, None, None, vec![clipboard_banner()]);
         assert_eq!(out.len(), 1);
         assert!(out[0].message.contains("Clipboard"));
     }
@@ -1485,7 +1522,7 @@ mod tests {
         // `summarize_warnings` is SSH-gated, so the Wayland warning reaches the
         // welcome banner through the assemble bypass instead.
         let w = diagnose_wayland_data_control(true, false, true).unwrap();
-        let out = assemble_startup_warnings(None, Some(&w), vec![clipboard_banner()]);
+        let out = assemble_startup_warnings(None, Some(&w), None, vec![clipboard_banner()]);
         assert_eq!(out.len(), 2);
         assert!(
             out[0].message.contains("focused"),
@@ -1499,11 +1536,40 @@ mod tests {
     fn wezterm_banner_outranks_wayland_banner() {
         let wez = wezterm_kitty_keyboard_warning(&wezterm_ctx(), false, None).unwrap();
         let way = diagnose_wayland_data_control(true, false, true).unwrap();
-        let out = assemble_startup_warnings(Some(&wez), Some(&way), vec![clipboard_banner()]);
+        let out = assemble_startup_warnings(Some(&wez), Some(&way), None, vec![clipboard_banner()]);
         assert_eq!(out.len(), 3);
         assert!(out[0].message.contains("WezTerm"));
         assert!(out[1].message.contains("focused"));
         assert!(out[2].message.contains("Clipboard"));
+    }
+
+    #[test]
+    fn sandbox_profile_conflict_warning_reports_conflicts() {
+        assert!(sandbox_profile_conflict_warning_from(vec![]).is_none());
+
+        let w = sandbox_profile_conflict_warning_from(vec!["dev".to_string()]).unwrap();
+        assert_eq!(w.category, WarningCategory::SandboxProfileConflict);
+        assert!(
+            w.message
+                .starts_with("Your project sandbox profile conflicts with user config.")
+        );
+        assert!(w.message.contains("Profile: 'dev'"));
+        assert_eq!(w.fix.as_deref(), Some("Using the user profile instead."));
+    }
+
+    #[test]
+    fn sandbox_banner_sits_below_terminal_banners() {
+        let sandbox = sandbox_profile_conflict_warning_from(vec!["dev".to_string()]).unwrap();
+
+        let out = assemble_startup_warnings(None, None, Some(&sandbox), vec![]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].message.contains("sandbox profile"));
+
+        let wez = wezterm_kitty_keyboard_warning(&wezterm_ctx(), false, None).unwrap();
+        let out = assemble_startup_warnings(Some(&wez), None, Some(&sandbox), vec![]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].message.contains("WezTerm"));
+        assert!(out[1].message.contains("sandbox profile"));
     }
 
     // -- Warning ordering: clipboard before DCS --------------------------------

@@ -34,6 +34,31 @@ pub(super) fn with_active_agent(app: &mut AppView, f: impl FnOnce(&mut AgentView
     }
 }
 
+/// Open `url` via the system browser, falling back to a visible URL when the
+/// browser cannot open (headless VM / missing opener). Prefer this over raw
+/// `open_url_if_safe` for user-initiated billing/upgrade CTAs.
+///
+/// When no agent is active (welcome/gate screen), still attempts the open and
+/// falls back to clipboard + toast.
+pub(super) fn open_url_or_show(app: &mut AppView, url: &str) {
+    if let Some(agent) = get_active_agent_mut(app) {
+        agent.open_url_or_show(url);
+        return;
+    }
+
+    use crate::app::link_opener::{OpenUrlResult, browser_unavailable_message, try_open_url};
+    use crate::terminal::hyperlinks::SchemeFilter;
+
+    match try_open_url(url, SchemeFilter::Standard) {
+        OpenUrlResult::Opened | OpenUrlResult::RejectedScheme => {}
+        OpenUrlResult::BrowserUnavailable => {
+            let _ = crate::clipboard::SystemClipboard::try_set(url);
+            // No scrollback on the welcome screen — toast carries the URL.
+            app.show_toast(&browser_unavailable_message(url));
+        }
+    }
+}
+
 /// Get a shared reference to the active agent view (if any).
 pub(super) fn get_active_agent(app: &AppView) -> Option<&AgentView> {
     if let ActiveView::Agent(id) = app.active_view
@@ -163,6 +188,17 @@ pub(super) fn surface_yolo_launch_block_notice(app: &mut AppView, target: AgentI
                 warning.to_string(),
             ));
         agent.show_toast(warning);
+    }
+    surface_screen_mode_switch_hint(app, target);
+}
+
+/// Surface a one-shot switch-back toast after a screen-mode relaunch (fullscreen only).
+pub(super) fn surface_screen_mode_switch_hint(app: &mut AppView, target: AgentId) {
+    if let Some(hint) = app.screen_mode_switch_hint.take()
+        && !app.screen_mode.is_minimal()
+        && let Some(agent) = app.agents.get_mut(&target)
+    {
+        agent.show_toast(hint);
     }
 }
 

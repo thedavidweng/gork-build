@@ -420,7 +420,7 @@ pub struct ClipboardTextReadError;
 
 /// Read CLIPBOARD text while distinguishing emptiness from failure.
 pub fn system_clipboard_read_text() -> Result<Option<String>, ClipboardTextReadError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(text) = test_support::hook_text_result() {
         return text;
     }
@@ -438,7 +438,7 @@ pub fn system_clipboard_get() -> Option<String> {
 /// Read X11 PRIMARY text for an unmodified Linux middle-button press.
 #[cfg(target_os = "linux")]
 pub fn system_primary_selection_get() -> Option<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(available) = test_support::hook_x11_primary_available() {
         if !available {
             return None;
@@ -705,7 +705,7 @@ pub fn system_clipboard_probe_attachments(
     if !attachment_probe_would_run(clipboard_text) {
         return Ok((None, None));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(canned) = test_support::hook_attachments() {
         return canned;
     }
@@ -786,7 +786,7 @@ pub use xai_grok_shared::clipboard::ImageData;
 /// single native pass (macOS native, sub-millisecond, no data read). `(None,
 /// false)` off-macOS or when AppKit cannot be loaded.
 pub fn clipboard_image_snapshot() -> (Option<u64>, bool) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(snapshot) = test_support::hook_image_snapshot() {
         return snapshot;
     }
@@ -799,7 +799,7 @@ pub fn clipboard_image_snapshot() -> (Option<u64>, bool) {
 /// [`clipboard_image_snapshot`] classification. `None` off-macOS.
 pub fn clipboard_change_count() -> Option<u64> {
     // Seam consistency: a hooked snapshot's change_count is the changeCount.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some((change_count, _)) = test_support::hook_image_snapshot() {
         return change_count;
     }
@@ -809,7 +809,7 @@ pub fn clipboard_change_count() -> Option<u64> {
 /// Whether the fast image probe exists on this platform. Gates the
 /// focus-driven clipboard-image tip so non-macOS never probes.
 pub fn clipboard_image_probe_supported() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(supported) = test_support::hook_image_probe_supported() {
         return supported;
     }
@@ -880,7 +880,7 @@ pub fn system_clipboard_get_image() -> Option<ImageData> {
 /// (the off-thread probe reads the REAL pasteboard there), so tests exercise
 /// deferral by asserting the enqueued effect and then driving
 /// `complete_clipboard_attachment_paste` directly with a canned outcome.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{ClipboardProbeError, ClipboardTextReadError, ImageData};
     use std::cell::{Cell, RefCell};
@@ -1039,9 +1039,9 @@ pub mod test_support {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub use test_support::primary_selection_read_call_count;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use test_support::{
     ClipboardProbeHook, clear_clipboard_probe_hook, clipboard_probe_call_count,
     set_clipboard_probe_hook,

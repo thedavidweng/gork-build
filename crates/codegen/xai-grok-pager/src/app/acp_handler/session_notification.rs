@@ -546,30 +546,30 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     )),
                 };
                 agent.scrollback.push_block(block);
-            } else if let Some(eid) = entry_id {
-                if let Some(entry) = agent.scrollback.get_by_id_mut(eid) {
-                    if let RenderBlock::Subagent(ref mut sb) = entry.block {
-                        match status.as_str() {
-                            "completed" => {
-                                sb.kind = crate::scrollback::blocks::SubagentBlockKind::Completed {
-                                    elapsed: elapsed_dur,
-                                };
-                            }
-                            "cancelled" => {
-                                sb.kind = crate::scrollback::blocks::SubagentBlockKind::Cancelled {
-                                    elapsed: elapsed_dur,
-                                };
-                            }
-                            _ => {
-                                sb.kind = crate::scrollback::blocks::SubagentBlockKind::Failed {
-                                    elapsed: elapsed_dur,
-                                    error: error.clone(),
-                                };
-                            }
+            } else if let Some(eid) = entry_id
+                && let Some(entry) = agent.scrollback.get_by_id_mut(eid)
+            {
+                if let RenderBlock::Subagent(ref mut sb) = entry.block {
+                    match status.as_str() {
+                        "completed" => {
+                            sb.kind = crate::scrollback::blocks::SubagentBlockKind::Completed {
+                                elapsed: elapsed_dur,
+                            };
+                        }
+                        "cancelled" => {
+                            sb.kind = crate::scrollback::blocks::SubagentBlockKind::Cancelled {
+                                elapsed: elapsed_dur,
+                            };
+                        }
+                        _ => {
+                            sb.kind = crate::scrollback::blocks::SubagentBlockKind::Failed {
+                                elapsed: elapsed_dur,
+                                error: error.clone(),
+                            };
                         }
                     }
-                    entry.invalidate_cache();
                 }
+                entry.invalidate_cache();
             }
             let mut was_running = false;
             if let Some(info) = agent.subagent_sessions.get_mut(&child_session_id) {

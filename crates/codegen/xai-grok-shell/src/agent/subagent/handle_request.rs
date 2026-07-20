@@ -236,7 +236,7 @@ pub(crate) async fn handle_subagent_request(
         request.runtime_overrides.model_override_provenance,
         resume_source.is_some(),
         &ctx.available_models,
-        ctx.auth_manager.auth_mode().is_some_and(|mode| mode.is_session_auth()),
+        ctx.auth_manager.current_or_expired().is_some_and(|a| a.is_session_auth()),
     ) {
         pending_guard.set_error(error.clone());
         send_failure(request, &error);
@@ -544,17 +544,15 @@ pub(crate) async fn handle_subagent_request(
         forked_conversation,
         inherited_prefix_len.unwrap_or(0),
     );
-    if crate::session::is_cursor_user_template(&definition.user_message_template)
-        && context_source != InitialContextSource::Resumed && !verbatim_mirror_fork
-    {} else if context_source != InitialContextSource::Resumed && !verbatim_mirror_fork {
-        if let Some(ref pi) = effective_runtime.persona_instructions {
-            let reminder = xai_grok_sampling_types::conversation::ConversationItem::system_reminder(
-                format!("<system-reminder>\n{pi}\n</system-reminder>"),
-            );
-            let insert_at = inherited_prefix_len.min(forked_conversation.len());
-            forked_conversation.insert(insert_at, reminder);
-            inherited_prefix_len += 1;
-        }
+    if context_source != InitialContextSource::Resumed && !verbatim_mirror_fork
+        && let Some(ref pi) = effective_runtime.persona_instructions
+    {
+        let reminder = xai_grok_sampling_types::conversation::ConversationItem::system_reminder(
+            format!("<system-reminder>\n{pi}\n</system-reminder>"),
+        );
+        let insert_at = inherited_prefix_len.min(forked_conversation.len());
+        forked_conversation.insert(insert_at, reminder);
+        inherited_prefix_len += 1;
     }
     let effective_source_str = match &context_source {
         InitialContextSource::New => "new",
@@ -1208,6 +1206,7 @@ pub(crate) async fn handle_subagent_request(
     };
     if cancel_token.is_cancelled() {
         pending_guard.defuse();
+        ctx.workspace_ops.end_local_session(child_session_id.0.as_ref());
         cancel_pending_subagent_at_promote(
                 request,
                 &child_handle,
@@ -1889,6 +1888,7 @@ pub(crate) async fn handle_subagent_request(
         (None, None) => {}
     }
     let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown);
+    ctx.workspace_ops.end_local_session(child_session_id.0.as_ref());
     let mut disposed_snapshot_ref: Option<String> = None;
     let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {

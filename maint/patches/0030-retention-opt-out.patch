@@ -18,7 +18,7 @@ Gork-Risk: critical
  8 files changed, 119 insertions(+), 122 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager/src/settings/defs.rs b/crates/codegen/xai-grok-pager/src/settings/defs.rs
-index 63443570680a68b4af391b6220ec88afed57b0f7..eed5dceac0f1f1b22de356d6da3a0cecb2a0b160 100644
+index 92fd2bdb3a707e16bd3baa8ca99106f9e93174a0..95369019cb53e1c29fb57985de5f25fc569682d6 100644
 --- a/crates/codegen/xai-grok-pager/src/settings/defs.rs
 +++ b/crates/codegen/xai-grok-pager/src/settings/defs.rs
 @@ -130,18 +130,11 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
@@ -45,7 +45,7 @@ index 63443570680a68b4af391b6220ec88afed57b0f7..eed5dceac0f1f1b22de356d6da3a0cec
  
  // ---------------------------------------------------------------------------
  // Plan-mode catalog.
-@@ -1045,16 +1038,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
+@@ -1104,16 +1097,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
              restart_required: false,
              hidden_in_minimal: false,
          },
@@ -65,7 +65,7 @@ index 63443570680a68b4af391b6220ec88afed57b0f7..eed5dceac0f1f1b22de356d6da3a0cec
              keywords: &[
                  "privacy",
                  "data",
-@@ -1063,11 +1053,10 @@ pub fn default_settings() -> Vec<SettingMeta> {
+@@ -1122,11 +1112,10 @@ pub fn default_settings() -> Vec<SettingMeta> {
                  "retention",
                  "telemetry",
                  "training",
@@ -78,7 +78,7 @@ index 63443570680a68b4af391b6220ec88afed57b0f7..eed5dceac0f1f1b22de356d6da3a0cec
                  choices: CODING_DATA_SHARING_CHOICES,
                  supports_preview: false,
              },
-@@ -1221,12 +1210,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
+@@ -1280,12 +1269,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
              category: SettingCategory::Advanced,
              owner: SettingOwner::Shell,
              label: "Auto-update",
@@ -96,7 +96,7 @@ index 63443570680a68b4af391b6220ec88afed57b0f7..eed5dceac0f1f1b22de356d6da3a0cec
              hidden_in_minimal: false,
          },
 diff --git a/crates/codegen/xai-grok-pager/src/settings/registry.rs b/crates/codegen/xai-grok-pager/src/settings/registry.rs
-index dd7c798a54b128f7dd79f588a1f6fb7fbac2ccf1..6900b82d9fcb3e0ec91f1fb8ad3ec021af718273 100644
+index 7e95ee999edc484147fb3611ba715c6efb6a69b6..0afa095219f551cba2099813637f1bcb4b7b2c96 100644
 --- a/crates/codegen/xai-grok-pager/src/settings/registry.rs
 +++ b/crates/codegen/xai-grok-pager/src/settings/registry.rs
 @@ -257,7 +257,8 @@ pub struct PagerLocalSnapshot {
@@ -119,7 +119,7 @@ index dd7c798a54b128f7dd79f588a1f6fb7fbac2ccf1..6900b82d9fcb3e0ec91f1fb8ad3ec021
              plan_mode_active: false,
              show_tips: None,
              auto_update: None,
-@@ -638,7 +640,7 @@ pub fn current_value_for(
+@@ -652,7 +654,7 @@ pub fn current_value_for(
          )),
          // CLI batch: snapshot mirrors; `None` → effective default `true`.
          "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
@@ -128,7 +128,7 @@ index dd7c798a54b128f7dd79f588a1f6fb7fbac2ccf1..6900b82d9fcb3e0ec91f1fb8ad3ec021
          // fork_secondary_model: baseline value folds to empty string.
          "fork_secondary_model" => Some(SettingValue::String({
              let baseline = xai_grok_shell::models::default_model();
-@@ -831,15 +833,12 @@ mod tests {
+@@ -854,15 +856,12 @@ mod tests {
                          "max_thoughts_width default drifts from UiConfig::default()",
                      );
                  }
@@ -147,7 +147,7 @@ index dd7c798a54b128f7dd79f588a1f6fb7fbac2ccf1..6900b82d9fcb3e0ec91f1fb8ad3ec021
                      );
                  }
                  // CLI batch: fields live on CliConfig, not UiConfig.
-@@ -849,9 +848,9 @@ mod tests {
+@@ -872,9 +871,9 @@ mod tests {
                  }
                  ("auto_update", SettingKind::Bool { default }) => {
                      assert!(
@@ -209,10 +209,10 @@ index d0dceb35ad33327cae0dc39702bfddc3510730b6..460b752c5441a77689dd38c147491100
          }
      }
 diff --git a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
-index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c9ce9b311 100644
+index 9a418c9fd3efebe27619db2615cec7240a7cdbbd..493c134e6c2b64f5101fc943c4552563a61af8fc 100644
 --- a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
 +++ b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
-@@ -1712,14 +1712,14 @@ fn defaults_round_trip_through_registry() {
+@@ -1750,14 +1750,14 @@ fn defaults_round_trip_through_registry() {
              "scroll_lines" => SettingValue::Int(3),
              "invert_scroll" => SettingValue::Bool(false),
              "display_refresh_auto_cadence" => SettingValue::Bool(false),
@@ -229,7 +229,7 @@ index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c
              "fork_secondary_model" => SettingValue::String(String::new()),
              "show_thinking_blocks" => SettingValue::Bool(true),
              "prompt_suggestions" => SettingValue::Bool(true),
-@@ -4451,8 +4451,8 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
+@@ -4491,8 +4491,8 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
              assert_eq!(*key, "coding_data_sharing");
              assert_eq!(
                  original_value,
@@ -240,7 +240,7 @@ index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c
              );
          }
          other => panic!("expected PickingEnum mode, got {other:?}"),
-@@ -4595,7 +4595,7 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
+@@ -4635,7 +4635,7 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
      }
  }
  
@@ -249,7 +249,7 @@ index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c
  #[test]
  fn pr9_coding_data_sharing_choices_use_canonical_strings() {
      let reg = SettingsRegistry::defaults();
-@@ -4605,19 +4605,9 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
+@@ -4645,19 +4645,9 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
          _ => panic!("coding_data_sharing must be Enum"),
      };
      assert_eq!(
@@ -272,7 +272,7 @@ index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c
      );
  }
  
-@@ -5993,14 +5983,13 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
+@@ -6175,14 +6165,13 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
      use xai_grok_pager::settings::current_value_for;
      let ui = UiConfig::default();
      let pager = PagerLocalSnapshot::default();
@@ -290,10 +290,10 @@ index 689ae0bd3523d69f7933375acab85c1fd4bbab98..d228d33b6b6655aa8afb8f25487cd13c
      }
  }
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager.rs b/crates/codegen/xai-grok-shell/src/auth/manager.rs
-index aa5b1c46e8606ddf9f2bc4f25d210eec363a8ca3..ce6f83dfa8e13bc6a67b000af01baa4d75ddd32c 100644
+index 417994c2455cca9653e0afa775188f8ccb0e9186..2fd3d4856785ce62264d211a40c432cb72857ce4 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager.rs
-@@ -716,10 +716,16 @@ impl AuthManager {
+@@ -732,10 +732,16 @@ impl AuthManager {
      /// [`Self::current_or_expired`] because neither flag changes on token
      /// expiry and `current()` returns `None` during the refresh window.
      ///
@@ -313,7 +313,7 @@ index aa5b1c46e8606ddf9f2bc4f25d210eec363a8ca3..ce6f83dfa8e13bc6a67b000af01baa4d
          self.current_or_expired()
              .is_some_and(|a| a.is_data_collection_disabled())
      }
-@@ -729,7 +735,12 @@ impl AuthManager {
+@@ -745,7 +751,12 @@ impl AuthManager {
      /// cleared auth (e.g. after a mid-session `/logout`) counts as
      /// disabled — nothing may leave the machine while the privacy state is
      /// unknown.
@@ -326,7 +326,7 @@ index aa5b1c46e8606ddf9f2bc4f25d210eec363a8ca3..ce6f83dfa8e13bc6a67b000af01baa4d
          self.current_or_expired()
              .is_some_and(|a| !a.is_data_collection_disabled())
      }
-@@ -1318,7 +1329,7 @@ impl AuthManager {
+@@ -1329,7 +1340,7 @@ impl AuthManager {
              }
              TokenType::LegacySession => {
                  // Deliberate side effect: re-read auth.json under the
@@ -336,7 +336,7 @@ index aa5b1c46e8606ddf9f2bc4f25d210eec363a8ca3..ce6f83dfa8e13bc6a67b000af01baa4d
                  // the on-disk credentials. `pick_up_sibling_token` only
                  // mutates inner when the disk holds a *different valid*
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
-index db11e1651d0eec1a8c4d0522047fb95ba656cae7..c48ad382c3ce8482b0f93bd905b02b4f71c37477 100644
+index 07e5075ae0ecae7abc3aee58cdf9b70a121d309a..8586a8fdbf1ae3203ee58e3e5839a63b755ae2b5 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
 @@ -443,68 +443,54 @@ fn clear_does_not_remove_legacy_scope() {
@@ -471,7 +471,7 @@ index db11e1651d0eec1a8c4d0522047fb95ba656cae7..c48ad382c3ce8482b0f93bd905b02b4f
      let err = mgr.auth().await.unwrap_err();
      assert!(
          matches!(err, AuthError::NotLoggedIn),
-@@ -2904,9 +2885,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
+@@ -2908,9 +2889,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
      assert_eq!(auth.principal_type.as_deref(), Some("Team"));
      assert_eq!(auth.principal_id.as_deref(), Some("team-1"));
      assert!(auth.is_zdr_team());
@@ -485,7 +485,7 @@ index db11e1651d0eec1a8c4d0522047fb95ba656cae7..c48ad382c3ce8482b0f93bd905b02b4f
  }
  
 diff --git a/crates/codegen/xai-grok-shell/src/auth/model.rs b/crates/codegen/xai-grok-shell/src/auth/model.rs
-index 3b8741cd16302aa0b2c13f0c0aaff35d3d1a1bc1..0e10545b8098b6d223b77473b5ce936581e3a0c2 100644
+index 0e4b3d61bb7c4c04515fe3e07648830d2ddbe281..89acee63803585837d4987433073dd934072f3d8 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/model.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/model.rs
 @@ -10,7 +10,7 @@ const DEFAULT_EARLY_INVALIDATION_SECS: u64 = 300; // 5 minutes
@@ -506,7 +506,7 @@ index 3b8741cd16302aa0b2c13f0c0aaff35d3d1a1bc1..0e10545b8098b6d223b77473b5ce9365
      ApiKey,
  }
  
-@@ -162,7 +162,13 @@ impl GrokAuth {
+@@ -175,7 +175,13 @@ impl GrokAuth {
      /// retention. Use this for trace-upload and research-data gates.
      /// Product analytics (`telemetry_enabled`) and user-facing sync
      /// features should use `is_zdr_team()` directly.
@@ -520,7 +520,7 @@ index 3b8741cd16302aa0b2c13f0c0aaff35d3d1a1bc1..0e10545b8098b6d223b77473b5ce9365
          self.is_zdr_team() || self.coding_data_retention_opt_out
      }
  
-@@ -205,7 +211,8 @@ impl Default for GrokAuth {
+@@ -218,7 +224,8 @@ impl Default for GrokAuth {
              organization_role: None,
              user_blocked_reason: None,
              team_blocked_reasons: vec![],
@@ -530,7 +530,7 @@ index 3b8741cd16302aa0b2c13f0c0aaff35d3d1a1bc1..0e10545b8098b6d223b77473b5ce9365
              has_grok_code_access: None,
              refresh_token: None,
              expires_at: None,
-@@ -286,7 +293,7 @@ pub(crate) fn token_suffix(t: &str) -> &str {
+@@ -299,7 +306,7 @@ pub(crate) fn token_suffix(t: &str) -> &str {
  
  /// Look up auth from the store by scope key.
  ///
@@ -591,8 +591,8 @@ index 9161dc76ce6d63b395a12dedac080ce065fc6815..b332a5729ef2e5bdcc70ab177a758762
      }))
  }
 
-base-commit: c1b5909ec707c069f1d21a93917af044e71da0d7
-prerequisite-patch-id: 79b1e58c605978883f3e24694470838c84408deb
+base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
 -- 

@@ -7,6 +7,7 @@
 //! - [`Effect`] — produced by dispatch, consumed by the event loop (async).
 //! - [`TaskResult`] — produced by spawned tasks, fed back into dispatch.
 use super::agent::AgentId;
+use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 /// Typed error for model switch failures. Replaces the raw `String` in
@@ -41,9 +42,7 @@ pub enum Action {
     QuitForUpdate,
     /// Resume the recent foreign session offered on the launch welcome screen.
     ResumeForeignSession,
-    /// Quit and re-exec the pager to reopen the active session in another
-    /// screen mode (`true` = `--minimal`, `false` = fullscreen / non-minimal).
-    /// Driven by `/minimal` and `/fullscreen`.
+    /// Re-exec into the other screen mode (`true` = minimal).
     RelaunchInScreenMode {
         minimal: bool,
     },
@@ -63,6 +62,8 @@ pub enum Action {
     CheckSubscription,
     /// Open an arbitrary URL in the system browser (with scheme validation).
     OpenUrl(String),
+    /// Open a semantic scrollback link.
+    OpenLink(crate::render::osc8::LinkTarget),
     /// Open grok.com managed connectors, appending session teamId when set.
     OpenManagedConnectors,
     /// Cycle to the next visible link (or highlight the first if none selected).
@@ -492,6 +493,8 @@ pub enum Action {
     SetDefaultSelectedPermission(String),
     /// Set the hunk-tracker mode. Payload is the registry canonical string.
     SetHunkTrackerMode(String),
+    /// Set default screen mode (`fullscreen` | `minimal`); restart-required.
+    SetScreenMode(String),
     /// Set the voice capture mode (`toggle` | `hold`). SHELL-owned; persisted to
     /// `[ui].voice_capture_mode`. Takes effect for the next Ctrl+Space press.
     SetVoiceCaptureMode(String),
@@ -506,6 +509,8 @@ pub enum Action {
     SetCompactMode(bool),
     /// Set timestamp display on messages.
     SetTimestamps(bool),
+    /// Set timeline sidebar visibility (per-turn tick rail).
+    SetTimeline(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).
@@ -943,6 +948,12 @@ pub enum Action {
     /// Submit an inline edit: conversation-only rewind to that prompt, then
     /// resubmit the edited text (state lives on `AgentView::inline_edit`).
     InlineEditSubmit,
+    /// Open the `/jump` turn picker.
+    JumpShowPicker,
+    /// Jump to a turn by its prompt's stable id and close the picker.
+    JumpPickerSelect(EntryId),
+    /// Close the picker and restore the stashed viewport.
+    JumpDismiss,
 }
 /// Persist-and-notify semantics for [`Effect::PersistPermissionMode`].
 ///

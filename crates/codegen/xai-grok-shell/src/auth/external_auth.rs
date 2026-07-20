@@ -7,6 +7,10 @@ pub(crate) struct ExternalAuthOutput {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub expires_in: Option<u64>,
+    /// Token issuer. An xAI issuer marks the credential as first-party;
+    /// see [`GrokAuth::is_xai_auth`].
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 /// Parse process output (stdout) into a `GrokAuth`. Accepts bare token or JSON.
@@ -20,23 +24,33 @@ pub(crate) fn parse_output(output: &std::process::Output) -> anyhow::Result<Grok
         anyhow::bail!("produced no output on stdout");
     }
 
-    let (token, refresh_token, expires_at) =
+    let (token, refresh_token, expires_at, issuer) =
         if let Ok(parsed) = serde_json::from_str::<ExternalAuthOutput>(&stdout) {
             tracing::debug!(
                 has_refresh_token = parsed.refresh_token.is_some(),
                 expires_in = ?parsed.expires_in,
+                issuer = ?parsed.issuer,
                 "auth: parsed external provider output as JSON"
             );
             let expires_at = parsed
                 .expires_in
                 .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
-            (parsed.access_token, parsed.refresh_token, expires_at)
+            let issuer = parsed
+                .issuer
+                .map(|i| i.trim().to_owned())
+                .filter(|i| !i.is_empty());
+            (
+                parsed.access_token,
+                parsed.refresh_token,
+                expires_at,
+                issuer,
+            )
         } else {
             tracing::debug!(
                 stdout_len = stdout.len(),
                 "auth: treating output as bare token"
             );
-            (stdout, None, None)
+            (stdout, None, None, None)
         };
 
     Ok(GrokAuth {
@@ -62,7 +76,7 @@ pub(crate) fn parse_output(output: &std::process::Output) -> anyhow::Result<Grok
         has_grok_code_access: None,
         refresh_token,
         expires_at,
-        oidc_issuer: None,
+        oidc_issuer: issuer,
         oidc_client_id: None,
     })
 }
@@ -167,6 +181,46 @@ mod tests {
             stderr: vec![],
         };
         assert!(parse_output(&output).is_err());
+    }
+
+    #[test]
+    fn parse_output_issuer_claim_enables_xai_auth() {
+        let ok = |stdout: &str| std::process::Output {
+            status: std::process::Command::new("true").status().unwrap(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: vec![],
+        };
+
+        // x.ai issuer claim → first-party session (relay-eligible).
+        let auth = parse_output(&ok(
+            r#"{"access_token":"t","expires_in":900,"issuer":"https://auth.x.ai"}"#,
+        ))
+        .unwrap();
+        assert_eq!(auth.oidc_issuer.as_deref(), Some("https://auth.x.ai"));
+        assert!(auth.is_xai_auth());
+
+        // Non-x.ai issuer is stored but stays third-party.
+        let auth = parse_output(&ok(
+            r#"{"access_token":"t","issuer":"https://idp.acme.example"}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            auth.oidc_issuer.as_deref(),
+            Some("https://idp.acme.example")
+        );
+        assert!(!auth.is_xai_auth());
+
+        // Missing / empty / whitespace issuer → None.
+        let auth = parse_output(&ok(r#"{"access_token":"t"}"#)).unwrap();
+        assert_eq!(auth.oidc_issuer, None);
+        assert!(!auth.is_xai_auth());
+        let auth = parse_output(&ok(r#"{"access_token":"t","issuer":"  "}"#)).unwrap();
+        assert_eq!(auth.oidc_issuer, None);
+
+        // Bare-token output never carries an issuer.
+        let auth = parse_output(&ok("bare-token")).unwrap();
+        assert_eq!(auth.oidc_issuer, None);
+        assert!(!auth.is_xai_auth());
     }
 
     #[test]

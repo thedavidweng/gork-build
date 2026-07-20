@@ -139,19 +139,19 @@ pub(crate) fn unified_log_url(
         "https://console.cloud.google.com/storage/browser/_details/{bucket}/{session_id}/turn_{turn_number}/unified_log.jsonl"
     ))
 }
-/// Upload bytes to the `auth-diagnostics/{version}/{email}/{ts}.jsonl` path
+/// Upload bytes to the `auth-diagnostics/{version}/{user_id}/{ts}.jsonl` path
 /// for easy aggregation across users. Used by both the auth refresh failure
 /// uploader and the 401/404 error trace uploader.
 pub(crate) async fn upload_to_auth_diagnostics(
     log_bytes: &[u8],
-    email: &str,
+    user_id: &str,
     upload_method: &crate::session::repo_changes::UploadMethod,
     auth_manager: Arc<crate::auth::AuthManager>,
 ) {
-    let email = email.replace('/', "_");
+    let user_id = user_id.replace('/', "_");
     let ts = chrono::Utc::now().timestamp_millis();
     let version = xai_grok_version::VERSION;
-    let object_path = format!("auth-diagnostics/{version}/{email}/{ts}.jsonl");
+    let object_path = format!("auth-diagnostics/{version}/{user_id}/{ts}.jsonl");
     let config = crate::session::repo_changes::TraceExportConfig {
         bucket_url: None,
         service_account_key: None,
