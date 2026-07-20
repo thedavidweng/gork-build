@@ -7,5 +7,5 @@ source_rev = "2ec0f0c8488842da03a71eeee3c61154957ca919"
 version = "0.2.101"
 
 patchset_revision = 1
-patch_tip = "e365908509d0820ec8f8e51eda57ef0cbae60ee4"
-product_tip = "eb2f7cdf9338b828fb13d9a5f6170d43b0ca1282"
+patch_tip = "d78293ac6f0b1ddfa37246a9cca91bf389980fa0"
+product_tip = "d78293ac6f0b1ddfa37246a9cca91bf389980fa0"
