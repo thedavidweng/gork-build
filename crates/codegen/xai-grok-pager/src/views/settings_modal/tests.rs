@@ -3248,7 +3248,7 @@ fn picker_long_description_wraps_to_multiple_lines() {
     for word in [
         "Allow",
         "account",
-        "retain",
+        "retention",
         "session",
         "training",
         "improvement",
@@ -4735,7 +4735,7 @@ fn two_line_row_with_expansion_renders_three_segments() {
     // The row label is on line 1.
     let label_line = buf_row_text(&buf, rect.y, area.x, area.width);
     assert!(
-        label_line.contains("Coding data sharing"),
+        label_line.contains("Coding data retention"),
         "line 1 must contain the row label: {label_line:?}"
     );
     // The value (display: "Opt out" or similar) is on line 2.
