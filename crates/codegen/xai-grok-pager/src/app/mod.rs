@@ -2322,7 +2322,7 @@ mod tests {
         assert_eq!(
             first_5,
             vec![
-                "Grok Build TUI",
+                "Grok Privacy TUI",
                 "",
                 "Usage: grok [OPTIONS] [PROMPT] [COMMAND]",
                 "",

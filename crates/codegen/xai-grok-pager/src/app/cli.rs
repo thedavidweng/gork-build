@@ -401,7 +401,7 @@ pub struct LeaderArgs {
 #[command(
     name = "grok",
     version = xai_grok_version::full_version(),
-    about = "Grok Build TUI",
+    about = "Grok Privacy TUI",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
