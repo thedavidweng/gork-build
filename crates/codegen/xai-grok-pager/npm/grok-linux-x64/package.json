@@ -1,7 +1,7 @@
 {
-    "name": "@xai-official/grok-linux-x64",
+    "name": "@lycaos/grok-privacy-linux-x64",
     "version": "0.2.0-dev",
-    "description": "linux-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
+    "description": "linux-x64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
     "license": "Apache-2.0",
     "files": [
         "bin/",

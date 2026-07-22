@@ -1,7 +1,7 @@
 {
-    "name": "@xai-official/grok-darwin-arm64",
+    "name": "@lycaos/grok-privacy-darwin-arm64",
     "version": "0.2.0-dev",
-    "description": "darwin-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
+    "description": "darwin-arm64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
     "license": "Apache-2.0",
     "files": [
         "bin/",

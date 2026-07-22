@@ -1,7 +1,7 @@
 {
-    "name": "@xai-official/grok-win32-arm64",
+    "name": "@lycaos/grok-privacy-win32-arm64",
     "version": "0.2.0-dev",
-    "description": "win32-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
+    "description": "win32-arm64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
     "license": "Apache-2.0",
     "files": [
         "bin/",

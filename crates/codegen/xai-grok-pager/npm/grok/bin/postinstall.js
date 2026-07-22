@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Runs once after npm install/update. Reads the grok binary from the
-// matching per-platform optional dependency (@xai-official/grok-<platform>)
+// matching per-platform optional dependency (@lycaos/grok-privacy-<platform>)
 // and installs it to ~/.grok/bin/ using versioned filenames:
 //
 //   Unix:    grok-<version>  +  grok  (symlink)
@@ -36,7 +36,7 @@ const SUPPORTED = new Set([
     'win32-arm64',
 ]);
 if (!SUPPORTED.has(key)) {
-    console.error(`@xai-official/grok: unsupported platform ${key}`);
+    console.error(`@lycaos/grok-privacy: unsupported platform ${key}`);
     process.exit(0);
 }
 
@@ -45,7 +45,7 @@ if (!SUPPORTED.has(key)) {
 // other five are silently skipped. If the matching one is missing, npm was
 // likely invoked with --no-optional or the platform is unsupported.
 function resolvePlatformPackageDir() {
-    const platformPkg = `@xai-official/grok-${key}`;
+    const platformPkg = `@lycaos/grok-privacy-${key}`;
     try {
         return path.dirname(require.resolve(`${platformPkg}/package.json`));
     } catch {
@@ -56,7 +56,7 @@ function resolvePlatformPackageDir() {
 let version;
 try { version = require('../package.json').version; } catch {}
 if (!version) {
-    console.error('@xai-official/grok: unable to determine version');
+    console.error('@lycaos/grok-privacy: unable to determine version');
     process.exit(0);
 }
 
@@ -89,6 +89,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
     const brotliPath = path.join(sourceDir, 'bin', vendorSubpath + '.br');
     const binaryPath = path.join(sourceDir, 'bin', vendorSubpath);
 
+
     const versionedName = `${binName}-${version}${EXE}`;
     const versionedPath = path.join(CANONICAL_DIR, versionedName);
     const canonicalName = `${binName}${EXE}`;
@@ -119,7 +120,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
                     throw copyErr;
                 }
             } catch (e2) {
-                console.error(`@xai-official/grok: failed to update ${canonicalPath}: ${e2.message}`);
+                console.error(`@lycaos/grok-privacy: failed to update ${canonicalPath}: ${e2.message}`);
                 console.error('Close all running grok processes and try again.');
                 return false;
             }
@@ -180,9 +181,9 @@ function cleanupOldVersions(binName) {
 
 const platformDir = resolvePlatformPackageDir();
 if (!platformDir) {
-    console.error(`@xai-official/grok: platform package @xai-official/grok-${key} not installed.`);
+    console.error(`@lycaos/grok-privacy: platform package @lycaos/grok-privacy-${key} not installed.`);
     console.error('  This usually means npm was invoked with --no-optional, or the install failed.');
-    console.error('  Try: npm install -g @xai-official/grok');
+    console.error('  Try: npm install -g @lycaos/grok-privacy');
     process.exit(0);
 }
 
@@ -231,7 +232,7 @@ const npmRegistry = process.env.GROK_NPM_REGISTRY
     || (() => {
         try {
             const resolved = execSync(
-                'npm config get @xai-official:registry',
+                'npm config get @lycaos:registry',
                 { encoding: 'utf8', timeout: 5000 }
             ).trim();
             if (resolved && resolved !== 'undefined') return resolved;

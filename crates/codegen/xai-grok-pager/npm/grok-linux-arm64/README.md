@@ -1,11 +1,9 @@
-# @xai-official/grok-linux-arm64
+# @lycaos/grok-privacy-linux-arm64
 
-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on linux-arm64.
+Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
 
-Do not install this package directly. Install the main package instead:
+Do not install this package directly:
 
 ```sh
-npm install -g @xai-official/grok
+npm install -g @lycaos/grok-privacy
 ```
-
-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
