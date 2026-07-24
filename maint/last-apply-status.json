@@ -1,0 +1,23 @@
+{
+  "branch": "sync/upstream-0.2.101-8adf901",
+  "upstream": "8adf9013a0929e5c7f1d4e849492d2387837a28d",
+  "version": "0.2.101",
+  "source_rev": "2ec0f0c8488842da03a71eeee3c61154957ca919",
+  "applied": [
+    "0001-privacy-core.patch",
+    "0010-telemetry-hard-off.patch",
+    "0020-research-upload-hard-off.patch",
+    "0030-retention-opt-out.patch",
+    "0040-vendor-updater-hard-off.patch",
+    "0050-privacy-contract-tests.patch",
+    "0060-egress-guard.patch",
+    "0070-supply-chain-policy.patch",
+    "0080-product-identity.patch",
+    "0081-package-publishing.patch"
+  ],
+  "skipped": [
+    "0082-branding-docs.patch"
+  ],
+  "conflicted": null,
+  "branding_required": true
+}

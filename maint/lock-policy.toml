@@ -1,0 +1,17 @@
+# Cargo.lock strategy for upstream replay.
+schema = 1
+
+# inherit-upstream: keep upstream Cargo.lock; do not commit Gork-only lock churn
+# into the functional patch series.
+mode = "inherit-upstream"
+
+# Run after successful apply (before contracts). Fail-closed if any command fails.
+post_apply_commands = [
+  # Validate lockfile is coherent with the tree (does not rewrite it).
+  ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+]
+
+# Optional: pin security bumps that Gork must carry (uncomment and set precise versions).
+# cargo_update_pins = [
+#   ["cargo", "update", "-p", "quinn-proto", "--precise", "X.Y.Z"],
+# ]

@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:26 -0700
+Subject: [PATCH] product-identity: CLI binary name and entry surface
+
+Gork-Patch-Id: product-identity
+Gork-Invariant: product-cli-gork
+Gork-Risk: medium
+---
+ crates/codegen/xai-grok-pager-bin/Cargo.toml  | 18 +++++++++++-------
+ crates/codegen/xai-grok-pager-bin/src/main.rs |  3 ++-
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
+index a1020025635f3b39d430363ca2eca26be615b482..292972f5e7944d53cf2806d6222918f3e93b41eb 100644
+--- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
++++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
+@@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
+ version = "0.2.101"
+ edition.workspace = true
+ license = "Apache-2.0"
+-authors = ["xAI"]
+-default-run = "xai-grok-pager"
++authors = ["Gork Build contributors"]
++default-run = "gork"
++
++# Composition-root binary for the Gork Build TUI (privacy fork of Grok Build).
++# Primary artifact: `gork`. Alias `xai-grok-pager` kept for path/compat.
++# This package links the pager library and optional `xai-grok-pager-minimal`
++# render mode (minimal depends on pager, so pager cannot depend back — cargo
++# cycle). The binary installs the minimal-mode IoC hooks at startup.
++[[bin]]
++name = "gork"
++path = "src/main.rs"
+ 
+-# Composition-root binary for the Grok Build TUI. The artifact is still named
+-# `xai-grok-pager`. This package exists so the binary can link both the pager
+-# library and the optional `xai-grok-pager-minimal` render mode: `minimal`
+-# depends on `xai-grok-pager`, so the pager library cannot depend back on it
+-# (cargo cycle). The binary installs the minimal-mode IoC hooks at startup.
+ [[bin]]
+ name = "xai-grok-pager"
+ path = "src/main.rs"
+diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
+index de17b9af8045de1377129cc2b127c94ddfec5f9a..15c6cec7aadf3aaadbcce41d960424ca043a01d4 100644
+--- a/crates/codegen/xai-grok-pager-bin/src/main.rs
++++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
+@@ -3,7 +3,8 @@
+     unused_variables,
+     unused_mut,
+     unreachable_code,
+-    dead_code
++    dead_code,
++    clippy::possible_missing_else
+ )]
+ #[cfg(all(feature = "jemalloc", unix))]
+ #[global_allocator]
+
+base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
+prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
+prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
+prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
+prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
+-- 
+2.50.1 (Apple Git-155)
+

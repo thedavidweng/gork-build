@@ -1,0 +1,420 @@
+# Apply privacy patch series onto a pinned upstream SHA.
+# Split into read-only replay/test and write-only publish jobs.
+name: Upstream replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: "Exact upstream commit SHA (pinned)"
+        required: true
+        type: string
+      upstream_version:
+        description: "Expected product version (empty to skip check)"
+        required: false
+        default: ""
+        type: string
+      source_rev:
+        description: "Expected SOURCE_REV (empty allowed)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: upstream-replay-${{ inputs.upstream_sha }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.92.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ── Read-only: apply, test, package git bundle ────────────────────────────
+  replay-and-test:
+    name: Replay and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    outputs:
+      apply_rc: ${{ steps.apply.outputs.apply_rc }}
+      conflict: ${{ steps.apply.outputs.conflict }}
+      branding_required: ${{ steps.apply.outputs.branding_required }}
+      branch: ${{ steps.meta.outputs.branch }}
+      version: ${{ steps.meta.outputs.version }}
+      source_rev: ${{ steps.meta.outputs.source_rev }}
+      sha: ${{ steps.meta.outputs.sha }}
+      contracts_ok: ${{ steps.contracts.outcome }}
+      sensitive_count: ${{ steps.sensitive.outputs.count }}
+    steps:
+      - name: Checkout control tree
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch and validate pinned upstream
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.upstream_sha }}"
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "upstream_sha must be full 40-char hex" >&2
+            exit 1
+          fi
+          git remote add upstream https://github.com/xai-org/grok-build.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/xai-org/grok-build.git
+          git fetch --no-tags upstream "$SHA"
+          git cat-file -e "${SHA}^{commit}"
+
+          EXTRA_ARGS=()
+          EXPECT_VER="${{ inputs.upstream_version }}"
+          EXPECT_SR="${{ inputs.source_rev }}"
+          VER=$(git show "${SHA}:crates/codegen/xai-grok-version/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          SR=""
+          if git cat-file -e "${SHA}:SOURCE_REV" 2>/dev/null; then
+            SR=$(git show "${SHA}:SOURCE_REV" | head -1 | tr -d '[:space:]')
+          fi
+          if [[ -n "$EXPECT_VER" && "$EXPECT_VER" != "$VER" ]]; then
+            echo "version mismatch: expected $EXPECT_VER got $VER" >&2
+            exit 1
+          fi
+          if [[ -n "$EXPECT_SR" && "$EXPECT_SR" != "$SR" ]]; then
+            echo "SOURCE_REV mismatch: expected $EXPECT_SR got $SR" >&2
+            exit 1
+          fi
+          SHORT="${SHA:0:7}"
+          BRANCH="sync/upstream-${VER:-unknown}-${SHORT}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "source_rev=${SR}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Sensitive upstream diff
+        id: sensitive
+        run: |
+          set -euo pipefail
+          OLD=$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("maint/upstream.lock.toml").read_text())["commit"])
+          PY
+          )
+          python3 maint/scripts/upstream_diff_report.py \
+            --json "$OLD" "${{ steps.meta.outputs.sha }}" | tee upstream-sensitive.json
+          COUNT=$(python3 -c "import json; print(json.load(open('upstream-sensitive.json'))['sensitive_count'])")
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: Apply patch series
+        id: apply
+        run: |
+          set -euo pipefail
+          set +e
+          python3 maint/scripts/patchctl.py apply \
+            --upstream "${{ steps.meta.outputs.sha }}" \
+            --branch "${{ steps.meta.outputs.branch }}" \
+            --force \
+            --expect-version "${{ steps.meta.outputs.version }}" \
+            --expect-source-rev "${{ steps.meta.outputs.source_rev }}"
+          RC=$?
+          set -e
+          echo "apply_rc=${RC}" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 3 ]]; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "branding_required=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$RC" -eq 4 ]]; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "branding_required=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$RC" -eq 0 ]]; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "branding_required=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$RC"
+          fi
+
+      - name: Install system deps
+        if: steps.apply.outputs.conflict != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        if: steps.apply.outputs.conflict != 'true'
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        if: steps.apply.outputs.conflict != 'true'
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: upstream-replay
+          cache-targets: "true"
+
+      - name: Privacy contracts
+        id: contracts
+        if: steps.apply.outputs.conflict != 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 maint/scripts/patchctl.py verify \
+            --skip-expensive \
+            --exclude-group supply-chain \
+            --exclude-group egress \
+            | tee privacy-contracts.log
+
+      - name: Finalize lock + re-export on success
+        if: steps.apply.outputs.conflict != 'true'
+        run: |
+          set -euo pipefail
+          python3 maint/scripts/patchctl.py finalize-sync \
+            --upstream "${{ steps.meta.outputs.sha }}" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --source-rev "${{ steps.meta.outputs.source_rev }}"
+
+      - name: Package git bundle
+        if: always()
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.meta.outputs.branch }}"
+          if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+            git bundle create sync.bundle "HEAD" "main" 2>/dev/null || \
+              git bundle create sync.bundle "HEAD"
+          else
+            # critical conflict: still bundle current detached state if any
+            git bundle create sync.bundle "HEAD" || true
+          fi
+          test -f sync.bundle
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-replay-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.sha }}
+          path: |
+            sync.bundle
+            upstream-sensitive.json
+            privacy-contracts.log
+            maint/last-apply-status.json
+            maint/patches/series
+            maint/patches/SHA256SUMS
+            maint/upstream.lock.toml
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ── Write: push branch + draft PR / conflict issue ────────────────────────
+  publish-sync:
+    name: Publish sync PR
+    needs: replay-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Protected environment optional — enable in repo settings for extra approval.
+    # environment: upstream-sync
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout (for gh + metadata only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download replay artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: upstream-replay-${{ needs.replay-and-test.outputs.version }}-${{ needs.replay-and-test.outputs.sha }}
+          path: artifacts
+
+      - name: Publish branch from bundle
+        if: needs.replay-and-test.outputs.conflict != 'true'
+        env:
+          BRANCH: ${{ needs.replay-and-test.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git bundle unbundle artifacts/sync.bundle
+          # Find the tip of the sync branch from bundle refs
+          git fetch artifacts/sync.bundle "HEAD:refs/heads/${BRANCH}"
+          git push -u origin "refs/heads/${BRANCH}:refs/heads/${BRANCH}" --force
+
+      - name: Open or update draft PR
+        if: needs.replay-and-test.outputs.conflict != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          BRANCH: ${{ needs.replay-and-test.outputs.branch }}
+          UPSTREAM_SHA: ${{ needs.replay-and-test.outputs.sha }}
+          UPSTREAM_VERSION: ${{ needs.replay-and-test.outputs.version }}
+          SOURCE_REV: ${{ needs.replay-and-test.outputs.source_rev }}
+          CONTRACTS_OK: ${{ needs.replay-and-test.outputs.contracts_ok }}
+          BRANDING: ${{ needs.replay-and-test.outputs.branding_required }}
+          SENSITIVE: ${{ needs.replay-and-test.outputs.sensitive_count }}
+        with:
+          script: |
+            const fs = require('fs');
+            const branch = process.env.BRANCH;
+            const branding = process.env.BRANDING === 'true';
+            const sensitive = Number(process.env.SENSITIVE || '0');
+            const labels = [];
+            if (branding) labels.push('branding-required');
+            if (sensitive > 0) labels.push('security-review-required');
+
+            let sensitiveBody = '(missing)';
+            try {
+              sensitiveBody = fs.readFileSync('artifacts/upstream-sensitive.json', 'utf8').slice(0, 60000);
+            } catch (_) {}
+
+            const body = [
+              '## Upstream sync (automated draft)',
+              '',
+              '| Field | Value |',
+              '| --- | --- |',
+              `| Upstream version | \`${process.env.UPSTREAM_VERSION}\` |`,
+              `| Upstream commit | \`${process.env.UPSTREAM_SHA}\` |`,
+              `| SOURCE_REV | \`${process.env.SOURCE_REV || '(empty)'}\` |`,
+              `| Privacy contracts | ${process.env.CONTRACTS_OK === 'success' ? 'passed (--skip-expensive)' : 'FAILED or incomplete'} |`,
+              `| Branding skipped | ${branding ? 'yes — see branding-required' : 'no'} |`,
+              `| Sensitive paths | ${sensitive} |`,
+              '',
+              '### Notes',
+              '',
+              '- Opened by `upstream-replay.yml` **publish-sync** job. **Do not auto-merge.**',
+              '- Critical patches applied with `git am --3way` (fail-closed).',
+              '- Trailing non-critical branding patches may be skipped.',
+              '- Lock + patch queue finalized in this PR via `patchctl finalize-sync`.',
+              '',
+              '### Sensitive upstream diff',
+              '',
+              '```json',
+              sensitiveBody,
+              '```',
+            ].join('\n');
+
+            // Ensure labels exist (ignore errors)
+            for (const name of labels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color: name === 'security-review-required' ? 'B60205' : 'FBCA04',
+                });
+              } catch (_) {}
+            }
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open',
+            });
+            if (prs.length) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prs[0].number,
+                body,
+              });
+              if (labels.length) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prs[0].number,
+                  labels,
+                });
+              }
+              core.info(`Updated existing PR #${prs[0].number}`);
+            } else {
+              const { data: pr } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `sync: upstream ${process.env.UPSTREAM_VERSION} (${process.env.UPSTREAM_SHA.slice(0, 7)})`,
+                head: branch,
+                base: 'main',
+                draft: true,
+                body,
+              });
+              if (labels.length) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels,
+                });
+              }
+              core.info(`Opened draft PR #${pr.number}`);
+            }
+
+      - name: Open conflict issue (dedupe)
+        if: needs.replay-and-test.outputs.conflict == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          UPSTREAM_SHA: ${{ needs.replay-and-test.outputs.sha }}
+          UPSTREAM_VERSION: ${{ needs.replay-and-test.outputs.version }}
+          SOURCE_REV: ${{ needs.replay-and-test.outputs.source_rev }}
+        with:
+          script: |
+            const fs = require('fs');
+            const title = `sync conflict: upstream ${process.env.UPSTREAM_VERSION} (${process.env.UPSTREAM_SHA.slice(0, 7)})`;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync',
+              per_page: 50,
+            });
+            const existing = issues.find(i => i.title === title);
+            let sensitiveBody = '(missing)';
+            try {
+              sensitiveBody = fs.readFileSync('artifacts/upstream-sensitive.json', 'utf8').slice(0, 60000);
+            } catch (_) {}
+            const body = [
+              '## Upstream patch replay conflict (fail-closed)',
+              '',
+              '| Field | Value |',
+              '| --- | --- |',
+              `| Upstream version | \`${process.env.UPSTREAM_VERSION}\` |`,
+              `| Upstream commit | \`${process.env.UPSTREAM_SHA}\` |`,
+              `| SOURCE_REV | \`${process.env.SOURCE_REV || '(empty)'}\` |`,
+              '',
+              'Critical patch conflict — no draft PR created.',
+              '',
+              '```bash',
+              `python3 maint/scripts/patchctl.py apply --upstream ${process.env.UPSTREAM_SHA}`,
+              '```',
+              '',
+              '```json',
+              sensitiveBody,
+              '```',
+            ].join('\n');
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+              core.info(`Updated issue #${existing.number}`);
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['upstream-sync', 'security-review-required'],
+              });
+            }
+
+      - name: Fail if critical conflict or contracts failed
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.replay-and-test.outputs.conflict }}" == "true" ]]; then
+            exit 1
+          fi
+          if [[ "${{ needs.replay-and-test.outputs.contracts_ok }}" == "failure" ]]; then
+            exit 1
+          fi
