@@ -159,6 +159,11 @@ jobs:
 
       - name: Build gork (release)
         shell: bash
+        env:
+          # MSVC: this binary's symbol count exceeds PDB limits
+          # (LNK4319/LNK1318 on both win32 targets). Release artifacts ship
+          # without debug info anyway — disable PDB generation outright.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C link-arg=/DEBUG:NONE' || '' }}
         run: |
           set -euo pipefail
           if [[ -n "${{ matrix.target }}" ]]; then
