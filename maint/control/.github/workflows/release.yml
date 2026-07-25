@@ -108,19 +108,42 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler pkg-config libssl-dev cmake libclang-dev \
-            build-essential
-
-      - name: Install system deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+            pkg-config libssl-dev cmake libclang-dev build-essential
 
       - name: Install system deps (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install -y protoc nasm
+          choco install -y nasm
           echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Pinned protoc matching upstream's dotslash wrapper (bin/protoc → v29.3).
+      # Discovery in xai-proto-build honors $PROTOC first, so set it explicitly
+      # instead of relying on package managers (choco's protoc broke win32).
+      - name: Install protoc 29.3 (pinned, all platforms)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=29.3
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)      SUFFIX="linux-x86_64" ;;
+            Linux-ARM64)    SUFFIX="linux-aarch_64" ;;
+            macOS-ARM64)    SUFFIX="osx-aarch_64" ;;
+            macOS-X64)      SUFFIX="osx-x86_64" ;;
+            Windows-X64)    SUFFIX="win64" ;;
+            Windows-ARM64)  SUFFIX="win64" ;;  # x64 protoc runs under ARM emulation
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+          esac
+          DEST="${RUNNER_TEMP}/protoc"
+          mkdir -p "$DEST"
+          curl -fsSL --retry 5 -o "${RUNNER_TEMP}/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${VER}/protoc-${VER}-${SUFFIX}.zip"
+          unzip -q -o "${RUNNER_TEMP}/protoc.zip" -d "$DEST"
+          BIN="${DEST}/bin/protoc"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          "$BIN" --version
+          echo "PROTOC=${BIN}" >> "$GITHUB_ENV"
+          echo "${DEST}/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
