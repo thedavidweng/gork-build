@@ -1,0 +1,29 @@
+# Dependabot for Gork Build — intentionally quiet.
+#
+# This repo is a VSCodium-style tracking fork of xai-org/grok-build: the
+# dependency set (Cargo.lock, action pins) must follow upstream, not drift
+# ahead of it. Automated bump PRs here would decouple us from upstream and
+# make every future sync harder, so:
+#
+# - cargo: NOT managed by Dependabot. The lockfile is inherited from upstream
+#   on every sync (maint/lock-policy.toml `inherit-upstream`). Security fixes
+#   land via maint/security-floors.toml (minimum-version floors applied during
+#   sync, no-op once upstream catches up) — enforced by the `cargo audit`
+#   required check.
+# - github-actions: monitoring only (open-pull-requests-limit: 0 opens no
+#   PRs but keeps the dependency graph fresh for alerts). Workflows are
+#   control-plane files owned by maint/control/ templates; a Dependabot PR
+#   editing only the live copies would be silently reverted by the next sync.
+#   To bump an action: update maint/control/.github/workflows/* AND the live
+#   copies in the same PR.
+# - Repo-level "automated security fixes" (Dependabot security PRs) are
+#   disabled in settings for the same reason; RustSec coverage comes from the
+#   `cargo audit` gate instead.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0

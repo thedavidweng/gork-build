@@ -1,0 +1,21 @@
+# Security minimum-version floors for the upstream-inherited Cargo.lock.
+#
+# Applied during every sync by maint/scripts/apply_security_floors.py
+# (lock-policy post_apply hook): a floor bumps the locked package to exactly
+# `precise` ONLY when the locked version is lower. Once upstream's lockfile
+# reaches the floor the entry is a no-op — we never downgrade and never move
+# ahead of a floor, so drift from upstream stays bounded to known RustSec
+# fixes. Remove entries once upstream has caught up.
+#
+# Gate: the `cargo audit` required check (maint/contracts/privacy-contract.toml).
+schema = 1
+
+[[floor]]
+package = "crossbeam-epoch"
+precise = "0.9.20"
+advisory = "RUSTSEC-2026-0204"
+
+[[floor]]
+package = "quinn-proto"
+precise = "0.11.15"
+advisory = "RUSTSEC-2026-0185"
