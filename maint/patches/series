@@ -1,0 +1,12 @@
+# Gork privacy patch series (apply order)
+0001-privacy-core.patch
+0010-telemetry-hard-off.patch
+0020-research-upload-hard-off.patch
+0030-retention-opt-out.patch
+0040-vendor-updater-hard-off.patch
+0050-privacy-contract-tests.patch
+0060-egress-guard.patch
+0070-supply-chain-policy.patch
+0080-product-identity.patch
+0081-package-publishing.patch
+0082-branding-docs.patch
