@@ -1070,6 +1070,24 @@ def cmd_lint(args: argparse.Namespace) -> int:
         if p.get("critical", True) and p["file"] not in series:
             err(f"critical patch missing from series: {p['id']}")
 
+    # Patches must not touch control-plane paths: cmd_apply restores the
+    # control plane BEFORE `git am`, so a patch creating a control file hits
+    # "untracked working tree files would be overwritten" and fail-closes
+    # (or skips branding). One owner per path — control wins.
+    control_cfg = load_control_files(root)
+    for fname in series:
+        pf = patches_dir(root) / fname
+        if not pf.is_file():
+            continue
+        for line in pf.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("+++ b/"):
+                target = line[6:].strip()
+                if control_path_allowed(target, control_cfg):
+                    err(
+                        f"patch {fname} touches control-plane path {target}; "
+                        "move ownership to maint/control or drop the hunk"
+                    )
+
     # contracts resolve
     contracts_path = root / "maint/contracts/privacy-contract.toml"
     if contracts_path.is_file():
