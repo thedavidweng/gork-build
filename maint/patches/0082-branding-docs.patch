@@ -9,7 +9,6 @@ Gork-Risk: medium
 ---
  .github/ISSUE_TEMPLATE/bug_report.md          |   26 +
  .github/ISSUE_TEMPLATE/feature_request.md     |   13 +
- .github/dependabot.yml                        |   22 +
  .github/pull_request_template.md              |   23 +
  LICENSE                                       |    5 +
  crates/codegen/xai-chat-state/Cargo.toml      |    2 +-
@@ -116,10 +115,9 @@ Gork-Risk: medium
  crates/common/xai-tool-protocol/Cargo.toml    |    2 +-
  crates/common/xai-tool-runtime/Cargo.toml     |    2 +-
  crates/common/xai-tool-types/Cargo.toml       |    2 +-
- 109 files changed, 577 insertions(+), 3038 deletions(-)
+ 108 files changed, 555 insertions(+), 3038 deletions(-)
  create mode 100644 .github/ISSUE_TEMPLATE/bug_report.md
  create mode 100644 .github/ISSUE_TEMPLATE/feature_request.md
- create mode 100644 .github/dependabot.yml
  create mode 100644 .github/pull_request_template.md
 
 diff --git a/.github/ISSUE_TEMPLATE/bug_report.md b/.github/ISSUE_TEMPLATE/bug_report.md
@@ -173,34 +171,6 @@ index 0000000000000000000000000000000000000000..66423b497c137344e61515a455fd7a60
 +**Alternatives considered:**
 +
 +**Privacy / telemetry notes:** Gork Build hard-disables vendor research telemetry; proposals that re-enable product analytics need a clear opt-in story (see `PRIVACY.md`).
-diff --git a/.github/dependabot.yml b/.github/dependabot.yml
-new file mode 100644
-index 0000000000000000000000000000000000000000..fc4573c8588e56644a1d181d86e6b808bbc14bae
---- /dev/null
-+++ b/.github/dependabot.yml
-@@ -0,0 +1,22 @@
-+# Dependabot for Gork Build.
-+#
-+# Only github-actions: CI workflows are fork-owned surface area.
-+# Cargo deps intentionally follow xai-org/grok-build — version bumps here
-+# would drift the lockfile from upstream and make re-sync harder (VSCodium
-+# model: track upstream tree; don't parallel-maintain their dependency set).
-+# Security alerts remain enabled at the repo level; review critically and
-+# prefer fixing via upstream sync when possible.
-+version: 2
-+updates:
-+  - package-ecosystem: github-actions
-+    directory: "/"
-+    schedule:
-+      interval: weekly
-+      day: monday
-+    open-pull-requests-limit: 5
-+    labels:
-+      - dependencies
-+      - github-actions
-+    commit-message:
-+      prefix: build
-+      include: scope
 diff --git a/.github/pull_request_template.md b/.github/pull_request_template.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..64c1ce1484c8013365028d8d2297c340d7356b14
