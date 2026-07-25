@@ -32,6 +32,8 @@
 //! notification params. Clients should parse the `method` field to determine
 //! the update type (`"session/update"` for ACP, `"_x.ai/session/update"` for
 //! xAI extensions) and extract the notification payload from `params`.
+//!
+//! Metadata columns and cross-host import live in [`crate::extensions::session_state`].
 
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -344,16 +346,19 @@ pub async fn handle(
         id: acp::SessionId::new(request.session_id.clone()),
         cwd: request.cwd.clone(),
     };
-    let session_dir = crate::session::persistence::session_dir(&session_info);
-    let mut updates_path = session_dir.join("updates.jsonl");
+    let mut updates_path = crate::session::persistence::session_dir(&session_info)
+        .join(crate::session::storage::UPDATES_FILE);
 
     // Subagents persist under their own cwd (may differ from the parent cwd
     // passed here), so fall back to an id scan when the (id, cwd) path misses.
     if !updates_path.exists()
         && let Some(found_dir) =
-            crate::session::persistence::find_session_dir_by_id(&request.session_id)
+            crate::session::persistence::find_persisted_session_dir_by_id_result(
+                &request.session_id,
+            )
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?
     {
-        let candidate = found_dir.join("updates.jsonl");
+        let candidate = found_dir.join(crate::session::storage::UPDATES_FILE);
         if candidate.exists() {
             updates_path = candidate;
         }
@@ -625,6 +630,7 @@ mod tests {
         };
         let child_dir = crate::session::persistence::session_dir(&child_info);
         std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(child_dir.join("summary.json"), "{}").unwrap();
         std::fs::write(
             child_dir.join("updates.jsonl"),
             [

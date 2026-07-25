@@ -22,10 +22,10 @@ impl SessionActor {
             xai_grok_telemetry::unified_log::error(
                 "sampling auth error",
                 Some(self.session_info.id.0.as_ref()),
-                Some(serde_json::json!(
-                    { "method" : method.map(| id | id.0.as_ref()), "error" :
-                    format!("{err}"), }
-                )),
+                Some(serde_json::json!({
+                    "method": method.map(|id| id.0.as_ref()),
+                    "error": format!("{err}"),
+                })),
             );
             return acp::Error::auth_required().data(msg);
         }
@@ -79,8 +79,10 @@ impl SessionActor {
         }
         conversation.retain(|item| {
             !matches!(
-                item, ConversationItem::User(u) if u.synthetic_reason ==
-                Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                item,
+                ConversationItem::User(u)
+                    if u.synthetic_reason
+                        == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
             )
         });
         let effects = bridge.apply_pending_skill_update().await?;
@@ -101,32 +103,35 @@ impl SessionActor {
         }
         let prefix = self.build_user_message_prefix().await;
         tracing::info!(
-            session_id = % self.session_info.id.0, elapsed_ms = start.elapsed()
-            .as_millis() as u64, "build_prefix_background: done"
+            session_id = %self.session_info.id.0,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "build_prefix_background: done"
         );
         prefix
     }
     /// Await the background prefix and inject at conversation index 1.
     /// Falls back to synchronous build on timeout (10s) or panic.
     pub(super) async fn ensure_prefix_ready(&self) {
-        let Some(handle) = self.deferred_prefix.take() else {
+        let Some(mut handle) = self.deferred_prefix.take() else {
             return;
         };
         let start = std::time::Instant::now();
         const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let (prefix, source) = match tokio::time::timeout(WAIT_TIMEOUT, handle).await {
+        let (prefix, source) = match tokio::time::timeout(WAIT_TIMEOUT, &mut handle).await {
             Ok(Ok(p)) => (p, "background"),
             Ok(Err(join_err)) => {
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, error = % join_err,
+                    session_id = %self.session_info.id.0,
+                    error = %join_err,
                     "ensure_prefix_ready: background task panicked, sync fallback"
                 );
                 (self.build_user_message_prefix().await, "sync_fallback")
             }
             Err(_elapsed) => {
+                handle.abort();
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, timeout_ms = WAIT_TIMEOUT
-                    .as_millis() as u64,
+                    session_id = %self.session_info.id.0,
+                    timeout_ms = WAIT_TIMEOUT.as_millis() as u64,
                     "ensure_prefix_ready: background task not ready, sync fallback"
                 );
                 (self.build_user_message_prefix().await, "sync_fallback")
@@ -146,17 +151,16 @@ impl SessionActor {
             );
         }
         if let Some(personas_reminder) = self.agent.borrow().personas_user_reminder() {
-            let personas_at = conversation.len().min(
-                conversation
-                    .iter()
-                    .position(|item| {
-                        matches!(
-                            item, ConversationItem::User(u) if u.synthetic_reason
-                            .is_none()
-                        )
-                    })
-                    .unwrap_or(conversation.len()),
-            );
+            let personas_at = conversation
+                .len()
+                .min(
+                    conversation
+                        .iter()
+                        .position(|item| {
+                            matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        })
+                        .unwrap_or(conversation.len()),
+                );
             conversation.insert(
                 personas_at,
                 ConversationItem::system_reminder(personas_reminder),
@@ -164,8 +168,10 @@ impl SessionActor {
         }
         self.chat_state_handle.replace_conversation(conversation);
         tracing::info!(
-            session_id = % self.session_info.id.0, source, elapsed_ms = start.elapsed()
-            .as_millis() as u64, "ensure_prefix_ready: done"
+            session_id = %self.session_info.id.0,
+            source,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "ensure_prefix_ready: done"
         );
     }
     /// Re-discover skills from disk, update the SkillManager baseline,
@@ -184,13 +190,15 @@ impl SessionActor {
         .await;
         let skill_count = new_skills.len();
         tracing::info!(
-            session_id = % self.session_info.id.0, skill_count,
+            session_id = %self.session_info.id.0,
+            skill_count,
             "Reloaded skills from disk",
         );
         let bridge = self.agent.borrow().tool_bridge().clone();
         bridge.update_skill_baseline(new_skills).await;
-        if let Some(effects) = bridge.apply_pending_skill_update().await {
-            self.apply_skill_update_effects(effects).await;
+        match bridge.apply_pending_skill_update().await {
+            Some(effects) => self.apply_skill_update_effects(effects).await,
+            None => self.send_available_commands_update().await,
         }
         skill_count
     }
@@ -207,17 +215,20 @@ impl SessionActor {
             .into_iter()
             .map(|td| td.function.name)
             .collect();
-        let availability = self.build_command_availability(&tool_names);
-        self.maybe_reconcile_active_goal_without_harness().await;
+        let has_workflow_runs = !self.workflow_tracker().await.lock().list().is_empty();
+        let availability = self.build_command_availability(&tool_names, has_workflow_runs);
         self.maybe_reconcile_active_goal_without_plan().await;
-        let commands = slash_commands::available_commands(&skills, availability);
+        let (_, workflows) = self.named_workflow_snapshot();
+        let commands = slash_commands::available_commands(&skills, availability, &workflows);
         if commands.is_empty() {
             return;
         }
         let meta = Some(slash_commands::build_tools_meta(&tool_names));
         tracing::info!(
-            session_id = % self.session_info.id.0, command_count = commands.len(),
-            tool_count = tool_names.len(), "Advertising available slash commands",
+            session_id = %self.session_info.id.0,
+            command_count = commands.len(),
+            tool_count = tool_names.len(),
+            "Advertising available slash commands",
         );
         self.send_update(
             acp::SessionUpdate::AvailableCommandsUpdate(
@@ -395,7 +406,7 @@ impl SessionActor {
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = % e, "Failed to fetch models for idle refresh");
+                tracing::warn!(error = %e, "Failed to fetch models for idle refresh");
                 return;
             }
         };
@@ -514,7 +525,6 @@ impl SessionActor {
     /// Inject the actor's managed Read-deny globs into the current ToolBridge so
     /// the Grep tool excludes policy-forbidden paths. No-op when empty. Called on
     /// session setup and re-called after an agent rebuild (the rebuilt bridge
-    /// starts empty), mirroring how `GoalUpdateHandle` is re-registered.
     pub(super) async fn inject_deny_read_globs(&self) {
         if self.deny_read_globs.is_empty() {
             return;
@@ -537,10 +547,7 @@ impl SessionActor {
         let counts = self.chat_state_handle.get_conversation_counts().await;
         let turns = counts.user;
         let turn_index = self.chat_state_handle.get_prompt_index().await as u64;
-        tracing::info!(
-            turn_index, turns, resolved_model_id = ? model_metadata.resolved_model_id,
-            model_fingerprint = ? model_metadata.model_fingerprint, "build_session_info"
-        );
+        tracing::info!(turn_index, turns, resolved_model_id = ?model_metadata.resolved_model_id, model_fingerprint = ?model_metadata.model_fingerprint, "build_session_info");
         let model_fingerprint = model_metadata.model_fingerprint;
         let resolved_model_id = model_metadata.resolved_model_id.filter(|resolved| {
             model
@@ -556,13 +563,12 @@ impl SessionActor {
             .as_ref()
             .map(xai_chat_state::estimate_system_message_tokens)
             .unwrap_or(0);
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        let backend_search_active = self.backend_search_active();
         let tool_defs: Vec<_> = self
             .prepare_tool_definitions_inner()
             .await
             .into_iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
+            .filter(|td| !backend_search_active || td.function.name != "web_search")
             .collect();
         let tool_definitions_count = tool_defs.len();
         let tool_definitions_tokens = xai_chat_state::estimate_tool_definitions_tokens(&tool_defs);

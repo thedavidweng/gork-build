@@ -46,8 +46,9 @@ impl SlashCommand for PrivacyCommand {
             }
             Some(opted_in) => CommandResult::Action(Action::SetCodingDataSharing { opted_in }),
             None => CommandResult::Error(format!(
-                "Unknown argument `{arg}`. In Gork Build, use `/privacy` to view status \
-                 (retention is locked to opt-out)."
+                "Unknown argument `{arg}`. Use `/privacy` to view status, or \
+                 `/privacy opt-out` (aliases: `out`, `private`) to confirm opt-out. \
+                 Gork Build locks retention to opt-out; opt-in is not available."
             )),
         }
     }
@@ -176,7 +177,9 @@ mod tests {
         );
     }
 
-    /// Error message must list every accepted alias.
+    /// Gork Build: the unknown-arg error lists the *usable* opt-out aliases
+    /// and states that opt-in is locked off — it must not advertise opt-in
+    /// aliases (`in`, `share`) as if they worked.
     #[test]
     fn error_message_lists_all_accepted_aliases() {
         use crate::acp::model_state::ModelState;
@@ -190,19 +193,29 @@ mod tests {
             session_id: None,
             bundle_state: &bundle,
             screen_mode: crate::app::ScreenMode::Inline,
+            billing_surface_visible: true,
             pager_state: crate::settings::PagerLocalSnapshot::default(),
         };
         let result = cmd.run(&mut ctx, "garbage-input");
         match result {
             CommandResult::Error(msg) => {
-                // Every accepted alias appears in the error message.
-                for alias in &["opt-in", "in", "share", "opt-out", "out", "private"] {
+                // Every usable (opt-out) alias appears in the error message.
+                for alias in &["opt-out", "out", "private"] {
                     assert!(
                         msg.contains(alias),
                         "error message must mention alias `{alias}` so the user knows \
                          what to type; msg = {msg:?}",
                     );
                 }
+                // The lock is stated instead of advertising opt-in aliases.
+                assert!(
+                    msg.contains("opt-in is not available"),
+                    "error message must state the retention lock; msg = {msg:?}",
+                );
+                assert!(
+                    !msg.contains("`share`"),
+                    "opt-in alias `share` must NOT be advertised; msg = {msg:?}",
+                );
                 // Dropped ambiguous aliases must not appear.
                 for dropped in &["off", "true", "false", "enable", "disable"] {
                     assert!(

@@ -9,6 +9,8 @@ use crate::views::session_picker::{
     capture_picker_selection, effective_filter_query, repo_name_from_cwd, restore_picker_selection,
 };
 
+use xai_grok_shell::session::unified_list::ListScope;
+
 type SearchHit = xai_grok_shell::extensions::session_search::SearchSessionHit;
 
 struct PickerSurface<'a> {
@@ -30,7 +32,7 @@ impl PickerSurface<'_> {
             self.entries.as_deref(),
             self.content_results.as_deref(),
             self.state,
-            effective_filter_query(&self.state.query, self.entries_query.as_deref()),
+            effective_filter_query(self.state.query(), self.entries_query.as_deref()),
             self.grouped,
             *self.content_loading,
             self.source_filter,
@@ -40,7 +42,7 @@ impl PickerSurface<'_> {
 
     fn restore_selection(&mut self, anchor: PickerSelectionAnchor) {
         let filter_query =
-            effective_filter_query(&self.state.query, self.entries_query.as_deref()).to_owned();
+            effective_filter_query(self.state.query(), self.entries_query.as_deref()).to_owned();
         restore_picker_selection(
             anchor,
             self.entries.as_deref(),
@@ -141,8 +143,7 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     app.session_picker_loading = true;
     app.session_picker_entries = None;
     app.session_picker_state.selected = 0;
-    app.session_picker_state.query.clear();
-    app.session_picker_state.query_cursor = 0;
+    app.session_picker_state.set_query("");
     app.session_picker_state.search_active = false;
     app.session_picker_state.expanded.clear();
     app.session_picker_content_results = None;
@@ -189,6 +190,7 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
     app: &mut AppView,
     sessions: Vec<SessionPickerEntry>,
     partial: Option<ConversationsPartial>,
+    scope: ListScope,
     seq: u64,
     query: Option<String>,
 ) -> Vec<Effect> {
@@ -209,6 +211,7 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
     );
     let partial_notice = partial.map(ConversationsPartial::picker_notice);
     let chat_mode = app.chat_mode;
+    let is_browse = query.is_none();
     let mut sessions = Some(sessions);
     let mut notice = None;
     if let Some(agent) = get_active_agent_mut(app) {
@@ -264,6 +267,27 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
     }
     if let Some(notice) = notice {
         app.show_toast(&notice);
+    } else if scope.is_relaxed()
+        && app.session_picker_relaxed_notified_for.as_deref() != Some(app.cwd.as_path())
+    {
+        // Welcome view drops toasts; don't consume the one-shot notice unless
+        // it can render.
+        if !matches!(app.active_view, crate::app::app_view::ActiveView::Welcome) {
+            // Notify once per directory; the browse is scoped to `app.cwd`.
+            app.session_picker_relaxed_notified_for = Some(app.cwd.clone());
+            let message = match scope {
+                ListScope::Repo => {
+                    "No sessions in this directory. Showing other sessions from this repository."
+                }
+                _ => "No sessions in this directory. Showing sessions from other directories.",
+            };
+            app.show_toast(message);
+        }
+    }
+    // A cwd-scoped browse clears the latch so a later relax re-notifies; search
+    // responses leave it alone.
+    if !scope.is_relaxed() && is_browse {
+        app.session_picker_relaxed_notified_for = None;
     }
     vec![]
 }

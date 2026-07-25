@@ -8,14 +8,14 @@ Gork-Patch-Id: research-upload-hard-off
 Gork-Invariant: research-upload-unreachable
 Gork-Risk: critical
 ---
- .../xai-grok-shell/src/agent/config.rs        | 146 ++++++++++++++++--
- 1 file changed, 135 insertions(+), 11 deletions(-)
+ .../xai-grok-shell/src/agent/config.rs        | 144 ++++++++++++++++--
+ 1 file changed, 134 insertions(+), 10 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf90b33b9b 100644
+index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f31cb4854 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
-@@ -323,7 +323,7 @@ impl EndpointsConfig {
+@@ -326,7 +326,7 @@ impl EndpointsConfig {
      pub fn resolve_trace_upload_url(&self) -> String {
          blank_as_unset(&self.trace_upload_url).unwrap_or_else(|| self.proxy_url())
      }
@@ -24,7 +24,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
      /// else `proxy_url` + `/deployment/config`. Never `xai_api_base_url`, so the
      /// deployment key reaches the proxy, not the inference host.
      pub fn resolve_managed_config_url(&self) -> String {
-@@ -1070,7 +1070,7 @@ pub struct RemoteConfig {
+@@ -1126,7 +1126,7 @@ pub struct RemoteConfig {
  /// `[hub]` section from config.toml.
  ///
  /// Optional default Computer Hub URL for **workspace provider** exposure
@@ -33,7 +33,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
  /// agent-side harness/client connections or alter local session behavior.
  ///
  /// ```toml
-@@ -1081,7 +1081,7 @@ pub struct RemoteConfig {
+@@ -1137,7 +1137,7 @@ pub struct RemoteConfig {
  #[serde(default)]
  pub struct HubConfig {
      /// Hub WebSocket URL (`ws://` or `wss://`) used as the leader default for
@@ -42,16 +42,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
      #[serde(skip_serializing_if = "Option::is_none")]
      pub url: Option<String>,
  }
-@@ -1278,7 +1278,7 @@ pub struct Config {
-     /// `[model.*]` overrides from config.toml. Resolve via `resolve_model_list()`.
-     #[serde(skip)]
-     pub config_models: IndexMap<String, ConfigModelOverride>,
--    /// Warnings from `[model.*]` parsing; surfaced by `grok inspect`.
-+    /// Warnings from `[model.*]` parsing; surfaced by `gork inspect`.
-     #[serde(skip)]
-     pub model_override_warnings: Vec<super::config_model_override_parse::ModelOverrideWarning>,
-     pub grok_com_config: GrokComConfig,
-@@ -1669,6 +1669,8 @@ pub struct SessionConfig {
+@@ -1761,6 +1761,8 @@ pub struct SessionConfig {
  #[derive(Debug, Clone, Serialize, Deserialize)]
  #[serde(default)]
  pub struct RepoChangesDedupConfig {
@@ -60,7 +51,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
      pub enabled: bool,
      /// Include inline content even when references exist.
      pub include_inline_fallback: bool,
-@@ -1687,7 +1689,8 @@ impl RepoChangesDedupConfig {}
+@@ -1779,7 +1781,8 @@ impl RepoChangesDedupConfig {}
  impl Default for RepoChangesDedupConfig {
      fn default() -> Self {
          Self {
@@ -70,7 +61,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
              include_inline_fallback: false,
              max_inline_bytes: 0,
              dedup_untracked: true,
-@@ -2057,7 +2060,13 @@ impl Config {
+@@ -2301,7 +2304,13 @@ impl Config {
      pub fn is_two_pass_compaction_enabled(&self) -> bool {
          self.resolve_two_pass_compaction().value
      }
@@ -85,7 +76,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
          if let Some(mode) = self.requirements.telemetry.pinned() {
              return Resolved::new(mode, ConfigSource::Requirement);
          }
-@@ -2079,7 +2088,12 @@ impl Config {
+@@ -2323,7 +2332,12 @@ impl Config {
          }
          Resolved::new(TelemetryMode::Disabled, ConfigSource::Default)
      }
@@ -99,7 +90,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
          let mode = self.resolve_telemetry_mode();
          let ff = if mode.value.is_disabled() {
              None
-@@ -3010,7 +3024,7 @@ pub(crate) fn external_otel_master_switch_from(
+@@ -3353,7 +3367,7 @@ pub(crate) fn external_otel_master_switch_from(
  /// Layering follows `resolve_telemetry_mode`: **requirement > env > config >
  /// remote > default**, where the `[telemetry]` `otel_*` keys from the
  /// effective config (which already includes managed-config layers distributed
@@ -108,7 +99,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
  /// top, and the remote layer is restrictive-only + asynchronous
  /// ([`apply_external_otel_remote_policy`]).
  pub fn resolve_external_otel_config(
-@@ -8121,6 +8135,19 @@ reasoning_effort = "low"
+@@ -9174,6 +9188,19 @@ reasoning_effort = "low"
      #[test]
      #[serial]
      fn resolve_trace_upload_explicit_config_wins_over_telemetry_off() {
@@ -128,7 +119,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
          unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
          unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
          let mut cfg = Config::default();
-@@ -8151,19 +8178,46 @@ reasoning_effort = "low"
+@@ -9204,19 +9231,46 @@ reasoning_effort = "low"
          });
          let d = cfg.trace_upload_decision_debug();
          assert_eq!(d["trace_upload"], serde_json::json!(false));
@@ -178,7 +169,7 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
          unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
          unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
          let mut cfg = Config::default();
-@@ -8176,6 +8230,76 @@ reasoning_effort = "low"
+@@ -9229,6 +9283,76 @@ reasoning_effort = "low"
          let r = cfg.resolve_trace_upload();
          assert!(r.value, "defaults on when telemetry fully enabled");
      }
@@ -256,8 +247,8 @@ index c02a5c7523f64e996b9c294c8652de8b01ed3374..b74d14fc46ace37a2d42373f800929bf
      #[serial]
      fn resolve_goal_defaults_to_true_when_unset() {
 
-base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
-prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
+base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
+prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 -- 
 2.50.1 (Apple Git-155)

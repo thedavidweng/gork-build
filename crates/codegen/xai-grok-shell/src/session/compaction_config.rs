@@ -17,13 +17,12 @@ pub(crate) const SUPPRESS_TURN: u8 = 1;
 /// cleared only when the context budget changes — a successful compaction, a
 /// rewind (context shrank), or a model switch (a larger window may now fit).
 pub(crate) const SUPPRESS_STICKY: u8 = 2;
-/// Account-state failure (credit block / non-refreshable auth): re-sending fails
-/// identically every turn until the user acts (adds credits, re-authenticates), so
-/// per-turn clearing just re-fires the doomed compaction once per turn. It is not
-/// budget-related either, so a context change can't fix it. Survives turn
-/// boundaries; cleared only when a model call actually succeeds — a `200` proves
-/// the account can sample again (see the `ModelResponseReceived` site in `turn.rs`).
+/// Credit block: suppress until a model `200` (credits aren't client-observable).
+/// Survives turns; context changes can't fix it. Token refresh must not clear this.
 pub(crate) const SUPPRESS_UNTIL_SUCCESS: u8 = 3;
+/// Auth-expired auto-compact: suppress until login/token refresh, not until 200
+/// (waiting for a sample deadlocks when context is already over the window).
+pub(crate) const SUPPRESS_AUTH: u8 = 4;
 
 /// Model slug and context window from the previous turn.
 #[derive(Clone, Debug)]
@@ -147,6 +146,7 @@ pub struct CompactionConfig {
     pub compaction_mode: xai_chat_state::CompactionMode,
     /// When `true`, feed the summarizer the verbatim conversation instead of the lossy rewrite (the retry loop may still fall back).
     pub verbatim_input: bool,
+    pub tool_choice: crate::util::config::CompactionToolChoice,
     /// Prefire two-pass state (background NOTE₁ cache + in-flight guard).
     /// `Default` (empty cache, not in-flight).
     pub prefire: PrefireState,

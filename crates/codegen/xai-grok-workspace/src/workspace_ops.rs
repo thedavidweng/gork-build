@@ -867,14 +867,17 @@ fn hook_registry_to_wire(
         serde_json::to_value(registry).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
     serde_json::from_value(value).map_err(|e| WorkspaceError::HubError(e.to_string()))
 }
-/// Inverse of [`hook_registry_to_wire`]. The compiled `matcher` is absent from
-/// the wire (and from this result); callers recompile it via
-/// `HookRegistry::recompile_matchers`, exactly as the proxy path already did.
+/// Inverse of [`hook_registry_to_wire`]. Rebuilds compiled matchers via
+/// [`HookRegistry::recompile_matchers`] so invalid patterns fail closed
+/// (match nothing) rather than widening to match-all after the wire hop.
 fn wire_to_hook_registry(
     wire: &HookRegistryWire,
 ) -> WorkspaceResult<xai_grok_hooks::discovery::HookRegistry> {
     let value = serde_json::to_value(wire).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
-    serde_json::from_value(value).map_err(|e| WorkspaceError::HubError(e.to_string()))
+    let mut registry: xai_grok_hooks::discovery::HookRegistry =
+        serde_json::from_value(value).map_err(|e| WorkspaceError::HubError(e.to_string()))?;
+    registry.recompile_matchers();
+    Ok(registry)
 }
 #[async_trait]
 impl WorkspaceOp for HookRegistryReq {
@@ -1301,10 +1304,7 @@ impl WorkspaceOps {
         };
         handle.on_session_ended(session_id);
         if let Err(e) = handle.drop_session(session_id, session_id) {
-            tracing::debug!(
-                % session_id, error = % e,
-                "end_local_session: drop_session failed (expected if never bound)"
-            );
+            tracing::debug!(%session_id, error = %e, "end_local_session: drop_session failed (expected if never bound)");
         }
     }
     pub async fn on_before_turn(
@@ -1752,7 +1752,7 @@ mod tests {
         let spec = xai_grok_hooks::config::HookSpec {
             name: "global/safety".to_string(),
             event: xai_grok_hooks::event::HookEventName::PreToolUse,
-            handler_type: "command".to_string(),
+            handler_type: xai_grok_hooks::config::HandlerType::Command,
             configured_matcher: Some("Bash".to_string()),
             matcher: None,
             enabled: true,
@@ -1862,7 +1862,7 @@ mod tests {
             HookSpecWire {
                 name,
                 event,
-                handler_type,
+                handler_type: handler_type.as_str().to_string(),
                 configured_matcher,
                 enabled,
                 command,
@@ -1877,7 +1877,7 @@ mod tests {
         let spec = HookSpec {
             name: "global/safety".to_string(),
             event: xai_grok_hooks::event::HookEventName::PreToolUse,
-            handler_type: "command".to_string(),
+            handler_type: xai_grok_hooks::config::HandlerType::Command,
             configured_matcher: Some("Bash".to_string()),
             matcher: None,
             enabled: true,
@@ -2041,9 +2041,10 @@ mod tests {
     /// PutFileEntry serde round-trip with defaults.
     #[test]
     fn put_file_entry_defaults() {
-        let json = serde_json::json!(
-            { "path" : "src/main.rs", "content" : "fn main() {}" }
-        );
+        let json = serde_json::json!({
+            "path": "src/main.rs",
+            "content": "fn main() {}"
+        });
         let entry: PutFileEntry = serde_json::from_value(json).unwrap();
         assert_eq!(entry.path, "src/main.rs");
         assert_eq!(entry.content, "fn main() {}");
@@ -2089,7 +2090,7 @@ mod tests {
     /// GetFileEntry serde round-trip with defaults.
     #[test]
     fn get_file_entry_defaults() {
-        let json = serde_json::json!({ "path" : "lib.rs" });
+        let json = serde_json::json!({ "path": "lib.rs" });
         let entry: GetFileEntry = serde_json::from_value(json).unwrap();
         assert_eq!(entry.path, "lib.rs");
         assert!(entry.if_none_match.is_none());
@@ -2124,7 +2125,10 @@ mod tests {
     /// GetFileResult serialization skips None fields, defaults matched to false.
     #[test]
     fn get_file_result_defaults_and_skip() {
-        let json = serde_json::json!({ "path" : "a.txt", "exists" : true, });
+        let json = serde_json::json!({
+            "path": "a.txt",
+            "exists": true,
+        });
         let result: GetFileResult = serde_json::from_value(json).unwrap();
         assert!(!result.matched, "matched should default to false");
         assert!(result.content.is_none());

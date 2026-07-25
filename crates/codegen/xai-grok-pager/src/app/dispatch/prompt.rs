@@ -7,19 +7,20 @@ use super::interject;
 use super::permissions::drain_permission_queue;
 use super::queue::{
     apply_turn_start_shim, drain_prompt_state_to_last_queued, immediate_server_send_eligible,
-    maybe_drain_queue, push_server_queue_echo, retire_optimistic_echo,
+    maybe_drain_queue, note_peek_page_flip, push_server_queue_echo, retire_optimistic_echo,
 };
 use super::router::dispatch;
 use super::session::fork::open_project_question;
 use super::session::lifecycle::skip_picker_and_create_session;
-use super::voice::voice_stop_on_submit;
-use crate::app::actions::{Action, Effect};
+use super::voice::{merge_prompt_with_voice_interim, voice_stop_on_submit};
+use crate::app::actions::{Action, DoctorFixTarget, Effect};
 use crate::app::agent::{AgentId, AgentState};
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::notifications::{NotificationEvent, NotificationEventKind};
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
+use crate::slash::command::DoctorRequest;
 use agent_client_protocol as acp;
 use xai_grok_telemetry::session_ctx::log_event;
 
@@ -52,6 +53,118 @@ pub(crate) fn dispatch_initial_prompt(app: &mut AppView, prompt: String) -> Vec<
     }
     effects.extend(dispatch(Action::SendPrompt(prompt), app));
     effects
+}
+
+pub(super) fn collect_live_doctor_report_for_terminal(
+    app: &AppView,
+    agent_id: AgentId,
+    terminal: &crate::terminal::TerminalContext,
+) -> Option<crate::diagnostics::DiagnosticReport> {
+    let agent = app.agents.get(&agent_id)?;
+    let mut report = crate::slash::commands::doctor::DoctorCommand::report_for_terminal(
+        terminal,
+        app.screen_mode,
+        crate::diagnostics::TuiRuntimeRequest {
+            workspace: &agent.session.cwd,
+            notification_method: app.notification_service.config().method,
+            notification_protocol: app.notification_service.protocol(),
+            notification_condition: app.notification_service.config().condition,
+        },
+    );
+    if crate::app::voice_mode_enabled() {
+        crate::diagnostics::apply_voice_probe(&mut report, true);
+    }
+    Some(report)
+}
+
+fn doctor_fix_target(agent: &AgentView) -> DoctorFixTarget {
+    DoctorFixTarget {
+        agent_id: agent.session.id,
+        session_id: agent.session.session_id.clone(),
+        session_binding_epoch: agent.session_binding_epoch,
+        cwd: agent.session.cwd.clone(),
+    }
+}
+
+pub(super) fn dispatch_doctor(request: DoctorRequest, app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    let terminal = crate::terminal::terminal_context().clone();
+    let Some(report) = collect_live_doctor_report_for_terminal(app, agent_id, &terminal) else {
+        return vec![];
+    };
+
+    match request {
+        DoctorRequest::Report => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                agent.scrollback.push_block(RenderBlock::system(
+                    crate::diagnostics::format_doctor(&report),
+                ));
+            }
+        }
+        DoctorRequest::ListFixes | DoctorRequest::Fix(_) => {
+            let Some(agent) = app.agents.get(&agent_id) else {
+                return vec![];
+            };
+            let target = doctor_fix_target(agent);
+            return vec![Effect::PlanDoctorFix {
+                target,
+                report: Box::new(report),
+                terminal,
+                request,
+            }];
+        }
+    }
+    vec![]
+}
+
+pub(super) fn open_doctor_fix_question(
+    app: &mut AppView,
+    target: DoctorFixTarget,
+    plan: Box<crate::diagnostics::FixPlan>,
+) {
+    use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
+    use xai_grok_tools::implementations::grok_build::ask_user_question::{
+        Question, QuestionOption,
+    };
+
+    let Some(agent) = app.agents.get_mut(&target.agent_id) else {
+        return;
+    };
+    if agent.question_view.is_some() {
+        agent.scrollback.push_block(RenderBlock::system(
+            "Close the current question before applying this fix.",
+        ));
+        return;
+    }
+    let preview = crate::diagnostics::format_fix_preview(&plan);
+    let question = Question {
+        question: "Apply this fix?".to_owned(),
+        options: vec![
+            QuestionOption {
+                label: "Apply".to_owned(),
+                description: "Make the changes shown above.".to_owned(),
+                preview: Some(preview),
+                id: None,
+            },
+            QuestionOption {
+                label: "Cancel".to_owned(),
+                description: "Do not change the configuration.".to_owned(),
+                preview: None,
+                id: None,
+            },
+        ],
+        multi_select: Some(false),
+        id: None,
+    };
+    let stashed = agent.prompt.stash();
+    agent.question_view = Some(
+        QuestionViewState::new("doctor-fix".to_owned(), vec![question], stashed)
+            .with_local_kind(LocalQuestionKind::DoctorFix { target, plan })
+            .with_no_freeform(),
+    );
+    agent.prompt.set_text("");
 }
 
 pub(super) fn dispatch_send_prompt(app: &mut AppView, text: String) -> Vec<Effect> {
@@ -147,6 +260,28 @@ pub(in crate::app) fn show_small_screen_tip(app: &mut AppView) {
     ) {
         log_event(xai_grok_telemetry::events::ContextualTip {
             tip: xai_grok_telemetry::events::ContextualTipKind::SmallScreen,
+            action: xai_grok_telemetry::events::ContextualTipAction::Shown,
+        });
+    }
+}
+
+/// Show the existing one-shot SSH discovery tip, redirected to `/doctor`.
+pub(in crate::app) fn show_ssh_wrap_tip(app: &mut AppView) {
+    if !app.contextual_hints.ssh_wrap {
+        return;
+    }
+    let ActiveView::Agent(id) = app.active_view else {
+        return;
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return;
+    };
+    if agent.show_ephemeral_tip(
+        crate::tips::ssh_wrap::ssh_wrap_tip(),
+        &mut app.tip_seen_counts,
+    ) {
+        log_event(xai_grok_telemetry::events::ContextualTip {
+            tip: xai_grok_telemetry::events::ContextualTipKind::SshWrap,
             action: xai_grok_telemetry::events::ContextualTipAction::Shown,
         });
     }
@@ -302,13 +437,17 @@ pub(super) fn dispatch_send_prompt_inner(
     // no intervening key (mouse send, follow-up chip click `SubmitFollowUp`,
     // `SendSlashCommandPreservingDraft`) would otherwise leave a stale arm
     // (e.g. an idle-Esc `ClearPrompt`) that shadows the next Esc — firing stale
-    // ClearPrompt|Rewind instead of the mid-turn swallow until TTL. Cleared in
+    // ClearPrompt|Rewind instead of the mid-turn Esc policy until TTL. Cleared in
     // the common funnel so every submit path is covered, before any early-return
     // guard below.
     app.pending_action = None;
-    // Releases the mic and drops the recording target so a late in-flight final
-    // can't refill the prompt the user just sent.
-    voice_stop_on_submit(app);
+    // Promote interim + hard-reset; merge only when consuming the composer.
+    let interim = voice_stop_on_submit(app);
+    let text = if consume_input {
+        merge_prompt_with_voice_interim(text, interim)
+    } else {
+        text
+    };
 
     if app.reconnect_pending {
         app.show_toast("Reconnecting, please wait...");
@@ -409,6 +548,7 @@ pub(super) fn dispatch_send_prompt_inner(
                 session_id: agent.session.session_id.as_ref(),
                 bundle_state: &app.bundle_state,
                 screen_mode: app.screen_mode,
+                billing_surface_visible: app.usage_visible,
                 // PAGER-owned snapshot for slash commands.
                 pager_state: crate::settings::PagerLocalSnapshot {
                     multiline_mode: agent.multiline_mode,
@@ -461,7 +601,7 @@ pub(super) fn dispatch_send_prompt_inner(
                 if let Some(command) = command {
                     if ctx.screen_mode.is_minimal() && !command.available_in_minimal() {
                         // Central minimal gate: commands that drive the deleted
-                        // fullscreen pane / dashboard (/find, /copy, /dashboard)
+                        // fullscreen pane / dashboard (/find, /dashboard, …)
                         // have nothing to act on in scrollback-native mode.
                         // Surface a friendly system block instead of running them.
                         CommandResult::Message(format!(
@@ -508,11 +648,24 @@ pub(super) fn dispatch_send_prompt_inner(
                 agent.scrollback.push_block(RenderBlock::system(msg));
                 return vec![];
             }
+            CommandResult::Doctor(request) => {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                return dispatch_doctor(request, app);
+            }
             CommandResult::Action(Action::ExitSession) => {
                 if consume_input {
                     agent.prompt.set_text("");
                 }
                 return dispatch(Action::ExitSession, app);
+            }
+            CommandResult::Action(Action::EditPromptExternal) => {
+                // Typed slash input occupies the composer; the palette route preserves an existing draft.
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                return dispatch(Action::EditPromptExternal, app);
             }
             CommandResult::Action(action) => {
                 if consume_input {
@@ -563,6 +716,7 @@ pub(super) fn dispatch_send_prompt_inner(
                             created_at: std::time::Instant::now(),
                             next_fire_at: preview.next_fire_at,
                             tag: preview.tag,
+                            last_subagent_id: None,
                         },
                     );
                 }
@@ -765,7 +919,7 @@ pub(super) fn dispatch_send_prompt_inner(
         }
     }
 
-    {
+    let drain = {
         let Some(agent) = app.agents.get_mut(&id) else {
             return effects;
         };
@@ -773,9 +927,7 @@ pub(super) fn dispatch_send_prompt_inner(
         // Insert into local prompt history (move-to-front dedup, cap at 200).
         // Skipped for modal-driven dispatch: the user didn't type these
         // commands and shouldn't see them in up-arrow history.
-        if !consume_input {
-            effects.extend(maybe_drain_queue(agent));
-        } else {
+        if consume_input {
             let trimmed_key = text.trim().to_string();
             if !trimmed_key.is_empty() {
                 agent
@@ -787,9 +939,11 @@ pub(super) fn dispatch_send_prompt_inner(
                     agent.session.prompt_history.truncate(200);
                 }
             }
-            effects.extend(maybe_drain_queue(agent));
         }
-    }
+        maybe_drain_queue(agent)
+    };
+    effects.extend(drain.effects);
+    note_peek_page_flip(app, id, drain.page_flip_entry);
     effects
 }
 
@@ -883,7 +1037,9 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     agent.session.enqueue_bash_command(command.clone());
     agent.prompt.set_text("");
 
-    maybe_drain_queue(agent)
+    let drain = maybe_drain_queue(agent);
+    note_peek_page_flip(app, id, drain.page_flip_entry);
+    drain.effects
 }
 
 /// Whether a load-result handler must stand down because a reconnect reload
@@ -1064,7 +1220,7 @@ pub(super) fn handle_prompt_response(
             || result
                 .as_ref()
                 .err()
-                .is_some_and(|e| super::billing::is_free_usage_exhausted_error(e));
+                .is_some_and(|e| xai_grok_shell::sampling::error::is_free_usage_exhausted_error(e));
         let model_incompatible = agent.session.model_incompatible;
         // Context overflow: the RetryState handler already pushed the actionable
         // block, so the generic TurnFailed + error toast are redundant. Derived
@@ -1112,12 +1268,17 @@ pub(super) fn handle_prompt_response(
         if credit_limit_blocked {
             agent.credit_limit_stashed_prompt = agent.session.in_flight_prompt.clone();
         }
-        // Likewise, stash the prompt from a turn that failed on an
-        // expired login (401 / re-auth). The AuthComplete handler
-        // auto-resubmits it after a successful mid-session re-auth.
-        // A non-rewindable turn (None) must not clobber an earlier stash.
-        if reauth_prompted && let Some(prompt) = agent.session.in_flight_prompt.as_ref() {
-            agent.reauth_stashed_prompt = Some(prompt.clone());
+        // Stash for AuthComplete after 401. Prefer in_flight; fall back to
+        // compact_held (cleared for cancel-rewind during auto-compact). Skip if both None.
+        if reauth_prompted {
+            let held = agent
+                .session
+                .in_flight_prompt
+                .clone()
+                .or_else(|| agent.session.compact_held_prompt.clone());
+            if let Some(prompt) = held {
+                agent.reauth_stashed_prompt = Some(prompt);
+            }
         }
 
         // qtrace: turn end on this client. This clears current_prompt_id
@@ -1184,7 +1345,6 @@ pub(super) fn handle_prompt_response(
             agent,
             event,
             ending_prompt_id.as_deref(),
-            false,
         );
 
         let notification = match (&result, was_cancelling) {
@@ -1384,19 +1544,24 @@ pub(super) fn handle_prompt_response(
         // turn-start shim. This sets `TurnRunning`, so the
         // `maybe_drain_queue` below no-ops rather than draining a local
         // prompt — the leader owns the drain order.
-        if let Some(p) = pending_adoption
+        let adopted_page_flip = if let Some(p) = pending_adoption
             && agent.session.current_prompt_id.is_none()
         {
             if response_pid.as_deref() != Some(p.prompt_id.as_str())
                 && agent.should_adopt_running_prompt(&p.prompt_id)
             {
-                apply_turn_start_shim(agent, p.prompt_id, p.text, &p.kind);
+                apply_turn_start_shim(agent, p.prompt_id, p.text, &p.kind, p.combined_texts)
             } else {
                 agent.discard_pending_adoption_updates(&p.prompt_id);
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        let mut effects = maybe_drain_queue(agent);
+        let drain = maybe_drain_queue(agent);
+        let page_flip_entry = adopted_page_flip.or(drain.page_flip_entry);
+        let mut effects = drain.effects;
 
         // Predicted-next-prompt (tab autocomplete): fetch a fresh suggestion
         // (the stale one was wiped above) — but only after a clean, non-bash
@@ -1429,6 +1594,7 @@ pub(super) fn handle_prompt_response(
             agent_id,
             silent: true,
         });
+        note_peek_page_flip(app, agent_id, page_flip_entry);
         return effects;
     }
     vec![]
@@ -1475,7 +1641,9 @@ pub(super) fn handle_compact_complete(
         if app.reconnect_pending {
             return vec![];
         }
-        return maybe_drain_queue(agent);
+        let drain = maybe_drain_queue(agent);
+        note_peek_page_flip(app, agent_id, drain.page_flip_entry);
+        return drain.effects;
     }
     vec![]
 }

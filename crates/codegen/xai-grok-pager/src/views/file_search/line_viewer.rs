@@ -1007,13 +1007,13 @@ fn build_source_lines(path: &Path, content: &str) -> Vec<SourceLine> {
         .enumerate()
         .map(|(i, text)| {
             let line_number = i + 1;
-            let styled_line = if text.is_empty() {
-                // Empty line — still needs a Line (for line number prefix).
-                Line::from(" ".to_owned())
-            } else if let Some(ref mut hl) = highlighter {
-                highlight_to_ratatui_line(hl, text, &syntect.syntax_set)
-            } else {
-                Line::from((*text).to_owned())
+            // Feed every line, blank ones included, through the highlighter so
+            // its parse state stays in sync. Skipping blanks corrupts constructs
+            // that span multiple lines (block comments, multi-line strings).
+            let styled_line = match highlighter.as_mut() {
+                Some(hl) => highlight_to_ratatui_line(hl, text, &syntect.syntax_set),
+                None if text.is_empty() => Line::from(" ".to_owned()),
+                None => Line::from((*text).to_owned()),
             };
             SourceLine::new(line_number, styled_line, (*text).to_owned(), max_digits)
         })
@@ -1128,27 +1128,38 @@ fn highlight_to_ratatui_line(
     text: &str,
     syntax_set: &syntect::parsing::SyntaxSet,
 ) -> Line<'static> {
-    let highlighted = match hl.highlight_line(text, syntax_set) {
+    // syntect needs the trailing newline to recognize line-spanning constructs.
+    // Feed it, then strip the newline back out of the rendered spans.
+    let with_newline = format!("{text}\n");
+    let highlighted = match hl.highlight_line(&with_newline, syntax_set) {
         Ok(h) => h,
+        Err(_) if text.is_empty() => return Line::from(" ".to_owned()),
         Err(_) => return Line::from(text.to_owned()),
     };
 
-    let spans: Vec<Span<'static>> = highlighted
-        .into_iter()
-        .map(|(style, content)| {
-            let fg = syntect_to_ratatui_color(style.foreground);
-            Span::styled(content.to_owned(), Style::default().fg(fg))
-        })
-        .collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (style, segment) in highlighted {
+        let mut piece = segment.to_owned();
+        while piece.ends_with('\n') || piece.ends_with('\r') {
+            piece.pop();
+        }
+        if piece.is_empty() {
+            continue;
+        }
+        // Shared path: polarity-safe under the terminal-native lock, else
+        // normal theme quantize (see xai_grok_pager_render::syntax).
+        let fg = crate::syntax::syntect_rgb_to_fg(
+            style.foreground.r,
+            style.foreground.g,
+            style.foreground.b,
+        );
+        spans.push(Span::styled(piece, Style::default().fg(fg)));
+    }
 
+    if spans.is_empty() {
+        return Line::from(" ".to_owned());
+    }
     Line::from(spans)
-}
-
-/// Convert a syntect RGBA color to a ratatui Color.
-///
-/// Quantizes the RGB value to the terminal's supported color level.
-fn syntect_to_ratatui_color(c: syntect::highlighting::Color) -> ratatui::style::Color {
-    crate::theme::quantize(ratatui::style::Color::Rgb(c.r, c.g, c.b))
 }
 
 /// Count digits in a number (for line number padding).

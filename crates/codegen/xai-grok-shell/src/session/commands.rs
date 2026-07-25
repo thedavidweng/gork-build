@@ -24,6 +24,9 @@ pub struct CancellationContext {
 #[derive(Debug, Clone)]
 pub enum PromptCompletionKind {
     Completed,
+    /// Silent EndTurn after stationarity/true-noop thrash. Distinct from
+    /// Completed so goal continuation is not re-queued under an active goal.
+    StationarityEnded,
     Cancelled {
         category: Option<xai_file_utils::events::types::CancellationCategory>,
         context: Option<CancellationContext>,
@@ -40,7 +43,7 @@ pub enum PromptCompletionKind {
     /// every attached leader-mode client the *running* turn ended) and the
     /// roster `Idle` delta (which would flip the dashboard off `Working` while
     /// the real turn is still in flight) must be skipped. See
-    /// `MvpAgent::prompt`'s short-circuit and `respond_removed_queued_prompt`.
+    /// `MvpAgent::prompt`'s short-circuit and `respond_removed_prompt`.
     RemovedFromQueue,
 }
 /// Successful prompt/turn payload returned to the ACP layer and trace uploaders.
@@ -55,6 +58,7 @@ pub struct PromptTurnOk {
     /// `Some(Err)` carries a parse/validation error message.
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub usage: Option<crate::extensions::notification::PromptUsage>,
+    pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
 }
 /// Result of a prompt turn, containing the stop reason, accumulated token count,
 /// and an optional turn-end signals snapshot (for trace metadata enrichment).
@@ -68,6 +72,7 @@ pub(crate) fn ok_end_turn(tokens: u64, snapshot: Option<TurnDeltaSnapshot>) -> P
         completion_kind: PromptCompletionKind::Completed,
         structured_output: None,
         usage: None,
+        tool_overrides: None,
     })
 }
 /// Pre-parsed prompt metadata sent back to the caller after `parse_prompt`.
@@ -94,14 +99,28 @@ pub enum NotificationPriority {
 #[derive(Debug, Clone)]
 pub enum NotificationSource {
     MonitorEvent { task_id: String },
+    MonitorCompleted { task_id: String },
     BashTaskCompleted { task_id: String },
 }
 impl NotificationSource {
     pub fn task_id(&self) -> &str {
         match self {
-            Self::MonitorEvent { task_id } | Self::BashTaskCompleted { task_id } => task_id,
+            Self::MonitorEvent { task_id }
+            | Self::MonitorCompleted { task_id }
+            | Self::BashTaskCompleted { task_id } => task_id,
         }
     }
+}
+#[derive(Debug)]
+pub struct TaskWakeFallback {
+    pub prompt_id: String,
+    pub prompt_blocks: Vec<acp::ContentBlock>,
+    pub source: NotificationSource,
+}
+#[derive(Debug)]
+pub struct TaskWakeAdmission {
+    pub respond_to: oneshot::Sender<bool>,
+    pub fallback: TaskWakeFallback,
 }
 pub enum SessionCommand {
     Initialize {
@@ -119,6 +138,15 @@ pub enum SessionCommand {
     /// reverse-request so the client re-shows approval chrome over a real live
     /// waiter. Fire-and-forget; the actor spawns the round-trip + decision.
     RestorePlanApproval,
+    GetToolOverrides {
+        respond_to: oneshot::Sender<Option<xai_grok_sampling_types::ToolOverrides>>,
+    },
+    /// Establish the per-turn tool-overrides state before the first prompt runs. Sent once by
+    /// `handle_subagent_request` ahead of the child's first `Prompt`, so a spawned subagent's
+    /// inherited cutoff is applied and published (for its own subagents to read) before any turn.
+    SetToolOverrides {
+        overrides: xai_grok_sampling_types::ToolOverrides,
+    },
     Prompt {
         prompt_id: String,
         prompt_blocks: Vec<acp::ContentBlock>,
@@ -142,6 +170,9 @@ pub enum SessionCommand {
         /// Also derived server-side during an interruptible wait (see
         /// [`SessionActor::queue_input`]).
         send_now: bool,
+        /// Actor-authoritative admission and deferred fallback for terminal task wakes.
+        admission: Option<TaskWakeAdmission>,
+        tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
         respond_to: oneshot::Sender<PromptTurnResult>,
         /// Optional oneshot fired after the user message has been appended to
         /// chat history and a persistence flush barrier has completed, before
@@ -546,6 +577,15 @@ pub enum SessionCommand {
         new_text: String,
         editor: Option<String>,
     },
+    /// Hold a queued prompt out of combine-on-promote while a client edits it
+    /// in the composer. Released via [`Self::ReleaseCombineEdit`].
+    HoldCombineEdit {
+        id: String,
+    },
+    /// Release a previous [`Self::HoldCombineEdit`].
+    ReleaseCombineEdit {
+        id: String,
+    },
     /// Atomically interject a queued (not-yet-running) prompt into the running
     /// turn: the actor removes it from `pending_inputs` and pushes
     /// its text into `pending_interjections` in a single mailbox op, so the
@@ -567,10 +607,10 @@ pub enum SessionCommand {
     },
     /// Cancel the running turn. `kill_background_tasks` distinguishes a hard
     /// teardown (subagent shutdown — drains the whole queue) from a normal
-    /// interactive cancel (Ctrl+C — preserves the queued prompts so the next
-    /// one auto-runs). On an interactive cancel only the running turn (the front
-    /// of `pending_inputs`) is torn down; the follow-up `maybe_start_running_task`
-    /// promotes the new front so the user's next queued prompt auto-runs.
+    /// interactive cancel (Ctrl+C — preserves queued user prompts so the next
+    /// one auto-runs). Ctrl+C tears down the running turn and queued terminal
+    /// task-completion wakes; other cancel triggers tear down only the running
+    /// turn. The follow-up `maybe_start_running_task` promotes the next item.
     Cancel {
         cancel_subagents: bool,
         kill_background_tasks: bool,
@@ -595,6 +635,12 @@ pub enum SessionCommand {
     /// files and is included in GCS CopyFile snapshots.
     PersistFeedback(Box<crate::session::persistence::LocalFeedbackEntry>),
     AdvertiseCommands,
+    GetWorkflowCatalogState {
+        respond_to: oneshot::Sender<(bool, bool)>,
+    },
+    ListAvailableCommands {
+        respond_to: oneshot::Sender<crate::session::slash_commands::ListCommandsResponse>,
+    },
     /// Re-discover skills from disk, update the SkillManager baseline,
     /// and re-advertise slash commands to the client.
     ReloadSkills,
@@ -689,6 +735,10 @@ pub enum SessionCommand {
     GoalSummaryTurn {
         /// Short instruction appended as a verbatim user message.
         prompt_text: String,
+    },
+    WorkflowCompletionTurn {
+        run_id: String,
+        revision: u64,
     },
     /// Take turn messages from the chat state actor (proxied from mvp_agent).
     TakeTurnMessages {

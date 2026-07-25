@@ -6,7 +6,6 @@
 //! are re-copied at session spawn / reload by [`super::local_refresh`].
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::install_registry::{
     InstallError, InstallKind, InstallRegistry, InstalledRepo, RepoPlugin,
@@ -16,7 +15,7 @@ use super::manifest::{ManifestLoadResult, load_manifest, name_from_dirname};
 /// Source of a plugin installation.
 #[derive(Debug, Clone)]
 pub enum InstallSource {
-    /// Remote git repo — will be cloned.
+    /// Remote git repo or Git-supported local repository path — will be cloned.
     Git {
         url: String,
         git_ref: Option<String>,
@@ -36,6 +35,7 @@ pub struct InstallResult {
     pub repo_path: PathBuf,
     pub plugins: Vec<DiscoveredPlugin>,
     pub commit: Option<String>,
+    kind: InstallKind,
 }
 
 /// A plugin discovered within an installed source.
@@ -123,6 +123,94 @@ pub fn parse_install_source(input: &str, cwd: &Path) -> InstallSource {
     }
 }
 
+/// A full commit sha (40-hex SHA-1 or 64-hex SHA-256) — the only thing the
+/// pin policy accepts; branches, tags, and short prefixes are mutable or forgeable.
+pub fn is_full_commit_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_git_operand<'a>(value: &'a str, kind: &str) -> Result<&'a str, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("empty git {kind}"));
+    }
+    if value.contains('\0') {
+        return Err(format!("git {kind} contains NUL"));
+    }
+    if value.starts_with('-') {
+        return Err(format!("git {kind} may not begin with '-'"));
+    }
+    Ok(value)
+}
+
+/// Validate and trim a Git repository URL or path used as a CLI operand.
+pub fn validate_git_url(url: &str) -> Result<&str, String> {
+    validate_git_operand(url, "URL")
+}
+
+/// Validate and trim a Git ref used as a CLI operand.
+pub fn validate_git_ref(git_ref: &str) -> Result<&str, String> {
+    validate_git_operand(git_ref, "ref")
+}
+
+/// Validate and trim a full Git commit object ID.
+pub fn validate_git_sha(sha: &str) -> Result<&str, String> {
+    let sha = sha.trim();
+    if sha.contains('\0') {
+        return Err("git commit SHA contains NUL".into());
+    }
+    if sha.starts_with('-') {
+        return Err("git commit SHA may not begin with '-'".into());
+    }
+    if is_full_commit_sha(sha) {
+        Ok(sha)
+    } else {
+        Err("git commit SHA must be 40 or 64 hexadecimal characters".into())
+    }
+}
+
+/// The require-sha gate every remote plugin fetch goes through: policy on + no
+/// full-hex pin → typed refusal. Local-directory installs are exempt (the
+/// operator controls that disk; nothing is fetched).
+pub fn ensure_pinned(
+    require_sha: bool,
+    sha: Option<&str>,
+    plugin: &str,
+    url: &str,
+) -> Result<(), InstallError> {
+    if !require_sha {
+        return Ok(());
+    }
+    if sha.map(str::trim).is_some_and(is_full_commit_sha) {
+        return Ok(());
+    }
+    tracing::warn!(
+        plugin,
+        url,
+        "refusing unpinned remote plugin code (require_sha)"
+    );
+    Err(InstallError::UnpinnedRemoteRefused {
+        plugin: plugin.to_owned(),
+        url: url.to_owned(),
+    })
+}
+
+/// Prefer an explicit supplied SHA; if only `git_ref` is a full commit SHA,
+/// hoist it into the SHA slot so the verified clone path is used. Catalog pins
+/// published as `ref` still need this.
+pub fn hoist_pin_slots<'a>(
+    git_ref: Option<&'a str>,
+    git_sha: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    match git_sha.map(str::trim) {
+        Some(s) => (git_ref, Some(s)),
+        None => match git_ref.map(str::trim).filter(|s| is_full_commit_sha(s)) {
+            Some(s) => (None, Some(s)),
+            None => (git_ref, None),
+        },
+    }
+}
+
 /// Check if a string looks like a GitHub `owner/repo` shorthand.
 ///
 /// Returns `true` for strings like `user/repo` or `user/repo@v1.0`
@@ -163,7 +251,24 @@ fn repo_source_id(source: &InstallSource) -> String {
 pub fn install_from_source(
     source: &InstallSource,
     registry: &InstallRegistry,
+    require_sha: bool,
 ) -> Result<InstallResult, InstallError> {
+    install_from_source_with_label(source, registry, require_sha, None)
+}
+
+/// Like [`install_from_source`]; when `plugin_label` is set it appears in
+/// pin-refusal errors instead of the git URL (marketplace catalog names).
+pub fn install_from_source_with_label(
+    source: &InstallSource,
+    registry: &InstallRegistry,
+    require_sha: bool,
+    plugin_label: Option<&str>,
+) -> Result<InstallResult, InstallError> {
+    let source = &normalize_install_source(source)?;
+    if let InstallSource::Git { url, git_sha, .. } = source {
+        let label = plugin_label.unwrap_or(url.as_str());
+        ensure_pinned(require_sha, git_sha.as_deref(), label, url)?;
+    }
     let source_id = repo_source_id(source);
     let repo_key = InstallRegistry::repo_key(&source_id);
 
@@ -180,7 +285,7 @@ pub fn install_from_source(
 
     let repo_path = install_dir.join(&repo_key);
 
-    let (_kind, commit) = match source {
+    let (kind, commit) = match source {
         InstallSource::Git {
             url,
             git_ref,
@@ -191,7 +296,7 @@ pub fn install_from_source(
             let commit = read_head_commit(&repo_path);
             let kind = InstallKind::Git {
                 url: url.clone(),
-                git_ref: git_ref.clone(),
+                git_ref: git_sha.clone().or_else(|| git_ref.clone()),
                 commit: commit.clone().unwrap_or_default(),
                 subdir: subdir.clone(),
             };
@@ -238,7 +343,57 @@ pub fn install_from_source(
         repo_path,
         plugins,
         commit,
+        kind,
     })
+}
+
+fn normalize_install_source(source: &InstallSource) -> Result<InstallSource, InstallError> {
+    match source {
+        InstallSource::Git {
+            url,
+            git_ref,
+            git_sha,
+            subdir,
+        } => {
+            let (git_ref, git_sha) = hoist_pin_slots(git_ref.as_deref(), git_sha.as_deref());
+            let (url, git_ref, git_sha) = clone_operands(url, git_ref, git_sha)?;
+            Ok(InstallSource::Git {
+                url: url.to_owned(),
+                git_ref: git_ref.map(str::to_owned),
+                git_sha: git_sha.map(str::to_owned),
+                subdir: subdir.clone(),
+            })
+        }
+        local @ InstallSource::Local { .. } => Ok(local.clone()),
+    }
+}
+
+/// Argv for `git remote add` with options terminated before free operands.
+pub fn remote_add_args(url: &str) -> [&str; 5] {
+    ["remote", "add", "--", "origin", url]
+}
+
+/// Argv for shallow `git fetch` of a SHA with options terminated before free operands.
+pub fn fetch_sha_args(sha: &str) -> [&str; 6] {
+    ["fetch", "--depth", "1", "--", "origin", sha]
+}
+
+/// Validate/normalize URL + optional ref/SHA for pre-trust clone paths.
+pub fn clone_operands<'a>(
+    url: &'a str,
+    git_ref: Option<&'a str>,
+    git_sha: Option<&'a str>,
+) -> Result<(&'a str, Option<&'a str>, Option<&'a str>), InstallError> {
+    let url = validate_git_url(url).map_err(|detail| InstallError::InstallFailed { detail })?;
+    let git_ref = git_ref
+        .map(validate_git_ref)
+        .transpose()
+        .map_err(|detail| InstallError::InstallFailed { detail })?;
+    let git_sha = git_sha
+        .map(validate_git_sha)
+        .transpose()
+        .map_err(|detail| InstallError::InstallFailed { detail })?;
+    Ok((url, git_ref, git_sha))
 }
 
 /// Clone a git repo using the `git` CLI (supports shallow clone, SSH, etc.;
@@ -249,26 +404,25 @@ fn clone_repo(
     git_sha: Option<&str>,
     target: &Path,
 ) -> Result<(), InstallError> {
+    let (url, git_ref, git_sha) = clone_operands(url, git_ref, git_sha)?;
     if let Some(sha) = git_sha {
         if git_ref.is_some() {
-            tracing::debug!(?git_ref, sha, "git_sha takes precedence over git_ref");
+            tracing::debug!(git_ref, sha, "git_sha takes precedence over git_ref");
         }
         return clone_repo_at_sha(url, sha, target);
     }
 
-    let mut cmd = Command::new("git");
-    xai_grok_tools::util::detach_std_command(&mut cmd);
+    // Match marketplace cache: BatchMode SSH, empty ASKPASS, skip LFS smudge.
+    let mut cmd = xai_tty_utils::git_command();
     cmd.arg("clone").arg("--depth").arg("1");
-    cmd.stdin(std::process::Stdio::null());
-    cmd.envs(xai_grok_tools::util::pager_env());
 
     if let Some(r) = git_ref {
         cmd.arg("--branch").arg(r);
     }
 
-    cmd.arg(url).arg(target);
+    cmd.arg("--").arg(url).arg(target);
 
-    tracing::info!(url = url, target = %target.display(), "cloning plugin repo");
+    tracing::info!(url, target = %target.display(), "cloning plugin repo");
 
     let output = cmd.output().map_err(|e| InstallError::InstallFailed {
         detail: format!("failed to run git clone: {e}"),
@@ -290,13 +444,10 @@ fn clone_repo(
 }
 
 fn clone_repo_at_sha(url: &str, sha: &str, target: &Path) -> Result<(), InstallError> {
-    if sha.is_empty() {
-        return Err(InstallError::InstallFailed {
-            detail: "empty SHA provided for pinned clone".into(),
-        });
-    }
+    let url = validate_git_url(url).map_err(|detail| InstallError::InstallFailed { detail })?;
+    let sha = validate_git_sha(sha).map_err(|detail| InstallError::InstallFailed { detail })?;
 
-    tracing::info!(url = url, sha = sha, target = %target.display(), "cloning plugin repo at SHA");
+    tracing::info!(url, sha, target = %target.display(), "cloning plugin repo at SHA");
 
     std::fs::create_dir_all(target).map_err(|e| InstallError::Io {
         path: target.to_path_buf(),
@@ -309,8 +460,8 @@ fn clone_repo_at_sha(url: &str, sha: &str, target: &Path) -> Result<(), InstallE
     };
 
     run_git_in(target, &["init", "--quiet"]).map_err(wrap_fail)?;
-    run_git_in(target, &["remote", "add", "origin", url]).map_err(wrap_fail)?;
-    run_git_in(target, &["fetch", "--depth", "1", "origin", sha])
+    run_git_in(target, &remote_add_args(url)).map_err(wrap_fail)?;
+    run_git_in(target, &fetch_sha_args(sha))
         .map_err(|d| wrap_fail(format!("fetch-by-sha failed: {d}")))?;
     run_git_in(target, &["checkout", "--quiet", "FETCH_HEAD"]).map_err(wrap_fail)?;
 
@@ -336,12 +487,9 @@ fn run_git_in(cwd: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn run_git_in_capture(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut cmd = Command::new("git");
-    xai_grok_tools::util::detach_std_command(&mut cmd);
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .envs(xai_grok_tools::util::pager_env());
+    // Same auth/LFS/SSH suppression as marketplace cache clones.
+    let mut cmd = xai_tty_utils::git_command();
+    cmd.args(args).current_dir(cwd);
     let output = cmd
         .output()
         .map_err(|e| format!("failed to run git {}: {e}", args.first().unwrap_or(&"")))?;
@@ -503,28 +651,11 @@ fn try_load_plugin(dir: &Path, subdir: Option<&str>) -> Option<DiscoveredPlugin>
     }
 }
 
-/// Build an `InstalledRepo` from an install result and the original source.
-pub fn build_installed_repo(result: &InstallResult, source: &InstallSource) -> InstalledRepo {
-    let kind = match source {
-        InstallSource::Git {
-            url,
-            git_ref,
-            git_sha,
-            subdir,
-        } => InstallKind::Git {
-            url: url.clone(),
-            git_ref: git_sha.clone().or_else(|| git_ref.clone()),
-            commit: result.commit.clone().unwrap_or_default(),
-            subdir: subdir.clone(),
-        },
-        InstallSource::Local { path, subdir } => InstallKind::Local {
-            source_path: path.clone(),
-            subdir: subdir.clone(),
-        },
-    };
+/// Build an `InstalledRepo` from the normalized install result.
+pub fn build_installed_repo(result: &InstallResult, _: &InstallSource) -> InstalledRepo {
     let now = chrono::Utc::now().to_rfc3339();
     InstalledRepo {
-        kind,
+        kind: result.kind.clone(),
         installed_at: now.clone(),
         updated_at: now,
         path: result.repo_path.clone(),
@@ -579,27 +710,34 @@ pub enum UpdateStatus {
 /// - Tag installs: pinned — no-op
 /// - Commit installs: pinned — no-op
 /// - Local installs: no-op (explicit update); [`super::local_refresh`] re-copies on session spawn / reload
-pub fn update_repo(repo_key: &str, repo: &InstalledRepo) -> Result<UpdateStatus, InstallError> {
+pub fn update_repo(
+    repo_key: &str,
+    repo: &InstalledRepo,
+    require_sha: bool,
+) -> Result<UpdateStatus, InstallError> {
     match &repo.kind {
         InstallKind::Local { .. } => Ok(UpdateStatus::LiveLocal),
         InstallKind::Git {
+            url,
             git_ref,
             commit,
             subdir,
-            ..
         } => {
             // Check if pinned
             if let Some(r) = git_ref {
-                // Heuristic: if the ref looks like a commit hash (40 hex chars)
+                // Heuristic: if the ref looks like a commit hash
                 // or a version tag (starts with v and contains dots), it's pinned.
-                let is_tag_or_commit = r.len() == 40 && r.chars().all(|c| c.is_ascii_hexdigit())
-                    || (r.starts_with('v') && r.contains('.'));
+                let is_tag_or_commit =
+                    is_full_commit_sha(r) || (r.starts_with('v') && r.contains('.'));
                 if is_tag_or_commit {
                     return Ok(UpdateStatus::Pinned {
                         ref_name: r.clone(),
                     });
                 }
             }
+            // An update pulls whatever the mutable ref now points at — the same
+            // unpinned fetch the install gate refuses.
+            ensure_pinned(require_sha, None, repo_key, url)?;
 
             let old_commit = Some(commit.clone());
 
@@ -611,12 +749,8 @@ pub fn update_repo(repo_key: &str, repo: &InstalledRepo) -> Result<UpdateStatus,
                 });
             }
 
-            let mut cmd = Command::new("git");
-            xai_grok_tools::util::detach_std_command(&mut cmd);
-            cmd.args(["pull", "--ff-only"])
-                .current_dir(repo_path)
-                .stdin(std::process::Stdio::null())
-                .envs(xai_grok_tools::util::pager_env());
+            let mut cmd = xai_tty_utils::git_command();
+            cmd.args(["pull", "--ff-only"]).current_dir(repo_path);
             let output = cmd.output().map_err(|e| InstallError::InstallFailed {
                 detail: format!("failed to run git pull: {e}"),
             })?;
@@ -677,6 +811,7 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn repo_key_distinct_per_git_subdir_and_bare_unchanged() {
@@ -1037,6 +1172,25 @@ mod tests {
     }
 
     #[test]
+    fn sha_git_args_terminate_options_before_operands() {
+        assert_eq!(
+            remote_add_args("repo"),
+            ["remote", "add", "--", "origin", "repo"]
+        );
+        assert_eq!(
+            fetch_sha_args("0123456789abcdef0123456789abcdef01234567"),
+            [
+                "fetch",
+                "--depth",
+                "1",
+                "--",
+                "origin",
+                "0123456789abcdef0123456789abcdef01234567",
+            ]
+        );
+    }
+
+    #[test]
     fn clone_at_correct_sha_succeeds() {
         if !git_available() {
             eprintln!("skipping: `git` binary not available in test sandbox");
@@ -1079,26 +1233,22 @@ mod tests {
     }
 
     #[test]
-    fn clone_at_sha_handles_short_sha_via_mismatch() {
-        if !git_available() {
-            eprintln!("skipping: `git` binary not available in test sandbox");
-            return;
-        }
-        let (repo, sha) = make_local_repo();
-        let short = &sha[..7];
-        let dest = tempfile::tempdir().unwrap();
-        let url = format!("file://{}", repo.path().display());
-
-        let err = clone_repo_at_sha(&url, short, dest.path())
-            .expect_err("short sha should fail verification");
-
-        match err {
-            InstallError::ShaMismatch { expected, actual } => {
-                assert_eq!(expected, short);
-                assert_eq!(actual, sha);
-            }
-            InstallError::InstallFailed { .. } => {}
-            other => panic!("expected ShaMismatch or InstallFailed, got: {other:?}"),
+    fn clone_at_sha_rejects_malformed_pin_before_target_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let bad_shas = [
+            "deadbee",
+            "--upload-pack=cmd",
+            "gggggggggggggggggggggggggggggggggggggggg",
+        ];
+        for (index, bad) in bad_shas.into_iter().enumerate() {
+            let target = root.path().join(index.to_string());
+            let err = clone_repo_at_sha("file:///unused", bad, &target)
+                .expect_err("malformed SHA must be rejected");
+            assert!(matches!(err, InstallError::InstallFailed { .. }));
+            assert!(
+                !target.exists(),
+                "validation must precede filesystem mutation"
+            );
         }
     }
 
@@ -1156,7 +1306,7 @@ mod tests {
             marketplace: None,
         };
 
-        match update_repo("acme-deadbeef", &repo).expect("update should succeed") {
+        match update_repo("acme-deadbeef", &repo, false).expect("update should succeed") {
             UpdateStatus::Updated(result) => {
                 assert_eq!(result.plugins.len(), 1);
                 assert_eq!(result.plugins[0].name, "acme");
@@ -1220,10 +1370,227 @@ mod tests {
             marketplace: None,
         };
 
-        match update_repo("acme-deadbeef", &repo) {
+        match update_repo("acme-deadbeef", &repo, false) {
             Err(InstallError::InstallFailed { .. }) => {}
             Err(e) => panic!("expected InstallFailed, got {e:?}"),
             Ok(_) => panic!("expected InstallFailed when stored subdir is missing, got Ok"),
         }
+    }
+
+    #[test]
+    fn git_operand_validators_preserve_supported_inputs() {
+        for url in [
+            "https://example.com/repo.git",
+            "ssh://git@example.com/repo.git",
+            "git@example.com:repo.git",
+            "file:///tmp/repo.git",
+            "/tmp/repo.git",
+            "./repo.git",
+            "../repo.git",
+            "ext::helper-specific-address",
+        ] {
+            assert_eq!(validate_git_url(&format!(" {url} ")).unwrap(), url);
+        }
+        for git_ref in [
+            "main",
+            "feature/topic",
+            "refs/tags/v1.2.3",
+            "release@{yesterday}",
+        ] {
+            assert_eq!(validate_git_ref(&format!(" {git_ref} ")).unwrap(), git_ref);
+        }
+        for bad in ["", "  ", "--upload-pack=cmd", "bad\0value"] {
+            assert!(validate_git_url(bad).is_err(), "URL {bad:?} must fail");
+            assert!(validate_git_ref(bad).is_err(), "ref {bad:?} must fail");
+        }
+    }
+
+    #[test]
+    fn supplied_sha_is_always_full_hex() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "B".repeat(64);
+        assert_eq!(validate_git_sha(&format!(" {sha1} ")).unwrap(), sha1);
+        assert_eq!(validate_git_sha(&sha256).unwrap(), sha256);
+        assert!(ensure_pinned(false, None, "p", "u").is_ok());
+        assert!(ensure_pinned(true, Some(&sha1), "p", "u").is_ok());
+        let nonhex = "g".repeat(40);
+        for bad in [
+            "",
+            "deadbeef",
+            nonhex.as_str(),
+            "--upload-pack=cmd",
+            "bad\0sha",
+        ] {
+            assert!(validate_git_sha(bad).is_err(), "SHA {bad:?} must fail");
+        }
+        assert!(matches!(
+            ensure_pinned(true, None, "p", "u"),
+            Err(InstallError::UnpinnedRemoteRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn hoist_pin_slots_moves_full_sha_ref_into_sha_slot() {
+        let sha = "a".repeat(40);
+        assert_eq!(
+            hoist_pin_slots(Some(sha.as_str()), None),
+            (None, Some(sha.as_str()))
+        );
+        assert_eq!(
+            hoist_pin_slots(Some("main"), Some(sha.as_str())),
+            (Some("main"), Some(sha.as_str()))
+        );
+        assert_eq!(hoist_pin_slots(Some("main"), None), (Some("main"), None));
+        assert_eq!(
+            hoist_pin_slots(Some(sha.as_str()), Some("  ")),
+            (Some(sha.as_str()), Some("")),
+            "a supplied blank SHA remains a SHA field and must fail validation"
+        );
+    }
+
+    #[test]
+    fn normalized_git_kind_stays_pinned_in_durable_metadata() {
+        for (git_ref, git_sha, expected_pin) in [
+            (Some(" v1.2.3 "), None, "v1.2.3".to_string()),
+            (None, Some(format!(" {} ", "a".repeat(40))), "a".repeat(40)),
+        ] {
+            let source = InstallSource::Git {
+                url: " https://example.com/repo.git ".into(),
+                git_ref: git_ref.map(str::to_owned),
+                git_sha,
+                subdir: None,
+            };
+            let normalized = normalize_install_source(&source).unwrap();
+            let (url, git_ref) = match normalized {
+                InstallSource::Git {
+                    url,
+                    git_ref,
+                    git_sha,
+                    ..
+                } => (url, git_sha.or(git_ref)),
+                InstallSource::Local { .. } => unreachable!(),
+            };
+            let repo_key = InstallRegistry::repo_key(&url);
+            let result = InstallResult {
+                repo_key: repo_key.clone(),
+                repo_path: PathBuf::from("/unused"),
+                plugins: Vec::new(),
+                commit: Some("a".repeat(40)),
+                kind: InstallKind::Git {
+                    url,
+                    git_ref,
+                    commit: "a".repeat(40),
+                    subdir: None,
+                },
+            };
+            let repo = build_installed_repo(&result, &source);
+
+            assert_eq!(
+                repo_key,
+                InstallRegistry::repo_key("https://example.com/repo.git")
+            );
+            match &repo.kind {
+                InstallKind::Git { url, git_ref, .. } => {
+                    assert_eq!(url, "https://example.com/repo.git");
+                    assert_eq!(git_ref.as_deref(), Some(expected_pin.as_str()));
+                }
+                InstallKind::Local { .. } => panic!("expected Git"),
+            }
+            assert!(matches!(
+                update_repo(&repo_key, &repo, true),
+                Ok(UpdateStatus::Pinned { ref_name }) if ref_name == expected_pin
+            ));
+        }
+    }
+
+    #[test]
+    fn install_from_source_rejects_malformed_operands_before_install_dir_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let install_dir = root.path().join("installed-plugins");
+        let registry = InstallRegistry::empty(install_dir.clone());
+        for (url, git_ref, git_sha) in [
+            ("--upload-pack=cmd", None, None),
+            ("file:///unused", Some("--upload-pack=cmd"), None),
+            ("file:///unused", None, Some("deadbeef")),
+        ] {
+            let source = InstallSource::Git {
+                url: url.into(),
+                git_ref: git_ref.map(str::to_owned),
+                git_sha: git_sha.map(str::to_owned),
+                subdir: None,
+            };
+            assert!(matches!(
+                install_from_source(&source, &registry, false),
+                Err(InstallError::InstallFailed { .. })
+            ));
+            assert!(!install_dir.exists());
+        }
+    }
+
+    #[test]
+    fn install_from_source_gates_and_hoists_sha_pins() {
+        let install = tempfile::tempdir().unwrap();
+        let registry = InstallRegistry::empty(install.path().join("installed-plugins"));
+
+        let unpinned = InstallSource::Git {
+            url: "https://example.com/repo.git".into(),
+            git_ref: Some("main".into()),
+            git_sha: None,
+            subdir: None,
+        };
+        assert!(
+            matches!(
+                install_from_source(&unpinned, &registry, true),
+                Err(InstallError::UnpinnedRemoteRefused { .. })
+            ),
+            "unpinned git source must be refused before any fetch"
+        );
+
+        // Pinned path needs a real git binary (remote CI sandboxes often lack it).
+        if !git_available() {
+            eprintln!("skipping pin-hoist install: `git` binary not available in test sandbox");
+            return;
+        }
+
+        // Real pinned install from a local origin. allowAnySHA1InWant matches
+        // make_local_repo so fetch-by-sha against file:// succeeds.
+        let (origin, sha) = make_local_repo();
+        let pinned_via_ref = InstallSource::Git {
+            url: format!("file://{}", origin.path().display()),
+            git_ref: Some(sha.clone()), // full sha in the REF slot (url@sha syntax)
+            git_sha: None,
+            subdir: None,
+        };
+        let result = install_from_source(&pinned_via_ref, &registry, true)
+            .expect("a full-sha ref satisfies the pin policy via the hoist");
+        assert_eq!(
+            result.commit.as_deref(),
+            Some(sha.as_str()),
+            "the installed checkout is the pinned commit"
+        );
+    }
+
+    #[test]
+    fn update_repo_gates_unpinned_branch_updates() {
+        let repo = InstalledRepo {
+            kind: InstallKind::Git {
+                url: "https://example.com/repo.git".into(),
+                git_ref: Some("main".into()),
+                commit: "c0ffee".into(),
+                subdir: None,
+            },
+            installed_at: String::new(),
+            updated_at: String::new(),
+            path: PathBuf::from("/nonexistent"),
+            plugins: std::collections::HashMap::new(),
+            marketplace: None,
+        };
+        assert!(
+            matches!(
+                update_repo("acme-deadbeef", &repo, true),
+                Err(InstallError::UnpinnedRemoteRefused { .. })
+            ),
+            "a mutable-ref update must be refused under the pin policy"
+        );
     }
 }

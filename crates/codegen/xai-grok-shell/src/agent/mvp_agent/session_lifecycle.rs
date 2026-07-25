@@ -23,21 +23,15 @@ impl MvpAgent {
             let sid = id.0.to_string();
             tokio::spawn(async move {
                 if let Err(e) = client.finalize(&sid).await {
-                    tracing::warn!(
-                        error = % e, "session registry finalize failed (non-fatal)"
-                    );
+                    tracing::warn!(error = %e, "session registry finalize failed (non-fatal)");
                 }
             });
         }
     }
-    /// Remove a session and its thread handle without finalizing the cloud
-    /// replica; the conversation stays resumable on disk. Reached by
-    /// dead-actor reaping and the terminal close and delete paths. Idle
-    /// unload does not route here: `handle_evict_sessions` removes its
-    /// handle inline and keeps the thread for reconnect.
+    /// Remove a session without finalizing; it stays resumable on disk.
     pub(crate) fn remove_session(&self, id: &acp::SessionId) {
         self.sessions.borrow_mut().remove(id);
-        self.prompt_intake_locks.borrow_mut().remove(id);
+        self.dispatch_locks.borrow_mut().remove(id);
         self.session_threads.borrow_mut().remove(id);
         self.session_index_claims.borrow_mut().remove(id);
         self.require_gateway_sessions.borrow_mut().remove(id);
@@ -50,14 +44,16 @@ impl MvpAgent {
         if let Some(ops) = self.workspace_ops.borrow().as_ref() {
             ops.end_local_session(id.0.as_ref());
         }
+        let _ = self
+            .subagent_event_tx
+            .send(xai_grok_tools::implementations::grok_build::task::types::SubagentEvent::DiscardSessionCompletions {
+                parent_session_id: id.0.to_string(),
+            });
     }
-    /// Get-or-create the per-session prompt-intake lock (see
-    /// [`Self::prompt_intake_locks`]). Cheap clone of the shared `Rc`.
-    pub(super) fn prompt_intake_lock(
-        &self,
-        id: &acp::SessionId,
-    ) -> std::rc::Rc<tokio::sync::Mutex<()>> {
-        self.prompt_intake_locks
+    /// Get-or-create the per-session dispatch lock (see
+    /// [`Self::dispatch_locks`]). Cheap clone of the shared `Rc`.
+    pub(super) fn dispatch_lock(&self, id: &acp::SessionId) -> std::rc::Rc<tokio::sync::Mutex<()>> {
+        self.dispatch_locks
             .borrow_mut()
             .entry(id.clone())
             .or_default()
@@ -92,7 +88,9 @@ impl MvpAgent {
             .borrow_mut()
             .push((id.0.to_string(), final_state));
         tracing::debug!(
-            session_id = % id.0, ? final_state, "roster delta: session removed"
+            session_id = %id.0,
+            ?final_state,
+            "roster delta: session removed"
         );
         self.emit_roster_changed(Vec::new(), vec![id.0.to_string()]);
     }
@@ -305,7 +303,7 @@ impl MvpAgent {
         for id in dead {
             if self.sessions.borrow().contains_key(&id) {
                 tracing::warn!(
-                    session_id = % id.0,
+                    session_id = %id.0,
                     "Resident session actor exited unexpectedly; reaping as DeadFailed"
                 );
                 self.reap_dead_session(&id);
@@ -313,7 +311,7 @@ impl MvpAgent {
                 self.session_threads.borrow_mut().remove(&id);
                 self.session_live_state.borrow_mut().remove(&id);
                 tracing::debug!(
-                    session_id = % id.0,
+                    session_id = %id.0,
                     "Reaped finished thread for non-resident session (clean exit)"
                 );
             }
@@ -409,4 +407,51 @@ impl MvpAgent {
             .await
             .unwrap_or(true)
     }
+    /// Entry counts for every collection [`Self::remove_session`] drains,
+    /// plus workspace bindings and shared coordinator state.
+    pub(crate) async fn registry_snapshot(&self) -> RegistrySnapshot {
+        let subagents =
+            xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
+                self.subagent_event_tx.clone(),
+            )
+            .registry_counts()
+            .await;
+        RegistrySnapshot {
+            sessions: self.sessions.borrow().len(),
+            session_threads: self.session_threads.borrow().len(),
+            dispatch_locks: self.dispatch_locks.borrow().len(),
+            session_turn_numbers: self.session_turn_numbers.borrow().len(),
+            permission_event_receivers: self.permission_event_receivers.borrow().len(),
+            model_unavailable_sessions: self.model_unavailable_sessions.borrow().len(),
+            session_live_state: self.session_live_state.borrow().len(),
+            session_index_claims: self.session_index_claims.borrow().len(),
+            require_gateway_sessions: self.require_gateway_sessions.borrow().len(),
+            subagent_pending: subagents.pending,
+            subagent_active: subagents.active,
+            subagent_completed: subagents.completed,
+            workspace_bindings: self
+                .workspace_ops
+                .borrow()
+                .as_ref()
+                .and_then(|ops| ops.workspace_handle().map(|h| h.session_count())),
+        }
+    }
+}
+/// Field names are the wire contract of `x.ai/debug/agent`'s `registries`
+/// object; each maps to the same-named registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RegistrySnapshot {
+    pub sessions: usize,
+    pub session_threads: usize,
+    pub dispatch_locks: usize,
+    pub session_turn_numbers: usize,
+    pub permission_event_receivers: usize,
+    pub model_unavailable_sessions: usize,
+    pub session_live_state: usize,
+    pub session_index_claims: usize,
+    pub require_gateway_sessions: usize,
+    pub subagent_pending: usize,
+    pub subagent_active: usize,
+    pub subagent_completed: usize,
+    pub workspace_bindings: Option<usize>,
 }

@@ -68,11 +68,17 @@ fn show_privacy_info_zdr() {
     assert!(effects.is_empty());
     let text = last_system_text(&app, AgentId(0));
     assert!(text.contains("Gork Build"));
-    assert!(
-        text.contains("Zero Data Retention") || text.contains("Enterprise Zero Data Retention")
-    );
+    assert!(text.contains("Zero Data Retention"));
     assert!(
         text.contains("research uploads: disabled") || text.contains("Client research uploads")
+    );
+    assert!(
+        text.contains("Other settings (not changed by /privacy)"),
+        "must list other settings knobs: {text}",
+    );
+    assert!(
+        text.contains("GROK_TELEMETRY_ENABLED") && text.contains("GROK_EXTERNAL_OTEL"),
+        "must list telemetry/OTEL config keys: {text}",
     );
 }
 
@@ -87,6 +93,16 @@ fn show_privacy_info_opted_out() {
     assert!(
         text.contains("Gork Build") && text.contains("privacy mode"),
         "info-print must mention Gork Build privacy mode: {text}",
+    );
+    // Gork Build: `/privacy opt-in` is not offered, so the info text must
+    // not advertise it — but the passive config knobs are still listed.
+    assert!(!text.contains("/privacy opt-in"));
+    assert!(
+        text.contains("Other settings (not changed by /privacy)")
+            && text.contains("GROK_TELEMETRY_ENABLED")
+            && text.contains("trace_upload")
+            && text.contains("GROK_EXTERNAL_OTEL"),
+        "must list config knobs not changed by /privacy: {text}",
     );
 }
 
@@ -138,31 +154,21 @@ fn show_privacy_info_mentions_privacy_mode() {
 /// glyph** on the opt-in direction (privacy-degrading).
 #[test]
 fn set_coding_data_sharing_idempotent_opt_in() {
+    // Gork Build: the retention lock (Guard 0) fires before the idempotent
+    // path — an opt-in re-dispatch toasts the lock message and forces local
+    // state back to opted-out, even when the UI thought it was opted in.
     let mut app = test_app_with_agent();
-    app.coding_data_retention_opt_out = false; // currently opted-in
+    app.coding_data_retention_opt_out = false; // stale "opted-in" UI state
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
-    assert!(
-        effects.is_empty(),
-        "idempotent re-dispatch must NOT emit Effect"
-    );
+    assert!(effects.is_empty(), "locked opt-in must NOT emit Effect");
     let toast = read_toast(&app);
     assert!(
-        toast.contains("Opt in"),
-        "toast must show display name 'Opt in' (PR 9 R1, General-3 Issue 6): {toast}",
+        toast.contains("locks coding data retention"),
+        "toast must state the Gork Build retention lock: {toast}",
     );
     assert!(
-        !toast.contains("opt-in"),
-        "toast must NOT use snake-case canonical 'opt-in' — display name only: {toast}",
-    );
-    assert!(
-        toast.contains('\u{26A0}'),
-        "idempotent opt-in toast uses ⚠ destructive-warning glyph (PR 9 R1, \
-             General-3 Issue 5): {toast}",
-    );
-    // State unchanged.
-    assert!(
-        !app.coding_data_retention_opt_out,
-        "idempotent path must not mutate state",
+        app.coding_data_retention_opt_out,
+        "lock must restore local state to opted-out",
     );
 }
 
@@ -231,10 +237,12 @@ fn set_coding_data_sharing_blocked_by_zdr() {
 /// from a user the policy says shouldn't be touching this).
 #[test]
 fn set_coding_data_sharing_blocked_by_zdr_even_if_idempotent() {
+    // Opt-out direction so the Gork Build retention lock (Guard 0, opt-in
+    // only) does not shadow the ZDR guard under test.
     let mut app = test_app_with_agent();
     app.is_zdr = true;
-    app.coding_data_retention_opt_out = false;
-    let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+    app.coding_data_retention_opt_out = true;
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
     assert!(effects.is_empty());
     assert!(read_toast(&app).contains("Zero Data Retention"));
 }
@@ -740,29 +748,69 @@ fn scrub_error_for_toast_unit() {
     );
 }
 
-/// The no-agent path
-/// returns empty cleanly — no toast (the show_toast call would
-/// no-op anyway), no panic, no Effect emitted. A "✗ No active
-/// session" toast would be dead UX (no agent = no toast surface
-/// to render on), so this path emits a tracing::warn! instead.
+/// Gork Build: even on the agent-less welcome path, an opt-in dispatch is
+/// blocked by the retention lock — no effect, state stays opted out.
 #[test]
-fn set_coding_data_sharing_no_agents_returns_empty_without_panic() {
+fn set_coding_data_sharing_no_agents_opt_in_stays_locked() {
     let mut app = test_app_with_agent();
-    // Remove every agent so the dispatcher hits the no-agent path.
     app.agents.clear();
-    // Force the view off Agent so the dispatcher falls through to
-    // app.agents.keys().next() which is now empty.
     app.active_view = ActiveView::Welcome;
-    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+    app.coding_data_retention_opt_out = true;
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+    assert!(effects.is_empty(), "locked opt-in must NOT emit Effect");
+    assert!(
+        app.coding_data_retention_opt_out,
+        "opt-in must not apply under the retention lock",
+    );
+}
+
+fn privacy_banner_ready_app() -> AppView {
+    let mut app = test_app_with_agent();
+    app.active_view = ActiveView::Welcome;
+    app.auth_state = AuthState::Done;
+    app.trust_state = TrustState::Done;
+    app.privacy_notice_rollout = true;
+    app.privacy_banner_acked = None;
+    app.privacy_banner_reshow_days = None;
+    app.privacy_banner_accept_inflight = false;
+    app.is_zdr = false;
+    app.team_name = None;
+    app.coding_data_retention_opt_out = true;
+    app
+}
+
+/// Gork Build: retention is locked to opt-out, so the upstream opt-in
+/// banner must never show — not even when the remote `privacy_notice_rollout`
+/// flag is on and every upstream gate would pass.
+#[test]
+fn privacy_banner_never_shows_in_gork_build() {
+    let app = privacy_banner_ready_app();
+    assert!(
+        !app.privacy_banner_should_show(),
+        "Gork Build must never surface the retention opt-in banner"
+    );
+}
+
+/// Accept and Customize are inert: no effects, no opt-in, no ack.
+#[test]
+fn privacy_banner_accept_and_customize_are_inert_in_gork_build() {
+    let mut app = privacy_banner_ready_app();
+
+    let effects = dispatch(Action::PrivacyBannerAccept, &mut app);
+    assert!(effects.is_empty(), "Accept must emit nothing: {effects:?}");
+    assert!(!app.privacy_banner_accept_inflight);
+    assert!(
+        app.coding_data_retention_opt_out,
+        "Accept must not opt the user in"
+    );
+    assert!(app.privacy_banner_acked.is_none());
+
+    let effects = dispatch(Action::PrivacyBannerCustomize, &mut app);
     assert!(
         effects.is_empty(),
-        "no-agent path must return empty (no Effect to fire)",
+        "Customize must emit nothing: {effects:?}"
     );
-    // State unchanged (we never reach the optimistic mutation).
-    assert!(
-        !app.coding_data_retention_opt_out,
-        "no-agent path must NOT mutate state",
-    );
+    assert!(app.privacy_banner_acked.is_none());
 }
 
 #[test]
@@ -836,30 +884,34 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
 fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum() {
     use crate::settings::SettingValue;
     use crate::views::modal::ResetSettingsResult;
-    let mut app = test_app_with_agent();
-    // Flip theme to a non-default first.
-    let _ = dispatch(Action::SetTheme("tokyonight".to_string()), &mut app);
-    assert_eq!(app.current_ui.theme.as_deref(), Some("tokyonight"));
+    // SetTheme mutates the global theme cache — serialize with the
+    // other theme tests via the theme test lock.
+    with_theme_test_env(|| {
+        let mut app = test_app_with_agent();
+        // Flip theme to a non-default first.
+        let _ = dispatch(Action::SetTheme("tokyonight".to_string()), &mut app);
+        assert_eq!(app.current_ui.theme.as_deref(), Some("tokyonight"));
 
-    setup_reset_confirm_open(&mut app, "theme");
+        setup_reset_confirm_open(&mut app, "theme");
 
-    let effects = dispatch(
-        Action::ConfirmResetSetting {
-            choice: ResetSettingsResult::Reset,
-        },
-        &mut app,
-    );
+        let effects = dispatch(
+            Action::ConfirmResetSetting {
+                choice: ResetSettingsResult::Reset,
+            },
+            &mut app,
+        );
 
-    // Reset → SetTheme("groknight") (the registered default).
-    assert_eq!(effects.len(), 1);
-    match &effects[0] {
-        Effect::PersistSetting { key, value, .. } => {
-            assert_eq!(*key, "theme");
-            assert_eq!(value, &SettingValue::Enum("groknight"));
+        // Reset → SetTheme("groknight") (the registered default).
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Effect::PersistSetting { key, value, .. } => {
+                assert_eq!(*key, "theme");
+                assert_eq!(value, &SettingValue::Enum("groknight"));
+            }
+            other => panic!("expected PersistSetting, got {other:?}"),
         }
-        other => panic!("expected PersistSetting, got {other:?}"),
-    }
-    assert_eq!(app.current_ui.theme.as_deref(), Some("groknight"));
+        assert_eq!(app.current_ui.theme.as_deref(), Some("groknight"));
+    });
 }
 
 #[test]
@@ -873,24 +925,20 @@ fn show_usage_on_welcome_screen_is_noop() {
 }
 
 #[test]
-fn show_usage_with_redirect_url_shows_link_and_skips_fetch() {
+fn show_usage_with_redirect_url_fetches_session_only() {
+    // Redirect link is deferred until SessionUsageComplete (see billing tests).
     let mut app = test_app_with_agent();
     app.usage_billing_redirect_url = Some("https://billing.example.com/me".to_string());
     let before = agent_scrollback_len(&app);
     let effects = dispatch(Action::ShowUsage, &mut app);
     assert!(
-        effects.is_empty(),
-        "with a redirect URL set, ShowUsage should not fetch (billing or auto-topup), got: {effects:?}"
+        matches!(
+            effects.as_slice(),
+            [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
+        ),
+        "got: {effects:?}"
     );
-    assert_eq!(
-        agent_scrollback_len(&app),
-        before + 1,
-        "redirect path should push one system message with the billing link"
-    );
-    assert!(
-        last_system_text(&app, AgentId(0)).contains("https://billing.example.com/me"),
-        "redirect message should use the remote settings-provided URL"
-    );
+    assert_eq!(agent_scrollback_len(&app), before);
 }
 
 // ── Minimal update-notice tests ──────────────────────────────────────
@@ -911,4 +959,20 @@ fn minimal_update_notice_no_active_agent_is_noop() {
     let mut app = test_app();
     // Must not panic and must not require an agent.
     commit_minimal_update_notice(&mut app, "9.9.9");
+}
+
+// ── Tutorial dispatch tests ──────────────────────────────────────────
+
+/// `/tutorial` (and the palette entry) open the overlay; dispatching again
+/// while open toggles it closed. No side effects either way.
+#[test]
+fn open_tutorial_toggles_overlay_without_effects() {
+    let mut app = test_app();
+    let effects = dispatch(Action::OpenTutorial, &mut app);
+    assert!(app.tutorial.is_some(), "tutorial opens");
+    assert!(effects.is_empty(), "open emits nothing, got: {effects:?}");
+
+    let effects = dispatch(Action::OpenTutorial, &mut app);
+    assert!(app.tutorial.is_none(), "toggle closes");
+    assert!(effects.is_empty(), "close emits nothing, got: {effects:?}");
 }

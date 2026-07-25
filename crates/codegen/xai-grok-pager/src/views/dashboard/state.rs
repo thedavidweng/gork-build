@@ -14,6 +14,7 @@ use crate::actions::ActionRegistry;
 use crate::app::actions::Action;
 use crate::app::agent::AgentId;
 use crate::app::app_view::InputOutcome;
+use crate::input::line_editor::{LineEditOutcome, LineEditor};
 use crate::key;
 use crate::views::prompt_widget::PromptWidget;
 
@@ -46,6 +47,49 @@ impl DashboardRowId {
     /// subagents are read-only in this version.
     pub fn is_subagent(&self) -> bool {
         matches!(self, Self::Subagent { .. })
+    }
+
+    pub(crate) fn matches_top_level_agent(&self, agent_id: AgentId) -> bool {
+        matches!(self, Self::TopLevel(id) if *id == agent_id)
+    }
+}
+
+pub(crate) struct PeekViewportLease {
+    pub row: DashboardRowId,
+    pub snapshot: crate::scrollback::state::ViewportSnapshot,
+    pub page_flip_entry: Option<crate::scrollback::EntryId>,
+}
+
+pub(crate) fn scrollback_mut_for_row<'a>(
+    row: &DashboardRowId,
+    agents: &'a mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+) -> Option<&'a mut crate::scrollback::state::ScrollbackState> {
+    match row {
+        DashboardRowId::TopLevel(id) => agents.get_mut(id).map(|a| &mut a.scrollback),
+        DashboardRowId::Subagent {
+            parent,
+            child_session_id,
+        } => agents
+            .get_mut(parent)
+            .and_then(|p| p.subagent_views.get_mut(child_session_id))
+            .map(|c| &mut c.scrollback),
+        DashboardRowId::Roster { .. } => None,
+    }
+}
+
+pub(crate) fn scrollback_available_for_row(
+    row: &DashboardRowId,
+    agents: &indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+) -> bool {
+    match row {
+        DashboardRowId::TopLevel(id) => agents.contains_key(id),
+        DashboardRowId::Subagent {
+            parent,
+            child_session_id,
+        } => agents
+            .get(parent)
+            .is_some_and(|p| p.subagent_views.contains_key(child_session_id)),
+        DashboardRowId::Roster { .. } => false,
     }
 }
 
@@ -408,6 +452,9 @@ pub struct DashboardState {
     pub(crate) deferred_peek_send: Option<DeferredPeekSend>,
     /// Peek panel state (Space toggles).
     pub peek: Option<PeekPanelState>,
+    /// Session-scoped guest viewport for the live-tail peek (capture once
+    /// on select; sticky while the same row is peeked; restore on leave).
+    pub(crate) peek_viewport: Option<PeekViewportLease>,
     /// The peek panel's `❯ reply` input — a full [`PromptWidget`] so
     /// the reply gets paste chips (`[Pasted: N lines]`), word
     /// navigation, undo, and text selection exactly like [`Self::dispatch`].
@@ -720,7 +767,51 @@ pub struct ShortcutsModalState {
 #[derive(Debug, Clone)]
 pub struct RenameDraft {
     pub row: DashboardRowId,
-    pub draft: String,
+    editor: LineEditor,
+}
+
+const MAX_RENAME_SCALARS: usize = 100;
+
+impl RenameDraft {
+    pub fn new(row: DashboardRowId, text: impl Into<String>) -> Self {
+        let mut draft = Self {
+            row,
+            editor: LineEditor::default(),
+        };
+        draft.set_text(text);
+        draft
+    }
+
+    pub fn text(&self) -> &str {
+        self.editor.text()
+    }
+
+    pub fn cursor_byte(&self) -> usize {
+        self.editor.cursor_byte()
+    }
+
+    pub(crate) fn viewport(&self, width: usize) -> xai_ratatui_textarea::SingleLineViewport {
+        self.editor.viewport(width)
+    }
+
+    pub(crate) fn set_text(&mut self, text: impl Into<String>) {
+        let text = text
+            .into()
+            .chars()
+            .filter(|character| rename_wire_character_allowed(*character))
+            .take(MAX_RENAME_SCALARS)
+            .collect::<String>();
+        self.editor.set_text(text);
+    }
+}
+
+fn rename_character_allowed(character: char) -> bool {
+    !crate::render::line_utils::is_unsafe_display_char(character)
+}
+
+fn rename_wire_character_allowed(character: char) -> bool {
+    // Preserve an existing emoji ZWJ sequence; interactive inserts still reject format chars.
+    character == '\u{200d}' || rename_character_allowed(character)
 }
 
 /// One selectable directory in the location picker (see
@@ -798,10 +889,7 @@ impl LocationPickerState {
         base_cwd: PathBuf,
         worktrees: std::collections::HashMap<PathBuf, String>,
     ) -> Self {
-        let picker = crate::views::picker::PickerState {
-            search_active: true,
-            ..crate::views::picker::PickerState::default()
-        };
+        let picker = crate::views::picker::PickerState::input_active();
         Self {
             picker,
             window: crate::views::modal_window::ModalWindowState::new(),
@@ -834,7 +922,7 @@ impl LocationPickerState {
     /// Whether the current query should be treated as a filesystem path
     /// (directory completion) rather than a fuzzy filter over recents.
     pub fn query_is_path(&self) -> bool {
-        let q = &self.picker.query;
+        let q = self.picker.query();
         q.starts_with('/')
             || q.starts_with('~')
             || q.contains('/')
@@ -850,7 +938,7 @@ impl LocationPickerState {
     /// home; relative parents join [`Self::base_cwd`]. The separator is `/`
     /// on all hosts and additionally `\` on Windows.
     fn path_query_parts(&self) -> (PathBuf, String) {
-        let q = self.picker.query.as_str();
+        let q = self.picker.query();
         // Last path separator: `/` always; `\` additionally on Windows.
         let sep = match (q.rfind('/'), cfg!(windows).then(|| q.rfind('\\')).flatten()) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -917,7 +1005,7 @@ impl LocationPickerState {
                 .cloned()
                 .collect()
         } else {
-            let q = self.picker.query.trim().to_lowercase();
+            let q = self.picker.query().trim().to_lowercase();
             self.recents
                 .iter()
                 .filter(|c| {
@@ -940,7 +1028,7 @@ impl LocationPickerState {
         if let Some(c) = visible.get(self.picker.selected) {
             return Some(c.path.to_string_lossy().into_owned());
         }
-        let q = self.picker.query.trim();
+        let q = self.picker.query().trim();
         if !q.is_empty() {
             return Some(q.to_string());
         }
@@ -1056,6 +1144,7 @@ fn location_picker_config<'a>() -> crate::views::picker::PickerConfig<'a> {
         filter_label: None,
         filter_key_hint: None,
         filter_active: false,
+        header_note: None,
         action_keys: &[],
         disable_search: false,
         compact_bottom_bar: false,
@@ -1255,6 +1344,7 @@ impl DashboardState {
             deferred_dispatch_send: None,
             deferred_peek_send: None,
             peek: None,
+            peek_viewport: None,
             peek_reply,
             peek_reply_rect: None,
             peek_reply_cwd: None,
@@ -1320,6 +1410,17 @@ impl DashboardState {
     ) {
         self.dispatch.adopt_slash_mru(mru.clone());
         self.peek_reply.adopt_slash_mru(mru);
+    }
+
+    /// Adopt the shared per-command tag map (owned by `AppView`) into both the
+    /// dispatch input and the peek-reply input so dashboard slash completion
+    /// renders the same tags as agent prompts.
+    pub(crate) fn adopt_command_tags(
+        &mut self,
+        command_tags: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>>,
+    ) {
+        self.dispatch.adopt_command_tags(command_tags.clone());
+        self.peek_reply.adopt_command_tags(command_tags);
     }
 
     pub(crate) fn set_screen_mode(&mut self, mode: crate::app::ScreenMode) {
@@ -1701,6 +1802,10 @@ impl DashboardState {
     /// open, or retarget). Per-frame refreshes of an open panel go
     /// through `PeekPanelState::apply_fields` (not here), so an
     /// in-progress draft survives live updates.
+    ///
+    /// Does **not** restore the live-tail viewport lease — permission
+    /// refresh may call `set_peek(None)` while the same row stays
+    /// selected and reopens next paint.
     pub fn set_peek(&mut self, peek: Option<PeekPanelState>) {
         if peek.is_none() {
             self.peek_close_rect = None;
@@ -1711,6 +1816,82 @@ impl DashboardState {
             self.clear_peek_reply();
         }
         self.peek = peek;
+    }
+
+    pub fn restore_peek_viewport(
+        &mut self,
+        agents: &mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        let Some(lease) = self.peek_viewport.take() else {
+            return;
+        };
+        let Some(sb) = scrollback_mut_for_row(&lease.row, agents) else {
+            return;
+        };
+        let page_flip = lease.page_flip_entry;
+        let w = lease.snapshot.last_width;
+        let h = lease.snapshot.viewport_height;
+        sb.restore_viewport_snapshot(lease.snapshot);
+        if let Some(entry_id) = page_flip
+            && let Some(idx) = sb.index_of_id(entry_id)
+        {
+            if w > 0 && h > 0 {
+                sb.prepare_layout(w, h);
+            }
+            sb.set_selected(Some(idx));
+            sb.scroll_to_entry_top(idx);
+            sb.enable_follow_with_preserve();
+        }
+    }
+
+    pub fn begin_peek_viewport(
+        &mut self,
+        row: DashboardRowId,
+        agents: &mut indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        if self
+            .peek_viewport
+            .as_ref()
+            .is_some_and(|lease| lease.row == row)
+        {
+            return;
+        }
+        self.restore_peek_viewport(agents);
+        let Some(sb) = scrollback_mut_for_row(&row, agents) else {
+            return;
+        };
+        let snapshot = sb.capture_viewport_snapshot();
+        sb.set_view_mode(crate::scrollback::state::ViewMode::AllTurns);
+        sb.enable_follow_mode();
+        self.peek_viewport = Some(PeekViewportLease {
+            row,
+            snapshot,
+            page_flip_entry: None,
+        });
+    }
+
+    pub(crate) fn note_page_flip_for_lease(
+        &mut self,
+        agent_id: AgentId,
+        entry_id: crate::scrollback::EntryId,
+        agents: &indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        let Some(lease) = self.peek_viewport.as_mut() else {
+            return;
+        };
+        if !lease.row.matches_top_level_agent(agent_id) {
+            return;
+        }
+        let Some(sb) = agents.get(&agent_id).map(|agent| &agent.scrollback) else {
+            return;
+        };
+        if sb.index_of_id(entry_id).is_none() {
+            return;
+        }
+        if !sb.is_follow_preserve_scroll() {
+            return;
+        }
+        lease.page_flip_entry = Some(entry_id);
     }
 
     /// Clear the peek reply draft AND its undo history.
@@ -1848,12 +2029,14 @@ impl DashboardState {
             return self.handle_worktree_dialog_input(ev);
         }
 
-        // Rename mode owns the keyboard until Enter / Esc.
+        // Rename mode owns input until committed or cancelled.
         if let Some(ref mut rn) = self.rename {
-            if let Event::Key(key) = ev
-                && key.kind != KeyEventKind::Release
-            {
-                return handle_rename_key(rn, key);
+            match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    return handle_rename_key(rn, key);
+                }
+                Event::Paste(text) => return handle_rename_paste(rn, text),
+                _ => {}
             }
             return InputOutcome::Unchanged;
         }
@@ -3337,7 +3520,7 @@ impl DashboardState {
 
         // Forward to the prompt widget (single-line).
         let old = self.dispatch.text().to_string();
-        let _ = self.dispatch.handle_key(key);
+        let event = self.dispatch.handle_key(key);
         let new = self.dispatch.text().to_string();
         if old != new {
             // Live-update the filter as the user types ONLY in search
@@ -3369,6 +3552,8 @@ impl DashboardState {
                 // the viewport tracks selection again.
                 self.manual_scroll_active = false;
             }
+            InputOutcome::Changed
+        } else if event == crate::views::prompt_widget::PromptEvent::Edited {
             InputOutcome::Changed
         } else {
             InputOutcome::Unchanged
@@ -3817,8 +4002,7 @@ impl DashboardState {
             if !filled.ends_with('/') {
                 filled.push('/');
             }
-            lp.picker.query = filled;
-            lp.picker.query_cursor = lp.picker.query.len();
+            lp.picker.set_query(filled);
             lp.picker.selected = 0;
             lp.picker.scroll_offset = None;
             // The path changed — drop any stale "Not a directory" error.
@@ -3829,23 +4013,22 @@ impl DashboardState {
 
         let entry_count = lp.visible_candidates().len();
         let config = location_picker_config();
-        let query_before = lp.picker.query.clone();
         let outcome =
             crate::views::picker::handle_picker_input(ev, &mut lp.picker, entry_count, &config);
         // When the user edits the path, drop the stale validation error so a
         // corrected (possibly valid) path isn't shown next to a red
         // "Not a directory" left over from the previous failed attempt.
-        if lp.picker.query != query_before {
+        if matches!(&outcome, crate::views::picker::PickerOutcome::QueryChanged) {
             lp.error = None;
+            // Re-list only when the edited path changes; cursor motion is redraw-only.
+            lp.refresh_suggestions();
         }
-        // The query may have changed (typing / backspace / Ctrl+U) — re-list
-        // the parent directory if its path-mode parent moved.
-        lp.refresh_suggestions();
         match outcome {
             crate::views::picker::PickerOutcome::Closed => {
                 InputOutcome::Action(Action::DashboardCloseLocationPicker)
             }
-            crate::views::picker::PickerOutcome::Changed => InputOutcome::Changed,
+            crate::views::picker::PickerOutcome::Changed
+            | crate::views::picker::PickerOutcome::QueryChanged => InputOutcome::Changed,
             _ => InputOutcome::Unchanged,
         }
     }
@@ -3937,14 +4120,12 @@ impl DashboardState {
         let Some(dialog) = self.worktree_dialog.as_mut() else {
             return InputOutcome::Unchanged;
         };
-        let Event::Key(key) = ev else {
-            // Consume mouse / resize while the dialog is modal.
-            return InputOutcome::Unchanged;
+        let outcome = match ev {
+            Event::Key(key) if key.kind != KeyEventKind::Release => dialog.handle_key(key),
+            Event::Paste(text) => dialog.insert_paste(text),
+            _ => return InputOutcome::Unchanged,
         };
-        if key.kind == KeyEventKind::Release {
-            return InputOutcome::Unchanged;
-        }
-        match dialog.handle_key(key) {
+        match outcome {
             NewWorktreeDialogOutcome::Submitted(label) => {
                 self.worktree_dialog = None;
                 InputOutcome::Action(Action::DashboardConfirmWorktree { label })
@@ -3980,7 +4161,7 @@ impl DashboardState {
     /// chrome + picker pipeline via `handle_modal_key`.
     fn handle_shortcuts_modal_input(&mut self, ev: &Event) -> InputOutcome {
         use crate::views::shortcuts_help::{
-            ModalKeyOutcome, ShortcutsHelpOutcome, handle_modal_key, handle_mouse,
+            ModalKeyOutcome, ShortcutsHelpOutcome, handle_modal_key, handle_mouse, handle_paste,
             toggle_membership,
         };
 
@@ -4072,6 +4253,10 @@ impl DashboardState {
                     ShortcutsHelpOutcome::Unchanged => InputOutcome::Unchanged,
                 }
             }
+            Event::Paste(text) => match handle_paste(text, &mut modal.state, &modal.mode) {
+                ShortcutsHelpOutcome::Changed => InputOutcome::Changed,
+                _ => InputOutcome::Unchanged,
+            },
             _ => InputOutcome::Unchanged,
         }
     }
@@ -4267,6 +4452,7 @@ fn dashboard_action_for_id(
         | ActionId::OpenPrevLink
         | ActionId::ToggleTodos
         | ActionId::ToggleTasks
+        | ActionId::EditPromptExternal
         | ActionId::ToggleQueue
         | ActionId::OpenSessions
         | ActionId::OpenExtensions
@@ -4299,40 +4485,43 @@ fn dashboard_action_for_id(
 
 fn handle_rename_key(draft: &mut RenameDraft, key: &KeyEvent) -> InputOutcome {
     use crate::input::key::is_altgr;
-    // Reject Ctrl/Alt-modified character keys so
-    // Ctrl+R / Ctrl+A / Ctrl+V don't smuggle a bare letter into the
-    // draft. Ctrl+C is explicitly mapped to cancel.
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && !is_altgr(key.modifiers)
-        && let KeyCode::Char(c) = key.code
-    {
-        if c == 'c' {
+    match key.code {
+        KeyCode::Esc => return InputOutcome::Action(Action::DashboardCancelRename),
+        KeyCode::Enter if key.modifiers.is_empty() => {
+            return InputOutcome::Action(Action::DashboardCommitRename);
+        }
+        KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !is_altgr(key.modifiers) =>
+        {
             return InputOutcome::Action(Action::DashboardCancelRename);
         }
-        return InputOutcome::Unchanged;
+        _ => {}
     }
-    if key.modifiers.contains(KeyModifiers::ALT) && !is_altgr(key.modifiers) {
-        return InputOutcome::Unchanged;
-    }
-    match key.code {
-        KeyCode::Esc => InputOutcome::Action(Action::DashboardCancelRename),
-        KeyCode::Enter => InputOutcome::Action(Action::DashboardCommitRename),
-        KeyCode::Backspace => {
-            draft.draft.pop();
-            InputOutcome::Action(Action::DashboardRenameInput(draft.draft.clone()))
-        }
-        KeyCode::Char(c) => {
-            // Reject control characters and zero-width chars.
-            if c.is_control() {
-                return InputOutcome::Unchanged;
-            }
-            // Cap at 100 chars to match the worktree dialog input.
-            if draft.draft.chars().count() < 100 {
-                draft.draft.push(c);
-            }
-            InputOutcome::Action(Action::DashboardRenameInput(draft.draft.clone()))
-        }
-        _ => InputOutcome::Unchanged,
+
+    let can_insert = draft.text().chars().count() < MAX_RENAME_SCALARS;
+    let outcome = draft
+        .editor
+        .handle_key_with_insert_policy(key, |character| {
+            can_insert && rename_character_allowed(character)
+        });
+    rename_edit_outcome(outcome)
+}
+
+fn handle_rename_paste(draft: &mut RenameDraft, text: &str) -> InputOutcome {
+    let remaining = MAX_RENAME_SCALARS.saturating_sub(draft.text().chars().count());
+    let outcome =
+        draft
+            .editor
+            .insert_paste_with_policy(text, rename_wire_character_allowed, remaining);
+    rename_edit_outcome(outcome)
+}
+
+fn rename_edit_outcome(outcome: LineEditOutcome) -> InputOutcome {
+    match outcome {
+        LineEditOutcome::TextChanged
+        | LineEditOutcome::HandledNoChange
+        | LineEditOutcome::CursorChanged => InputOutcome::Changed,
+        LineEditOutcome::Unhandled => InputOutcome::Unchanged,
     }
 }
 
@@ -5247,45 +5436,38 @@ mod tests {
     /// Rename cap is honored exactly.
     #[test]
     fn rename_at_cap_drops_extra_char() {
-        let mut draft = RenameDraft {
-            row: DashboardRowId::TopLevel(AgentId(0)),
-            draft: "a".repeat(100),
-        };
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "a".repeat(100));
         let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
-        let _ = handle_rename_key(&mut draft, &key);
-        assert_eq!(draft.draft.chars().count(), 100);
+        let outcome = handle_rename_key(&mut draft, &key);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text().chars().count(), 100);
         assert!(
-            draft.draft.ends_with('a'),
+            draft.text().ends_with('a'),
             "char at cap should NOT be replaced: got {:?}",
-            draft.draft
+            draft.text()
         );
     }
 
     /// under-cap appends correctly.
     #[test]
     fn rename_under_cap_appends() {
-        let mut draft = RenameDraft {
-            row: DashboardRowId::TopLevel(AgentId(0)),
-            draft: "a".repeat(99),
-        };
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "a".repeat(99));
         let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
-        let _ = handle_rename_key(&mut draft, &key);
-        assert_eq!(draft.draft.chars().count(), 100);
-        assert!(draft.draft.ends_with('b'));
+        let outcome = handle_rename_key(&mut draft, &key);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text().chars().count(), 100);
+        assert!(draft.text().ends_with('b'));
     }
 
     /// Ctrl+letter in rename mode rejected (does not type
     /// the bare letter into the draft); Ctrl+C cancels.
     #[test]
     fn rename_rejects_ctrl_chars() {
-        let mut draft = RenameDraft {
-            row: DashboardRowId::TopLevel(AgentId(0)),
-            draft: "hello".to_string(),
-        };
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "hello");
         let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         let outcome = handle_rename_key(&mut draft, &ctrl_r);
         assert!(matches!(outcome, InputOutcome::Unchanged));
-        assert_eq!(draft.draft, "hello", "draft must not gain 'r'");
+        assert_eq!(draft.text(), "hello", "draft must not gain 'r'");
         // Ctrl+C → cancel.
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let outcome = handle_rename_key(&mut draft, &ctrl_c);
@@ -5293,6 +5475,125 @@ mod tests {
             outcome,
             InputOutcome::Action(crate::app::actions::Action::DashboardCancelRename)
         ));
+    }
+
+    #[test]
+    fn rename_word_motion_is_canonical_and_cursor_only() {
+        for key in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        ] {
+            let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "hello-world");
+            let outcome = handle_rename_key(&mut draft, &key);
+            assert!(matches!(outcome, InputOutcome::Changed));
+            assert_eq!(draft.text(), "hello-world");
+            assert_eq!(draft.cursor_byte(), "hello-".len());
+        }
+
+        for key in [
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "hello-world");
+            let _ = handle_rename_key(
+                &mut draft,
+                &KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            );
+            let outcome = handle_rename_key(&mut draft, &key);
+            assert!(matches!(outcome, InputOutcome::Changed));
+            assert_eq!(draft.cursor_byte(), "hello".len());
+        }
+
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "hello-world");
+        let outcome = handle_rename_key(
+            &mut draft,
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text(), "hello-");
+    }
+
+    #[test]
+    fn rename_grapheme_delete_and_middle_insert() {
+        let grapheme = "👩🏽\u{200d}💻";
+        let mut draft = RenameDraft::new(
+            DashboardRowId::TopLevel(AgentId(0)),
+            format!("a{grapheme}b"),
+        );
+        let _ = handle_rename_key(
+            &mut draft,
+            &KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        );
+        let _ = handle_rename_key(
+            &mut draft,
+            &KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        let outcome = handle_rename_key(
+            &mut draft,
+            &KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text(), "ab");
+
+        let outcome = handle_rename_key(
+            &mut draft,
+            &KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text(), "aXb");
+    }
+
+    #[test]
+    fn rename_policy_and_paste_preserve_scalar_cap() {
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "a".repeat(99));
+        let outcome = handle_rename_key(
+            &mut draft,
+            &KeyEvent::new(KeyCode::Char('\u{202e}'), KeyModifiers::NONE),
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text().chars().count(), 99);
+
+        let outcome = handle_rename_paste(&mut draft, "中\r\n文");
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text().chars().count(), 100);
+        assert!(draft.text().ends_with('中'));
+    }
+
+    #[test]
+    fn modified_enter_does_not_commit_rename() {
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "name");
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            let outcome = handle_rename_key(&mut draft, &KeyEvent::new(KeyCode::Enter, modifiers));
+            assert!(!matches!(
+                outcome,
+                InputOutcome::Action(Action::DashboardCommitRename)
+            ));
+        }
+    }
+
+    #[test]
+    fn rename_paste_preserves_emoji_zwj_sequences() {
+        let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "");
+        let outcome = handle_rename_paste(&mut draft, "👩‍💻");
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(draft.text(), "👩‍💻");
+    }
+
+    #[test]
+    fn rename_mode_routes_bracketed_paste_only_to_rename_editor() {
+        let mut state = DashboardState::new();
+        state.dispatch.set_text("hidden dispatch");
+        state.rename = Some(RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "ab"));
+        let registry = crate::actions::ActionRegistry::defaults();
+        let _ = state.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &registry,
+        );
+        let outcome = state.handle_input(&Event::Paste("中\r\n".to_owned()), &registry);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(state.rename.as_ref().map(RenameDraft::text), Some("a中b"));
+        assert_eq!(state.dispatch.text(), "hidden dispatch");
     }
 
     /// Esc-cancelling the worktree-label dialog must restore the stashed
@@ -5393,8 +5694,6 @@ mod tests {
             time_ago: String::new(),
             response_type: response_type.to_string(),
             last_user_message: None,
-            last_agent_lines: Vec::new(),
-            last_response_truncated: false,
             question: None,
             options: Vec::new(),
             request_id: None,
@@ -6584,8 +6883,6 @@ mod tests {
             time_ago: String::new(),
             response_type: "Idle".into(),
             last_user_message: None,
-            last_agent_lines: vec![],
-            last_response_truncated: false,
             question: None,
             options: vec![],
             request_id: None,
@@ -8557,6 +8854,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn search_mode_cursor_only_edit_redraws_without_filter_change() {
+        let mut state = DashboardState::new();
+        let registry = crate::actions::ActionRegistry::defaults();
+        state.enter_search_mode();
+        state.dispatch.set_text("auth");
+        state.dispatch.set_cursor(0);
+        state.filter = Filter::Substring("auth".to_owned());
+
+        let outcome = state.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &registry,
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(state.dispatch.text(), "auth");
+        assert_eq!(state.dispatch.cursor(), 1);
+        assert!(matches!(&state.filter, Filter::Substring(text) if text == "auth"));
+    }
+
     /// Esc in search mode CANCELS: clears the filter and exits.
     #[test]
     fn search_mode_esc_cancels_and_clears_filter() {
@@ -9224,7 +9540,7 @@ mod tests {
             let m = s.shortcuts_modal.as_ref().unwrap();
             (
                 m.state.selected,
-                m.state.query.clone(),
+                m.state.query().to_owned(),
                 m.filter_active,
                 m.collapsed_sections.clone(),
                 m.expanded_ids.clone(),
@@ -9982,7 +10298,7 @@ mod tests {
             location_candidate("/home/me/alpha", "alpha"),
             location_candidate("/home/me/beta", "beta"),
         ]);
-        lp.picker.query = "bet".to_string();
+        lp.picker.set_query("bet");
         assert_eq!(visible_labels(&lp), vec!["beta"]);
     }
 
@@ -9990,11 +10306,11 @@ mod tests {
     fn location_query_is_path_detection() {
         let mut lp = location_picker(vec![]);
         for q in ["/abs", "~/x", "rel/sub", "~"] {
-            lp.picker.query = q.to_string();
+            lp.picker.set_query(q);
             assert!(lp.query_is_path(), "`{q}` should be path mode");
         }
         for q in ["", "alpha", "bet"] {
-            lp.picker.query = q.to_string();
+            lp.picker.set_query(q);
             assert!(!lp.query_is_path(), "`{q}` should be recents mode");
         }
     }
@@ -10017,7 +10333,7 @@ mod tests {
     fn location_chosen_input_falls_back_to_typed_path() {
         let mut lp = location_picker(vec![location_candidate("/home/me/alpha", "alpha")]);
         // A path with no matching suggestion → the raw typed path is used.
-        lp.picker.query = "/no/such/dir".to_string();
+        lp.picker.set_query("/no/such/dir");
         assert_eq!(lp.chosen_input().as_deref(), Some("/no/such/dir"));
     }
 
@@ -10040,7 +10356,7 @@ mod tests {
         let mut lp = location_picker(vec![]);
 
         // Trailing slash → list the (non-hidden) subdirs.
-        lp.picker.query = format!("{}/", tmp.path().display());
+        lp.picker.set_query(format!("{}/", tmp.path().display()));
         lp.refresh_suggestions();
         let labels = visible_labels(&lp);
         assert!(labels.contains(&"alpha".to_string()), "got: {labels:?}");
@@ -10051,12 +10367,12 @@ mod tests {
         );
 
         // Prefix filter on the final segment.
-        lp.picker.query = format!("{}/al", tmp.path().display());
+        lp.picker.set_query(format!("{}/al", tmp.path().display()));
         lp.refresh_suggestions();
         assert_eq!(visible_labels(&lp), vec!["alpha"]);
 
         // A leading dot in the partial reveals dot-directories.
-        lp.picker.query = format!("{}/.h", tmp.path().display());
+        lp.picker.set_query(format!("{}/.h", tmp.path().display()));
         lp.refresh_suggestions();
         assert_eq!(visible_labels(&lp), vec![".hidden"]);
     }
@@ -10072,7 +10388,7 @@ mod tests {
         worktrees.insert(canon.join("wt"), "my-feature".to_string());
 
         let mut lp = location_picker_with_worktrees(vec![], worktrees);
-        lp.picker.query = format!("{}/", tmp.path().display());
+        lp.picker.set_query(format!("{}/", tmp.path().display()));
         lp.refresh_suggestions();
 
         let visible = lp.visible_candidates();
@@ -10102,7 +10418,7 @@ mod tests {
         worktrees.insert(real_canon, "linked-wt".to_string());
 
         let mut lp = location_picker_with_worktrees(vec![], worktrees);
-        lp.picker.query = format!("{}/", parent.path().display());
+        lp.picker.set_query(format!("{}/", parent.path().display()));
         lp.refresh_suggestions();
 
         let link = lp
@@ -10214,8 +10530,8 @@ mod tests {
             InputOutcome::Changed
         ));
         let lp = state.location_picker.as_ref().unwrap();
-        assert_eq!(lp.picker.query, "/opt/projects/beta/");
-        assert_eq!(lp.picker.query_cursor, lp.picker.query.len());
+        assert_eq!(lp.picker.query(), "/opt/projects/beta/");
+        assert_eq!(lp.picker.query_cursor(), lp.picker.query().len());
     }
 
     #[test]
@@ -10223,7 +10539,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("alpha")).unwrap();
         let mut lp = location_picker(vec![]);
-        lp.picker.query = format!("{}/al", tmp.path().display());
+        lp.picker.set_query(format!("{}/al", tmp.path().display()));
         lp.refresh_suggestions();
 
         let mut state = DashboardState::new();
@@ -10259,5 +10575,223 @@ mod tests {
             }
             other => panic!("expected DashboardChangeLocation, got {other:?}"),
         }
+    }
+
+    fn lease_fixture_agent() -> (
+        AgentId,
+        indexmap::IndexMap<AgentId, crate::app::agent_view::AgentView>,
+    ) {
+        use crate::scrollback::block::RenderBlock;
+        let id = AgentId(1);
+        let mut agent = crate::test_util::make_agent_view(Some("s1"), "/tmp");
+        agent.scrollback.push_block(RenderBlock::user_prompt("one"));
+        agent
+            .scrollback
+            .push_block(RenderBlock::agent_message("long response body for wrap"));
+        agent.scrollback.push_block(RenderBlock::user_prompt("two"));
+        agent
+            .scrollback
+            .push_block(RenderBlock::agent_message("second reply"));
+        agent.scrollback.prepare_layout(80, 24);
+        agent.scrollback.set_selected(Some(0));
+        agent.scrollback.set_scroll_offset(2);
+        let mut agents = indexmap::IndexMap::new();
+        agents.insert(id, agent);
+        (id, agents)
+    }
+
+    #[test]
+    fn peek_viewport_lease_restore_without_page_flip_keeps_pre_guest_nav() {
+        let (id, mut agents) = lease_fixture_agent();
+        let pre = agents[&id].scrollback.capture_viewport_snapshot();
+        let mut dash = DashboardState::new();
+        let row = DashboardRowId::TopLevel(id);
+        dash.begin_peek_viewport(row, &mut agents);
+        assert!(dash.peek_viewport.is_some());
+        assert!(agents[&id].scrollback.is_follow_mode());
+        assert!(
+            agents
+                .get_mut(&id)
+                .unwrap()
+                .scrollback
+                .prepare_layout(40, 6),
+            "guest width change is Case 1"
+        );
+
+        dash.restore_peek_viewport(&mut agents);
+        assert!(dash.peek_viewport.is_none());
+        let sb = &mut agents.get_mut(&id).unwrap().scrollback;
+        assert_eq!(sb.scroll_offset(), pre.scroll_offset);
+        assert_eq!(sb.is_follow_mode(), pre.follow_mode);
+        assert_eq!(sb.selected(), pre.selected);
+        assert!(
+            sb.prepare_layout(80, 24),
+            "restore must invalidate so full-width prepare is Case 1"
+        );
+        let snap = sb.capture_viewport_snapshot();
+        assert_eq!(snap.last_width, 80);
+    }
+
+    #[test]
+    fn peek_viewport_lease_page_flip_re_pins_entry_on_restore() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        let page_flip_entry = {
+            let sb = &mut agents.get_mut(&id).unwrap().scrollback;
+            sb.prepare_layout(40, 6);
+            let last = sb.len().saturating_sub(1);
+            let entry_id = sb.entry(last).unwrap().id;
+            sb.set_selected(Some(last));
+            sb.scroll_to_entry_top(last);
+            sb.enable_follow_with_preserve();
+            entry_id
+        };
+        assert!(agents[&id].scrollback.is_follow_preserve_scroll());
+        dash.note_page_flip_for_lease(id, page_flip_entry, &agents);
+        assert_eq!(
+            dash.peek_viewport.as_ref().and_then(|l| l.page_flip_entry),
+            Some(page_flip_entry)
+        );
+
+        dash.restore_peek_viewport(&mut agents);
+        let sb = &agents[&id].scrollback;
+        assert!(sb.is_follow_mode());
+        assert!(sb.is_follow_preserve_scroll());
+        assert_eq!(sb.selected(), Some(sb.len().saturating_sub(1)));
+        let snap = sb.capture_viewport_snapshot();
+        assert_eq!(snap.last_width, 80);
+    }
+
+    #[test]
+    fn set_peek_none_does_not_clear_viewport_lease() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        assert!(dash.peek_viewport.is_some());
+        dash.set_peek(None);
+        assert!(dash.peek_viewport.is_some());
+        dash.restore_peek_viewport(&mut agents);
+        assert!(dash.peek_viewport.is_none());
+    }
+
+    #[test]
+    fn sticky_begin_peek_does_not_recapture() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        let snap_offset = dash
+            .peek_viewport
+            .as_ref()
+            .map(|l| l.snapshot.scroll_offset)
+            .unwrap();
+        agents.get_mut(&id).unwrap().scrollback.set_scroll_offset(0);
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        assert_eq!(
+            dash.peek_viewport.as_ref().unwrap().snapshot.scroll_offset,
+            snap_offset
+        );
+    }
+
+    #[test]
+    fn note_page_flip_only_when_row_and_entry_match() {
+        let (id, mut agents) = lease_fixture_agent();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        let entry_id = agents[&id].scrollback.entry(3).unwrap().id;
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .scrollback
+            .enable_follow_with_preserve();
+        dash.note_page_flip_for_lease(AgentId(99), entry_id, &agents);
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none()
+        );
+        dash.note_page_flip_for_lease(id, crate::scrollback::EntryId::new(u64::MAX), &agents);
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none()
+        );
+        dash.note_page_flip_for_lease(id, entry_id, &agents);
+        let lease = dash.peek_viewport.as_ref().unwrap();
+        assert_eq!(lease.page_flip_entry, Some(entry_id));
+        assert!(!lease.snapshot.follow_preserve_scroll);
+        assert_eq!(lease.snapshot.selected, Some(0));
+    }
+
+    #[test]
+    fn restore_ignores_page_flip_entry_removed_during_lease() {
+        let (id, mut agents) = lease_fixture_agent();
+        let pre = agents[&id].scrollback.capture_viewport_snapshot();
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(DashboardRowId::TopLevel(id), &mut agents);
+        let entry_id = agents[&id].scrollback.entry(2).unwrap().id;
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .scrollback
+            .enable_follow_with_preserve();
+        dash.note_page_flip_for_lease(id, entry_id, &agents);
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .scrollback
+            .remove_entry(entry_id);
+
+        dash.restore_peek_viewport(&mut agents);
+
+        assert!(dash.peek_viewport.is_none());
+        assert_eq!(agents[&id].scrollback.selected(), pre.selected);
+        assert_eq!(agents[&id].scrollback.is_follow_mode(), pre.follow_mode);
+    }
+
+    #[test]
+    fn note_page_flip_ignores_subagent_lease_on_parent_agent() {
+        let (id, mut agents) = lease_fixture_agent();
+        let child = crate::test_util::make_agent_view(Some("child"), "/tmp");
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .subagent_views
+            .insert("child".into(), Box::new(child));
+        let mut dash = DashboardState::new();
+        dash.begin_peek_viewport(
+            DashboardRowId::Subagent {
+                parent: id,
+                child_session_id: "child".into(),
+            },
+            &mut agents,
+        );
+        let entry_id = agents[&id].scrollback.entry(3).unwrap().id;
+        dash.note_page_flip_for_lease(id, entry_id, &agents);
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none(),
+            "parent drain must not write parent entries onto a subagent lease"
+        );
+        agents
+            .get_mut(&id)
+            .unwrap()
+            .scrollback
+            .enable_follow_with_preserve();
+        dash.note_page_flip_for_lease(id, entry_id, &agents);
+        assert!(
+            dash.peek_viewport
+                .as_ref()
+                .unwrap()
+                .page_flip_entry
+                .is_none()
+        );
     }
 }

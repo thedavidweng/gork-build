@@ -808,14 +808,6 @@ impl ScrollbackState {
         None
     }
 
-    /// Whether a turn-terminal marker stamped with `prompt_id` is in scrollback.
-    pub fn has_turn_terminal_marker_with_pid(&self, prompt_id: &str) -> bool {
-        self.entries.iter().any(|(_, entry)| {
-            matches!(&entry.block, RenderBlock::SessionEvent(b)
-                if b.event.is_turn_terminal() && b.prompt_id.as_deref() == Some(prompt_id))
-        })
-    }
-
     /// Merge a stop/stop_failure hook batch into a turn-terminal marker
     /// entry and collapse it so the right-justified summary — not the
     /// fold-out detail — is the resting state. Returns `false` unless the
@@ -856,41 +848,56 @@ impl ScrollbackState {
         true
     }
 
-    /// Refresh an uncommitted parked marker after a subagent completion.
-    pub(crate) fn refresh_parked_subagent_marker(
+    /// Fold a turn completion into a tail-adjacent parked "Worked for X"
+    /// marker from the same prompt turn: the parked row already IS the
+    /// turn's boundary, so it takes the final elapsed + stop hooks in place
+    /// (unparked) instead of an identical row stacking beneath it. Returns
+    /// `false` (caller pushes a fresh marker) when the tail doesn't match,
+    /// the event isn't a completion (a failure/cancel is a different
+    /// outcome), or minimal mode already committed the row — print-once: an
+    /// in-place mutation would never reach the terminal.
+    pub fn fold_completion_into_tail_parked_marker(
         &mut self,
-        id: EntryId,
-        prompt_id: &str,
-        elapsed: std::time::Duration,
-        end_work: super::blocks::EndWork,
+        event: &super::blocks::SessionEvent,
+        stop_hooks: &[(String, Vec<super::blocks::tool::HookRunEntry>)],
+        prompt_id: Option<&str>,
     ) -> bool {
+        use super::blocks::SessionEvent;
+        // `is_none` also keeps `None` from matching a pid-less parked marker.
+        if prompt_id.is_none() || !matches!(event, SessionEvent::TurnCompleted { .. }) {
+            return false;
+        }
+        let tail_match = self.last().and_then(|entry| match &entry.block {
+            RenderBlock::SessionEvent(b) if b.parked && b.prompt_id.as_deref() == prompt_id => {
+                Some(entry.id)
+            }
+            _ => None,
+        });
+        let Some(id) = tail_match else {
+            return false;
+        };
         if self.is_committed(id) {
             return false;
         }
-        let Some(end_work) = end_work.nonzero() else {
-            return false;
-        };
         let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
-        let RenderBlock::SessionEvent(block) = &mut entry.block else {
+        let RenderBlock::SessionEvent(ref mut b) = entry.block else {
             return false;
         };
-        if !block.parked
-            || block.prompt_id.as_deref() != Some(prompt_id)
-            || !matches!(
-                &block.event,
-                super::blocks::SessionEvent::TurnCompleted { .. }
-            )
-        {
-            return false;
+        b.event = event.clone();
+        b.parked = false;
+        b.stop_hooks = stop_hooks.to_vec();
+        // A hook-carrying marker rests Collapsed (the right-justified summary)
+        // on every sibling path — fresh pushes via `default_display_mode` and
+        // `attach_stop_hooks_to_marker` — so the fold matches.
+        if b.has_stop_hook_content() && !entry.display_mode_pinned {
+            entry.display_mode = DisplayMode::Collapsed;
         }
-        block.event = super::blocks::SessionEvent::TurnCompleted {
-            elapsed: Some(elapsed),
-        };
-        block.end_work = Some(end_work);
         entry.invalidate_cache();
-        self.mark_height_dirty(id);
+        self.mark_structurally_dirty(id);
+        // The marker's searchable text changed (parked elapsed → final).
+        self.bump_content_generation();
         true
     }
 
@@ -1172,20 +1179,25 @@ impl ScrollbackState {
     /// the single point where block timing begins — constructors default
     /// to `started_at = None`.
     pub fn set_last_running(&mut self, running: bool) {
-        if let Some((_, entry)) = self.entries.last_mut() {
-            let was_running = entry.is_running;
-            entry.is_running = running;
-            entry.invalidate_cache();
+        if let Some(id) = self.entries.last().map(|(_, entry)| entry.id) {
+            self.set_entry_running(id, running);
+        }
+    }
 
-            // Start timing when a tool block enters running state.
-            if running && !was_running {
-                if let RenderBlock::ToolCall(ref mut tc) = entry.block {
-                    tc.start_timing();
-                }
-                self.running.insert(entry.id);
-            } else if !running && was_running {
-                self.running.remove(&entry.id);
+    pub fn set_entry_running(&mut self, id: EntryId, running: bool) {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        let was_running = entry.is_running;
+        entry.is_running = running;
+        entry.invalidate_cache();
+        if running && !was_running {
+            if let RenderBlock::ToolCall(ref mut tc) = entry.block {
+                tc.start_timing();
             }
+            self.running.insert(entry.id);
+        } else if !running && was_running {
+            self.running.remove(&entry.id);
         }
     }
 
@@ -1691,6 +1703,32 @@ impl ScrollbackState {
         self.scroll_offset
     }
 
+    pub fn capture_viewport_snapshot(&self) -> ViewportSnapshot {
+        ViewportSnapshot {
+            scroll_offset: self.scroll_offset,
+            follow_mode: self.follow_mode,
+            follow_preserve_scroll: self.follow_preserve_scroll,
+            viewport_height: self.viewport_height,
+            last_width: self.last_width,
+            selected: self.selected,
+            current_turn: self.current_turn,
+            view_mode: self.view_mode,
+            total_height: self.total_height,
+        }
+    }
+
+    pub fn restore_viewport_snapshot(&mut self, snap: ViewportSnapshot) {
+        self.scroll_offset = snap.scroll_offset;
+        self.follow_mode = snap.follow_mode;
+        self.follow_preserve_scroll = snap.follow_preserve_scroll;
+        self.viewport_height = snap.viewport_height;
+        self.last_width = snap.last_width;
+        self.selected = snap.selected;
+        self.current_turn = snap.current_turn;
+        self.view_mode = snap.view_mode;
+        self.invalidate_layout_cache();
+    }
+
     /// Set viewport height.
     pub fn set_viewport_height(&mut self, height: u16) {
         self.viewport_height = height;
@@ -1893,12 +1931,11 @@ pub(super) mod test_util {
             self.state.set_selected(Some(idx));
         }
 
+        /// Send with page-flip on (default product behavior).
         pub(super) fn send_prompt(&mut self, text: &str) -> EntryId {
             let id = self.state.push_block(RenderBlock::user_prompt(text));
             let prompt_idx = self.state.len().saturating_sub(1);
-            self.state.set_selected(Some(prompt_idx));
-            self.state.scroll_to_entry_top(prompt_idx);
-            self.state.enable_follow_with_preserve();
+            self.state.follow_new_turn(Some(prompt_idx), true);
             self.frame();
             id
         }
@@ -2265,34 +2302,6 @@ mod tests {
             state.latest_turn_marker_accepting("stop_failure", None),
             Some(marker)
         );
-    }
-
-    #[test]
-    fn subagent_marker_refresh_does_not_mutate_terminal_marker() {
-        use crate::scrollback::blocks::{EndWork, SessionEvent, SessionEventBlock};
-
-        let mut state = ScrollbackState::new();
-        let mut block = SessionEventBlock::new(SessionEvent::TurnCompleted {
-            elapsed: Some(std::time::Duration::from_secs(1)),
-        });
-        block.prompt_id = Some("p1".into());
-        let marker = state.push_block(RenderBlock::SessionEvent(block));
-
-        assert!(!state.refresh_parked_subagent_marker(
-            marker,
-            "p1",
-            std::time::Duration::from_secs(2),
-            EndWork {
-                running_subagents: 1,
-                ..EndWork::default()
-            },
-        ));
-
-        let RenderBlock::SessionEvent(block) = &state.get_by_id(marker).unwrap().block else {
-            panic!("expected terminal marker");
-        };
-        assert_eq!(block.marker_text(), "Worked for 1.0s.");
-        assert!(block.end_work.is_none());
     }
 
     #[test]
@@ -3302,5 +3311,150 @@ mod tests {
             state.get_by_id(id).unwrap().display_mode,
             DisplayMode::Expanded
         );
+    }
+
+    fn long_wrap_text() -> String {
+        "word ".repeat(80)
+    }
+
+    fn snapshot_fixture() -> ScrollbackState {
+        let mut state = ScrollbackState::new();
+        state.push_block(user_block("Q1"));
+        state.push_block(agent_block(&long_wrap_text()));
+        state.push_block(user_block("Q2"));
+        state.push_block(agent_block(&long_wrap_text()));
+        state
+    }
+
+    #[test]
+    fn viewport_snapshot_restore_roundtrip_after_guest_mutate() {
+        let mut state = snapshot_fixture();
+        const W0: u16 = 80;
+        const H0: u16 = 20;
+        state.prepare_layout(W0, H0);
+        state.follow_mode = false;
+        state.follow_preserve_scroll = true;
+        state.set_selected(Some(0));
+        state.set_scroll_offset(3);
+        state.view_mode = ViewMode::SingleTurn;
+        state.current_turn = Some(0);
+        state.prepare_layout(W0, H0);
+
+        let snap = state.capture_viewport_snapshot();
+        let expected_offset = snap.scroll_offset;
+        let expected_follow = snap.follow_mode;
+        let expected_preserve = snap.follow_preserve_scroll;
+        let expected_vh = snap.viewport_height;
+        let expected_lw = snap.last_width;
+        let expected_sel = snap.selected;
+        let expected_turn = snap.current_turn;
+        let expected_mode = snap.view_mode;
+
+        state.enable_follow_mode();
+        state.view_mode = ViewMode::AllTurns;
+        assert!(state.prepare_layout(40, 8));
+        assert!(state.layout_cache.is_some());
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, 40);
+
+        state.restore_viewport_snapshot(snap);
+
+        assert_eq!(state.scroll_offset, expected_offset);
+        assert_eq!(state.follow_mode, expected_follow);
+        assert_eq!(state.follow_preserve_scroll, expected_preserve);
+        assert_eq!(state.viewport_height, expected_vh);
+        assert_eq!(state.last_width, expected_lw);
+        assert_eq!(state.selected, expected_sel);
+        assert_eq!(state.current_turn, expected_turn);
+        assert_eq!(state.view_mode, expected_mode);
+        assert!(state.layout_cache.is_none());
+
+        assert!(state.prepare_layout(W0, H0));
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, W0);
+    }
+
+    #[test]
+    fn restore_invalidates_stale_peek_width_cache_before_full_prepare() {
+        let mut state = snapshot_fixture();
+        const W0: u16 = 80;
+        const W1: u16 = 40;
+        const H: u16 = 20;
+
+        assert!(state.prepare_layout(W0, H));
+        assert_eq!(state.last_width, W0);
+        let snap = state.capture_viewport_snapshot();
+        assert_eq!(snap.last_width, W0);
+
+        assert!(state.prepare_layout(W1, H));
+        assert_eq!(state.last_width, W1);
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, W1);
+        let peek_height = state.layout_cache.as_ref().unwrap().entries[1].height;
+
+        state.restore_viewport_snapshot(snap);
+        assert_eq!(state.last_width, W0);
+        assert!(state.layout_cache.is_none());
+
+        assert!(
+            state.prepare_layout(W0, H),
+            "restore must force Case 1 full rebuild at restored width"
+        );
+        let cache = state.layout_cache.as_ref().unwrap();
+        assert_eq!(cache.width, W0);
+        assert_ne!(
+            cache.entries[1].height, peek_height,
+            "heights must be recomputed for W0, not left at W1 wrap"
+        );
+    }
+
+    #[test]
+    fn prepare_layout_width_change_is_case1_height_only_is_not() {
+        let mut state = snapshot_fixture();
+        assert!(state.prepare_layout(80, 20));
+        assert!(
+            !state.prepare_layout(80, 20),
+            "stable WxH with clean cache is Case 3"
+        );
+        assert!(
+            !state.prepare_layout(80, 12),
+            "height-only change is not Case 1"
+        );
+        assert_eq!(state.last_width, 80);
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, 80);
+        assert!(
+            !state.prepare_layout(80, 12),
+            "stable width after height-only stays Case 3"
+        );
+        assert!(state.prepare_layout(50, 12), "width change is Case 1");
+        assert_eq!(state.layout_cache.as_ref().unwrap().width, 50);
+        assert!(
+            !state.prepare_layout(50, 12),
+            "stable width after Case 1 is Case 3"
+        );
+    }
+
+    #[test]
+    fn restore_reverts_follow_autoselect_and_current_turn() {
+        let mut state = snapshot_fixture();
+        state.prepare_layout(80, 20);
+        state.follow_mode = false;
+        state.set_selected(Some(0));
+        assert_eq!(state.current_turn(), Some(0));
+        state.set_scroll_offset(2);
+
+        let snap = state.capture_viewport_snapshot();
+        assert_eq!(snap.selected, Some(0));
+        assert_eq!(snap.current_turn, Some(0));
+        assert!(!snap.follow_mode);
+
+        state.enable_follow_mode();
+        state.prepare_layout(80, 20);
+        assert!(state.is_follow_mode());
+        assert_ne!(state.selected(), Some(0));
+        assert_eq!(state.current_turn(), Some(1));
+
+        state.restore_viewport_snapshot(snap);
+        assert!(!state.is_follow_mode());
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.current_turn(), Some(0));
+        assert_eq!(state.scroll_offset(), 2);
     }
 }

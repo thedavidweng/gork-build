@@ -479,6 +479,7 @@ pub(super) mod paste_key_tests {
                 bg_tool_call_to_task: std::collections::HashMap::new(),
                 scheduled_tasks: std::collections::HashMap::new(),
                 in_flight_prompt: None,
+                compact_held_prompt: None,
                 current_prompt_id: None,
                 created_via_new: false,
             },
@@ -1121,9 +1122,24 @@ pub(super) mod paste_key_tests {
     #[test]
     fn event_paste_plan_approval_non_image_file_url_decoded_into_prompt() {
         assert_event_paste_arm_decodes_non_image("plan_approval", |agent| {
-            agent.plan_approval_view = Some(make_plan_approval_view_state());
+            let mut view = make_plan_approval_view_state();
+            view.focus = crate::views::plan_approval_view::PlanApprovalFocus::Prompt;
+            agent.plan_approval_view = Some(view);
             agent.line_viewer = None;
         });
+    }
+    #[test]
+    fn event_paste_plan_preview_does_not_mutate_hidden_prompt() {
+        let mut agent = make_agent();
+        agent.prompt.set_text("hidden prompt");
+        agent.plan_approval_view = Some(make_plan_approval_view_state());
+        agent.line_viewer = None;
+        let outcome = agent.handle_input(
+            &Event::Paste("ignored".to_owned()),
+            &ActionRegistry::defaults(),
+        );
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
     /// Question-view `Event::Paste` arm routes through the classifier when
     /// the question view is in `InputMode` focus.
@@ -1195,17 +1211,19 @@ pub(super) mod paste_key_tests {
     /// Build a `QuestionViewState` already in `InputMode` focus.
     pub(in crate::app::agent_view) fn make_question_view_state_in_input_mode()
     -> crate::views::question_view::QuestionViewState {
-        let question =
-            xai_grok_tools::implementations::grok_build::ask_user_question::Question {
-                question: "Pick one?".to_string(),
-                options: vec![
-                xai_grok_tools::implementations::grok_build::ask_user_question::QuestionOption
-                { label : "A".to_string(), description : "Option A".to_string(), preview
-                : None, id : None, },
+        let question = xai_grok_tools::implementations::grok_build::ask_user_question::Question {
+            question: "Pick one?".to_string(),
+            options: vec![
+                xai_grok_tools::implementations::grok_build::ask_user_question::QuestionOption {
+                    label: "A".to_string(),
+                    description: "Option A".to_string(),
+                    preview: None,
+                    id: None,
+                },
             ],
-                multi_select: Some(false),
-                id: None,
-            };
+            multi_select: Some(false),
+            id: None,
+        };
         let mut state = crate::views::question_view::QuestionViewState::new(
             "tc-1".into(),
             vec![question],
@@ -1600,7 +1618,10 @@ pub(super) mod paste_key_tests {
             .map(|(m, _)| m.clone())
             .unwrap_or_default();
         assert!(
-            toast.starts_with("Copied") || toast.starts_with("Copy failed"),
+            toast.starts_with("Copied")
+                || toast.starts_with("Copy sent")
+                || toast.starts_with("Clipboard unreachable")
+                || toast.starts_with("Copy failed"),
             "copy-source emits a clipboard toast, got {toast:?}",
         );
         assert!(
@@ -2051,16 +2072,11 @@ pub(super) mod paste_key_tests {
             &mut scratch,
             None,
             false,
-            0,
-            &[],
-            &std::collections::BTreeSet::new(),
-            None,
+            crate::app::agent_view::BannerSlotParams::none(),
             &bundle,
             false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
     }
     /// The scrolled-off/overlay branch of `AgentView::draw` (render.rs) must

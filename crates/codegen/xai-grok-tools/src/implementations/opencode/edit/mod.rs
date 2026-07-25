@@ -42,15 +42,19 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 // Description
 // ───────────────────────────────────────────────────────────────────────────
 
+// NOTE: OpenCode's `EditInput` serializes camelCase (`oldString`, `newString`,
+// `replaceAll`), so param refs must use the camelCase schema property names —
+// the snake_case `params.edit.old_string` keys of the grok_build twin resolve
+// to "" here (the kind-params map is keyed by schema property names).
 const DESCRIPTION: &str = r#"Performs exact string replacements in files.
 
 Usage:
 - You must use your `${{ tools.by_kind.read }}` tool at least once in the conversation before editing.
-- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + →. Everything after that → separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.old_string }} or ${{ params.edit.new_string }}.
+- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + →. Everything after that → separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.oldString }} or ${{ params.edit.newString }}.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
-- The edit will FAIL if `${{ params.edit.old_string }}` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `${{ params.edit.replace_all }}` to change every instance of `${{ params.edit.old_string }}`.
-- Use `${{ params.edit.replace_all }}` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
-- To create a new file, set ${{ params.edit.old_string }} to an empty string.
+- The edit will FAIL if `${{ params.edit.oldString }}` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `${{ params.edit.replaceAll }}` to change every instance of `${{ params.edit.oldString }}`.
+- Use `${{ params.edit.replaceAll }}` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
+- To create a new file, set ${{ params.edit.oldString }} to an empty string.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked."#;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -70,16 +74,18 @@ pub struct EditInput {
     pub old_string: String,
 
     /// The replacement text (must differ from old_string).
-    #[schemars(description = "The text to replace it with (must be different from old_string)")]
+    #[schemars(
+        description = "The text to replace it with (must be different from ${{ params.edit.oldString }})"
+    )]
     pub new_string: String,
 
-    /// When true, replace every occurrence of `old_string` (default false).
+    /// When true, replace every occurrence of `old_string`.
     #[serde(
         default,
-        deserialize_with = "crate::types::schema::deserialize_lenient_option_bool"
+        deserialize_with = "crate::types::schema::deserialize_lenient_bool"
     )]
-    #[schemars(description = "Replace all occurrences of old_string (default false)")]
-    pub replace_all: Option<bool>,
+    #[schemars(description = "Replace all occurrences of ${{ params.edit.oldString }}")]
+    pub replace_all: bool,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -189,7 +195,7 @@ impl xai_tool_runtime::Tool for EditTool {
         };
         let tool_call_id = ctx.call_id.as_str().to_owned();
 
-        let replace_all = input.replace_all.unwrap_or(false);
+        let replace_all = input.replace_all;
 
         // Resolve the model-provided path.
         let path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
@@ -373,7 +379,7 @@ async fn handle_replacement(
     if positions.len() > 1 && !replace_all {
         let replace_all_name = crate::types::template_renderer::TemplateRenderer::resolve(
             &resources,
-            "${{ params.edit.replace_all }}",
+            "${{ params.edit.replaceAll }}",
         )
         .await?;
         return Ok(SearchReplaceOutput::MultipleMatchesFound(format!(
@@ -493,10 +499,12 @@ mod tests {
         resources.insert(FileSystem(Arc::new(LocalFs)));
         resources.insert(NotificationHandle(ToolNotificationHandle::noop()));
 
+        // Keys mirror finalize-time seeding: schema property names, which are
+        // camelCase for OpenCode's EditInput.
         let edit_params = std::collections::HashMap::from([
-            ("old_string".to_string(), "old_string".to_string()),
-            ("new_string".to_string(), "new_string".to_string()),
-            ("replace_all".to_string(), "replaceAll".to_string()),
+            ("oldString".to_string(), "oldString".to_string()),
+            ("newString".to_string(), "newString".to_string()),
+            ("replaceAll".to_string(), "replaceAll".to_string()),
         ]);
         resources.insert(TemplateRenderer::new(
             std::collections::HashMap::from([(ToolKind::Read, "read_file".to_string())]),
@@ -511,8 +519,28 @@ mod tests {
             file_path: file_path.to_string(),
             old_string: old_string.to_string(),
             new_string: new_string.to_string(),
-            replace_all: None,
+            replace_all: false,
         }
+    }
+
+    #[test]
+    fn replace_all_defaults_false_and_schema_is_boolean() {
+        let missing: EditInput =
+            serde_json::from_str(r#"{"filePath":"/f","oldString":"a","newString":"b"}"#).unwrap();
+        assert!(!missing.replace_all);
+
+        let nullv: EditInput = serde_json::from_str(
+            r#"{"filePath":"/f","oldString":"a","newString":"b","replaceAll":null}"#,
+        )
+        .unwrap();
+        assert!(!nullv.replace_all);
+
+        let schema = serde_json::to_value(schemars::schema_for!(EditInput)).unwrap();
+        // rename_all = camelCase → replaceAll
+        let p = &schema["properties"]["replaceAll"];
+        assert_eq!(p["type"], "boolean", "schema: {schema}");
+        assert_eq!(p["default"], false, "schema: {schema}");
+        assert!(p.get("anyOf").is_none(), "schema: {schema}");
     }
 
     // ── Tool metadata ───────────────────────────────────────────────
@@ -550,7 +578,7 @@ mod tests {
         assert_eq!(input.file_path, "src/main.rs");
         assert_eq!(input.old_string, "hello");
         assert_eq!(input.new_string, "goodbye");
-        assert_eq!(input.replace_all, Some(true));
+        assert!(input.replace_all);
     }
 
     #[test]
@@ -562,7 +590,7 @@ mod tests {
         });
         let input: EditInput = serde_json::from_value(json).unwrap();
         assert_eq!(input.file_path, "test.txt");
-        assert_eq!(input.replace_all, None);
+        assert!(!input.replace_all);
     }
 
     // ── Validation ──────────────────────────────────────────────────
@@ -765,8 +793,10 @@ mod tests {
             std::collections::HashMap::from([(ToolKind::Read, "file_reader".to_string())]),
             std::collections::HashMap::from([(
                 ToolKind::Edit,
+                // Keyed by the camelCase schema property name (finalize seeds
+                // kind params from schema properties).
                 std::collections::HashMap::from([(
-                    "replace_all".to_string(),
+                    "replaceAll".to_string(),
                     "replaceEverything".to_string(),
                 )]),
             )]),
@@ -804,7 +834,7 @@ mod tests {
             file_path: "test.txt".to_string(),
             old_string: "aaa".to_string(),
             new_string: "ccc".to_string(),
-            replace_all: Some(true),
+            replace_all: true,
         };
         let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
             .await
@@ -978,7 +1008,7 @@ mod tests {
             file_path: "test.txt".to_string(),
             old_string: "foo".to_string(),
             new_string: "qux".to_string(),
-            replace_all: Some(true),
+            replace_all: true,
         };
         let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
             .await

@@ -2,15 +2,6 @@
 //! its buffered/transient/direct variants, xAI-notification handling, and
 //! the gateway-bridge dispatch shims.
 use super::*;
-/// Exit code reported on the `SubagentStop` hook payload; unknown statuses report none.
-fn subagent_exit_code(status: &str) -> Option<i32> {
-    match status {
-        "completed" => Some(0),
-        "failed" => Some(1),
-        "cancelled" => Some(-1),
-        _ => None,
-    }
-}
 /// Result of applying a subagent fold into parent ledgers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubagentUsageApply {
@@ -129,10 +120,11 @@ impl SessionActor {
         let agent_timestamp_ms =
             agent_timestamp_ms_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let (update_type, update_params) = Self::extract_update_info(&update);
-        let mut meta = json!(
-            { "totalTokens" : total_tokens, "eventId" : event_id, "agentTimestampMs" :
-            agent_timestamp_ms, }
-        );
+        let mut meta = json!({
+            "totalTokens": total_tokens,
+            "eventId": event_id,
+            "agentTimestampMs": agent_timestamp_ms,
+        });
         let obj = meta
             .as_object_mut()
             .expect("json! literal is always an Object");
@@ -248,8 +240,10 @@ impl SessionActor {
             return;
         }
         tracing::info!(
-            target : "acp_event", event = "xai_buffered_notification_sent", session_id =
-            % self.session_info.id, "Sending buffered xAI session notification"
+            target: "acp_event",
+            event = "xai_buffered_notification_sent",
+            session_id = %self.session_info.id,
+            "Sending buffered xAI session notification"
         );
     }
     fn log_outbound_notification(&self, notification: &acp::SessionNotification) {
@@ -270,9 +264,13 @@ impl SessionActor {
             .and_then(|m| m.get("chunkIndex"))
             .and_then(|v| v.as_u64());
         tracing::info!(
-            target : "acp_event", event = "agent_message_sent", event_id = % event_id,
-            session_id = % self.session_info.id, agent_timestamp_ms = agent_timestamp_ms,
-            update_type = % update_type, chunk_index = ? chunk_index,
+            target: "acp_event",
+            event = "agent_message_sent",
+            event_id = %event_id,
+            session_id = %self.session_info.id,
+            agent_timestamp_ms = agent_timestamp_ms,
+            update_type = %update_type,
+            chunk_index = ?chunk_index,
             "Sending session update"
         );
     }
@@ -357,31 +355,37 @@ impl SessionActor {
             }
             acp::SessionUpdate::ToolCall(tool_call) => (
                 Some("ToolCall".to_string()),
-                Some(json!(
-                    { "toolCallId" : tool_call.tool_call_id.0, "title" :
-                    tool_call.title, "kind" : format!("{:?}", tool_call.kind),
-                    "status" : format!("{:?}", tool_call.status), }
-                )),
+                Some(json!({
+                    "toolCallId": tool_call.tool_call_id.0,
+                    "title": tool_call.title,
+                    "kind": format!("{:?}", tool_call.kind),
+                    "status": format!("{:?}", tool_call.status),
+                })),
             ),
             acp::SessionUpdate::ToolCallUpdate(tool_update) => (
                 Some("ToolCallUpdate".to_string()),
-                Some(json!(
-                    { "toolCallId" : tool_update.tool_call_id.0, "status" :
-                    tool_update.fields.status.as_ref().map(| s | format!("{:?}",
-                    s)), }
-                )),
+                Some(json!({
+                    "toolCallId": tool_update.tool_call_id.0,
+                    "status": tool_update.fields.status.as_ref().map(|s| format!("{:?}", s)),
+                })),
             ),
             acp::SessionUpdate::Plan(plan) => (
                 Some("Plan".to_string()),
-                Some(json!({ "planSteps" : plan.entries.len(), })),
+                Some(json!({
+                    "planSteps": plan.entries.len(),
+                })),
             ),
             acp::SessionUpdate::AvailableCommandsUpdate(update) => (
                 Some("AvailableCommandsUpdate".to_string()),
-                Some(json!({ "commandsCount" : update.available_commands.len(), })),
+                Some(json!({
+                    "commandsCount": update.available_commands.len(),
+                })),
             ),
             acp::SessionUpdate::CurrentModeUpdate(update) => (
                 Some("CurrentModeUpdate".to_string()),
-                Some(json!({ "currentModeId" : update.current_mode_id, })),
+                Some(json!({
+                    "currentModeId": update.current_mode_id,
+                })),
             ),
             _ => (None, None),
         }
@@ -396,7 +400,10 @@ impl SessionActor {
     pub(super) fn build_notification_meta(&self) -> serde_json::Value {
         let event_id = self.generate_event_id();
         let agent_timestamp_ms = chrono::Utc::now().timestamp_millis();
-        json!({ "eventId" : event_id, "agentTimestampMs" : agent_timestamp_ms, })
+        json!({
+            "eventId": event_id,
+            "agentTimestampMs": agent_timestamp_ms,
+        })
     }
     /// Handle xAI session notifications - store them in persistence
     /// These are client-side events (like diff reviews) that should be part of session history.
@@ -428,13 +435,6 @@ impl SessionActor {
                 model,
                 ..
             } => {
-                self.subagent_spawn_info.lock().insert(
-                    subagent_id.clone(),
-                    SubagentSpawnInfo {
-                        description: description.clone(),
-                        subagent_type: subagent_type.clone(),
-                    },
-                );
                 if let Some(parent_id) = resumed_from {
                     debug_assert_ne!(parent_id, subagent_id, "subagent cannot resume itself");
                 }
@@ -451,7 +451,8 @@ impl SessionActor {
                             Some(r) => r.last_cumulative_reported,
                             None => {
                                 tracing::debug!(
-                                    parent_id = % pid, subagent_id = % subagent_id,
+                                    parent_id = %pid,
+                                    subagent_id = %subagent_id,
                                     "resume parent not in token registry; anchoring at 0"
                                 );
                                 0
@@ -473,10 +474,12 @@ impl SessionActor {
                         },
                     );
                 }
-                let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
                 if self.goal_harness_enabled() {
-                    self.drain_goal_updates(current_tokens, DrainPurpose::MidTurn)
-                        .await;
+                    let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+                    if !self.goal_runs_on_workflow_engine() {
+                        self.drain_goal_updates(current_tokens, DrainPurpose::MidTurn)
+                            .await;
+                    }
                     let (tokens_used, finished_marginal) = self.goal_tokens(current_tokens);
                     let notify = self.goal_notify_sender();
                     notify.emit_goal_updated(
@@ -508,38 +511,9 @@ impl SessionActor {
             }
             XaiSessionUpdate::SubagentFinished {
                 subagent_id,
-                status,
-                duration_ms,
                 tokens_used,
                 ..
             } => {
-                let spawn_info = self.subagent_spawn_info.lock().remove(subagent_id);
-                let exit_code = subagent_exit_code(status.as_str());
-                let envelope = self.fire_hook(
-                    xai_grok_hooks::event::HookEventName::SubagentEnd,
-                    None,
-                    xai_grok_hooks::event::HookPayload::SubagentStop {
-                        subagent_id: subagent_id.clone(),
-                        subagent_type: spawn_info
-                            .as_ref()
-                            .map(|i| i.subagent_type.clone())
-                            .unwrap_or_default(),
-                        description: spawn_info.map(|i| i.description),
-                        exit_code,
-                        duration_ms: Some(*duration_ms),
-                    },
-                );
-                let hook_registry_snapshot = self.hook_registry.borrow().clone();
-                if let Some(registry) = hook_registry_snapshot {
-                    let ctx = self.hook_run_ctx();
-                    let _ = xai_grok_hooks::dispatcher::dispatch_non_blocking(
-                        &registry,
-                        xai_grok_hooks::event::HookEventName::SubagentEnd,
-                        &envelope,
-                        &ctx,
-                    )
-                    .await;
-                }
                 {
                     let mut records = self.subagent_token_records.lock();
                     if let Some(rec) = records.get_mut(subagent_id) {
@@ -597,7 +571,7 @@ impl SessionActor {
                         Some(_) => None,
                         None => {
                             tracing::debug!(
-                                subagent_id = % subagent_id,
+                                subagent_id = %subagent_id,
                                 "progress tick for unregistered subagent; dropped"
                             );
                             None

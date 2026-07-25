@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::extensions::notification::SessionNotification;
 use crate::sampling::ConversationItem;
@@ -16,10 +16,457 @@ use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_workspace::session::file_state::RewindPoint;
 
 pub mod jsonl;
+#[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
+pub(crate) mod relocation;
 pub mod search;
 pub mod search_fts;
 pub mod search_remote_sync;
 pub(crate) mod summary_write;
+
+/// On-disk file names, relative to a session directory. Single source of truth for
+/// the storage adapter and the session/state and session/import extensions.
+pub(crate) const SUMMARY_FILE: &str = "summary.json";
+pub(crate) const PLAN_FILE: &str = "plan.json";
+pub(crate) const PLAN_MODE_FILE: &str = "plan_mode.json";
+pub(crate) const SIGNALS_FILE: &str = "signals.json";
+pub(crate) const GOAL_STATE_FILE: &str = "goal/state.json";
+pub(crate) const ANNOUNCEMENT_STATE_FILE: &str = "announcement_state.json";
+pub(crate) const CHAT_HISTORY_FILE: &str = "chat_history.jsonl";
+pub(crate) const UPDATES_FILE: &str = "updates.jsonl";
+
+/// Write `bytes` to `path` by writing a uniquely named sibling temp file and
+/// renaming it over the target, so a crash or a concurrent writer never leaves a
+/// torn file. The temp is removed on failure.
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = temp_sibling(path);
+    match std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn sync_file_durable(file: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    file.sync_all()?;
+    fullfsync_raw(file.as_raw_fd())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn fullfsync_raw(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // macOS fsync may stop at volatile drive caches; F_FULLFSYNC requests stable media.
+    if unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), windows))]
+pub(crate) fn sync_file_durable(file: &std::fs::File) -> io::Result<()> {
+    file.sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_file_durable(_file: &std::fs::File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable file sync is unsupported on this platform",
+    ))
+}
+
+/// Async sibling of [`write_bytes_atomic`].
+pub(crate) async fn write_bytes_atomic_async(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+    let tmp = temp_sibling(path);
+    let result = match tokio::fs::write(&tmp, bytes).await {
+        Ok(()) => tokio::fs::rename(&tmp, path).await,
+        Err(e) => Err(e),
+    };
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+/// Serialize `items` to newline-delimited JSON bytes.
+fn to_jsonl_bytes<T: serde::Serialize>(items: &[T]) -> io::Result<Vec<u8>> {
+    let mut content = Vec::new();
+    for item in items {
+        serde_json::to_writer(&mut content, item)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        content.push(b'\n');
+    }
+    Ok(content)
+}
+
+/// Write `items` as newline-delimited JSON to `path`, atomically (see
+/// [`write_bytes_atomic`]).
+pub(crate) fn write_jsonl_atomic<T: serde::Serialize>(path: &Path, items: &[T]) -> io::Result<()> {
+    write_bytes_atomic(path, &to_jsonl_bytes(items)?)
+}
+
+/// Async sibling of [`write_jsonl_atomic`].
+pub(crate) async fn write_jsonl_atomic_async<T: serde::Serialize>(
+    path: &Path,
+    items: &[T],
+) -> io::Result<()> {
+    write_bytes_atomic_async(path, to_jsonl_bytes(items)?).await
+}
+
+/// A unique sibling temp path, e.g. `summary.json` -> `summary.json.<uuid>.tmp`.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", uuid::Uuid::now_v7()));
+    PathBuf::from(name)
+}
+
+/// Rebuild the derived `chat_history.jsonl` cache from `updates.jsonl`, the durable
+/// source of truth, so a session restores from its update stream alone.
+pub(crate) mod chat_rebuild {
+    use std::collections::{HashMap, HashSet};
+    use std::io;
+    use std::path::Path;
+
+    use agent_client_protocol as acp;
+
+    use super::{CHAT_HISTORY_FILE, SessionUpdate, UPDATES_FILE, UpdatesIterator};
+    use crate::sampling::{AssistantItem, ContentPart, ConversationItem, ToolCall};
+
+    /// Rebuild `chat_history.jsonl` from `updates.jsonl` alone. Builds a temp file and
+    /// renames it over the target, so a failed rebuild leaves the existing cache intact
+    /// rather than a truncated partial that load would trust.
+    pub(crate) fn rebuild_chat_history(dir: &Path) -> io::Result<usize> {
+        use std::io::{Seek, Write};
+
+        let updates_path = dir.join(UPDATES_FILE);
+        let Some(iter) = UpdatesIterator::open(&updates_path)? else {
+            return Ok(0);
+        };
+
+        let chat_path = dir.join(CHAT_HISTORY_FILE);
+        let tmp_path = dir.join(format!("{CHAT_HISTORY_FILE}.{}.tmp", uuid::Uuid::now_v7()));
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let mut reducer = ChatReducer::new();
+
+        for result in iter {
+            let update = match result {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            for item in reducer.process(&update) {
+                if let Ok(line) = serde_json::to_string(&item) {
+                    let _ = writer.write_all(line.as_bytes());
+                    let _ = writer.write_all(b"\n");
+                }
+            }
+
+            // CompactionCheckpoint: truncate file and reset
+            if reducer.should_truncate() {
+                reducer.clear_truncate_flag();
+                let _ = writer.seek(std::io::SeekFrom::Start(0));
+                let _ = writer.get_mut().set_len(0);
+            }
+        }
+
+        for item in reducer.flush() {
+            if let Ok(line) = serde_json::to_string(&item) {
+                let _ = writer.write_all(line.as_bytes());
+                let _ = writer.write_all(b"\n");
+            }
+        }
+
+        if let Err(e) = writer.flush() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        drop(writer);
+        if let Err(e) = std::fs::rename(&tmp_path, &chat_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        Ok(reducer.count())
+    }
+
+    /// Reduces ACP session updates into conversation items.
+    ///
+    /// Turn boundaries: User→Agent flushes user, Agent→User flushes agent,
+    /// tool completion flushes agent before emitting result.
+    struct ChatReducer {
+        user_parts: Vec<ContentPart>,
+        agent_text: String,
+        agent_tool_calls: Vec<ToolCall>,
+
+        in_user_turn: bool,
+        has_agent_content: bool,
+        needs_truncate: bool,
+
+        tool_args: HashMap<String, String>,
+        emitted_tool_results: HashSet<String>,
+        item_count: usize,
+    }
+
+    impl ChatReducer {
+        fn new() -> Self {
+            Self {
+                user_parts: Vec::new(),
+                agent_text: String::new(),
+                agent_tool_calls: Vec::new(),
+                in_user_turn: false,
+                has_agent_content: false,
+                needs_truncate: false,
+                tool_args: HashMap::new(),
+                emitted_tool_results: HashSet::new(),
+                item_count: 0,
+            }
+        }
+
+        fn process(&mut self, update: &SessionUpdate) -> Vec<ConversationItem> {
+            match update {
+                SessionUpdate::Acp(n) => self.handle_acp(&n.update),
+                SessionUpdate::Xai(n) => self.handle_xai(&n.update),
+            }
+        }
+
+        fn handle_acp(&mut self, update: &acp::SessionUpdate) -> Vec<ConversationItem> {
+            match update {
+                acp::SessionUpdate::UserMessageChunk(chunk) => self.on_user_chunk(chunk),
+                acp::SessionUpdate::AgentMessageChunk(chunk) => self.on_agent_chunk(chunk),
+                acp::SessionUpdate::ToolCall(tc) => self.on_tool_call(tc),
+                acp::SessionUpdate::ToolCallUpdate(tc) => self.on_tool_call_update(tc),
+                _ => Vec::new(), // AgentThoughtChunk, Retry, Plan not needed
+            }
+        }
+
+        fn handle_xai(
+            &mut self,
+            update: &crate::extensions::notification::SessionUpdate,
+        ) -> Vec<ConversationItem> {
+            use crate::extensions::notification::SessionUpdate as XaiUpdate;
+
+            match update {
+                XaiUpdate::CompactionCheckpoint(_) => {
+                    self.reset();
+                    self.needs_truncate = true;
+                    Vec::new()
+                }
+                _ => Vec::new(), // DiffReview, MemoryFlush, etc. not needed
+            }
+        }
+
+        fn on_user_chunk(&mut self, chunk: &acp::ContentChunk) -> Vec<ConversationItem> {
+            if super::is_host_turn_chunk(chunk) {
+                return self.flush_host_turn_boundary();
+            }
+            let mut out = Vec::new();
+
+            if !self.in_user_turn {
+                out.extend(self.flush_agent());
+                self.in_user_turn = true;
+            }
+
+            match &chunk.content {
+                acp::ContentBlock::Text(t) => {
+                    self.user_parts.push(ContentPart::Text {
+                        text: std::sync::Arc::<str>::from(t.text.clone()),
+                    });
+                }
+                acp::ContentBlock::Image(img) => {
+                    if let Some(uri) = &img.uri {
+                        self.user_parts.push(ContentPart::Image {
+                            url: std::sync::Arc::<str>::from(uri.clone()),
+                        });
+                    }
+                }
+                _ => {} // Audio, Resource, etc. not needed for chat replay
+            }
+
+            out
+        }
+
+        fn on_agent_chunk(&mut self, chunk: &acp::ContentChunk) -> Vec<ConversationItem> {
+            if super::is_host_turn_chunk(chunk) {
+                return self.flush_host_turn_boundary();
+            }
+            let mut out = Vec::new();
+
+            if self.in_user_turn {
+                out.extend(self.flush_user());
+                self.in_user_turn = false;
+            }
+
+            if let acp::ContentBlock::Text(t) = &chunk.content {
+                self.agent_text.push_str(&t.text);
+                self.has_agent_content = true;
+            }
+
+            out
+        }
+
+        fn flush_host_turn_boundary(&mut self) -> Vec<ConversationItem> {
+            let mut out = Vec::new();
+            if self.in_user_turn {
+                out.extend(self.flush_user());
+                self.in_user_turn = false;
+            }
+            out.extend(self.flush_agent());
+            out
+        }
+
+        fn on_tool_call(&mut self, tc: &acp::ToolCall) -> Vec<ConversationItem> {
+            let id = tc.tool_call_id.0.to_string();
+            let args = tc
+                .raw_input
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            self.tool_args.insert(id.clone(), args.clone());
+            self.agent_tool_calls.push(ToolCall {
+                id: std::sync::Arc::<str>::from(id),
+                name: tc.title.clone(),
+                arguments: std::sync::Arc::<str>::from(args),
+            });
+
+            Vec::new()
+        }
+
+        fn on_tool_call_update(&mut self, tc: &acp::ToolCallUpdate) -> Vec<ConversationItem> {
+            let id = tc.tool_call_id.0.to_string();
+            self.maybe_backfill_args(&id, &tc.fields);
+
+            if Self::is_completed(&tc.fields) && self.emitted_tool_results.insert(id.clone()) {
+                return self.emit_tool_result(&id, &tc.fields);
+            }
+            Vec::new()
+        }
+
+        /// Backfill tool arguments from ToolCallUpdate if ToolCall didn't have them.
+        fn maybe_backfill_args(&mut self, id: &str, fields: &acp::ToolCallUpdateFields) {
+            let Some(raw) = &fields.raw_input else { return };
+            let needs_backfill = self.tool_args.get(id).is_none_or(String::is_empty);
+            if !needs_backfill {
+                return;
+            }
+
+            let args = raw.to_string();
+            self.tool_args.insert(id.to_string(), args.clone());
+
+            if let Some(call) = self
+                .agent_tool_calls
+                .iter_mut()
+                .find(|c| c.id.as_ref() == id)
+            {
+                call.arguments = std::sync::Arc::<str>::from(args);
+            }
+        }
+
+        fn is_completed(fields: &acp::ToolCallUpdateFields) -> bool {
+            matches!(
+                fields.status,
+                Some(acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed)
+            )
+        }
+
+        fn emit_tool_result(
+            &mut self,
+            id: &str,
+            fields: &acp::ToolCallUpdateFields,
+        ) -> Vec<ConversationItem> {
+            let mut out = Vec::new();
+            out.extend(self.flush_agent());
+
+            let content = extract_tool_result_text(fields);
+            let item = ConversationItem::tool_result(id.to_string(), content);
+            self.item_count += 1;
+            out.push(item);
+            out
+        }
+
+        fn flush_user(&mut self) -> Option<ConversationItem> {
+            if self.user_parts.is_empty() {
+                return None;
+            }
+            let item = ConversationItem::user_with_parts(std::mem::take(&mut self.user_parts));
+            self.item_count += 1;
+            Some(item)
+        }
+
+        fn flush_agent(&mut self) -> Option<ConversationItem> {
+            if !self.has_agent_content && self.agent_tool_calls.is_empty() {
+                return None;
+            }
+            let item = ConversationItem::Assistant(AssistantItem {
+                content: std::sync::Arc::<str>::from(std::mem::take(&mut self.agent_text)),
+                tool_calls: std::mem::take(&mut self.agent_tool_calls),
+                model_id: None,
+                model_fingerprint: None,
+                reasoning_effort: None,
+            });
+            self.has_agent_content = false;
+            self.item_count += 1;
+            Some(item)
+        }
+
+        fn flush(&mut self) -> Vec<ConversationItem> {
+            let mut out = Vec::new();
+            out.extend(self.flush_user());
+            out.extend(self.flush_agent());
+            out
+        }
+
+        fn reset(&mut self) {
+            self.user_parts.clear();
+            self.agent_text.clear();
+            self.agent_tool_calls.clear();
+            self.tool_args.clear();
+            self.emitted_tool_results.clear();
+            self.in_user_turn = false;
+            self.has_agent_content = false;
+            self.item_count = 0;
+        }
+
+        fn should_truncate(&self) -> bool {
+            self.needs_truncate
+        }
+
+        fn clear_truncate_flag(&mut self) {
+            self.needs_truncate = false;
+        }
+
+        fn count(&self) -> usize {
+            self.item_count
+        }
+    }
+
+    /// Extract displayable text from a completed ToolCallUpdate.
+    fn extract_tool_result_text(fields: &acp::ToolCallUpdateFields) -> String {
+        if let Some(content) = &fields.content {
+            let text: String = content
+                .iter()
+                .filter_map(|c| match c {
+                    acp::ToolCallContent::Content(acp::Content {
+                        content: acp::ContentBlock::Text(t),
+                        ..
+                    }) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        if let Some(raw) = &fields.raw_output {
+            return raw.to_string();
+        }
+        String::new()
+    }
+}
 
 /// Iterator that streams session updates from a JSONL file without loading all into memory.
 /// Each call to `next()` reads and parses one line.
@@ -257,6 +704,7 @@ pub struct PersistedData {
     pub announcement_state: Option<crate::session::announcement_state::AnnouncementState>,
     /// Persisted goal mode orchestration state (None for sessions without goal mode)
     pub goal_mode_state: Option<crate::session::goal_tracker::GoalOrchestration>,
+    pub workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
 }
 
 /// Persisted data WITHOUT updates - for memory-efficient session loading
@@ -274,6 +722,7 @@ pub struct PersistedDataLight {
     pub announcement_state: Option<crate::session::announcement_state::AnnouncementState>,
     /// Persisted goal mode orchestration state (None for sessions without goal mode)
     pub goal_mode_state: Option<crate::session::goal_tracker::GoalOrchestration>,
+    pub workflow_runs: Vec<crate::session::workflow::store::RestoredWorkflowRun>,
 }
 
 /// Result of copying session data
@@ -292,6 +741,10 @@ pub struct CopySessionResult {
     /// Number of `compaction/segment_*.md` (+ `INDEX.md`) files copied from the
     /// source session's compaction archive. `0` when disabled or none exist.
     pub compaction_segments_copied: usize,
+    /// Number of `compaction_checkpoints/{uuid}.json` files copied for the
+    /// checkpoint records retained in the copied updates. `0` when no records
+    /// survive the copy or their files are missing from the source.
+    pub compaction_checkpoints_copied: usize,
 }
 
 /// Options for copying session data during fork
@@ -398,6 +851,27 @@ fn acp_user_chunk_prompt_index(update: &SessionUpdate) -> Option<usize> {
         .map(|v| v as usize)
 }
 
+pub(crate) const HOST_TURN_META_KEY: &str = "hostTurn";
+
+pub(crate) fn is_host_turn_chunk(chunk: &acp::ContentChunk) -> bool {
+    chunk
+        .meta
+        .as_ref()
+        .and_then(|m| m.get(HOST_TURN_META_KEY))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
+fn is_host_turn_update(update: &SessionUpdate) -> bool {
+    let SessionUpdate::Acp(n) = update else {
+        return false;
+    };
+    let acp::SessionUpdate::UserMessageChunk(chunk) = &n.update else {
+        return false;
+    };
+    is_host_turn_chunk(chunk)
+}
+
 fn is_acp_user_message_chunk(update: &SessionUpdate) -> bool {
     matches!(
         update,
@@ -469,7 +943,7 @@ pub fn updates_truncate_for_prompt(updates: &[SessionUpdate], target_prompt_inde
     let mut tracker = UserRunTurnTracker::new();
 
     for (i, update) in updates.iter().enumerate() {
-        if is_acp_user_message_chunk(update) {
+        if is_acp_user_message_chunk(update) && !is_host_turn_update(update) {
             if tracker.on_user_chunk(acp_user_chunk_prompt_index(update)) {
                 user_turn_count += 1;
                 if user_turn_count > target_prompt_index + 1 {
@@ -482,6 +956,37 @@ pub fn updates_truncate_for_prompt(updates: &[SessionUpdate], target_prompt_inde
     }
 
     updates.len()
+}
+
+#[derive(Debug)]
+pub enum AppendUpdateError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+}
+
+#[derive(Debug)]
+pub enum AppendCwdSwitchError {
+    NotCommitted(io::Error),
+    Committed {
+        acknowledgement: xai_chat_state::StrictAppendAck,
+        source: io::Error,
+    },
+}
+
+impl AppendUpdateError {
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for AppendUpdateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error.fmt(formatter),
+        }
+    }
 }
 
 /// Storage adapter trait for session persistence
@@ -512,8 +1017,43 @@ pub trait StorageAdapter: Send + Sync {
     /// Append a session update (ACP update or xAI extension update) and increment counter
     async fn append_update(&self, info: &Info, update: &SessionUpdate) -> io::Result<()>;
 
-    /// Append a chat message and increment counter
+    /// Append one update and report whether the replay record was committed before an error.
+    async fn append_update_commit_aware(
+        &self,
+        info: &Info,
+        update: &SessionUpdate,
+    ) -> Result<(), AppendUpdateError> {
+        self.append_update(info, update)
+            .await
+            .map_err(AppendUpdateError::NotCommitted)
+    }
+
+    /// Append one update durably, preserving whether the replay record committed before failure.
+    async fn append_update_durable_commit_aware(
+        &self,
+        _info: &Info,
+        _update: &SessionUpdate,
+    ) -> Result<(), AppendUpdateError> {
+        Err(AppendUpdateError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable session update append is unsupported",
+        )))
+    }
+
+    /// Append a chat message and increment counter.
     async fn append_chat_message(&self, info: &Info, message: &ConversationItem) -> io::Result<()>;
+
+    /// Append one working-directory switch generation exactly once.
+    async fn append_cwd_switch_commit_aware(
+        &self,
+        _info: &Info,
+        _message: &ConversationItem,
+    ) -> Result<xai_chat_state::StrictAppendAck, AppendCwdSwitchError> {
+        Err(AppendCwdSwitchError::NotCommitted(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "working-directory switch append is unsupported",
+        )))
+    }
 
     /// Update the current model in summary (delegates to
     /// `update_current_model_and_agent` with `agent_name = None`).
@@ -580,6 +1120,16 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         state: &crate::session::goal_tracker::GoalOrchestration,
     ) -> io::Result<()>;
+
+    async fn delete_goal_mode_state(&self, info: &Info) -> io::Result<()>;
+
+    async fn write_workflow_run_state(
+        &self,
+        info: &Info,
+        manifest: &crate::session::workflow::store::WorkflowRunManifest,
+    ) -> io::Result<()>;
+
+    async fn delete_workflow_run_state(&self, info: &Info, run_id: &str) -> io::Result<()>;
 
     /// Load all persisted data for a session
     async fn load_session(&self, info: &Info) -> io::Result<PersistedData>;
@@ -754,6 +1304,8 @@ pub(crate) struct RawUpdatePeek<'a> {
 pub(crate) struct RawChunkMetaPeek {
     #[serde(default, rename = "promptIndex")]
     pub prompt_index: Option<u64>,
+    #[serde(default, rename = "hostTurn")]
+    pub host_turn: Option<bool>,
 }
 
 /// Filter rewind dead branches from raw JSONL lines.
@@ -798,7 +1350,13 @@ pub(crate) fn filter_rewind_lines<'a>(lines: Vec<&'a str>) -> Vec<&'a str> {
             continue;
         }
 
+        let is_host_turn = peek
+            .as_ref()
+            .and_then(|u| u.meta.as_ref())
+            .and_then(|m| m.host_turn)
+            .unwrap_or(false);
         let is_user_chunk = !is_xai
+            && !is_host_turn
             && tag
                 .as_ref()
                 .map(|(s, _)| *s == *USER_MESSAGE_CHUNK)
@@ -861,7 +1419,7 @@ pub fn filter_rewind_updates(updates: Vec<SessionUpdate>) -> Vec<SessionUpdate> 
             continue;
         }
 
-        if is_acp_user_message_chunk(&update) {
+        if is_acp_user_message_chunk(&update) && !is_host_turn_update(&update) {
             if tracker.on_user_chunk(acp_user_chunk_prompt_index(&update)) {
                 prompt_starts.push(result.len());
             }
@@ -917,7 +1475,9 @@ pub fn strip_context_wrappers(update: acp::SessionUpdate) -> acp::SessionUpdate 
 pub fn load_updates_for_replay(
     session_id: &str,
 ) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
-    let Some(session_dir) = crate::session::persistence::find_session_dir_by_id(session_id) else {
+    let Some(session_dir) =
+        crate::session::persistence::find_persisted_session_dir_by_id_result(session_id)?
+    else {
         return Ok(None);
     };
     load_updates_for_replay_from_dir(&session_dir)
@@ -930,7 +1490,10 @@ pub fn load_updates_for_replay_at(
 ) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
     let sessions_root = grok_home.join("sessions");
     let Some(session_dir) =
-        crate::session::persistence::find_session_dir_by_id_in_root(session_id, &sessions_root)
+        crate::session::persistence::find_persisted_session_dir_by_id_in_root_result(
+            session_id,
+            &sessions_root,
+        )?
     else {
         return Ok(None);
     };
@@ -940,7 +1503,7 @@ pub fn load_updates_for_replay_at(
 fn load_updates_for_replay_from_dir(
     session_dir: &std::path::Path,
 ) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
-    let updates_path = session_dir.join("updates.jsonl");
+    let updates_path = session_dir.join(UPDATES_FILE);
     let Some(iter) = UpdatesIterator::open(&updates_path)? else {
         return Ok(None);
     };
@@ -1690,6 +2253,14 @@ pub(crate) fn parse_prompt_extract_event(line: &str) -> PromptExtractEvent {
                 .meta
                 .as_ref()
                 .is_some_and(|m| m.bash_command.is_some())
+            {
+                return PromptExtractEvent::NotUserMessage;
+            }
+            if peek
+                .update
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.host_turn == Some(true))
             {
                 return PromptExtractEvent::NotUserMessage;
             }

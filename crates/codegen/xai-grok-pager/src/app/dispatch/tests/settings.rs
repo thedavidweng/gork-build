@@ -222,7 +222,7 @@ fn cancel_before_first_activity_resets_state_and_discards_orphan_response() {
         Action::TaskComplete(TaskResult::PromptResponse {
             agent_id: id,
             result: Ok(acp::PromptResponse::new(acp::StopReason::Cancelled).meta(
-                serde_json::json!({ "promptId" : cancelled_pid })
+                serde_json::json!({ "promptId": cancelled_pid })
                     .as_object()
                     .cloned(),
             )),
@@ -252,10 +252,10 @@ fn set_default_model_allowed_when_agent_chat_kind() {
     app.agents.get_mut(&id).unwrap().chat_kind = true;
     let effects = dispatch(Action::SetDefaultModel(model_id.clone()), &mut app);
     assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::SwitchModel { model_id : mid, .. }
-        if mid == & model_id)),
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SwitchModel { model_id: mid, .. } if mid == &model_id
+        )),
         "chat_kind must still emit SwitchModel for live chat mode switches"
     );
     assert!(app.agents[&id].session.model_switch_pending);
@@ -295,8 +295,7 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
         effects[0],
     );
     assert!(
-        matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. } if mid == &
-        model_id),
+        matches!(&effects[1], Effect::SwitchModel { model_id: mid, .. } if mid == &model_id),
         "second effect must be SwitchModel(<resolved id>), got {:?}",
         effects[1],
     );
@@ -595,6 +594,32 @@ fn set_timeline_toggles_displayed_state_when_current_ui_diverges() {
     assert_eq!(app.current_ui.show_timeline, Some(false));
 }
 #[test]
+fn set_page_flip_on_send_emits_persist_setting_with_correct_payload() {
+    use crate::settings::SettingValue;
+    let mut app = test_app_with_agent();
+    let default_on = app.current_ui.page_flip_on_send_enabled();
+    crate::appearance::cache::set_page_flip_on_send(default_on);
+    let effects = dispatch(Action::SetPageFlipOnSend(!default_on), &mut app);
+    assert_eq!(effects.len(), 1);
+    match &effects[0] {
+        Effect::PersistSetting {
+            key,
+            value,
+            rollback_value,
+        } => {
+            assert_eq!(*key, "page_flip_on_send");
+            assert_eq!(value, &SettingValue::Bool(!default_on));
+            assert_eq!(rollback_value, &SettingValue::Bool(default_on));
+        }
+        other => panic!("expected PersistSetting, got {other:?}"),
+    }
+    assert_eq!(app.current_ui.page_flip_on_send, Some(!default_on));
+    assert_eq!(
+        crate::appearance::cache::load_page_flip_on_send(),
+        !default_on
+    );
+}
+#[test]
 fn set_simple_mode_emits_persist_setting_with_correct_payload() {
     use crate::settings::SettingValue;
     let mut app = test_app_with_agent();
@@ -634,6 +659,35 @@ fn dispatch_open_settings_opens_then_close_on_reentry() {
             "second dispatch should close the modal"
         );
     }
+}
+/// A focused open (privacy banner Customize) landing on an agent whose
+/// settings modal is already open must reopen focused on the requested
+/// row — not toggle the modal closed.
+#[test]
+fn dispatch_open_settings_focus_reopens_when_already_open() {
+    use crate::views::modal::ActiveModal;
+    let mut app = test_app_with_agent();
+    let _ = dispatch(Action::OpenSettings, &mut app);
+    let agent = app.agents.get(&AgentId(0)).unwrap();
+    assert!(matches!(
+        agent.active_modal,
+        Some(ActiveModal::Settings { .. })
+    ));
+    let _ = dispatch(
+        Action::OpenSettingsFocus {
+            key: "coding_data_sharing",
+        },
+        &mut app,
+    );
+    let agent = app.agents.get(&AgentId(0)).unwrap();
+    let Some(ActiveModal::Settings { state }) = &agent.active_modal else {
+        panic!("focused re-entry must keep the settings modal open")
+    };
+    assert_eq!(
+        state.focused_setting().map(|(k, _)| k),
+        Some("coding_data_sharing"),
+        "focused re-entry must land on the requested row"
+    );
 }
 /// `dispatch_open_reset_confirm` moves the Settings modal state
 /// into the new `ResetSettingsConfirm` variant, preserving it
@@ -680,10 +734,10 @@ fn dispatch_confirm_reset_setting_cancel_preserves_modal_state() {
     {
         let agent = app.agents.get_mut(&AgentId(0)).expect("agent must exist");
         if let Some(ActiveModal::Settings { state }) = &mut agent.active_modal {
-            state.query.push_str("stamp");
+            state.set_query("stamp");
             state.selected = 3;
             state.scroll_offset = 1;
-            state.mode = SettingsModalMode::FilterFocused;
+            state.focus_filter();
         } else {
             panic!("expected Settings modal");
         }
@@ -712,11 +766,11 @@ fn dispatch_confirm_reset_setting_cancel_preserves_modal_state() {
     match &agent.active_modal {
         Some(ActiveModal::Settings { state }) => {
             assert!(state.ui_snapshot.compact_mode, "ui_snapshot.compact_mode");
-            assert_eq!(state.query, "stamp", "query preserved");
+            assert_eq!(state.query(), "stamp", "query preserved");
             assert_eq!(state.selected, 3, "selected preserved");
             assert_eq!(state.scroll_offset, 1, "scroll_offset preserved");
             assert!(
-                matches!(state.mode, SettingsModalMode::FilterFocused),
+                matches!(state.mode(), SettingsModalMode::FilterFocused),
                 "mode preserved (FilterFocused)"
             );
         }
@@ -864,34 +918,36 @@ fn dispatch_open_reset_confirm_no_op_in_release_when_no_settings_modal() {
 #[test]
 fn every_setting_has_action_for_reset_arm() {
     use crate::settings::current_value_for;
-    let reg = crate::settings::SettingsRegistry::defaults();
-    for meta in reg.all() {
-        if matches!(meta.kind, crate::settings::SettingKind::Group { .. }) {
-            continue;
-        }
-        let default_value = crate::settings::default_value_for(meta);
-        let action = action_for_reset(meta.key, &default_value);
-        assert!(
-            action.is_some(),
-            "Setting `{}` has no `action_for_reset` arm — `d`-reset would silently \
+    with_theme_test_env(|| {
+        let reg = crate::settings::SettingsRegistry::defaults();
+        for meta in reg.all() {
+            if matches!(meta.kind, crate::settings::SettingKind::Group { .. }) {
+                continue;
+            }
+            let default_value = crate::settings::default_value_for(meta);
+            let action = action_for_reset(meta.key, &default_value);
+            assert!(
+                action.is_some(),
+                "Setting `{}` has no `action_for_reset` arm — `d`-reset would silently \
                  no-op. Add an arm to `action_for_reset` in dispatch.rs.",
-            meta.key,
-        );
-        if meta.key == "default_model" {
-            continue;
+                meta.key,
+            );
+            if meta.key == "default_model" {
+                continue;
+            }
+            let mut app = test_app_with_agent();
+            move_setting_away_from_default(&mut app, meta.key);
+            let _ = dispatch(action.unwrap(), &mut app);
+            let pager = build_pager_snapshot(&app);
+            let reread = current_value_for(meta.key, &app.current_ui, &pager);
+            assert_eq!(
+                reread,
+                Some(default_value.clone()),
+                "action_for_reset({}, ...) round-trip drift: dispatch did not restore the default",
+                meta.key,
+            );
         }
-        let mut app = test_app_with_agent();
-        move_setting_away_from_default(&mut app, meta.key);
-        let _ = dispatch(action.unwrap(), &mut app);
-        let pager = build_pager_snapshot(&app);
-        let reread = current_value_for(meta.key, &app.current_ui, &pager);
-        assert_eq!(
-            reread,
-            Some(default_value.clone()),
-            "action_for_reset({}, ...) round-trip drift: dispatch did not restore the default",
-            meta.key,
-        );
-    }
+    });
 }
 /// Every setting whose setter emits `Effect::PersistSetting` MUST have an
 /// `apply_setting_rollback` arm: a failed disk write rolls back through it,
@@ -900,38 +956,40 @@ fn every_setting_has_action_for_reset_arm() {
 /// persist, then asserts the rollback hits a real arm (not the catch-all).
 #[test]
 fn every_persisting_setting_has_rollback_arm() {
-    let reg = crate::settings::SettingsRegistry::defaults();
-    for meta in reg.all() {
-        let default_value = crate::settings::default_value_for(meta);
-        let Some(reset_action) = action_for_reset(meta.key, &default_value) else {
-            continue;
-        };
-        let mut app = test_app_with_agent();
-        move_setting_away_from_default(&mut app, meta.key);
-        for eff in dispatch(reset_action, &mut app) {
-            let Effect::PersistSetting {
-                key,
-                rollback_value,
-                ..
-            } = eff
-            else {
+    with_theme_test_env(|| {
+        let reg = crate::settings::SettingsRegistry::defaults();
+        for meta in reg.all() {
+            let default_value = crate::settings::default_value_for(meta);
+            let Some(reset_action) = action_for_reset(meta.key, &default_value) else {
                 continue;
             };
-            let mut rb_app = test_app_with_agent();
-            let _ = apply_setting_rollback(&mut rb_app, key, &rollback_value);
-            let toast = rb_app
-                .agents
-                .get(&AgentId(0))
-                .and_then(|a| a.toast.as_ref())
-                .map(|(s, _)| s.as_str().to_owned());
-            assert_ne!(
-                toast.as_deref(),
-                Some(crate::app::dispatch::ROLLBACK_NO_ARM_TOAST),
-                "Setting `{key}` emits Effect::PersistSetting but apply_setting_rollback has \
+            let mut app = test_app_with_agent();
+            move_setting_away_from_default(&mut app, meta.key);
+            for eff in dispatch(reset_action, &mut app) {
+                let Effect::PersistSetting {
+                    key,
+                    rollback_value,
+                    ..
+                } = eff
+                else {
+                    continue;
+                };
+                let mut rb_app = test_app_with_agent();
+                let _ = apply_setting_rollback(&mut rb_app, key, &rollback_value);
+                let toast = rb_app
+                    .agents
+                    .get(&AgentId(0))
+                    .and_then(|a| a.toast.as_ref())
+                    .map(|(s, _)| s.as_str().to_owned());
+                assert_ne!(
+                    toast.as_deref(),
+                    Some(crate::app::dispatch::ROLLBACK_NO_ARM_TOAST),
+                    "Setting `{key}` emits Effect::PersistSetting but apply_setting_rollback has \
                      no arm — a failed persist diverges in-memory state from config.toml. Add an arm.",
-            );
+                );
+            }
         }
-    }
+    });
 }
 /// Pin the
 /// asymmetric clear-default semantics. `Action::ClearDefaultModel`
@@ -966,8 +1024,13 @@ fn clear_default_model_persists_but_keeps_live_current() {
         "expected exactly one PersistSetting effect"
     );
     assert!(
-        matches!(& effects[0], Effect::PersistSetting { key : "default_model", value :
-        crate ::settings::SettingValue::String(s), .. } if s.is_empty()),
+        matches!(
+            &effects[0],
+            Effect::PersistSetting {
+                key: "default_model",
+                value: crate::settings::SettingValue::String(s),
+                .. } if s.is_empty()
+        ),
         "expected PersistSetting(default_model, ''), got {:?}",
         effects[0],
     );
@@ -1000,11 +1063,17 @@ fn set_default_model_resolves_known_name() {
         .insert(id.clone(), info);
     let effects = dispatch(Action::SetDefaultModel(id.clone()), &mut app);
     assert_eq!(effects.len(), 2);
-    assert!(
-        matches!(& effects[0], Effect::PersistSetting { key : "default_model", value :
-        crate ::settings::SettingValue::String(s), .. } if s == "grok-4.5")
-    );
-    assert!(matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. } if mid == & id));
+    assert!(matches!(
+        &effects[0],
+        Effect::PersistSetting {
+            key: "default_model",
+            value: crate::settings::SettingValue::String(s),
+            .. } if s == "grok-4.5"
+    ));
+    assert!(matches!(
+        &effects[1],
+        Effect::SwitchModel { model_id: mid, .. } if mid == &id
+    ));
     assert_eq!(app.agents[&agent_id].session.models.current, Some(id));
 }
 /// Re-dispatching the same model
@@ -1179,6 +1248,8 @@ fn pr13_set_show_tips_toast_includes_restart_marker() {
 /// setting to a non-default value so the round-trip dispatch has
 /// an observable effect (otherwise the assertion would pass
 /// vacuously when current == default).
+/// Dispatches theme-mutating actions for the theme keys — callers must
+/// hold the theme test lock (wrap the test in [`with_theme_test_env`]).
 fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::SettingKey) {
     match key {
         "compact_mode" => {
@@ -1190,6 +1261,14 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "show_timeline" => {
             let away = !app.current_ui.show_timeline_enabled();
             let _ = dispatch(Action::SetTimeline(away), app);
+        }
+        "page_flip_on_send" => {
+            let away = !crate::appearance::cache::load_page_flip_on_send();
+            let _ = dispatch(Action::SetPageFlipOnSend(away), app);
+        }
+        "combine_queued_prompts" => {
+            let away = !crate::appearance::cache::load_combine_queued_prompts();
+            let _ = dispatch(Action::SetCombineQueuedPrompts(away), app);
         }
         "simple_mode" => {
             let _ = dispatch(Action::SetSimpleMode(false), app);
@@ -1211,6 +1290,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "contextual_hints.word_select" => {
             let _ = dispatch(Action::SetContextualHintWordSelect(false), app);
+        }
+        "contextual_hints.ssh_wrap" => {
+            let _ = dispatch(Action::SetContextualHintSshWrap(false), app);
         }
         "multiline_mode" => {
             let _ = dispatch(Action::SetMultilineMode(true), app);
@@ -1249,7 +1331,7 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let _ = dispatch(Action::SetMaxThoughtsWidth(200), app);
         }
         "coding_data_sharing" => {
-            let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, app);
+            let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, app);
         }
         "plan_mode" => {
             let _ = dispatch(
@@ -1321,6 +1403,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "screen_mode" => {
             let _ = dispatch(Action::SetScreenMode("minimal".to_string()), app);
+        }
+        "voice_keybind_enabled" => {
+            let _ = dispatch(Action::SetVoiceKeybindEnabled(false), app);
         }
         "voice_capture_mode" => {
             let _ = dispatch(Action::SetVoiceCaptureMode("toggle".to_string()), app);
@@ -1445,6 +1530,7 @@ fn set_simple_mode_propagates_to_every_agent() {
             bg_tool_call_to_task: std::collections::HashMap::new(),
             scheduled_tasks: std::collections::HashMap::new(),
             in_flight_prompt: None,
+            compact_held_prompt: None,
             current_prompt_id: None,
             created_via_new: false,
         },

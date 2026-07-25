@@ -64,13 +64,14 @@ fn wait_for_raw_bytes(harness: &mut PtyHarness, needle: &[u8], timeout: Duration
 }
 
 /// Unknown brand → probe fires; the harness's scripted reply is surfaced
-/// in `/terminal-setup`, never as screen garbage.
+/// in `/doctor`, never as screen garbage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn unknown_brand_probe_round_trip() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
-        PtyHarness::new(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV).expect("spawn pager");
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV, None)
+            .expect("spawn pager");
 
     assert!(
         wait_for_raw_bytes(&mut harness, XTVERSION_QUERY, WELCOME_TIMEOUT),
@@ -87,13 +88,11 @@ async fn unknown_brand_probe_round_trip() {
         .expect("welcome text");
     assert_no_probe_garbage_on_screen(&harness);
 
-    // Surface check: /terminal-setup shows the probed identity.
-    harness
-        .inject_keys(b"/terminal-setup\r")
-        .expect("run /terminal-setup");
+    // Surface check: /doctor shows the probed identity.
+    harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
         .wait_for_text("PtyHarnessTerm 9.9", Duration::from_secs(10))
-        .expect("XTVERSION identity shown in /terminal-setup");
+        .expect("XTVERSION identity shown in /doctor");
 
     assert!(!harness.contains_text("panicked"));
     harness.quit().expect("clean quit");
@@ -108,7 +107,8 @@ async fn allowlisted_brand_probe_fires() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut env = UNKNOWN_BRAND_ENV.to_vec();
     env.push(("TERM_PROGRAM", "WezTerm"));
-    let mut harness = PtyHarness::new(&binary, ROWS, COLS, &[], &env).expect("spawn pager");
+    let mut harness =
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], &env, None).expect("spawn pager");
 
     assert!(
         wait_for_raw_bytes(&mut harness, XTVERSION_QUERY, WELCOME_TIMEOUT),
@@ -123,9 +123,7 @@ async fn allowlisted_brand_probe_fires() {
         .expect("welcome text");
     assert_no_probe_garbage_on_screen(&harness);
 
-    harness
-        .inject_keys(b"/terminal-setup\r")
-        .expect("run /terminal-setup");
+    harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
         .wait_for_text("PtyHarnessTerm 9.9", Duration::from_secs(10))
         .expect("XTVERSION identity shown for an allowlisted brand");
@@ -140,8 +138,15 @@ async fn allowlisted_brand_probe_fires() {
 #[ignore]
 async fn non_allowlisted_brand_skips_probe() {
     let binary = pager_binary().expect("resolve pager binary");
-    let mut harness = PtyHarness::new(&binary, ROWS, COLS, &[], &[("TERM_PROGRAM", "vscode")])
-        .expect("spawn pager");
+    let mut harness = PtyHarness::new_inherited_env(
+        &binary,
+        ROWS,
+        COLS,
+        &[],
+        &[("TERM_PROGRAM", "vscode")],
+        None,
+    )
+    .expect("spawn pager");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
@@ -165,7 +170,8 @@ async fn multiplexer_skips_probe() {
     let mut env = UNKNOWN_BRAND_ENV.to_vec();
     env.push(("TMUX", "/tmp/tmux-1000/default,12345,0"));
     env.push(("TMUX_PANE", "%0"));
-    let mut harness = PtyHarness::new(&binary, ROWS, COLS, &[], &env).expect("spawn pager");
+    let mut harness =
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], &env, None).expect("spawn pager");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
@@ -186,7 +192,8 @@ async fn multiplexer_skips_probe() {
 async fn unknown_brand_no_reply_starts_cleanly() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
-        PtyHarness::new(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV).expect("spawn pager");
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV, None)
+            .expect("spawn pager");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
@@ -195,13 +202,11 @@ async fn unknown_brand_no_reply_starts_cleanly() {
     assert!(!harness.contains_text("panicked"));
     assert_no_probe_garbage_on_screen(&harness);
 
-    // /terminal-setup must omit the xtversion line entirely.
-    harness
-        .inject_keys(b"/terminal-setup\r")
-        .expect("run /terminal-setup");
+    // /doctor must omit the xtversion line entirely.
+    harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
         .wait_for_text("Environment", Duration::from_secs(10))
-        .expect("terminal-setup output");
+        .expect("doctor output");
     assert!(
         !harness.contains_text("xtversion"),
         "xtversion line should be absent when the terminal never replied"
@@ -217,7 +222,8 @@ async fn unknown_brand_no_reply_starts_cleanly() {
 async fn unknown_brand_malformed_reply_is_discarded() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
-        PtyHarness::new(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV).expect("spawn pager");
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV, None)
+            .expect("spawn pager");
 
     assert!(
         wait_for_raw_bytes(&mut harness, XTVERSION_QUERY, WELCOME_TIMEOUT),
@@ -235,12 +241,10 @@ async fn unknown_brand_malformed_reply_is_discarded() {
     assert!(!harness.contains_text("panicked"));
     assert_no_probe_garbage_on_screen(&harness);
 
-    harness
-        .inject_keys(b"/terminal-setup\r")
-        .expect("run /terminal-setup");
+    harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
         .wait_for_text("Environment", Duration::from_secs(10))
-        .expect("terminal-setup output");
+        .expect("doctor output");
     assert!(
         !harness.contains_text("xtversion"),
         "malformed reply must not produce an xtversion line"
@@ -256,7 +260,8 @@ async fn unknown_brand_malformed_reply_is_discarded() {
 async fn unknown_brand_late_reply_swallowed_and_recorded() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
-        PtyHarness::new(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV).expect("spawn pager");
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV, None)
+            .expect("spawn pager");
 
     assert!(
         wait_for_raw_bytes(&mut harness, XTVERSION_QUERY, WELCOME_TIMEOUT),
@@ -276,12 +281,10 @@ async fn unknown_brand_late_reply_swallowed_and_recorded() {
         .expect("welcome text");
     assert_no_probe_garbage_on_screen(&harness);
 
-    harness
-        .inject_keys(b"/terminal-setup\r")
-        .expect("run /terminal-setup");
+    harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
         .wait_for_text("PtyHarnessTerm 9.9", Duration::from_secs(10))
-        .expect("late XTVERSION identity shown in /terminal-setup");
+        .expect("late XTVERSION identity shown in /doctor");
 
     assert!(!harness.contains_text("panicked"));
     harness.quit().expect("clean quit");
@@ -293,7 +296,8 @@ async fn unknown_brand_late_reply_swallowed_and_recorded() {
 async fn unknown_brand_keystrokes_interleaved_with_reply() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
-        PtyHarness::new(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV).expect("spawn pager");
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV, None)
+            .expect("spawn pager");
 
     assert!(
         wait_for_raw_bytes(&mut harness, XTVERSION_QUERY, WELCOME_TIMEOUT),
@@ -325,7 +329,8 @@ async fn unknown_brand_keystrokes_interleaved_with_reply() {
 async fn unknown_brand_split_reply_round_trip() {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness =
-        PtyHarness::new(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV).expect("spawn pager");
+        PtyHarness::new_inherited_env(&binary, ROWS, COLS, &[], UNKNOWN_BRAND_ENV, None)
+            .expect("spawn pager");
 
     assert!(
         wait_for_raw_bytes(&mut harness, XTVERSION_QUERY, WELCOME_TIMEOUT),
@@ -345,12 +350,10 @@ async fn unknown_brand_split_reply_round_trip() {
         .expect("welcome text");
     assert_no_probe_garbage_on_screen(&harness);
 
-    harness
-        .inject_keys(b"/terminal-setup\r")
-        .expect("run /terminal-setup");
+    harness.inject_keys(b"/doctor\r").expect("run /doctor");
     harness
         .wait_for_text("PtyHarnessTerm 9.9", Duration::from_secs(10))
-        .expect("split XTVERSION reply shown in /terminal-setup");
+        .expect("split XTVERSION reply shown in /doctor");
 
     assert!(!harness.contains_text("panicked"));
     harness.quit().expect("clean quit");

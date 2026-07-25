@@ -1,12 +1,8 @@
 //! Filesystem path tables for sandbox profiles.
 //!
-//! Collects device files, temp directories, sensitive deny-paths, and
-//! ecosystem (package-manager / toolchain) writable paths into helpers
-//! consumed by [`super::profiles`].
+//! Collects device files, temp directories, and essential writable paths.
 
-#[cfg(all(feature = "enforce", unix))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── Grok state directory ────────────────────────────────────────────────────
 
@@ -24,7 +20,7 @@ pub(crate) fn grok_home() -> PathBuf {
 /// or seed RNGs.
 ///
 /// These are individual files (use `allow_file`, not `allow_path`).
-/// `/dev/pts` is a directory (PTY slaves on Linux) so it uses `allow_path`.
+/// Directory nodes under `/dev` belong in [`DEVICE_DIRS`].
 #[cfg(all(feature = "enforce", unix))]
 pub(crate) const DEVICE_FILES: &[&str] = &[
     "/dev/null",    // output sink — used by virtually every CLI tool
@@ -33,13 +29,13 @@ pub(crate) const DEVICE_FILES: &[&str] = &[
     "/dev/urandom", // entropy — used by crypto/TLS
     "/dev/tty",     // controlling terminal — used by git, ssh, gpg
     "/dev/ptmx",    // PTY allocation — used by terminal spawning
-    "/dev/fd",      // file descriptor access (symlink to /proc/self/fd on Linux)
 ];
 
-/// Device directories that need write access.
+/// Device directories that need write access (use `allow_path`, not `allow_file`).
 #[cfg(all(feature = "enforce", unix))]
 pub(crate) const DEVICE_DIRS: &[&str] = &[
     "/dev/pts", // PTY slaves (Linux)
+    "/dev/fd",  // fd table (symlink to /proc/self/fd on Linux; a directory)
 ];
 
 // ── Temporary directories ───────────────────────────────────────────────────
@@ -51,7 +47,6 @@ pub(crate) const DEVICE_DIRS: &[&str] = &[
 /// `/private/var/folders/` (the real `TMPDIR` / `NSTemporaryDirectory()`).
 /// git, compilers, and other tools write temp files to `$TMPDIR` which
 /// resolves to `/private/var/folders/xx/.../T/` on macOS.
-#[cfg(all(feature = "enforce", unix))]
 pub(crate) fn temp_writable_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
 
@@ -81,7 +76,6 @@ pub(crate) fn temp_writable_paths() -> Vec<PathBuf> {
 
 /// Writable directory paths for profiles that allow workspace writes (workspace, devbox, strict).
 /// Device files are handled separately via `allow_file` in `to_capability_set_with_config`.
-#[cfg(all(feature = "enforce", unix))]
 pub(crate) fn essential_writable_paths(workspace: &Path) -> Vec<PathBuf> {
     let mut paths = vec![workspace.to_path_buf(), grok_home()];
     paths.extend(temp_writable_paths());
@@ -90,7 +84,6 @@ pub(crate) fn essential_writable_paths(workspace: &Path) -> Vec<PathBuf> {
 
 /// Writable directory paths for the read-only profile (minimal: just ~/.grok + temp).
 /// Device files are handled separately via `allow_file` in `to_capability_set_with_config`.
-#[cfg(all(feature = "enforce", unix))]
 pub(crate) fn essential_writable_paths_minimal() -> Vec<PathBuf> {
     let mut paths = vec![grok_home()];
     paths.extend(temp_writable_paths());

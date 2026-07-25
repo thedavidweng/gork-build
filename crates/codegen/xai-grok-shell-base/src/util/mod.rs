@@ -69,18 +69,49 @@ pub fn is_cli_chat_proxy_url(url: &str) -> bool {
     }
     false
 }
-/// True for first-party xAI endpoints (`*.x.ai`, cli-chat-proxy, and optional
-/// non-production first-party hosts when that feature is enabled).
+/// True for xAI-operated endpoints (`*.x.ai`, cli-chat-proxy, and optional
+/// non-production xAI hosts when that feature is enabled).
 /// `disable_api_key_auth` refuses keys only for these; other hosts are BYOK and
 /// exempt. Safe against invalid URLs and suffix attacks (`evil-x.ai.example`).
-pub fn is_first_party_xai_url(url: &str) -> bool {
+///
+/// Scheme-agnostic so credential *refusal* fails closed. To decide where to
+/// *attach* a credential, use [`is_xai_api_bearer_url`].
+pub fn is_xai_api_url(url: &str) -> bool {
+    is_xai_api_url_impl(url, false)
+}
+/// Like [`is_xai_api_url`], but requires `https` on every arm, so a
+/// session bearer is never attached to a cleartext endpoint, including loopback
+/// (a co-located process could otherwise read a token sent to `http://localhost`).
+pub fn is_xai_api_bearer_url(url: &str) -> bool {
+    is_xai_api_url_impl(url, true)
+}
+fn is_xai_api_url_impl(url: &str, require_https: bool) -> bool {
+    if require_https {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        if is_loopback_host(&parsed) {
+            return false;
+        }
+    }
     if is_cli_chat_proxy_url(url) {
         return true;
     }
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_owned()))
+        .and_then(|u| u.host_str().map(str::to_owned))
         .is_some_and(|host| host == "x.ai" || host.ends_with(".x.ai"))
+}
+fn is_loopback_host(parsed: &reqwest::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 /// Truncate a string to at most `max_chars` characters.
 /// Slices at char boundaries so multi-byte UTF-8 never panics.
@@ -125,24 +156,42 @@ pub fn is_process_alive(pid: u32) -> bool {
     let _ = unsafe { CloseHandle(handle) };
     wait_result == WAIT_TIMEOUT
 }
-/// Terminate a process by PID. Idempotent: already-dead is `Ok`.
-///
-/// - Unix: `SIGTERM` via `nix::sys::signal::kill`; ESRCH maps to `Ok`.
-/// - Windows: `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`;
-///   ERROR_INVALID_PARAMETER (Windows' "no such process") maps to `Ok`.
+/// Which termination signal to send. On Windows both map to `TerminateProcess`
+/// (already forceful), so the distinction only matters on Unix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillSignal {
+    /// Graceful `SIGTERM` (Unix) — the process may catch and drain.
+    Term,
+    /// Forceful `SIGKILL` (Unix) — unblockable escalation.
+    Kill,
+}
+/// Terminate a process by PID with `SIGTERM`. Idempotent: already-dead is `Ok`.
 pub fn kill_process_by_pid(pid: u32) -> std::io::Result<()> {
+    kill_process_with_signal(pid, KillSignal::Term)
+}
+/// Terminate a process by PID with a chosen signal. Idempotent: already-dead is `Ok`.
+///
+/// - Unix: `SIGTERM`/`SIGKILL` via `nix::sys::signal::kill`; ESRCH maps to `Ok`.
+/// - Windows: `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess` (already
+///   forceful, so `signal` is ignored); ERROR_INVALID_PARAMETER maps to `Ok`.
+pub fn kill_process_with_signal(pid: u32, signal: KillSignal) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use nix::errno::Errno;
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
-        match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+        let sig = match signal {
+            KillSignal::Term => Signal::SIGTERM,
+            KillSignal::Kill => Signal::SIGKILL,
+        };
+        match kill(Pid::from_raw(pid as i32), sig) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
         }
     }
     #[cfg(windows)]
     {
+        let _ = signal;
         use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
         use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
         use windows::core::HRESULT;
@@ -211,6 +260,38 @@ pub fn is_grok_process(pid: u32) -> bool {
         cmd.status().is_ok_and(|s| s.success())
     }
 }
+/// Stricter [`is_grok_process`] for the auto-kill zombie path: on macOS/BSD it
+/// name-matches via `ps` (not liveness-only), so eviction never SIGKILLs a
+/// recycled PID now owned by an unrelated process. Linux/Windows already match
+/// exactly, so this delegates there. Use the permissive [`is_grok_process`] for
+/// operator-driven `grok leaders kill`.
+pub fn is_grok_process_strict(pid: u32) -> bool {
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    {
+        let mut cmd = std::process::Command::new("ps");
+        cmd.args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        xai_tty_utils::detach_std_command(&mut cmd);
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                let comm = String::from_utf8_lossy(&out.stdout);
+                comm.lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .and_then(|line| std::path::Path::new(line).file_name())
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().contains("grok"))
+            }
+            _ => false,
+        }
+    }
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        is_grok_process(pid)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,25 +318,39 @@ mod tests {
         ));
     }
     #[test]
-    fn test_is_first_party_xai_url() {
-        assert!(is_first_party_xai_url("https://api.x.ai/v1"));
-        assert!(is_first_party_xai_url(
-            "https://api.x.ai/v1/chat/completions"
-        ));
-        assert!(is_first_party_xai_url("https://x.ai"));
-        assert!(is_first_party_xai_url(
+    fn test_is_xai_api_url() {
+        assert!(is_xai_api_url("https://api.x.ai/v1"));
+        assert!(is_xai_api_url("https://api.x.ai/v1/chat/completions"));
+        assert!(is_xai_api_url("https://x.ai"));
+        assert!(is_xai_api_url(
             "https://cli-chat-proxy.grok.com/v1/chat/completions"
         ));
-        assert!(!is_first_party_xai_url("https://api.openai.com/v1"));
-        assert!(!is_first_party_xai_url("https://api.anthropic.com/v1"));
-        assert!(!is_first_party_xai_url(
-            "https://generativelanguage.googleapis.com"
+        assert!(!is_xai_api_url("https://api.openai.com/v1"));
+        assert!(!is_xai_api_url("https://api.anthropic.com/v1"));
+        assert!(!is_xai_api_url("https://generativelanguage.googleapis.com"));
+        assert!(!is_xai_api_url("https://api.x.ai.evil.example/v1"));
+        assert!(!is_xai_api_url("https://evil-x.ai.attacker.com/v1"));
+        assert!(!is_xai_api_url("https://prefixx.ai/v1"));
+        assert!(!is_xai_api_url("not-a-url"));
+        assert!(!is_xai_api_url(""));
+        assert!(is_xai_api_url("http://api.x.ai/v1"));
+        assert!(is_xai_api_url("http://localhost:11434/v1"));
+    }
+    #[test]
+    fn test_is_xai_api_bearer_url() {
+        assert!(is_xai_api_bearer_url("https://api.x.ai/v1"));
+        assert!(!is_xai_api_bearer_url("http://api.x.ai/v1"));
+        assert!(!is_xai_api_bearer_url("http://localhost:11434/v1"));
+        {
+            assert!(!is_xai_api_bearer_url("https://localhost:11434/v1"));
+            assert!(!is_xai_api_bearer_url("https://127.0.0.2:11434/v1"));
+            assert!(!is_xai_api_bearer_url("https://[::1]:11434/v1"));
+        }
+        assert!(is_xai_api_bearer_url("https://API.X.AI/v1"));
+        assert!(!is_xai_api_bearer_url(
+            "https://api.x.ai@attacker.example/v1"
         ));
-        assert!(!is_first_party_xai_url("https://api.x.ai.evil.example/v1"));
-        assert!(!is_first_party_xai_url("https://evil-x.ai.attacker.com/v1"));
-        assert!(!is_first_party_xai_url("https://prefixx.ai/v1"));
-        assert!(!is_first_party_xai_url("not-a-url"));
-        assert!(!is_first_party_xai_url(""));
+        assert!(!is_xai_api_bearer_url("https://х.ai/v1"));
     }
     #[test]
     fn test_truncate() {
@@ -299,5 +394,22 @@ mod tests {
     fn is_grok_process_self_true_impossible_pid_false() {
         assert!(is_grok_process(std::process::id()));
         assert!(!is_grok_process(u32::MAX));
+    }
+    #[test]
+    fn is_grok_process_strict_self_true_impossible_pid_false() {
+        assert!(is_grok_process_strict(std::process::id()));
+        assert!(!is_grok_process_strict(u32::MAX));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_with_signal_sigkill_terminates_live_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        kill_process_with_signal(pid, KillSignal::Kill).expect("sigkill should succeed");
+        let status = child.wait().expect("wait child");
+        assert!(!status.success(), "sleep was killed, not exited cleanly");
     }
 }

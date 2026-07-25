@@ -67,7 +67,9 @@ fn voice_final_appends_to_prompt_with_single_space() {
         target: VoiceTarget::Agent(id),
         interim: None,
     };
-    app.agents.get_mut(&id).unwrap().prompt.set_text("hello");
+    let p = &mut app.agents.get_mut(&id).unwrap().prompt;
+    p.set_text("hello");
+    p.set_cursor(5);
     let redraw = crate::voice::handle_voice_event(
         &mut app,
         xai_grok_voice::VoiceEvent::UtteranceFinal {
@@ -75,7 +77,36 @@ fn voice_final_appends_to_prompt_with_single_space() {
         },
     );
     assert!(redraw);
-    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "hello world");
+    let p = &app.agents.get(&id).unwrap().prompt;
+    assert_eq!(p.text(), "hello world");
+    assert_eq!(p.cursor(), "hello world".len());
+}
+
+#[test]
+fn voice_final_preserves_mid_text_cursor() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::Agent(id),
+        interim: Some("partial".into()),
+    };
+    let p = &mut app.agents.get_mut(&id).unwrap().prompt;
+    p.set_text("hello world");
+    p.set_cursor(5);
+
+    crate::voice::handle_voice_event(
+        &mut app,
+        xai_grok_voice::VoiceEvent::UtteranceFinal {
+            text: "again".into(),
+        },
+    );
+
+    let p = &app.agents.get(&id).unwrap().prompt;
+    assert_eq!(p.text(), "hello world again");
+    assert_eq!(p.cursor(), 5);
+    assert!(app.voice_listening());
+    assert!(app.voice_interim().is_none());
 }
 
 #[test]
@@ -92,7 +123,29 @@ fn voice_final_into_empty_prompt_has_no_leading_space() {
             text: "hi there".into(),
         },
     );
-    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "hi there");
+    let p = &app.agents.get(&id).unwrap().prompt;
+    assert_eq!(p.text(), "hi there");
+    assert_eq!(p.cursor(), "hi there".len());
+}
+
+#[test]
+fn voice_final_replaces_whitespace_only_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.voice_state = VoiceState::Stopping {
+        target: VoiceTarget::Agent(id),
+        interim: None,
+    };
+    let p = &mut app.agents.get_mut(&id).unwrap().prompt;
+    p.set_text("  \n");
+    p.set_cursor(0);
+    crate::voice::handle_voice_event(
+        &mut app,
+        xai_grok_voice::VoiceEvent::UtteranceFinal { text: "hi".into() },
+    );
+    let p = &app.agents.get(&id).unwrap().prompt;
+    assert_eq!(p.text(), "hi");
+    assert_eq!(p.cursor(), 2);
 }
 
 #[test]
@@ -221,10 +274,94 @@ fn voice_interim_sets_then_error_clears_state() {
         &mut app,
         xai_grok_voice::VoiceEvent::Error {
             message: "boom".into(),
+            hint: None,
         },
     );
     assert!(!app.voice_listening());
     assert!(app.voice_interim().is_none());
+}
+
+#[test]
+fn voice_error_hint_lands_in_bound_agent_scrollback() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let before = app.agents.get(&id).unwrap().scrollback.len();
+
+    // Hint follows the bound target (like finals), not the active view.
+    app.active_view = ActiveView::AgentDashboard;
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::Agent(id),
+        interim: None,
+    };
+    crate::voice::handle_voice_event(
+        &mut app,
+        xai_grok_voice::VoiceEvent::Error {
+            message: "no speech detected".into(),
+            hint: Some("allow terminal mic access in system settings".into()),
+        },
+    );
+    let agent = app.agents.get(&id).unwrap();
+    assert_eq!(agent.scrollback.len(), before + 1);
+    let text = match agent
+        .scrollback
+        .get(agent.scrollback.len() - 1)
+        .map(|e| &e.block)
+    {
+        Some(crate::scrollback::block::RenderBlock::System(b)) => b.text.as_str(),
+        other => panic!("expected system hint block, got {other:?}"),
+    };
+    assert!(
+        text.contains("no speech detected")
+            && text.contains("allow terminal mic access in system settings"),
+        "scrollback should carry short message + long hint, got {text:?}"
+    );
+
+    // No hint while still bound → toast only, no scrollback growth.
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::Agent(id),
+        interim: None,
+    };
+    let before = app.agents.get(&id).unwrap().scrollback.len();
+    crate::voice::handle_voice_event(
+        &mut app,
+        xai_grok_voice::VoiceEvent::Error {
+            message: "boom".into(),
+            hint: None,
+        },
+    );
+    assert_eq!(app.agents.get(&id).unwrap().scrollback.len(), before);
+}
+
+#[test]
+fn voice_error_hint_dropped_for_dashboard_dispatch() {
+    // The dispatch box has no scrollback; only the dashboard toast survives.
+    let mut app = test_app_with_agent();
+    app.active_view = ActiveView::AgentDashboard;
+    ensure_dashboard_state(&mut app);
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::DashboardDispatch,
+        interim: None,
+    };
+    let before = app.agents.get(&AgentId(0)).unwrap().scrollback.len();
+    crate::voice::handle_voice_event(
+        &mut app,
+        xai_grok_voice::VoiceEvent::Error {
+            message: "no speech detected".into(),
+            hint: Some("allow terminal mic access in system settings".into()),
+        },
+    );
+    assert_eq!(
+        app.agents.get(&AgentId(0)).unwrap().scrollback.len(),
+        before
+    );
+    assert!(
+        app.dashboard
+            .as_ref()
+            .is_some_and(|d| d.error_toast.is_some())
+    );
 }
 
 #[test]
@@ -648,4 +785,67 @@ fn voice_stt_language_auto_stored_unresolved() {
 
     assert_eq!(app.voice_config.language, "auto");
     assert_eq!(app.current_ui.voice_stt_language.as_deref(), Some("auto"));
+}
+
+#[test]
+fn voice_submit_includes_interim() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    app.voice_cmd_tx = Some(tx);
+    app.agents.get_mut(&id).unwrap().prompt.set_text("hello");
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::Agent(id),
+        interim: Some("world".into()),
+    };
+
+    let effects = dispatch(Action::SendPrompt("hello".into()), &mut app);
+    let Effect::SendPrompt { text, .. } = &effects[0] else {
+        panic!("expected SendPrompt, got {effects:?}");
+    };
+    assert_eq!(text, "hello world");
+    assert!(!app.voice_listening());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+    ));
+}
+
+#[test]
+fn voice_submit_interim_only() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::Agent(id),
+        interim: Some("ghost only".into()),
+    };
+
+    let effects = dispatch(Action::SendPrompt(String::new()), &mut app);
+    let Effect::SendPrompt { text, .. } = &effects[0] else {
+        panic!("expected SendPrompt, got {effects:?}");
+    };
+    assert_eq!(text, "ghost only");
+    assert!(!app.voice_listening());
+}
+
+#[test]
+fn voice_submit_follow_up_keeps_chip_literal() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().prompt.set_text("draft");
+    app.voice_state = VoiceState::Recording {
+        hold: false,
+        target: VoiceTarget::Agent(id),
+        interim: Some("dictated".into()),
+    };
+
+    let effects = dispatch(Action::SubmitFollowUp("chip text".into()), &mut app);
+    let Effect::SendPrompt { text, .. } = &effects[0] else {
+        panic!("expected SendPrompt, got {effects:?}");
+    };
+    assert_eq!(text, "chip text");
+    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "draft dictated");
+    assert!(!app.voice_listening());
 }

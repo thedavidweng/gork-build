@@ -77,17 +77,6 @@ pub async fn discover_agents_md(root_cwd: &Path) -> Vec<Value> {
 
     files
         .into_iter()
-        .map(|mut file| {
-            // Strip rules-file YAML frontmatter so it does not leak as raw YAML (matches grok-build render).
-            if file.file_path.contains("/.grok/rules/")
-                || file.file_path.contains("/.claude/rules/")
-            {
-                file.content = xai_grok_tools::implementations::skills::skill::extract_skill_body(
-                    &file.content,
-                );
-            }
-            file
-        })
         .filter_map(|file| match serde_json::to_value(&file) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -215,13 +204,19 @@ fn toml_to_json(v: &toml::Value) -> Value {
 /// merges rules from requirements.toml, managed-settings.json,
 /// managed_config.toml, config.toml, and `.claude/settings.json`.
 ///
+/// `project_trusted` gates project-tier permission sources (same contract as
+/// env/hooks/plugins). Hub/cloud callers outside the local folder-trust model
+/// should pass `true`.
+///
 /// Returns a JSON object with `sources`, `loaded` (rule count), and
 /// `skipped` (unrecognized rules). Returns `Value::Null` if no
 /// permission sources are configured.
-pub async fn load_permissions(root_cwd: &Path) -> Value {
+pub async fn load_permissions(root_cwd: &Path, project_trusted: bool) -> Value {
     use crate::permission::resolution;
 
-    let Some(resolved) = resolution::resolve_permissions_with_provenance(root_cwd).await else {
+    let Some(resolved) =
+        resolution::resolve_permissions_with_provenance(root_cwd, project_trusted).await
+    else {
         return Value::Null;
     };
 
@@ -362,9 +357,9 @@ mod tests {
 
     // Discovery also scans the real `~/.grok`, so fixtures use test-unique names.
     #[tokio::test]
-    async fn discover_agents_md_strips_rules_frontmatter() {
+    async fn discover_agents_md_receives_normalized_rule_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let rules_dir = tmp.path().join(".grok").join("rules");
+        let rules_dir = tmp.path().join(".cursor").join("rules");
         fs::create_dir_all(&rules_dir).unwrap();
         fs::write(
             rules_dir.join("xyzzy-discover-agents-md-test.md"),
@@ -378,7 +373,7 @@ mod tests {
             .find(|f| {
                 f["file_path"]
                     .as_str()
-                    .is_some_and(|p| p.ends_with("/.grok/rules/xyzzy-discover-agents-md-test.md"))
+                    .is_some_and(|p| p.ends_with("/.cursor/rules/xyzzy-discover-agents-md-test.md"))
             })
             .expect("should discover the rules file");
         let content = rule["content"].as_str().unwrap();
@@ -547,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn load_permissions_returns_valid_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = load_permissions(tmp.path()).await;
+        let result = load_permissions(tmp.path(), true).await;
         // Result is either Null (no sources) or an object with
         // sources, loaded, and skipped fields. Both branches assert
         // a definite pass criterion.
@@ -574,7 +569,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_permissions(tmp.path()).await;
+        let result = load_permissions(tmp.path(), true).await;
         assert!(result.is_object(), "should return an object, got {result}");
         assert!(result["sources"].is_array(), "sources should be an array");
         assert!(result["loaded"].is_number(), "loaded should be a number");

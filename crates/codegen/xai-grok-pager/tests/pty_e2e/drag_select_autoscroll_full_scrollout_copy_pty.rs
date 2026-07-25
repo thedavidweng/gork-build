@@ -27,22 +27,29 @@ async fn drag_select_autoscroll_full_scrollout_copy_pty() {
     let content = ContentController::start().await.expect("start content");
     // Turn 1: a three-row anchor message (markdown hard breaks keep one row
     // per source line). Turn 2: filler tall enough to scroll it fully out.
-    content.set_turns([
+    let _anchor_turn = content.expect_agent_turn(
+        "selection anchor turn",
         format!("{ANCHOR_FIRST} anchor first line  \nmiddle filler line  \n{ANCHOR_LAST} anchor last line"),
+    );
+    let _filler_turn = content.expect_agent_turn(
+        "selection autoscroll filler turn",
         marker_response(MOCK_RESPONSE_SENTINEL, FILLER_ROWS),
-    ]);
+    );
 
     let binary = pager_binary().expect("resolve pager binary");
-    let mut env = content.env_for_pager();
-    env.push((
+    let overrides: Vec<(String, String)> = vec![(
         "SSH_CONNECTION".into(),
         "scripted-test 1 127.0.0.1 2".into(),
-    ));
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut harness = PtyHarness::new_in_dir(
+    )];
+    let env_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let mut harness = PtyHarness::spawn_with_content_env_in_dir(
         &binary,
         DEFAULT_ROWS,
         DEFAULT_COLS,
+        &content,
         &[],
         &env_refs,
         Some(content.home()),

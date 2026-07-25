@@ -101,8 +101,8 @@ pub fn truncate_trailing_incomplete_tool_call(
     mut conversation: Vec<ConversationItem>,
 ) -> Vec<ConversationItem> {
     while matches!(
-        conversation.last(), Some(ConversationItem::Assistant(a)) if ! a.tool_calls
-        .is_empty()
+        conversation.last(),
+        Some(ConversationItem::Assistant(a)) if !a.tool_calls.is_empty()
     ) {
         conversation.pop();
     }
@@ -176,7 +176,8 @@ fn recover_truncated_tail_unit(
         };
     }
     let owner = if matches!(
-        body.last(), Some(ConversationItem::Assistant(a)) if ! a.tool_calls.is_empty()
+        body.last(),
+        Some(ConversationItem::Assistant(a)) if !a.tool_calls.is_empty()
     ) {
         body.pop()
     } else {
@@ -532,6 +533,10 @@ pub struct TodoSummary {
 /// handled by the consumer (e.g. `xai-grok-shell`), which has access to
 /// memory backends and other shell-specific dependencies.
 pub struct CompactionStateContext {
+    /// Monotonic cwd generation; zero preserves the legacy compaction shape.
+    pub cwd_generation: u64,
+    /// Project instructions resolved for the latest destination cwd.
+    pub destination_project_instructions: Option<String>,
     /// Messages since the last **real** user turn (assistant + omitted tool
     /// results).  Synthetic user injections (system reminders) do not reset
     /// the boundary, preventing orphaned ToolResults in the compacted output.
@@ -555,6 +560,8 @@ pub struct CompactionStateContext {
 /// [`CompactionStateContext::build`].
 #[derive(Default)]
 pub struct CompactionInputs {
+    pub cwd_generation: u64,
+    pub destination_project_instructions: Option<String>,
     pub running_tasks: Vec<BackgroundTaskSummary>,
     pub running_subagents: Vec<RunningSubagentSummary>,
     pub agent_edited_paths: BTreeSet<String>,
@@ -569,6 +576,8 @@ impl CompactionStateContext {
     /// compaction boundary.
     pub async fn build(conversation: &[ConversationItem], inputs: CompactionInputs) -> Self {
         Self {
+            cwd_generation: inputs.cwd_generation,
+            destination_project_instructions: inputs.destination_project_instructions,
             recent_messages: extract_messages_since_last_real_user(conversation),
             last_user_query: extract_last_real_user_query(conversation),
             agent_edited_paths: inputs.agent_edited_paths.into_iter().collect(),
@@ -602,6 +611,8 @@ impl CompactionStateContext {
     /// `recent_messages` so the model keeps verbatim tool context.
     pub fn for_compaction(&self) -> Self {
         Self {
+            cwd_generation: self.cwd_generation,
+            destination_project_instructions: self.destination_project_instructions.clone(),
             recent_messages: Vec::new(),
             last_user_query: self.last_user_query.clone(),
             agent_edited_paths: self.agent_edited_paths.clone(),
@@ -839,7 +850,15 @@ pub fn build_compacted_history(input: CompactedHistoryInput<'_>) -> Vec<Conversa
         input.system_message,
         ConversationItem::user_meta(input.user_message_prefix),
     ];
-    if let Some(ref reminder) = input.agents_md_reminder {
+    let project_instructions = if input.state_context.cwd_generation == 0 {
+        input.agents_md_reminder.as_ref()
+    } else {
+        input
+            .state_context
+            .destination_project_instructions
+            .as_ref()
+    };
+    if let Some(reminder) = project_instructions {
         compacted.push(ConversationItem::project_instructions(reminder.clone()));
     }
     if let Some(ref last_query) = input.state_context.last_user_query {
@@ -1047,9 +1066,11 @@ mod tests {
     }
     #[test]
     fn compaction_attempt_defaults_optional_fields_for_old_artifacts() {
-        let json = serde_json::json!(
-            { "attempt" : 1, "outcome" : "transient", "summary_chars" : 0, }
-        );
+        let json = serde_json::json!({
+            "attempt": 1,
+            "outcome": "transient",
+            "summary_chars": 0,
+        });
         let parsed: CompactionAttempt = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.summary, None);
         assert_eq!(parsed.error, None);
@@ -1304,6 +1325,7 @@ actual user question";
                 "<user_info>OS: macos</user_info>\n<user_query>\nreal task\n</user_query>",
             ),
             ConversationItem::assistant("done"),
+            // This is what run_inline_auto_continue() pushes after compaction:
             ConversationItem::user(AUTO_CONTINUE_PROMPT),
             ConversationItem::assistant("continuing..."),
         ];
@@ -2222,7 +2244,9 @@ actual user question";
         let items = vec![
             ConversationItem::system("sys"),
             ConversationItem::user("prompt"),
+            // Orphaned tool result — no assistant with matching tool_calls
             ConversationItem::tool_result("call_ORPHAN", "result"),
+            // Valid pair
             ConversationItem::assistant_tool_calls(vec![ToolCall {
                 id: "call_VALID".into(),
                 name: "read_file".to_string(),
@@ -2336,6 +2360,7 @@ actual user question";
         let mut items = vec![
             ConversationItem::system("sys"),
             ConversationItem::user("prompt"),
+            // ← the assistant declaring call_LOST is missing here
             ConversationItem::tool_result("call_LOST", "orphaned result"),
             ConversationItem::assistant_tool_calls(vec![call("call_OK")]),
             ConversationItem::tool_result("call_OK", "fine"),
@@ -2409,6 +2434,7 @@ actual user question";
             ConversationItem::tool_result("call_A", "ok"),
             ConversationItem::assistant_tool_calls(vec![call("call_C")]),
             ConversationItem::tool_result("call_C", "ok"),
+            // call_B's owner was flushed two messages ago.
             ConversationItem::tool_result("call_B", "displaced"),
         ];
         let report = repair_history(&mut items);
@@ -2660,13 +2686,18 @@ actual user question";
     async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
         use xai_grok_sampling_types::{AssistantItem, ToolCall};
         let conversation = vec![
+            // [0] System prompt
             ConversationItem::system("You are a helpful coding assistant."),
+            // [1] User info prefix (no <user_query> tags — this is the initial message)
             ConversationItem::user(
                 "<user_info>\nOS Version: macos\nShell: /bin/bash\nWorkspace Path: /Users/dev/project\n</user_info>\n\n<project_layout>\n/Users/dev/project/\n  src/\n    main.rs\n    lib.rs\n</project_layout>",
             ),
+            // ── Turn 1 ──────────────────────────────────────────────────
+            // [2] User query (wrapped in <user_query> tags by parse_prompt)
             ConversationItem::user(
                 "<user_query>\nRead main.rs and lib.rs and tell me what they do\n</user_query>",
             ),
+            // [3] Assistant with 2 parallel tool calls
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll read both files for you.".into(),
                 tool_calls: vec![
@@ -2685,20 +2716,26 @@ actual user question";
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
+            // [4] Tool result for call_1
             ConversationItem::tool_result(
                 "call_1",
                 "fn main() {\n    println!(\"hello world\");\n}",
             ),
+            // [5] Tool result for call_2
             ConversationItem::tool_result(
                 "call_2",
                 "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}",
             ),
+            // [6] Assistant summary after reading both files
             ConversationItem::assistant(
                 "main.rs prints hello world. lib.rs has an `add` function.",
             ),
+            // ── Turn 2 ──────────────────────────────────────────────────
+            // [7] User query (second turn)
             ConversationItem::user(
                 "<user_query>\nNow fix the typo in main.rs and run the tests\n</user_query>",
             ),
+            // [8] Assistant with 2 parallel tool calls
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll fix the typo and run tests.".into(),
                 tool_calls: vec![
@@ -2718,11 +2755,14 @@ actual user question";
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
+            // [9] Tool result for call_3
             ConversationItem::tool_result("call_3", "File edited successfully."),
+            // [10] Tool result for call_4
             ConversationItem::tool_result(
                 "call_4",
                 "running 1 test\ntest tests::test_add ... ok\n\ntest result: ok. 1 passed",
             ),
+            // [11] Assistant final response
             ConversationItem::assistant("Fixed the typo and all tests pass!"),
         ];
         let mut edited = BTreeSet::new();
@@ -2764,8 +2804,7 @@ actual user question";
         });
         assert_eq!(compacted.len(), 9, "compacted history should have 9 items");
         assert!(
-            matches!(& compacted[0], ConversationItem::System(s) if s.content.as_ref() ==
-            "You are a helpful coding assistant.")
+            matches!(&compacted[0], ConversationItem::System(s) if s.content.as_ref() == "You are a helpful coding assistant.")
         );
         let prefix = compacted[1].text_content();
         assert!(
@@ -2852,21 +2891,93 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             "system-reminder should list edited files"
         );
     }
-    /// End-to-end test: build a compacted history with realistic file re-reads
-    /// (line-numbered content matching extract_file_content_lines output),
-    /// a truncated file, and a too-large file reference.
-    ///
-    /// Verifies the exact string content of every message in the compacted
-    /// history, including the plain-text "Called the read_file tool..." /
-    /// AGENTS.md slot in the post-compaction conversation must be tagged
-    /// `SyntheticReason::ProjectInstructions`, NOT `CompactionMeta`. This is
-    /// the contract `spawn_session_actor`'s idempotence guard relies on when
-    /// a session is resumed from a post-compaction `chat_history.jsonl`: it
-    /// skips re-inserting AGENTS.md when it sees a tagged `User` item,
-    /// preserving the KV-cache invariant.
+    /// Generation zero ignores relocation-only fields and preserves legacy output.
+    #[test]
+    fn generation_zero_compaction_keeps_legacy_project_instructions() {
+        let state_context = CompactionStateContext {
+            cwd_generation: 0,
+            destination_project_instructions: Some("destination rules".into()),
+            recent_messages: vec![],
+            last_user_query: None,
+            agent_edited_paths: vec![],
+            running_tasks: vec![],
+            running_subagents: vec![],
+            connected_mcp_servers: vec![],
+            todos: vec![],
+        };
+        let compacted = build_compacted_history(CompactedHistoryInput {
+            system_message: ConversationItem::system("sys"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: Some("startup rules".into()),
+            state_context: &state_context,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            summary_before_recent: false,
+            transcript_hint: None,
+            summary_count: 1,
+        });
+        assert_eq!(compacted[2].text_content(), "startup rules");
+    }
+    #[test]
+    fn relocated_compaction_uses_destination_project_instructions() {
+        let state_context = CompactionStateContext {
+            cwd_generation: 1,
+            destination_project_instructions: Some("destination rules".into()),
+            recent_messages: vec![],
+            last_user_query: None,
+            agent_edited_paths: vec![],
+            running_tasks: vec![],
+            running_subagents: vec![],
+            connected_mcp_servers: vec![],
+            todos: vec![],
+        };
+        let compacted = build_compacted_history(CompactedHistoryInput {
+            system_message: ConversationItem::system("sys"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: Some("startup rules".into()),
+            state_context: &state_context,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            summary_before_recent: false,
+            transcript_hint: None,
+            summary_count: 1,
+        });
+        assert_eq!(compacted[2].text_content(), "destination rules");
+    }
+    #[test]
+    fn relocated_compaction_does_not_restore_source_instructions_when_destination_has_none() {
+        let state_context = CompactionStateContext {
+            cwd_generation: 1,
+            destination_project_instructions: None,
+            recent_messages: vec![],
+            last_user_query: None,
+            agent_edited_paths: vec![],
+            running_tasks: vec![],
+            running_subagents: vec![],
+            connected_mcp_servers: vec![],
+            todos: vec![],
+        };
+        let compacted = build_compacted_history(CompactedHistoryInput {
+            system_message: ConversationItem::system("sys"),
+            user_message_prefix: "prefix".into(),
+            agents_md_reminder: Some("source rules".into()),
+            state_context: &state_context,
+            compaction_summary: "summary".into(),
+            system_reminder: None,
+            summary_before_recent: false,
+            transcript_hint: None,
+            summary_count: 1,
+        });
+        assert!(!compacted.iter().any(|item| {
+            matches!(item, ConversationItem::User(user) if user.synthetic_reason == Some(SyntheticReason::ProjectInstructions))
+        }));
+    }
+    /// The AGENTS.md slot must use the structural project-instructions tag.
     #[test]
     fn build_compacted_history_tags_agents_md_with_project_instructions() {
         let state_context = CompactionStateContext {
+            cwd_generation: 0,
+            destination_project_instructions: None,
             recent_messages: vec![],
             last_user_query: None,
             agent_edited_paths: vec![],
@@ -2908,6 +3019,8 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
     #[test]
     fn build_compacted_history_omits_agents_md_when_none() {
         let state_context = CompactionStateContext {
+            cwd_generation: 0,
+            destination_project_instructions: None,
             recent_messages: vec![],
             last_user_query: None,
             agent_edited_paths: vec![],
@@ -2929,8 +3042,9 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         });
         let has_project_instructions = compacted.iter().any(|item| {
             matches!(
-                item, ConversationItem::User(u) if u.synthetic_reason ==
-                Some(SyntheticReason::ProjectInstructions)
+                item,
+                ConversationItem::User(u)
+                    if u.synthetic_reason == Some(SyntheticReason::ProjectInstructions)
             )
         });
         assert!(
@@ -3299,11 +3413,9 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             ConversationItem::tool_result("c1", "fn main() {}"),
         ];
         let has_tool_calls = |items: &[ConversationItem]| {
-            items.iter().any(|i| {
-                matches!(
-                    i, ConversationItem::Assistant(a) if ! a.tool_calls.is_empty()
-                )
-            })
+            items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::Assistant(a) if !a.tool_calls.is_empty()))
         };
         let has_tool_result = |items: &[ConversationItem]| {
             items
@@ -3312,10 +3424,8 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         };
         let has_image = |items: &[ConversationItem]| {
             items.iter().any(|i| {
-                matches!(
-                    i, ConversationItem::User(u) if u.content.iter().any(| p |
-                    matches!(p, ContentPart::Image { .. }))
-                )
+                matches!(i, ConversationItem::User(u)
+                    if u.content.iter().any(|p| matches!(p, ContentPart::Image { .. })))
             })
         };
         let seg = prepare_conversation_for_segment(conv.clone());
@@ -3421,6 +3531,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 arguments: r#"{"target_file":"a.rs"}"#.into(),
             }]),
             ConversationItem::tool_result("c1", "fn main() {}"),
+            // Trailing, no matching ToolResult — results never arrived.
             ConversationItem::assistant_tool_calls(vec![ToolCall {
                 id: "c2".into(),
                 name: "grep".to_string(),
@@ -3471,8 +3582,8 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         let big = "x".repeat(800);
         let conv = vec![
             ConversationItem::system("sys"),
-            ConversationItem::user(&big),
-            ConversationItem::assistant(&big),
+            ConversationItem::user(&big),      // old + large -> dropped
+            ConversationItem::assistant(&big), // old + large -> dropped
             ConversationItem::user("recent question"),
             ConversationItem::assistant("recent answer"),
         ];
@@ -3527,7 +3638,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 name: "read_file".to_string(),
                 arguments: "{}".into(),
             }]),
-            ConversationItem::tool_result("c1", huge.as_str()),
+            ConversationItem::tool_result("c1", huge.as_str()), // triggering result
         ];
         let out = fit_conversation_to_budget(conv, 100);
         let tr = out
@@ -3547,8 +3658,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         );
         assert!(
             out.iter()
-                .any(|i| matches!(i, ConversationItem::Assistant(a) if ! a
-            .tool_calls.is_empty())),
+                .any(|i| matches!(i, ConversationItem::Assistant(a) if !a.tool_calls.is_empty())),
             "owning assistant tool_use must be kept so the result is not orphaned"
         );
         let est: u64 = out.iter().map(estimate_item_tokens).sum();
@@ -3585,15 +3695,17 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         }
         let conv = vec![
             ConversationItem::system("sys"),
-            img_user,
+            img_user, // old turn, huge by image charges, ~0 by text bytes
             ConversationItem::user("recent question"),
             ConversationItem::assistant("recent answer"),
         ];
         let out = fit_conversation_to_budget(conv, 1_000);
         assert!(
-            !out.iter()
-                .any(|i| matches!(i, ConversationItem::User(u) if u.content
-            .iter().any(| p | matches!(p, ContentPart::Image { .. })))),
+            !out.iter().any(|i| matches!(
+                i,
+                ConversationItem::User(u)
+                    if u.content.iter().any(|p| matches!(p, ContentPart::Image { .. }))
+            )),
             "image-heavy old turn must be counted (765/image) and trimmed, not kept"
         );
         assert!(
@@ -3615,7 +3727,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
         });
         let conv = vec![
             ConversationItem::system("sys"),
-            reasoning,
+            reasoning, // old turn, huge by encrypted bytes, 0 by visible text
             ConversationItem::user("recent question"),
             ConversationItem::assistant("recent answer"),
         ];

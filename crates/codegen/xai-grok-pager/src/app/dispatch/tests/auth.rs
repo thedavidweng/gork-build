@@ -303,6 +303,158 @@ fn login_from_welcome_does_not_stash_return_view() {
     assert_eq!(app.auth_return_view, None);
 }
 
+/// Compact-auth recovery: hold prompt across auto-compact 401, stash on
+/// PromptResponse, resubmit on mid-session AuthComplete.
+#[test]
+fn e2e_compact_auth_failure_holds_prompt_and_resubmits_after_login() {
+    use crate::app::acp_handler::apply_session_event_for_test;
+    use crate::app::agent::{AgentState, InFlightPrompt};
+    use crate::scrollback::EntryId;
+    use crate::scrollback::block::RenderBlock;
+    use xai_grok_shell::extensions::notification::{RetryState, SessionUpdate as XaiSessionUpdate};
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.session_id = Some(acp::SessionId::new("sess-compact-auth-e2e"));
+        agent.session.current_prompt_id = Some("prompt-1".into());
+        agent.session.in_flight_prompt = Some(InFlightPrompt {
+            text: "please continue after login".into(),
+            images: Vec::new(),
+            scrollback_entry: EntryId::new(1),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+
+        apply_session_event_for_test(
+            &XaiSessionUpdate::AutoCompactStarted {
+                tokens_used: 180_000,
+                context_window: 200_000,
+                percentage: 90,
+                reason: "threshold".into(),
+            },
+            &mut agent.session,
+            &mut agent.scrollback,
+        );
+        assert!(
+            agent.session.in_flight_prompt.is_none(),
+            "cancel rewind must still be blocked mid-compact"
+        );
+        assert_eq!(
+            agent
+                .session
+                .compact_held_prompt
+                .as_ref()
+                .map(|p| p.text.as_str()),
+            Some("please continue after login"),
+            "must hold the prompt text for reauth auto-resubmit"
+        );
+
+        apply_session_event_for_test(
+            &XaiSessionUpdate::AutoCompactFailed {
+                error: "authentication problem — re-authenticate using /login and retry.".into(),
+            },
+            &mut agent.session,
+            &mut agent.scrollback,
+        );
+        assert!(agent.session.compact_held_prompt.is_some());
+
+        apply_session_event_for_test(
+            &XaiSessionUpdate::RetryState(RetryState::Failed {
+                error_type: "auth".into(),
+                message: "Unauthorized (401): compaction failed".into(),
+            }),
+            &mut agent.session,
+            &mut agent.scrollback,
+        );
+        let has_reauth = (0..agent.scrollback.len()).any(|i| {
+            matches!(
+                agent.scrollback.entry(i).map(|e| &e.block),
+                Some(RenderBlock::SessionEvent(ev))
+                    if matches!(ev.event, SessionEvent::ReAuthRequired)
+            )
+        });
+        assert!(has_reauth, "RetryState auth must show ReAuthRequired");
+    }
+
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Unauthorized (401)".to_string()),
+            http_status: Some(401),
+            prompt_id: Some("prompt-1".into()),
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id]
+            .reauth_stashed_prompt
+            .as_ref()
+            .map(|p| p.text.as_str()),
+        Some("please continue after login"),
+        "PromptResponse must stash the compact-held prompt for AuthComplete"
+    );
+
+    dispatch(Action::Login, &mut app);
+    let seq = authenticating_seq(&app);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::AuthComplete {
+            request_seq: seq,
+            meta: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        app.agents[&id].reauth_stashed_prompt.is_none(),
+        "stash consumed on AuthComplete"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+        )),
+        "AuthComplete must resubmit the prompt so compact runs again with valid auth, got: {effects:?}"
+    );
+}
+
+/// Without compact_held, clearing in_flight on compact start leaves reauth empty.
+#[test]
+fn pre_fix_compact_start_without_hold_cannot_stash_for_reauth() {
+    use crate::app::agent::AgentState;
+    use crate::scrollback::block::RenderBlock;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.session_id = Some(acp::SessionId::new("sess-pre-fix"));
+        agent.session.current_prompt_id = Some("p1".into());
+        agent.session.in_flight_prompt = None;
+        agent.session.compact_held_prompt = None;
+        agent
+            .scrollback
+            .push_block(RenderBlock::session_event(SessionEvent::ReAuthRequired));
+    }
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Unauthorized (401)".to_string()),
+            http_status: Some(401),
+            prompt_id: Some("p1".into()),
+        }),
+        &mut app,
+    );
+    assert!(
+        app.agents[&id].reauth_stashed_prompt.is_none(),
+        "without compact_held / in_flight, reauth cannot stash — the pre-fix bug"
+    );
+}
+
 /// A second auth-failed turn with no rewindable prompt
 /// (`in_flight_prompt == None`) must not clobber the stash from an
 /// earlier 401.
@@ -317,6 +469,7 @@ fn second_auth_failure_does_not_clobber_reauth_stash() {
             text: "first prompt".into(),
             images: Vec::new(),
             scrollback_entry: crate::scrollback::EntryId::new(0),
+            combined_scrollback_entries: Vec::new(),
             chip_elements: Vec::new(),
         });
         agent
@@ -358,6 +511,7 @@ fn cancel_login_drops_reauth_stashed_prompt() {
             text: "stale".into(),
             images: Vec::new(),
             scrollback_entry: crate::scrollback::EntryId::new(0),
+            combined_scrollback_entries: Vec::new(),
             chip_elements: Vec::new(),
         });
 
@@ -384,6 +538,7 @@ fn cancel_login_strips_reauth_prompt_from_scrollback() {
             text: "stale".into(),
             images: Vec::new(),
             scrollback_entry: crate::scrollback::EntryId::new(0),
+            combined_scrollback_entries: Vec::new(),
             chip_elements: Vec::new(),
         });
         agent
@@ -438,6 +593,144 @@ fn login_with_empty_auth_methods_fails_closed() {
     assert!(app.login_method_id.is_none());
 }
 
+/// Puts the app in `Authenticating` with a live task's abort handle installed
+/// (as the event loop would), returning the task's JoinHandle and the seq.
+/// Callers assert the task actually gets aborted (`unwrap_err().is_cancelled()`),
+/// not merely that the handle slot was cleared.
+fn install_live_auth_task(
+    app: &mut AppView,
+    rt: &tokio::runtime::Runtime,
+) -> (tokio::task::JoinHandle<()>, u64) {
+    dispatch(Action::Login, app);
+    let task = rt.spawn(std::future::pending::<()>());
+    match &mut app.auth_state {
+        AuthState::Authenticating {
+            handle,
+            request_seq,
+            ..
+        } => {
+            *handle = Some(task.abort_handle());
+            (task, *request_seq)
+        }
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    }
+}
+
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+}
+
+/// A second `/login` while already authenticating must abort the prior auth
+/// task and bump the seq (single-flight: no stacked device-code mints).
+#[test]
+fn login_while_authenticating_aborts_prior_task() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    let (prior_task, first_seq) = install_live_auth_task(&mut app, &rt);
+
+    let effects = dispatch(Action::Login, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            prior_task.await.unwrap_err().is_cancelled(),
+            "prior auth task must be aborted"
+        );
+    });
+    match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => {
+            assert!(
+                *request_seq > first_seq,
+                "re-login must bump request_seq for single-flight"
+            );
+        }
+        other => panic!("expected Authenticating after re-Login, got {other:?}"),
+    }
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Authenticate { .. })),
+        "re-login must emit a new Authenticate"
+    );
+}
+
+/// A stale `AuthComplete` (from an attempt whose abort lost the race because
+/// the task had already finished) must not complete the new attempt: the
+/// request-seq guard is the only protection here.
+#[test]
+fn stale_auth_complete_after_relogin_is_ignored() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::Login, &mut app);
+    let first_seq = match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => *request_seq,
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    };
+    dispatch(Action::Login, &mut app); // re-login bumps to seq2
+
+    dispatch(
+        Action::TaskComplete(TaskResult::AuthComplete {
+            request_seq: first_seq,
+            meta: None,
+        }),
+        &mut app,
+    );
+
+    match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => {
+            assert!(
+                *request_seq > first_seq,
+                "stale AuthComplete must leave the new attempt authenticating"
+            );
+        }
+        other => panic!("stale AuthComplete must be ignored, got {other:?}"),
+    }
+}
+
+/// Switch-account while authenticating goes through the same single-flight
+/// abort as `/login` (sibling entry point).
+#[test]
+fn switch_account_while_authenticating_aborts_prior_task() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    let (prior_task, first_seq) = install_live_auth_task(&mut app, &rt);
+
+    dispatch(Action::SwitchAccount, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            prior_task.await.unwrap_err().is_cancelled(),
+            "prior auth task must be aborted on switch-account"
+        );
+    });
+    match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => {
+            assert!(*request_seq > first_seq, "switch must bump request_seq");
+        }
+        other => panic!("expected Authenticating after SwitchAccount, got {other:?}"),
+    }
+}
+
+/// Cancelling a mid-session login aborts the in-flight auth task (not just
+/// restores the view) so a retry cannot race a still-polling prior mint.
+#[test]
+fn cancel_login_aborts_prior_task() {
+    let rt = test_runtime();
+    let mut app = test_app_with_agent();
+    // Login from a session view stashes `auth_return_view`, making CancelLogin live.
+    let (prior_task, _) = install_live_auth_task(&mut app, &rt);
+
+    dispatch(Action::CancelLogin, &mut app);
+
+    rt.block_on(async {
+        assert!(
+            prior_task.await.unwrap_err().is_cancelled(),
+            "cancel must abort the in-flight auth task"
+        );
+    });
+}
+
 /// Cancelling a mid-session login returns to the session rather than
 /// quitting the app, and clears the stashed view + auth state.
 #[test]
@@ -445,10 +738,20 @@ fn cancel_login_restores_view() {
     let mut app = test_app_with_agent();
     dispatch(Action::Login, &mut app);
     assert_eq!(app.active_view, ActiveView::Welcome);
+    let prior_seq = match &app.auth_state {
+        AuthState::Authenticating { request_seq, .. } => *request_seq,
+        other => panic!("expected Authenticating after Login, got {other:?}"),
+    };
 
     let effects = dispatch(Action::CancelLogin, &mut app);
 
-    assert!(effects.is_empty(), "cancel is pure state, no effects");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CancelAuth { request_seq }] if *request_seq == prior_seq
+        ),
+        "cancel must tell the shell to stop the in-flight auth poll for this attempt"
+    );
     assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
     assert_eq!(app.auth_return_view, None);
     assert!(matches!(app.auth_state, AuthState::Done));

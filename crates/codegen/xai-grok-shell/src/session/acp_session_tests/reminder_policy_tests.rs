@@ -1,7 +1,6 @@
-use super::support::create_test_actor;
+use super::support::{create_test_actor, test_agent_with_user_message_template};
 use super::{
-    date_rollover_reminder, goal_slash_and_harness_available, laziness_injection_active,
-    resolve_reminder_policy, todo_gate_active,
+    date_rollover_reminder, laziness_injection_active, resolve_reminder_policy, todo_gate_active,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::util::config::RemoteSettings;
@@ -77,6 +76,7 @@ fn cli_todo_gate_overrides_remote_enable_false() {
         policy.todo_gate,
         TodoGateConfig {
             enabled: true,
+            // Cap stays whatever remote said; CLI only flips `enabled`.
             max_fires_per_prompt: 7,
         },
     );
@@ -127,24 +127,6 @@ fn policy_with_gate(enabled: bool) -> ReminderPolicy {
     p
 }
 use crate::session::goal_tracker::GoalStatus;
-#[test]
-fn goal_slash_and_harness_available_predicate_matrix() {
-    use xai_grok_tools::implementations::grok_build::UPDATE_GOAL_TOOL_NAME;
-    let other = vec!["todo_write".to_string()];
-    let with_update = vec![UPDATE_GOAL_TOOL_NAME.to_string()];
-    for (goal_enabled, tool_names, expect) in [
-        (false, &other, false),
-        (true, &other, false),
-        (true, &with_update, true),
-        (false, &with_update, false),
-    ] {
-        assert_eq!(
-            goal_slash_and_harness_available(goal_enabled, tool_names),
-            expect,
-            "goal_enabled={goal_enabled} tools={tool_names:?}",
-        );
-    }
-}
 #[test]
 fn laziness_injection_active_predicate_matrix() {
     let def = def_with_template(TemplateOverride::None);
@@ -329,6 +311,97 @@ async fn same_session_rolls_over_once_when_local_date_advances() {
                 actor.chat_state_handle.get_conversation_len().await,
                 1,
                 "rollover must not re-fire on a later same-day turn"
+            );
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn rollover_reminder_follows_the_custom_template_date_intent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(50_000, 256_000, 85, gateway_tx, persistence_tx).await;
+            let today = chrono::Local::now().date_naive();
+            let yesterday = today.pred_opt().expect("today is never the min date");
+            *actor.agent.borrow_mut() = test_agent_with_user_message_template(
+                xai_grok_agent::prompt::user_message::UserMessageTemplate::Custom(
+                    "Workspace: ${{ workspace_path }}".to_string(),
+                ),
+            )
+            .await;
+            actor.last_announced_local_date.set(yesterday);
+            actor.maybe_inject_date_rollover_reminder().await;
+            assert_eq!(
+                actor.chat_state_handle.get_conversation_len().await,
+                0,
+                "a date-free custom template must suppress the rollover reminder"
+            );
+            *actor.agent.borrow_mut() = test_agent_with_user_message_template(
+                xai_grok_agent::prompt::user_message::UserMessageTemplate::Custom(
+                    "Today is ${{ today_local }}".to_string(),
+                ),
+            )
+            .await;
+            actor.last_announced_local_date.set(yesterday);
+            actor.maybe_inject_date_rollover_reminder().await;
+            let conv = actor.chat_state_handle.get_conversation().await;
+            assert_eq!(
+                conv.len(),
+                1,
+                "a today_local-bearing custom template must keep the rollover reminder"
+            );
+            assert!(
+                conv[0]
+                    .text_content()
+                    .contains("The local date has changed since this session started"),
+                "the kept reminder must be the date-rollover reminder: {}",
+                conv[0].text_content()
+            );
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn rollover_reminder_fires_when_fallback_stamps_a_date_free_template() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(50_000, 256_000, 85, gateway_tx, persistence_tx).await;
+            let today = chrono::Local::now().date_naive();
+            let yesterday = today.pred_opt().expect("today is never the min date");
+            *actor.agent.borrow_mut() = test_agent_with_user_message_template(
+                xai_grok_agent::prompt::user_message::UserMessageTemplate::Custom(
+                    "Workspace: ${{ workspace_path }}".to_string(),
+                ),
+            )
+            .await;
+            actor.last_announced_local_date.set(yesterday);
+            actor.maybe_inject_date_rollover_reminder().await;
+            assert_eq!(
+                actor.chat_state_handle.get_conversation_len().await,
+                0,
+                "a date-free template without a fallback-stamped date must stay silent"
+            );
+            actor.prefix_carries_fallback_date.set(true);
+            actor.last_announced_local_date.set(yesterday);
+            actor.maybe_inject_date_rollover_reminder().await;
+            let conv = actor.chat_state_handle.get_conversation().await;
+            assert_eq!(
+                conv.len(),
+                1,
+                "a fallback-stamped date must roll over even under a date-free template"
+            );
+            assert!(
+                conv[0]
+                    .text_content()
+                    .contains("The local date has changed since this session started"),
+                "the injected reminder must be the date-rollover reminder: {}",
+                conv[0].text_content()
             );
         })
         .await;

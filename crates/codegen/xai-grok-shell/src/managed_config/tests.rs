@@ -338,7 +338,8 @@ fn marker_is_not_a_managed_artifact() {
         [
             "managed_config.toml",
             "requirements.toml",
-            "managed_config.sig.json"
+            "managed_config.sig.json",
+            "managed_identity.sig.json"
         ],
         "the artifact list is load-bearing for every derived loop; change it deliberately"
     );
@@ -392,4 +393,54 @@ fn purge_keeps_marker_when_an_artifact_removal_fails() {
             .exists(),
         "with every artifact removed, the marker goes last"
     );
+}
+
+// --- The is-managed claim persist rules ---
+
+/// Deployment id wins over team id (server parity).
+#[test]
+fn served_principal_prefers_deployment_id() {
+    use xai_grok_config::signed_policy::SignedPayload;
+    let payload = |dep: Option<&str>, team: Option<&str>| SignedPayload {
+        typ: xai_grok_config::signed_policy::MANAGED_POLICY_TYP.into(),
+        version: 1,
+        deployment_id: dep.map(Into::into),
+        team_id: team.map(Into::into),
+        managed_config: None,
+        requirements: None,
+        fail_closed: false,
+        expires_at: 0,
+        nonce: String::new(),
+        key_id: "v1".into(),
+    };
+    assert_eq!(
+        served_principal_of(&payload(Some("dep-1"), Some("team-007"))),
+        Some("dep-1")
+    );
+    assert_eq!(
+        served_principal_of(&payload(None, Some("team-007"))),
+        Some("team-007")
+    );
+    assert_eq!(served_principal_of(&payload(None, None)), None);
+}
+
+/// A verified claim persists ONLY when bound to the served principal.
+#[test]
+fn claim_persists_only_when_bound_to_served_principal() {
+    let claim = |principal: &str| xai_grok_config::signed_policy::ManagedIdentityClaim {
+        typ: xai_grok_config::signed_policy::MANAGED_IDENTITY_TYP.into(),
+        principal: principal.into(),
+        fail_closed: true,
+        expires_at: 4_000_000_000,
+        key_id: "v1".into(),
+    };
+    assert!(claim_binds_to(&claim("team-007"), Some("team-007")));
+    assert!(!claim_binds_to(&claim("team-evil"), Some("team-007")));
+    assert!(!claim_binds_to(&claim("team-007"), None));
+}
+
+/// Old server, no claim envelopes: nothing persists, nothing errors.
+#[test]
+fn absent_claim_is_skipped() {
+    assert!(verified_claim_sidecar(&ManagedConfigResponse::default(), Some("team-007")).is_none());
 }

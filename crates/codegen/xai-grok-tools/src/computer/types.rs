@@ -110,6 +110,8 @@ pub struct TerminalRunRequest {
     /// `kill_all_background_tasks_by_owner` only targets the requesting
     /// session's processes — not the parent's or sibling's.
     pub owner_session_id: Option<String>,
+    /// Model-supplied label for task UI / snapshots.
+    pub description: Option<String>,
 }
 
 /// Distinguishes different types of background tasks.
@@ -214,6 +216,9 @@ pub struct TaskSnapshot {
     /// the parent's or sibling's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
+    /// Model-supplied label for task UI / snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl TaskSnapshot {
@@ -292,9 +297,7 @@ pub trait TerminalBackend: Send + Sync {
     /// only the subagent's own tasks are killed — not the parent's.
     async fn kill_all_background_tasks_by_owner(&self, _owner_session_id: &str) {}
 
-    /// Fire-and-forget prewarm of the persistent login shell; default no-op for
-    /// backends without one (ACP/remote, non-persistent).
-    async fn warm_persistent_shell(&self, _cwd: &std::path::Path) {}
+    async fn warm_shell(&self, _cwd: &std::path::Path) {}
 
     /// Reparent notification handles for all tasks owned by `old_owner_session_id`.
     /// Swaps the dead child session's notification handle with the parent's

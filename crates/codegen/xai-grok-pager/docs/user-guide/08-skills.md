@@ -140,6 +140,8 @@ Grok asks where to save the skill:
 - **Project** (`<repo_root>/.grok/skills/<name>/`) -- available only in this repository and shareable with teammates through version control. Grok recommends this scope inside a git repository.
 - **User** (`~/.grok/skills/<name>/`) -- available across all your projects.
 
+To distribute a skill to a whole team or organization, package it in a plugin and publish it through a marketplace. See [Create your own marketplace](09-plugins.md#create-your-own-marketplace) and [Distribute across an organization](09-plugins.md#distribute-across-an-organization).
+
 The new skill appears in the slash menu within a few seconds, because Grok reloads skills when files change on disk.
 
 ---
@@ -199,7 +201,7 @@ The `--json` report includes the full detail for each skill: its `name`, `descri
 
 ## Bundled and Plugin Skills
 
-Grok ships with built-in skills and extracts them to `~/.grok/skills/` on startup -- among them `/create-skill`, `/help`, and `/check-work`. Bundled skills behave like user skills, and a same-named skill in a higher-priority location (local or repo) overrides the bundled copy; `grok inspect` labels the extracted copies `bundled` so they stay distinguishable from skills you authored yourself. (A plugin skill of the same name does not override it; it stays available under its qualified `plugin:name` form.)
+Grok distributes platform skills separately from your personal skills. Bundled skills are cached under `~/.grok/bundled/skills/`; Grok never writes them into `~/.grok/skills/`. A same-named local, repo, or user skill overrides the bundled copy. `grok inspect` labels each definition by its actual source. (A plugin skill of the same name does not override a native skill; it stays available under its qualified `plugin:name` form.)
 
 Skills can also come from plugins. When you install a plugin that includes skills, they appear alongside your user and project skills. `grok inspect` labels each plugin-provided skill with its source as `plugin: <name>`.
 

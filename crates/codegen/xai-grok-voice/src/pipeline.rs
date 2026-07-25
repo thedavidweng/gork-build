@@ -94,7 +94,7 @@ pub async fn run_voice_pipeline(
                 };
                 // The reader task owns the capture handle; signalling it lets the
                 // reader stop the mic and send `audio.done` in a single place,
-                // matching the silence-guard teardown below.
+                // matching the no-speech-watchdog teardown below.
                 let _ = session.finish_tx.send(()).await;
             }
         }
@@ -119,6 +119,7 @@ async fn open_session(
             let _ = event_tx
                 .send(VoiceEvent::Error {
                     message: e.to_string(),
+                    hint: None,
                 })
                 .await;
             None
@@ -190,6 +191,23 @@ async fn forward_pcm(
     }
 }
 
+/// How long a session may run without any transcript before it is torn down
+/// (instead of streaming a dead mic until the user gives up). Disarmed by the
+/// first transcript, so long dictation with pauses is unaffected.
+#[cfg(feature = "audio")]
+const NO_SPEECH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Message and permission guidance for a session torn down by
+/// [`NO_SPEECH_TIMEOUT`]. A denied grant is indistinguishable from not speaking
+/// because macOS may return silence instead of an error.
+#[cfg(feature = "audio")]
+fn no_speech_error() -> (String, Option<String>) {
+    (
+        "No speech was detected. Voice stopped.".to_owned(),
+        Some(crate::probe::mic_fix_help().to_owned()),
+    )
+}
+
 #[cfg(feature = "audio")]
 async fn start_capture_session(
     config: &VoiceConfig,
@@ -205,10 +223,8 @@ async fn start_capture_session(
     let capture_task =
         tokio::task::spawn_blocking(move || crate::audio::spawn_pcm_capture(sample_rate, mic_tx));
 
-    // Start draining the mic *now* — before connect resolves — so the capture
-    // chain never backpressures (and cpal never drops chunks) while the socket
-    // comes up. `forward_pcm` buffers until the STT sender arrives, then flushes
-    // and streams live.
+    // Drain mic before connect resolves so capture never backpressures while
+    // the socket comes up.
     let (audio_tx_tx, audio_tx_rx) = tokio::sync::oneshot::channel::<mpsc::Sender<Vec<u8>>>();
     tokio::spawn(forward_pcm(mic_rx, audio_tx_rx));
 
@@ -250,14 +266,9 @@ async fn start_capture_session(
                 handle.stop();
             }
         };
-        // Surface a hint if nothing is transcribed within the first 10s of a
-        // session — the usual sign of a denied mic permission, a muted mic, or
-        // the wrong input device (on macOS a "healthy" stream still delivers
-        // silence until access is granted). The check applies only before the
-        // first transcript: once the user starts talking, pauses can be as long
-        // as they like.
-        let silence_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut silence_check = true;
+        // No transcript within the timeout → tear down. Disarmed after speech.
+        let no_speech_deadline = tokio::time::Instant::now() + NO_SPEECH_TIMEOUT;
+        let mut awaiting_speech = true;
         // Chunk-final (`is_final && !speech_final`) text is locked: the server
         // sends it as a delta of the turn. Stitch those deltas into the live
         // preview so a long pauseless utterance keeps accumulating on screen
@@ -270,27 +281,20 @@ async fn start_capture_session(
             tokio::select! {
                 msg = finish_rx.recv() => {
                     if msg.is_some() {
-                        // User ended the turn; stop watching for initial silence.
-                        silence_check = false;
+                        // User ended the turn; stop the no-speech watchdog.
+                        awaiting_speech = false;
                         stop_capture(&mut capture);
                         stt.finish_audio();
                     } else {
                         return;
                     }
                 }
-                _ = tokio::time::sleep_until(silence_deadline), if silence_check => {
-                    // Give up on this turn: stop the mic and flush `audio.done`
-                    // so the session tears down instead of streaming silence
-                    // until the pager sends stop (toggle off).
+                _ = tokio::time::sleep_until(no_speech_deadline), if awaiting_speech => {
+                    // Tear down rather than streaming a dead mic until the user stops.
                     stop_capture(&mut capture);
                     stt.finish_audio();
-                    let _ = out
-                        .send(VoiceEvent::Error {
-                            message: "no audio detected in 10s: check that your \
-                                      terminal has microphone permission"
-                                .into(),
-                        })
-                        .await;
+                    let (message, hint) = no_speech_error();
+                    let _ = out.send(VoiceEvent::Error { message, hint }).await;
                     return;
                 }
                 ev = stt.recv() => {
@@ -300,8 +304,8 @@ async fn start_capture_session(
                             if text.is_empty() {
                                 continue;
                             }
-                            // Real speech arrived: disarm the initial-silence guard.
-                            silence_check = false;
+                            // Real speech arrived: disarm the no-speech watchdog.
+                            awaiting_speech = false;
 
                             let event = if p.speech_final {
                                 locked_prefix.clear();
@@ -332,12 +336,12 @@ async fn start_capture_session(
                         Some(StreamingSttEvent::Done { text }) => {
                             locked_prefix.clear();
                             if !text.trim().is_empty() {
-                                silence_check = false;
+                                awaiting_speech = false;
                                 let _ = out.send(VoiceEvent::UtteranceFinal { text }).await;
                             }
                         }
                         Some(StreamingSttEvent::Error { message }) => {
-                            let _ = out.send(VoiceEvent::Error { message }).await;
+                            let _ = out.send(VoiceEvent::Error { message, hint: None }).await;
                             return;
                         }
                         Some(StreamingSttEvent::Ready) | None => return,
@@ -403,5 +407,12 @@ mod tests {
         mic_tx.send(vec![1]).await.unwrap();
         drop(tx_tx);
         task.await.unwrap();
+    }
+
+    #[test]
+    fn no_speech_error_carries_permission_hint() {
+        let (message, hint) = no_speech_error();
+        assert_eq!(message, "No speech was detected. Voice stopped.");
+        assert!(hint.is_some_and(|hint| hint.contains(crate::probe::mic_fix_help())));
     }
 }

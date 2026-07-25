@@ -15,12 +15,13 @@
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use indexmap::IndexMap;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::Serialize;
 
-use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
+use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
@@ -272,9 +273,38 @@ struct StreamOptions {
     include_usage: bool,
 }
 
+/// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`, skipping unset/blank/invalid entries and trimming values.
+fn apply_env_http_headers(
+    env_http_headers: &IndexMap<String, String>,
+    getenv: impl Fn(&str) -> Option<String>,
+    headers: &mut HeaderMap,
+) {
+    for (key, env_var) in env_http_headers {
+        let Some(value) = getenv(env_var) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let (Ok(name), Ok(header_value)) = (
+            HeaderName::try_from(key.as_str()),
+            HeaderValue::from_str(value),
+        ) else {
+            tracing::warn!(
+                header = %key,
+                env_var = %env_var,
+                "skipping env_http_header with an invalid header name or value"
+            );
+            continue;
+        };
+        headers.insert(name, header_value);
+    }
+}
+
 /// HTTP client for sampling. Cheap to clone; carries an `Arc`-backed
-/// `reqwest::Client` and the default headers/request-defaults computed
-/// from a [`SamplerConfig`] at construction time.
+/// `reqwest::Client` and the default headers/request-defaults computed from a
+/// [`SamplerConfig`] at construction time.
 #[derive(Clone)]
 pub struct SamplingClient {
     http: reqwest::Client,
@@ -290,6 +320,8 @@ pub struct SamplingClient {
     bearer_resolver: Option<crate::config::SharedBearerResolver>,
     /// Per-request header injection (OTel traceparent).
     header_injector: Option<crate::config::SharedHeaderInjector>,
+    /// Endpoint URL builder, resolved once from `base_url` + `query_params`.
+    endpoint: EndpointTemplate,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -316,6 +348,74 @@ struct ClientDefaults {
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+}
+
+/// Endpoint URL builder, resolved once at client construction so each request
+/// only appends its path.
+#[derive(Clone, Debug)]
+enum EndpointTemplate {
+    /// No query params and no query on the base URL (or an unparseable base):
+    /// append the path to the base verbatim.
+    Plain(String),
+    /// Query params configured: `{prefix}/{path}{suffix}`. `suffix` starts with
+    /// `?` and folds any base-URL params, with a configured key winning over the
+    /// same key in `base_url` (percent-encoded, no duplicates).
+    WithQuery { prefix: String, suffix: String },
+}
+
+impl EndpointTemplate {
+    fn new(base_url: &str, query_params: &IndexMap<String, String>) -> Self {
+        let base = base_url.trim_end_matches('/').to_string();
+        // The fast path is safe only when there is nothing to fold: no configured
+        // params and no query already on the base (which would otherwise land
+        // before the appended path).
+        if query_params.is_empty() && !base.contains('?') {
+            return Self::Plain(base);
+        }
+        let mut url = match reqwest::Url::parse(&base) {
+            Ok(url) => url,
+            Err(error) => {
+                tracing::warn!(
+                    url = %base,
+                    %error,
+                    "failed to parse base URL for endpoint; sending without folded query"
+                );
+                return Self::Plain(base);
+            }
+        };
+        let overridden: std::collections::HashSet<&str> =
+            query_params.keys().map(String::as_str).collect();
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| !overridden.contains(k.as_ref()))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let prefix = {
+            let mut prefix_url = url.clone();
+            prefix_url.set_query(None);
+            prefix_url.as_str().trim_end_matches('/').to_string()
+        };
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.clear();
+            for (key, value) in &kept {
+                pairs.append_pair(key, value);
+            }
+            for (key, value) in query_params {
+                pairs.append_pair(key, value);
+            }
+        }
+        let suffix = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+        Self::WithQuery { prefix, suffix }
+    }
+
+    fn url_for_path(&self, path: &str) -> String {
+        let path = path.trim_start_matches('/');
+        match self {
+            Self::Plain(base) => format!("{base}/{path}"),
+            Self::WithQuery { prefix, suffix } => format!("{prefix}/{path}{suffix}"),
+        }
+    }
 }
 
 // =============================================================================
@@ -444,6 +544,14 @@ impl SamplingClient {
             headers.insert(header_name, header_value);
         }
 
+        // Resolve here, not into `extra_headers`, so an env-sourced secret stays
+        // out of persisted state.
+        apply_env_http_headers(
+            &config.env_http_headers,
+            |var| std::env::var(var).ok(),
+            &mut headers,
+        );
+
         // Add x-grok-client-version header for version gating at the proxy.
         if let Some(client_version) = config.client_version.as_ref()
             && let Ok(header_value) = HeaderValue::from_str(client_version)
@@ -530,6 +638,8 @@ impl SamplingClient {
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
+        let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
+
         Ok(Self {
             http,
             default_headers: headers,
@@ -538,6 +648,7 @@ impl SamplingClient {
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
+            endpoint,
         })
     }
 
@@ -546,23 +657,25 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
-    /// POST with default headers. Overrides auth from resolver if wired.
+    /// POST with default headers. When a bearer_resolver is wired it is the
+    /// sole auth source: a missing live bearer strips default Authorization /
+    /// x-api-key so a hard-expired seed key cannot ride on the wire.
     fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
         let mut headers = self.default_headers.clone();
-        if let Some(resolver) = &self.bearer_resolver
-            && let Some(fresh) = resolver.current_bearer()
-        {
-            match self.defaults.auth_scheme {
-                AuthScheme::XApiKey => {
-                    headers.remove(AUTHORIZATION);
-                    if let Ok(v) = HeaderValue::from_str(&fresh) {
-                        headers.insert(HeaderName::from_static("x-api-key"), v);
+        if let Some(resolver) = &self.bearer_resolver {
+            headers.remove(AUTHORIZATION);
+            headers.remove(HeaderName::from_static("x-api-key"));
+            if let Some(fresh) = resolver.current_bearer() {
+                match self.defaults.auth_scheme {
+                    AuthScheme::XApiKey => {
+                        if let Ok(v) = HeaderValue::from_str(&fresh) {
+                            headers.insert(HeaderName::from_static("x-api-key"), v);
+                        }
                     }
-                }
-                AuthScheme::Bearer => {
-                    headers.remove(HeaderName::from_static("x-api-key"));
-                    if let Ok(v) = HeaderValue::from_str(&format!("Bearer {fresh}")) {
-                        headers.insert(AUTHORIZATION, v);
+                    AuthScheme::Bearer => {
+                        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {fresh}")) {
+                            headers.insert(AUTHORIZATION, v);
+                        }
                     }
                 }
             }
@@ -596,16 +709,21 @@ impl SamplingClient {
         self.http.post(url).headers(headers)
     }
 
-    /// Bearer prefix for 401 attribution. Prefers live resolver, falls back to default_headers.
+    /// Bearer prefix for 401 attribution. When a resolver is wired it is
+    /// authoritative (including `None` ⇒ nothing was sent). Without a resolver,
+    /// fall back to construction-time default headers.
     fn current_sent_bearer_prefix(&self) -> Option<String> {
-        self.bearer_resolver
-            .as_ref()
-            .and_then(|r| r.current_bearer())
-            .or_else(|| self.extract_sent_bearer())
-            .map(|mut s| {
-                s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
-                s
-            })
+        if self.bearer_resolver.is_some() {
+            return self
+                .bearer_resolver
+                .as_ref()
+                .and_then(|r| r.current_bearer())
+                .map(|mut s| {
+                    s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
+                    s
+                });
+        }
+        self.extract_sent_bearer()
     }
 
     /// Extract the bearer from `default_headers`, truncated to prefix length.
@@ -678,48 +796,9 @@ impl SamplingClient {
             || lower.contains("secret")
     }
 
-    /// Format a single header for error messages, redacting sensitive values.
-    fn format_header(name: &str, value: &str) -> String {
-        let display_value = if Self::is_sensitive_header(name) {
-            "[REDACTED]"
-        } else {
-            value
-        };
-        format!("  {}: {}", name, display_value)
-    }
-
-    /// Build request headers string for error messages (redacting sensitive values).
-    fn format_request_headers(
-        &self,
-        x_grok_conv_id: &str,
-        x_grok_req_id: &str,
-        model_id: &str,
-        include_accept: bool,
-    ) -> Vec<String> {
-        let mut req_headers: Vec<String> = self
-            .default_headers
-            .iter()
-            .map(|(name, value)| {
-                Self::format_header(name.as_str(), value.to_str().unwrap_or("[non-utf8]"))
-            })
-            .collect();
-
-        req_headers.push(Self::format_header("x-grok-conv-id", x_grok_conv_id));
-        req_headers.push(Self::format_header("x-grok-req-id", x_grok_req_id));
-        req_headers.push(Self::format_header("x-grok-model-override", model_id));
-        if include_accept {
-            req_headers.push(Self::format_header("accept", "text/event-stream"));
-        }
-        req_headers
-    }
-
-    /// Build response headers string for error messages.
-    fn format_response_headers(response: &reqwest::Response) -> Vec<String> {
-        response
-            .headers()
-            .iter()
-            .map(|(name, value)| Self::format_header(name.as_str(), &format!("{:?}", value)))
-            .collect()
+    /// Short lossy body snippet for error logs (never user-facing).
+    fn body_preview(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).chars().take(500).collect()
     }
 
     /// Log all headers from a request at debug level (redacting sensitive values).
@@ -739,40 +818,8 @@ impl SamplingClient {
         }
     }
 
-    /// Build error context message based on error type and status code.
-    /// Includes relevant request/response details depending on what the error is about.
-    fn build_api_error_message(
-        &self,
-        status: reqwest::StatusCode,
-        server_message: &str,
-        endpoint: &str,
-        req_headers: &[String],
-        resp_headers: Option<&[String]>,
-    ) -> String {
-        let server_message_lower = server_message.to_lowercase();
-
-        let mut context_parts = vec![server_message.to_string()];
-        context_parts.push(format!("\nRequest URL: {}", endpoint));
-
-        // Show headers if error mentions headers
-        if server_message_lower.contains("header") {
-            context_parts.push(format!("Request headers:\n{}", req_headers.join("\n")));
-        }
-
-        // Always show response headers for server errors
-        if status.is_server_error()
-            && let Some(resp_hdrs) = resp_headers
-        {
-            context_parts.push(format!("Response headers:\n{}", resp_hdrs.join("\n")));
-        }
-
-        context_parts.join("\n")
-    }
-
     fn endpoint(&self, path: &str) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        let path = path.trim_start_matches('/');
-        format!("{base}/{path}")
+        self.endpoint.url_for_path(path)
     }
 
     fn apply_defaults(&self, mut request: ChatCompletionRequest) -> Result<ChatCompletionRequest> {
@@ -805,12 +852,12 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
-                let server_message = parse_error_bytes(bytes.as_ref());
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401): {server_message}"
                 )));
             }
-            let message = parse_error_bytes(bytes.as_ref());
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             return Err(SamplingError::Api {
                 status,
                 message,
@@ -956,30 +1003,20 @@ impl SamplingClient {
                     crate::attribution::SamplingConsumer::ChatCompletionsStream,
                 );
                 let endpoint = self.endpoint("chat/completions");
-                let server_message = response.text().await.unwrap_or_default();
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
             }
 
-            let req_headers =
-                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, true);
-            let resp_headers = Self::format_response_headers(&response);
             let bytes = response.bytes().await?;
-            let server_message = parse_error_bytes(bytes.as_ref());
-
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("chat/completions"),
-                &req_headers,
-                Some(&resp_headers),
-            );
-
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             span.record("error", message.as_str());
             tracing::error!(
                 status = %status,
                 error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "chat/completions API error"
             );
@@ -1161,26 +1198,17 @@ impl SamplingClient {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::Responses);
                 let endpoint = self.endpoint("responses");
-                let server_message = parse_error_bytes(bytes.as_ref());
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
             }
 
-            let req_headers =
-                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, false);
-            let server_message = parse_error_bytes(bytes.as_ref());
-
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("responses"),
-                &req_headers,
-                None,
-            );
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             tracing::warn!(
                 status = %status,
                 error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "responses API error"
             );
@@ -1268,7 +1296,7 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let extra_raw_tools = std::mem::take(&mut request.extra_raw_tools);
+        let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
@@ -1279,11 +1307,11 @@ impl SamplingClient {
         }
         // Inject xAI-specific tools (e.g., x_search) that can't be expressed
         // via async_openai's rs::Tool enum.
-        if !extra_raw_tools.is_empty() {
+        if !extra_tool_entries.is_empty() {
             if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                tools.extend(extra_raw_tools);
+                tools.extend(extra_tool_entries);
             } else {
-                request_body["tools"] = serde_json::Value::Array(extra_raw_tools);
+                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
@@ -1329,7 +1357,8 @@ impl SamplingClient {
                 span.record("error", "unauthorized (401)");
                 self.record_401_attribution(crate::attribution::SamplingConsumer::ResponsesStream);
                 let endpoint = self.endpoint("responses");
-                let server_message = response.text().await.unwrap_or_default();
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
@@ -1337,24 +1366,13 @@ impl SamplingClient {
             let model_metadata = extract_model_metadata(response.headers());
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
-            let req_headers =
-                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, true);
-            let resp_headers = Self::format_response_headers(&response);
             let bytes = response.bytes().await?;
-            let server_message = parse_error_bytes(bytes.as_ref());
-
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("responses"),
-                &req_headers,
-                Some(&resp_headers),
-            );
-
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             span.record("error", message.as_str());
             tracing::error!(
                 status = %status,
                 error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "responses API error"
             );
@@ -1519,26 +1537,17 @@ impl SamplingClient {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::Messages);
                 let endpoint = self.endpoint("messages");
-                let server_message = parse_error_bytes(bytes.as_ref());
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
             }
 
-            let req_headers =
-                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, false);
-            let server_message = parse_error_bytes(bytes.as_ref());
-
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("messages"),
-                &req_headers,
-                None,
-            );
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             tracing::warn!(
                 status = %status,
                 error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "messages API error"
             );
@@ -1648,7 +1657,8 @@ impl SamplingClient {
                 span.record("error", "unauthorized (401)");
                 self.record_401_attribution(crate::attribution::SamplingConsumer::MessagesStream);
                 let endpoint = self.endpoint("messages");
-                let server_message = response.text().await.unwrap_or_default();
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
@@ -1656,24 +1666,13 @@ impl SamplingClient {
             let model_metadata = extract_model_metadata(response.headers());
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
-            let req_headers =
-                self.format_request_headers(x_grok_conv_id, x_grok_req_id, &model_id, true);
-            let resp_headers = Self::format_response_headers(&response);
             let bytes = response.bytes().await?;
-            let server_message = parse_error_bytes(bytes.as_ref());
-
-            let message = self.build_api_error_message(
-                status,
-                &server_message,
-                &self.endpoint("messages"),
-                &req_headers,
-                Some(&resp_headers),
-            );
-
+            let message = user_facing_api_error_message(status, bytes.as_ref());
             span.record("error", message.as_str());
             tracing::error!(
                 status = %status,
                 error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
                 model_id = %model_id,
                 "messages API error"
             );
@@ -1848,7 +1847,7 @@ impl SamplingClient {
 
         // Collect xAI-specific tools that can't be expressed via rs::Tool
         // (e.g., x_search). These are injected as raw JSON after serialization.
-        let extra_tools = xai_grok_sampling_types::extra_raw_tools(&request.hosted_tools);
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -1858,7 +1857,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
-        wrapper.extra_raw_tools = extra_tools;
+        wrapper.extra_tool_entries = extra_tools;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2024,6 +2023,8 @@ mod tests {
             api_backend: ApiBackend::ChatCompletions,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            env_http_headers: IndexMap::new(),
             context_window: 8192,
             force_http1: false,
             max_retries: None,
@@ -2194,6 +2195,56 @@ mod tests {
         cfg.extra_headers
             .insert("x-XAI-token-auth".to_string(), "xai-grok-cli".to_string());
         let _client = SamplingClient::new(cfg).expect("client with extra headers should construct");
+    }
+
+    #[test]
+    fn apply_env_http_headers_resolves_trims_skips_and_overrides() {
+        let mut map = IndexMap::new();
+        map.insert("x-tenant-token".to_string(), "TENANT".to_string());
+        map.insert("x-blank".to_string(), "BLANK".to_string());
+        map.insert("x-missing".to_string(), "MISSING".to_string());
+        map.insert("x-override".to_string(), "OVERRIDE".to_string());
+        map.insert("x invalid".to_string(), "INVALID".to_string());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-override"),
+            HeaderValue::from_static("static"),
+        );
+
+        apply_env_http_headers(
+            &map,
+            |var| match var {
+                // Leading space + trailing newline exercises trimming.
+                "TENANT" => Some(" tenant-secret\n".to_string()),
+                "BLANK" => Some("   ".to_string()),
+                "OVERRIDE" => Some("from-env".to_string()),
+                "INVALID" => Some("value".to_string()),
+                _ => None,
+            },
+            &mut headers,
+        );
+
+        assert_eq!(headers.get("x-tenant-token").unwrap(), "tenant-secret");
+        assert!(headers.get("x-blank").is_none());
+        assert!(headers.get("x-missing").is_none());
+        // A resolved env value overrides an existing header of the same name.
+        assert_eq!(headers.get("x-override").unwrap(), "from-env");
+        // An invalid header name is skipped rather than panicking.
+        assert!(headers.get("x invalid").is_none());
+    }
+
+    #[test]
+    fn endpoint_appends_path_before_a_base_url_query_without_configured_params() {
+        let template =
+            EndpointTemplate::new("https://gateway.example/v1?api-version=x", &IndexMap::new());
+        let url = template.url_for_path("responses");
+        assert!(
+            url.starts_with("https://gateway.example/v1/responses?"),
+            "url: {url}"
+        );
+        assert!(url.contains("api-version=x"), "url: {url}");
+        assert!(!url.contains("x/responses"), "url: {url}");
     }
 
     #[test]
@@ -2502,6 +2553,63 @@ mod tests {
         assert_eq!(
             calls[0].1.as_deref().map(str::len),
             Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+        );
+    }
+
+    /// When a bearer_resolver is wired but returns `None`, attribution must
+    /// report no sent bearer (not the construction-time default header seed).
+    #[test]
+    fn bearer_resolver_none_attribution_ignores_default_headers() {
+        #[derive(Debug)]
+        struct EmptyResolver;
+        impl crate::config::BearerResolver for EmptyResolver {
+            fn current_bearer(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let cfg = SamplerConfig {
+            api_key: Some("stale-seed-token".to_string()),
+            api_backend: ApiBackend::Responses,
+            bearer_resolver: Some(std::sync::Arc::new(EmptyResolver)),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        assert_eq!(
+            client.current_sent_bearer_prefix(),
+            None,
+            "resolver None must not attribute a stripped default seed"
+        );
+    }
+
+    /// When a bearer_resolver is wired but returns `None` (hard-expired
+    /// session with no live AT), default Authorization / x-api-key must be
+    /// stripped so a stale seed key cannot ride the wire.
+    #[test]
+    fn bearer_resolver_none_strips_default_authorization() {
+        #[derive(Debug)]
+        struct EmptyResolver;
+        impl crate::config::BearerResolver for EmptyResolver {
+            fn current_bearer(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let cfg = SamplerConfig {
+            api_key: Some("stale-token".to_string()),
+            api_backend: ApiBackend::Responses,
+            bearer_resolver: Some(std::sync::Arc::new(EmptyResolver)),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let request = client
+            .post("https://example.test/v1/responses")
+            .body("")
+            .build()
+            .expect("request should build");
+        assert!(
+            request.headers().get(AUTHORIZATION).is_none(),
+            "stale default Authorization must not be sent when resolver is empty"
         );
     }
 

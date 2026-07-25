@@ -151,6 +151,16 @@ impl AgentView {
         // bypasses the multiline-mode Enter→newline swap so the command
         // is actually sent.
         let mut slash_accepted_send = false;
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && !self.prompt.slash_open()
+            && crate::slash::is_command_complete(
+                self.prompt.text(),
+                self.prompt.slash_controller.registry(),
+            )
+        {
+            slash_accepted_send = true;
+        }
         if self.prompt.slash_open() && !self.prompt.file_search_visible() {
             if prompt_paging && registry.matches_id(ActionId::PageUp, key) {
                 self.prompt
@@ -203,28 +213,38 @@ impl AgentView {
                 // stay open (row's insert_text ends with space => chains).
                 KeyCode::Enter if key.modifiers.is_empty() => {
                     let snap = self.prompt.slash_snapshot();
-                    // Trailing space = "more input expected" (command takes
-                    // args, or arg row chains into a sub-menu).
-                    let chains = snap
-                        .selection()
-                        .is_some_and(|row| row.insert_text.ends_with(' '));
-
-                    // Commit any live preview before accepting.
-                    self.prompt.slash_commit_preview();
-
-                    // Accept the selected completion (mutates text).
-                    self.prompt.accept_slash_completion(&self.session.models);
-
-                    if chains {
-                        // Stay open so refresh_slash renders the next phase.
-                        return InputOutcome::Changed;
+                    let exact_command = snap.cursor_in_command
+                        && crate::slash::parse_invocation(self.prompt.text()).is_some_and(
+                            |invocation| {
+                                invocation.args.is_empty()
+                                    && self
+                                        .prompt
+                                        .slash_controller
+                                        .registry()
+                                        .get_for_dispatch(invocation.token)
+                                        .is_some()
+                                    && crate::slash::is_command_complete(
+                                        self.prompt.text(),
+                                        self.prompt.slash_controller.registry(),
+                                    )
+                            },
+                        );
+                    if exact_command {
+                        self.prompt.slash_commit_preview();
+                        self.prompt.slash_close();
+                        slash_accepted_send = true;
+                    } else {
+                        let chains = snap
+                            .selection()
+                            .is_some_and(|row| row.insert_text.ends_with(' '));
+                        self.prompt.slash_commit_preview();
+                        self.prompt.accept_slash_completion(&self.session.models);
+                        if chains {
+                            return InputOutcome::Changed;
+                        }
+                        self.prompt.slash_close();
+                        slash_accepted_send = true;
                     }
-
-                    // Terminal row: close dropdown and send the prompt.
-                    self.prompt.slash_close();
-                    slash_accepted_send = true;
-                    // Fall through — the action registry will pick up SendPrompt
-                    // below, which calls try_send() on the updated text.
                 }
                 // Everything else: fall through to normal text editing
                 // (which calls refresh_slash via PromptEvent::Edited).
@@ -469,7 +489,8 @@ impl AgentView {
         // 0e. Exit special input mode on empty prompt using per-mode exit keys
         //     (Bash/Remember: Backspace/Esc/Ctrl+W/U/C; Feedback: Backspace/Esc only).
         //     With non-empty text, Esc falls through to Esc policy
-        //     (mid-turn swallow / clear / rewind). Mode is preserved for re-focus.
+        //     (cancel / mid-turn swallow / clear / rewind). Mode is preserved
+        //     for re-focus.
         if self.prompt_input_mode.is_exit_key(key) && self.prompt.text().is_empty() {
             self.prompt_input_mode = PromptInputMode::Normal;
             return InputOutcome::Changed;
@@ -679,7 +700,7 @@ impl AgentView {
             let cancel_with_draft =
                 matches!(action_id, ActionId::CancelTurn) && !self.prompt.text().is_empty();
             if !cancel_with_draft {
-                let outcome = self.handle_agent_action(action_id);
+                let outcome = self.handle_agent_action_with_registry(action_id, registry);
                 // Only consume the key if the agent action actually did
                 // something. When idle, runtime-guarded actions like
                 // CancelTurn return Unchanged so the key can fall through
@@ -736,13 +757,29 @@ impl AgentView {
             }
         }
 
-        // 4. Structural keys that aren't in the registry. Tab leaves prompt;
-        //    Esc is owned by try_handle_esc_policy (above), not focus.
+        // 4. Structural keys declined by the widget. Tab leaves the prompt only
+        //    when this registry exposes the scrollback surface; minimal omits
+        //    FocusScrollback, so an otherwise-unclaimed Tab stays with its
+        //    logical composer. Dropdown/completion Tab paths already consumed
+        //    their presses above. Esc remains owned by try_handle_esc_policy.
         match key.code {
-            KeyCode::Tab => InputOutcome::Action(Action::FocusScrollback),
+            KeyCode::Tab if registry.find(ActionId::FocusScrollback).is_some() => {
+                InputOutcome::Action(Action::FocusScrollback)
+            }
             _ => InputOutcome::Unchanged,
         }
     }
+
+    /// How long after an Esc-fired cancel the idle rewind ARM stays
+    /// suppressed (see [`Self::rewind_arm_suppressed`]). Must exceed
+    /// `PendingAction::ESC_DOUBLE_PRESS_TTL` (800ms): the grace exists to
+    /// absorb the double-press gesture itself, so it has to outlast one full
+    /// arm-to-fire window or a mash could still arm-and-fire around it
+    /// (invariant pinned by `esc_cancel_rewind_grace_outlives_double_press_ttl`).
+    /// The pty-only `GROK_ESC_DOUBLE_PRESS_MS` override can exceed this; no
+    /// pty case mashes Esc across a cancel.
+    pub(crate) const ESC_CANCEL_REWIND_GRACE: std::time::Duration =
+        std::time::Duration::from_millis(1000);
 
     /// Esc policy (Prompt/Scrollback after overlay steal).
     ///
@@ -757,19 +794,30 @@ impl AgentView {
         }
 
         // This bare Esc is now owned by the policy: every path below consumes the
-        // event (mid-turn swallow / arm-clear / arm-rewind / idle swallow). Disarm
-        // the Esc→d flight-recorder combo here, uniformly — the `0-esc-d` block
-        // set `esc_pressed_at` on this same press, but since the policy is
-        // handling the Esc, a following `d` is the user's text, not a dump.
+        // event (cancel / mid-turn swallow / arm-clear / arm-rewind / idle
+        // swallow). Disarm the Esc→d flight-recorder combo here, uniformly — the
+        // `0-esc-d` block set `esc_pressed_at` on this same press, but since the
+        // policy is handling the Esc, a following `d` is the user's text, not a
+        // dump.
         self.esc_pressed_at = None;
 
-        // Mid-turn running: swallow Esc (do not cancel or arm clear/rewind).
-        if self.session.state.is_turn_running() {
+        // Mid-turn running, fullscreen vim mode: swallow Esc (do not cancel or
+        // arm clear/rewind — Ctrl+C stays the cancel gesture there).
+        // `is_minimal_mode` is the per-agent injected screen mode, not the
+        // process global, so tests stay race-free.
+        if self.session.state.is_turn_running()
+            && !crate::app::esc_cancels_turn(self.is_minimal_mode(), self.vim_mode)
+        {
             return Some(InputOutcome::Changed);
         }
-        // Stuck cancel: re-send CancelTurn (Ctrl+C escalates to Quit instead).
-        if self.session.state.is_cancelling() {
+        // Mid-turn (minimal / non-vim): cancel immediately from prompt or
+        // scrollback, even with a draft. Also — in every mode — while already
+        // cancelling, so a lost cancel notification is re-sent (Ctrl+C
+        // escalates to Quit instead). Push the grace deadline out so an Esc
+        // mash past the cancel cannot silently arm the rewind picker below.
+        if self.session.state.is_turn_running() || self.session.state.is_cancelling() {
             self.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::Esc);
+            self.suppress_rewind_arm(std::time::Instant::now());
             return Some(InputOutcome::Action(Action::CancelTurn));
         }
 
@@ -778,8 +826,9 @@ impl AgentView {
         // keys — clearing a draft the reader has scrolled past would be a
         // surprising cross-pane side effect. REWIND requires an EMPTY prompt
         // (checked below), so there is no draft to clobber or silently stash and
-        // it may arm from EITHER pane. The mid-turn swallow / cancel-retry
-        // (above) stays cross-pane; any other idle Esc swallows (below).
+        // it may arm from EITHER pane. The mid-turn cancel or swallow /
+        // cancel-retry (above) stays cross-pane; any other idle Esc swallows
+        // (below).
         let has_content = !self.prompt.text().is_empty() || !self.prompt.images.is_empty();
 
         // Idle + non-empty (text and/or image chips) + prompt pane → arm clear (2× Esc).
@@ -809,11 +858,14 @@ impl AgentView {
         // key-starve it (and a rewind mutate the session out from under it);
         // and the step 0b history-search intercept is prompt-pane-only, so
         // arming would stack the rewind picker on the open search overlay.
+        // The grace guard holds only this ARM (never modal/other Esc handling)
+        // right after an Esc-fired cancel — see `rewind_arm_suppressed`.
         if !has_content
             && self.scrollback.turn_count() > 0
             && self.prompt_input_mode == PromptInputMode::Normal
             && self.no_input_overlay_pending()
             && !self.prompt.history_search.is_active()
+            && !self.rewind_arm_suppressed(std::time::Instant::now())
         {
             return Some(InputOutcome::ArmPending {
                 action: Action::RewindShowPicker,
@@ -824,10 +876,34 @@ impl AgentView {
         }
 
         // Idle with nothing to arm (scrollback pane with a draft, empty prompt
-        // + no turns, or a scrollback Esc under a latent composer mode /
-        // pending needs-input overlay / open history search): swallow Esc (not
-        // FocusScrollback, and not a bubble-up to global quit).
+        // + no turns, a scrollback Esc under a latent composer mode / pending
+        // needs-input overlay / open history search, or the post-cancel grace):
+        // swallow Esc (not FocusScrollback, and not a bubble-up to global quit).
         Some(InputOutcome::Changed)
+    }
+
+    /// Arm the post-cancel grace: push the rewind-ARM suppression deadline
+    /// out to `now + ESC_CANCEL_REWIND_GRACE`. After an Esc-fired cancel the
+    /// session goes Cancelling → Idle with (typically) an empty composer, so
+    /// a user mashing Esc would otherwise immediately arm-and-fire the
+    /// silent double-Esc rewind picker. Takes `now` so tests are
+    /// deterministic (no fabricated `Instant`s).
+    pub(crate) fn suppress_rewind_arm(&mut self, now: std::time::Instant) {
+        self.rewind_suppress_deadline = Some(now + Self::ESC_CANCEL_REWIND_GRACE);
+    }
+
+    /// Check-and-retire the post-cancel grace: true while `now` is before
+    /// the deadline set by [`Self::suppress_rewind_arm`]; an expired
+    /// deadline is cleared on this consult so no stale `Instant` lingers.
+    pub(crate) fn rewind_arm_suppressed(&mut self, now: std::time::Instant) -> bool {
+        match self.rewind_suppress_deadline {
+            Some(deadline) if now < deadline => true,
+            Some(_) => {
+                self.rewind_suppress_deadline = None;
+                false
+            }
+            None => false,
+        }
     }
 
     /// Put a history entry into the composer (browse-mode live populate and
@@ -1034,14 +1110,65 @@ mod shift_tab_cycle_mode_tests {
     }
 
     #[test]
-    fn plain_tab_does_not_cycle_mode() {
+    fn plain_tab_follows_focus_scrollback_registration() {
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        for mode in [
+            crate::app::ScreenMode::Fullscreen,
+            crate::app::ScreenMode::Inline,
+        ] {
+            let mut agent = super::test_fixtures::make_agent();
+            let registry = ActionRegistry::defaults_for(mode);
+            let outcome = agent.handle_prompt_key_with_registry_for_test(&tab, &registry);
+            assert!(
+                matches!(outcome, InputOutcome::Action(Action::FocusScrollback)),
+                "{mode:?} plain Tab must focus scrollback, got {outcome:?}",
+            );
+        }
+
+        let mut minimal = super::test_fixtures::make_agent();
+        let registry = ActionRegistry::defaults_for(crate::app::ScreenMode::Minimal);
+        let outcome = minimal.handle_prompt_key_with_registry_for_test(&tab, &registry);
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(minimal.active_pane, AgentPane::Prompt);
+    }
+
+    #[test]
+    fn exact_optional_arg_slash_enter_sends_without_accepting_completion() {
         let mut agent = super::test_fixtures::make_agent();
+        agent.multiline_mode = true;
+        agent.prompt.set_text("/doctor");
+        agent.prompt.refresh_slash(&agent.session.models);
+        assert!(agent.prompt.slash_open());
+
         let outcome =
-            agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            matches!(outcome, InputOutcome::Action(Action::FocusScrollback)),
-            "plain Tab must focus scrollback, got {outcome:?}",
+            matches!(
+                outcome,
+                InputOutcome::Action(Action::SendPrompt(ref text)) if text == "/doctor"
+            ),
+            "got {outcome:?}; prompt={:?}",
+            agent.prompt.text()
         );
+    }
+
+    #[test]
+    fn minimal_slash_dropdown_still_consumes_tab() {
+        let mut agent = super::test_fixtures::make_agent();
+        agent.prompt.set_text("/");
+        agent.prompt.refresh_slash(&agent.session.models);
+        assert!(
+            agent.prompt.slash_open(),
+            "precondition: slash dropdown open"
+        );
+
+        let registry = ActionRegistry::defaults_for(crate::app::ScreenMode::Minimal);
+        let outcome = agent.handle_prompt_key_with_registry_for_test(
+            &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &registry,
+        );
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(agent.active_pane, super::AgentPane::Prompt);
     }
 }
 
@@ -1438,6 +1565,59 @@ mod history_browse_panel_tests {
             "Down at the newest must still close the panel"
         );
         assert_eq!(agent.prompt.text(), "");
+    }
+}
+
+#[cfg(test)]
+mod rewind_grace_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Pure deadline semantics with an injected `now`: suppressed strictly
+    /// before the deadline, expired (and retired) at it.
+    #[test]
+    fn suppress_rewind_arm_holds_until_deadline_then_retires() {
+        let mut agent = super::test_fixtures::make_agent();
+        let t0 = Instant::now();
+        assert!(!agent.rewind_arm_suppressed(t0), "no cancel yet — no grace");
+
+        agent.suppress_rewind_arm(t0);
+        assert!(agent.rewind_arm_suppressed(t0));
+        assert!(agent.rewind_arm_suppressed(
+            t0 + AgentView::ESC_CANCEL_REWIND_GRACE - Duration::from_millis(1)
+        ));
+
+        assert!(
+            !agent.rewind_arm_suppressed(t0 + AgentView::ESC_CANCEL_REWIND_GRACE),
+            "the deadline itself is expiry"
+        );
+        assert!(
+            agent.rewind_suppress_deadline.is_none(),
+            "the expired deadline is cleared on the consult"
+        );
+    }
+
+    /// A later Esc-fired cancel (e.g. a cancel-retry mash) pushes the
+    /// deadline out; the grace is measured from the LAST cancel press.
+    #[test]
+    fn suppress_rewind_arm_refreshes_on_later_cancel() {
+        let mut agent = super::test_fixtures::make_agent();
+        let t0 = Instant::now();
+        agent.suppress_rewind_arm(t0);
+        let t1 = t0 + Duration::from_millis(500);
+        agent.suppress_rewind_arm(t1);
+        assert!(agent.rewind_arm_suppressed(t0 + AgentView::ESC_CANCEL_REWIND_GRACE));
+        assert!(!agent.rewind_arm_suppressed(t1 + AgentView::ESC_CANCEL_REWIND_GRACE));
+    }
+
+    /// The grace must outlast one full idle double-press window — see the
+    /// constant's doc for why.
+    #[test]
+    fn esc_cancel_rewind_grace_outlives_double_press_ttl() {
+        assert!(
+            AgentView::ESC_CANCEL_REWIND_GRACE
+                > crate::app::app_view::PendingAction::ESC_DOUBLE_PRESS_TTL
+        );
     }
 }
 

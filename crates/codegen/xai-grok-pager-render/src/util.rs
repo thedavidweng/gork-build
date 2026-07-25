@@ -16,7 +16,11 @@ pub fn pager_toml_path() -> PathBuf {
 /// Derived from resolved [`grok_home()`] vs `xai_grok_config::default_grok_home()`,
 /// not from whether `GROK_HOME` is set in the environment.
 pub fn display_grok_home_prefix() -> String {
-    if grok_home() == xai_grok_config::default_grok_home() {
+    display_grok_home_prefix_for(&grok_home())
+}
+
+fn display_grok_home_prefix_for(home: &Path) -> String {
+    if home == xai_grok_config::default_grok_home() {
         "~/.grok".to_string()
     } else {
         "$GROK_HOME".to_string()
@@ -25,8 +29,12 @@ pub fn display_grok_home_prefix() -> String {
 
 /// User-facing path under [`grok_home()`], e.g. ``~/.grok/config.toml``.
 pub fn display_user_grok_path(relative: impl AsRef<Path>) -> String {
+    display_user_grok_path_for(&grok_home(), relative)
+}
+
+fn display_user_grok_path_for(home: &Path, relative: impl AsRef<Path>) -> String {
     let rel = relative.as_ref();
-    let prefix = display_grok_home_prefix();
+    let prefix = display_grok_home_prefix_for(home);
     if rel.as_os_str().is_empty() {
         return prefix;
     }
@@ -198,9 +206,30 @@ pub fn parse_schedule_interval_secs(human: &str) -> Option<u64> {
     Some(n * secs_per)
 }
 
+/// Group a count's digits with commas for display: `1234567` → `"1,234,567"`.
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_thousands_inserts_separators() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
 
     #[test]
     fn subsecond() {
@@ -408,6 +437,19 @@ mod tests {
         let path = display_user_grok_path("config.toml");
         assert!(path.ends_with("/config.toml") || path.ends_with("\\config.toml"));
         assert!(path.contains(".grok") || path.contains("$GROK_HOME"));
+    }
+
+    #[test]
+    fn display_user_grok_path_for_custom_home_uses_override_label() {
+        let custom = std::env::temp_dir().join("grok-home-display-regression");
+        assert_eq!(
+            display_user_grok_path_for(&custom, "config.toml"),
+            "$GROK_HOME/config.toml"
+        );
+        assert_eq!(
+            display_user_grok_path_for(&custom, "sandbox.toml"),
+            "$GROK_HOME/sandbox.toml"
+        );
     }
 
     #[test]

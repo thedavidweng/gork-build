@@ -20,9 +20,10 @@ impl SessionActor {
         let prev_threshold = self.compaction.threshold_percent.get();
         if prev_threshold != auto_compact_threshold_percent {
             tracing::info!(
-                session_id = % self.session_info.id.0, new_model = % sampling_config
-                .model, old_threshold = prev_threshold, new_threshold =
-                auto_compact_threshold_percent,
+                session_id = %self.session_info.id.0,
+                new_model = %sampling_config.model,
+                old_threshold = prev_threshold,
+                new_threshold = auto_compact_threshold_percent,
                 "auto_compact_threshold_percent updated for model switch"
             );
         }
@@ -38,12 +39,11 @@ impl SessionActor {
         xai_grok_telemetry::unified_log::info(
             "backend_search: model switch",
             Some(self.session_info.id.0.as_ref()),
-            Some(serde_json::json!(
-                { "new_model" : & sampling_config.model, "api_backend" :
-                format!("{:?}", sampling_config.api_backend),
-                "supports_backend_search" : sampling_config.supports_backend_search,
-                }
-            )),
+            Some(serde_json::json!({
+                "new_model": &sampling_config.model,
+                "api_backend": format!("{:?}", sampling_config.api_backend),
+                "supports_backend_search": sampling_config.supports_backend_search,
+            })),
         );
         self.chat_state_handle
             .update_sampling_config(xai_grok_sampling_types::SamplingConfig {
@@ -54,6 +54,8 @@ impl SessionActor {
                 top_p: sampling_config.top_p,
                 api_backend: sampling_config.api_backend.clone(),
                 extra_headers: sampling_config.extra_headers.clone(),
+                query_params: sampling_config.query_params.clone(),
+                env_http_headers: sampling_config.env_http_headers.clone(),
                 context_window: new_context_window,
                 reasoning_effort: sampling_config.reasoning_effort,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
@@ -74,7 +76,7 @@ impl SessionActor {
                 alpha_test_key: existing.alpha_test_key,
                 client_version: sampling_config.client_version.clone(),
             });
-        self.model_auth_facts.replace(None);
+        self.invalidate_model_auth_memo();
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
         if apply_prompt_override && !skip_prompt_rewrite {
@@ -95,12 +97,14 @@ impl SessionActor {
             self.chat_state_handle.replace_conversation(conversation);
         } else if !apply_prompt_override {
             tracing::info!(
-                session_id = % self.session_info.id.0, model_id = % model_id.0,
+                session_id = %self.session_info.id.0,
+                model_id = %model_id.0,
                 "handle_set_session_model: skipping prompt override (apply_prompt_override=false)"
             );
         } else {
             tracing::info!(
-                session_id = % self.session_info.id.0, model_id = % model_id.0,
+                session_id = %self.session_info.id.0,
+                model_id = %model_id.0,
                 "handle_set_session_model: skipping prompt rewrite (just rebuilt harness)"
             );
         }
@@ -135,8 +139,8 @@ impl SessionActor {
             let state = self.state.lock().await;
             if state.running_task.is_some() {
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, new_agent_type = % definition
-                    .name,
+                    session_id = %self.session_info.id.0,
+                    new_agent_type = %definition.name,
                     "handle_rebuild_agent_for_definition: turn in flight, rejecting rebuild"
                 );
                 return Err(acp::Error::internal_error()
@@ -145,7 +149,8 @@ impl SessionActor {
         }
         let new_agent_name = definition.name.clone();
         tracing::info!(
-            session_id = % self.session_info.id.0, new_agent_type = % new_agent_name,
+            session_id = %self.session_info.id.0,
+            new_agent_type = %new_agent_name,
             "handle_rebuild_agent_for_definition: rebuilding harness"
         );
         let new_agent = self
@@ -154,8 +159,9 @@ impl SessionActor {
             .await
             .map_err(|e| {
                 tracing::error!(
-                    session_id = % self.session_info.id.0, new_agent_type = %
-                    new_agent_name, error = % e,
+                    session_id = %self.session_info.id.0,
+                    new_agent_type = %new_agent_name,
+                    error = %e,
                     "handle_rebuild_agent_for_definition: AgentBuilder::build failed"
                 );
                 acp::Error::internal_error().data(format!(
@@ -173,6 +179,7 @@ impl SessionActor {
         self.compaction.prefire.clear();
         *self.agent.borrow_mut() = new_agent;
         *self.active_agent_type.lock() = Some(new_agent_name.clone());
+        self.emit_resolved_tool_overrides();
         self.queue_exit_reminder_on_approved_exit.store(
             self.is_cursor_harness(),
             std::sync::atomic::Ordering::Relaxed,
@@ -184,9 +191,7 @@ impl SessionActor {
             self.agent.borrow().tool_bridge().toolset(),
             None,
         ) {
-            tracing::warn!(
-                error = % e, "failed to rebind local session toolset after agent rebuild"
-            );
+            tracing::warn!(error = %e, "failed to rebind local session toolset after agent rebuild");
         }
         {
             let bridge = self.agent.borrow().tool_bridge().clone();
@@ -211,11 +216,26 @@ impl SessionActor {
             }
             bridge
                 .update_resource(
-                    xai_grok_tools::implementations::grok_build::update_goal::GoalUpdateHandle(
-                        self.goal_update_tx.clone(),
+                    xai_grok_tools::implementations::grok_build::workflow::WorkflowLaunchHandle(
+                        self.workflow_launch_tx.clone(),
                     ),
                 )
                 .await;
+            if !self.goal_runs_on_workflow_engine() {
+                bridge
+                    .update_resource(
+                        xai_grok_tools::implementations::grok_build::update_goal::GoalUpdateHandle(
+                            self.goal_update_tx.clone(),
+                        ),
+                    )
+                    .await;
+            }
+            if let Some(reservations) = self.tool_context.task_completion_reservations.clone() {
+                bridge.update_resource(reservations).await;
+            }
+            if let Some(gate) = self.tool_context.task_wake_suppressed.clone() {
+                bridge.update_resource(gate).await;
+            }
             self.inject_deny_read_globs().await;
         }
         {
@@ -228,9 +248,12 @@ impl SessionActor {
             if needs_wait {
                 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
                 tokio::select! {
-                    () = & mut notified => {} () = tokio::time::sleep(TIMEOUT) => {
-                    tracing::warn!(session_id = % self.session_info.id.0,
-                    "handle_rebuild_agent_for_definition: timed out waiting for MCP handshakes");
+                    () = &mut notified => {}
+                    () = tokio::time::sleep(TIMEOUT) => {
+                        tracing::warn!(
+                            session_id = %self.session_info.id.0,
+                            "handle_rebuild_agent_for_definition: timed out waiting for MCP handshakes"
+                        );
                     }
                 }
             }
@@ -269,7 +292,8 @@ impl SessionActor {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.send_available_commands_update().await;
         tracing::info!(
-            session_id = % self.session_info.id.0, new_agent_type = % new_agent_name,
+            session_id = %self.session_info.id.0,
+            new_agent_type = %new_agent_name,
             "handle_rebuild_agent_for_definition: harness rebuild complete"
         );
         Ok(())
@@ -285,7 +309,7 @@ impl SessionActor {
     pub(super) async fn handle_replace_system_prompt(&self, system_prompt: String) {
         if self.startup_hints.preserve_inherited_system {
             tracing::debug!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "handle_replace_system_prompt: skipped (preserve_inherited_system)"
             );
             return;
@@ -296,7 +320,7 @@ impl SessionActor {
             .await
         else {
             tracing::error!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "handle_replace_system_prompt: chat-state actor unavailable; override not applied"
             );
             return;
@@ -304,12 +328,13 @@ impl SessionActor {
         save_system_prompt(&self.session_info, &system_prompt);
         if changed {
             tracing::info!(
-                session_id = % self.session_info.id.0, prompt_len = system_prompt.len(),
+                session_id = %self.session_info.id.0,
+                prompt_len = system_prompt.len(),
                 "handle_replace_system_prompt: client override applied"
             );
         } else {
             tracing::debug!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "handle_replace_system_prompt: head already matches, no-op"
             );
         }

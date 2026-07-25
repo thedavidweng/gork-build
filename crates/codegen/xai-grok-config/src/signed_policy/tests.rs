@@ -25,6 +25,7 @@ fn sign(kp: &ring::signature::Ed25519KeyPair, payload: &SignedPayload) -> Signat
 
 fn payload() -> SignedPayload {
     SignedPayload {
+        typ: MANAGED_POLICY_TYP.into(),
         version: 1,
         deployment_id: None,
         team_id: Some("team-007".into()),
@@ -32,6 +33,7 @@ fn payload() -> SignedPayload {
         requirements: Some("[features]\nweb_fetch = false\n".into()),
         fail_closed: false,
         expires_at: 4_000_000_000,
+        nonce: String::new(),
         key_id: "v1".into(),
     }
 }
@@ -54,6 +56,7 @@ fn write_policy(home: &std::path::Path, p: &SignedPayload) {
 fn server_wire_format_is_client_verifiable() {
     let (kp, pubkey) = test_keypair();
     let signed_payload = serde_json::json!({
+        "typ": "grok.managed_policy.v1",
         "deployment_id": serde_json::Value::Null,
         "team_id": "team-007",
         "managed_config": "[cli]\n",
@@ -82,6 +85,7 @@ fn server_wire_format_is_client_verifiable() {
 fn missing_fail_closed_defaults_false() {
     let (kp, pubkey) = test_keypair();
     let signed_payload = serde_json::json!({
+        "typ": "grok.managed_policy.v1",
         "team_id": "team-007",
         "expires_at": 4_000_000_000u64,
         "key_id": "v1",
@@ -885,6 +889,7 @@ fn unknown_signed_key_id_is_rejected() {
     let home = dir.path();
     let (kp, pubkey) = test_keypair();
     let p = SignedPayload {
+        nonce: String::new(),
         key_id: "v9".into(),
         fail_closed: true,
         ..payload()
@@ -927,6 +932,7 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
 
     let v1 = sign(&kp1, &payload());
     let v2_payload = SignedPayload {
+        nonce: String::new(),
         key_id: "v2".into(),
         ..payload()
     };
@@ -956,3 +962,8 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
         Err(SigError::SignatureMismatch)
     );
 }
+
+// The is-managed claim tests live in a sibling child module (this file is at the
+// 1k-line mark); same private access via the #[path] include below.
+#[path = "claim_tests.rs"]
+mod claim_tests;

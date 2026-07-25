@@ -103,11 +103,15 @@ fn extract_pptx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
 pub(crate) const DESCRIPTION_FULL: &str = r#"Read a file.
 
 Usage:
-- The target_file parameter can be a relative path in the workspace or an absolute path
+- The ${{ params.read.target_file }} parameter can be a relative path in the workspace or an absolute path
 - By default, it reads up to {max_lines_read} lines starting from the beginning of the file
 - Results are returned with line numbers starting at 1. The format is: LINE_NUMBER→LINE_CONTENT
 - This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).
 - When reading an image file the contents are presented visually as this tool uses multimodal LLMs."#;
+/// Schema-only advertised default (runtime still treats omit as line 1 via unwrap_or).
+fn schema_default_offset() -> Option<i64> {
+    Some(1)
+}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReadFileInput {
     #[serde(rename = "target_file")]
@@ -122,6 +126,7 @@ pub struct ReadFileInput {
     )]
     #[schemars(
         with = "GrokIntegerSchema",
+        default = "schema_default_offset",
         description = "The line number to start reading from. Only provide if the file is too large to read at once."
     )]
     pub offset: Option<i64>,
@@ -173,6 +178,37 @@ fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
 /// the resolved start line.
 fn stored_read_offset(offset: Option<i64>) -> Option<usize> {
     offset.filter(|&o| o >= 0).map(|o| o as usize)
+}
+/// Files read in full (no line/token cap): any file named exactly `SKILL.md`,
+/// plus any Markdown file with a `skills` path component so docs a `SKILL.md`
+/// references are never silently truncated. `.`/`..` are folded lexically
+/// (symlinks are not resolved). Intentionally broader than
+/// skill discovery's dir check — matches any `skills` segment
+/// (plugin/bundled/user roots), and matches it exactly (not case-folded) so
+/// near-misses like `skills-cursor` do not qualify.
+fn is_skill_markdown(path: &std::path::Path) -> bool {
+    if path.file_name().is_some_and(|n| n == "SKILL.md") {
+        return true;
+    }
+    let is_md = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_md {
+        return false;
+    }
+    use std::path::Component;
+    let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                stack.pop();
+            }
+            Component::Normal(c) => stack.push(c),
+        }
+    }
+    stack.into_iter().any(|c| c == "skills")
 }
 /// Result of extracting file content lines with both default and concise formats
 pub struct ExtractedContent {
@@ -299,6 +335,7 @@ pub(crate) async fn run_read_file(
     contract_version: Option<&str>,
     resources: SharedResources,
     streamable_out: Option<&mut bool>,
+    invoking_param_names: &crate::types::resources::InvokingToolParamNames,
 ) -> Result<ReadFileOutput, xai_tool_runtime::ToolError> {
     let (cwd, display_cwd, fs, hints_enabled);
     {
@@ -312,6 +349,7 @@ pub(crate) async fn run_read_file(
         hints_enabled = res.get::<PathNotFoundHints>().is_some_and(|h| h.0);
     }
     let joined_path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.path);
+    let is_skill_markdown = is_skill_markdown(&joined_path);
     let (path, _unicode_note) = match crate::util::fs::try_canonicalize(&joined_path).await {
         Ok(p) => (p, None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -324,10 +362,6 @@ pub(crate) async fn run_read_file(
     };
     let version = ReadFileVersion::from_contract(contract_version);
     let is_legacy = version.is_legacy();
-    let is_skill_file = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .is_some_and(|name| name == "SKILL.md");
     let skip_gitignore = is_legacy && versions::legacy_0_4_10::allows_gitignored_reads();
     if !skip_gitignore {
         let res = resources.lock().await;
@@ -415,9 +449,10 @@ pub(crate) async fn run_read_file(
     }
     if crate::util::binary::is_binary(&extension, &file_bytes) {
         tracing::info!(
-            path = % path.display(), extension = % extension, detected_by = if crate
-            ::util::binary::BINARY_EXTENSIONS.binary_search(& extension.as_str()).is_ok()
-            { "extension" } else { "content_inspection" },
+            path = %path.display(),
+            extension = %extension,
+            detected_by = if crate::util::binary::BINARY_EXTENSIONS
+                .binary_search(&extension.as_str()).is_ok() { "extension" } else { "content_inspection" },
             "binary file rejected by read_file"
         );
         return Ok(ReadFileOutput::FileReadError(format!(
@@ -446,7 +481,7 @@ pub(crate) async fn run_read_file(
             .map(|t| t.0.max_lines_read())
             .unwrap_or_else(|| TruncationConfig::default().max_lines_read())
     };
-    let (effective_offset, effective_limit) = if is_skill_file {
+    let (effective_offset, effective_limit) = if is_skill_markdown {
         (None, None)
     } else {
         (
@@ -461,7 +496,7 @@ pub(crate) async fn run_read_file(
         total_lines,
     );
     let token_count = crate::util::truncate::estimate_tokens(&extracted.content);
-    if !is_skill_file && token_count > MAX_NUM_TOKENS {
+    if !is_skill_markdown && token_count > MAX_NUM_TOKENS {
         let (grep_name, execute_name);
         {
             let res = resources.lock().await;
@@ -473,11 +508,13 @@ pub(crate) async fn run_read_file(
                 .render("${{ tools.by_kind.execute }}")
                 .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
         }
+        let offset_param = invoking_param_names.resolve("offset");
+        let limit_param = invoking_param_names.resolve("limit");
         let single_content_line = extracted.raw_output.lines().count() <= 1;
         let single_line_hint = if single_content_line && !execute_name.is_empty() {
             format!(
                 "\nNote: the requested read is a single very long line, so \
-                 line-based offset/limit cannot narrow it further. Use the \
+                 line-based {offset_param}/{limit_param} cannot narrow it further. Use the \
                  '{execute_name}' tool to extract the parts you need (e.g. \
                  `jq`, `python3`, or `cut -c`)."
             )
@@ -493,23 +530,21 @@ pub(crate) async fn run_read_file(
                 .limit
                 .map_or_else(|| "to end".to_string(), |v| v.to_string());
             format!(
-                "The requested line range (offset={}, limit={}) contains {} tokens, \
-                 which exceeds the maximum allowed tokens ({} tokens).\n\
-                 Try a smaller `limit`, a different starting `offset`, \
-                 or use the '{}' tool to search for specific content.{}",
-                off, lim, token_count, MAX_NUM_TOKENS, grep_name, single_line_hint
+                "The requested line range ({offset_param}={off}, {limit_param}={lim}) contains {token_count} tokens, \
+                 which exceeds the maximum allowed tokens ({MAX_NUM_TOKENS} tokens).\n\
+                 Try a smaller `{limit_param}`, a different starting `{offset_param}`, \
+                 or use the '{grep_name}' tool to search for specific content.{single_line_hint}"
             )
         } else {
             format!(
-                "File content ({} tokens) exceeds maximum allowed tokens ({} tokens).\n\
-                 Please use offset and limit parameters to read a shorter range, \
-                 or use the '{}' to search for specific content.{}",
-                token_count, MAX_NUM_TOKENS, grep_name, single_line_hint
+                "File content ({token_count} tokens) exceeds maximum allowed tokens ({MAX_NUM_TOKENS} tokens).\n\
+                 Please use {offset_param} and {limit_param} parameters to read a shorter range, \
+                 or use the '{grep_name}' to search for specific content.{single_line_hint}"
             )
         };
         return Ok(ReadFileOutput::FileTooLarge(msg));
     }
-    let (stored_offset, stored_limit) = if is_skill_file {
+    let (stored_offset, stored_limit) = if is_skill_markdown {
         (None, None)
     } else {
         (stored_read_offset(input.offset), input.limit)
@@ -596,25 +631,51 @@ impl xai_tool_runtime::Tool for ReadFileTool {
         let Some(spec) = admitted_spec else {
             let this = ReadFileTool;
             return Box::pin(async_stream::stream! {
-                yield xai_tool_runtime::ToolStreamItem::Terminal(this.run(ctx, input)
-                . await);
+                yield xai_tool_runtime::ToolStreamItem::Terminal(this.run(ctx, input).await);
             });
         };
         Box::pin(async_stream::stream! {
-            match ReadFileTool::read_with_streamability(& ctx, input). await {
-            Ok((output, streamable)) => { if streamable && let
-            ReadFileOutput::FileContent(fc) = & output && ! fc.content.is_empty() {
-            let content = fc.content.as_bytes(); let mut last_total : u64 = 0; let
-            mut window_start = 0usize; while window_start < content.len() { let mut
-            window_end = (window_start + STREAM_DELTA_TARGET_BYTES).min(content
-            .len()); while window_end > window_start && ! fc.content
-            .is_char_boundary(window_end) { window_end -= 1; } if let Some(p) =
-            xai_tool_runtime::stream_chunk(spec, & content[..window_end], window_end
-            as u64, & mut last_total, false,) { yield
-            xai_tool_runtime::ToolStreamItem::Progress(p); } window_start =
-            window_end; } } yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Ok(output)); } Err(e) => yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(e)), }
+            // `streamable` is call-local to this read.
+            match ReadFileTool::read_with_streamability(&ctx, input).await {
+                Ok((output, streamable)) => {
+                    if streamable
+                        && let ReadFileOutput::FileContent(fc) = &output
+                        && !fc.content.is_empty()
+                    {
+                        // Replay char-aligned slices of the final `content`
+                        // (each below the 16 KiB cap; see
+                        // STREAM_DELTA_TARGET_BYTES).
+                        let content = fc.content.as_bytes();
+                        let mut last_total: u64 = 0;
+                        let mut window_start = 0usize;
+                        while window_start < content.len() {
+                            let mut window_end =
+                                (window_start + STREAM_DELTA_TARGET_BYTES).min(content.len());
+                            // Align DOWN to a char boundary (a char is ≤ 4
+                            // bytes vs the 4 KiB target: never a zero-width
+                            // window).
+                            while window_end > window_start
+                                && !fc.content.is_char_boundary(window_end)
+                            {
+                                window_end -= 1;
+                            }
+                            if let Some(p) = xai_tool_runtime::stream_chunk(
+                                spec,
+                                &content[..window_end],
+                                window_end as u64,
+                                &mut last_total,
+                                // Full replay, no streaming loss ⇒ never truncated.
+                                false,
+                            ) {
+                                yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                            }
+                            window_start = window_end;
+                        }
+                    }
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(output));
+                }
+                Err(e) => yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e)),
+            }
         })
     }
     #[tracing::instrument(name = "tool.read_file", skip_all, fields(path = %input.path))]
@@ -643,12 +704,14 @@ impl ReadFileTool {
             .map(|c| c.0.clone());
         let bv = crate::types::tool_metadata::behavior_version(ctx);
         let mut streamable_text = false;
+        let invoking = crate::types::tool_metadata::invoking_param_names(ctx);
         let output = run_read_file(
             input,
             cwd_override.clone(),
             bv.as_deref(),
             resources.clone(),
             Some(&mut streamable_text),
+            &invoking,
         )
         .await?;
         Ok((output, streamable_text))
@@ -1003,6 +1066,63 @@ mod tests {
                     msg
                 );
                 assert!(!msg.contains("Please use offset and limit parameters"));
+            }
+            other => panic!("Expected FileTooLarge, got {:?}", other),
+        }
+    }
+    /// Regression: FileTooLarge must name *this* tool's schema keys, not
+    /// whatever a sibling Read tool last wrote into the kind-wide param map.
+    #[tokio::test]
+    async fn token_limit_error_uses_invoking_tool_param_names_not_kind_wide() {
+        let tmp = TempDir::new().unwrap();
+        let line = "x".repeat(200);
+        let big_content = std::iter::repeat_n(line.as_str(), 1100)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(tmp.path().join("big.txt"), &big_content).unwrap();
+        let tool = ReadFileTool;
+        let mut resources = test_resources(tmp.path());
+        resources.insert(TemplateRenderer::new(
+            [(ToolKind::Search, "Grep".to_string())].into(),
+            [(
+                ToolKind::Read,
+                [
+                    ("offset".to_string(), "poisoned_offset".to_string()),
+                    ("limit".to_string(), "poisoned_limit".to_string()),
+                ]
+                .into(),
+            )]
+            .into(),
+        ));
+        let input = ReadFileInput {
+            path: "big.txt".to_string(),
+            offset: Some(1),
+            limit: Some(800),
+            pages: None,
+            format: None,
+        };
+        let mut ctx = test_ctx(resources.into_shared());
+        ctx.extensions
+            .insert(crate::types::resources::InvokingToolParamNames(
+                [
+                    ("offset".to_string(), "start_line".to_string()),
+                    ("limit".to_string(), "max_lines".to_string()),
+                ]
+                .into(),
+            ));
+        let result = xai_tool_runtime::Tool::run(&tool, ctx, input)
+            .await
+            .unwrap();
+        match result {
+            ReadFileOutput::FileTooLarge(msg) => {
+                assert!(
+                    msg.contains("start_line=1") && msg.contains("max_lines=800"),
+                    "expected invoking-tool names, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("poisoned_offset") && !msg.contains("poisoned_limit"),
+                    "must not use kind-wide sibling renames: {msg}"
+                );
             }
             other => panic!("Expected FileTooLarge, got {:?}", other),
         }
@@ -1714,6 +1834,46 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
             std::mem::discriminant(&result),
         );
     }
+    #[tokio::test]
+    async fn md_in_skills_dir_ignores_model_offset_and_limit() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".grok/skills/my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let content = (1..=1200)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(skill_dir.join("reference.md"), &content).unwrap();
+        let tool = ReadFileTool;
+        let resources = test_resources(tmp.path());
+        let input = ReadFileInput {
+            path: ".grok/skills/my-skill/reference.md".to_string(),
+            offset: Some(3),
+            limit: Some(1),
+            pages: None,
+            format: None,
+        };
+        let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
+            .await
+            .unwrap();
+        match result {
+            ReadFileOutput::FileContent(fc) => {
+                assert!(
+                    fc.content.contains("line1"),
+                    "missing line1: {}",
+                    fc.content
+                );
+                assert!(
+                    fc.content.contains("line1200"),
+                    "missing line1200: {}",
+                    fc.content
+                );
+                assert_eq!(fc.offset, None);
+                assert_eq!(fc.limit, None);
+            }
+            other => panic!("Expected FileContent, got {:?}", other),
+        }
+    }
     #[test]
     fn parse_single_page() {
         assert_eq!(parse_page_range("3", 10).unwrap(), vec![2]);
@@ -2256,12 +2416,17 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         }
     }
     #[test]
-    fn read_file_offset_description_unchanged() {
+    fn read_file_offset_schema_advertises_start_default() {
         let src = include_str!("mod.rs");
         assert!(
-            src
-            .contains("description = \"The line number to start reading from. Only provide if the file is too large to read at once.\""),
-            "offset schemars description must not change"
+            src.contains(
+                "description = \"The line number to start reading from. Only provide if the file is too large to read at once.\""
+            ),
+            "offset schemars description must remain the pre-PR wording"
+        );
+        assert!(
+            src.contains("default = \"schema_default_offset\""),
+            "offset must advertise schema_default_offset"
         );
     }
     #[test]

@@ -13,7 +13,7 @@ use crate::app::dispatch::ctx::{
 };
 use crate::app::dispatch::modes::inherit_auto_mode;
 use crate::app::dispatch::prompt::{consume_chat_kind, dispatch_initial_prompt};
-use crate::app::dispatch::queue::maybe_drain_queue;
+use crate::app::dispatch::queue::{QueueDrain, maybe_drain_queue, note_peek_page_flip};
 use crate::app::dispatch::router::dispatch;
 use crate::app::dispatch::status::notify_session_ready;
 use crate::app::dispatch::task_result::unregister_session_effect;
@@ -320,6 +320,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             bg_tool_call_to_task: std::collections::HashMap::new(),
             scheduled_tasks: std::collections::HashMap::new(),
             in_flight_prompt: None,
+            compact_held_prompt: None,
             current_prompt_id: None,
             created_via_new: true,
         },
@@ -330,6 +331,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.prompt.set_compact(app.appearance.prompt.compact);
         agent.prompt.adopt_slash_mru(app.slash_mru.clone());
+        agent.prompt.adopt_command_tags(app.command_tags.clone());
         agent
             .prompt
             .set_contextual_hints(app.contextual_hints.undo, app.contextual_hints.plan_mode);
@@ -647,6 +649,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             bg_tool_call_to_task: std::collections::HashMap::new(),
             scheduled_tasks: std::collections::HashMap::new(),
             in_flight_prompt: None,
+            compact_held_prompt: None,
             current_prompt_id: None,
             created_via_new: false,
         },
@@ -669,6 +672,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.prompt.set_compact(app.appearance.prompt.compact);
         agent.prompt.adopt_slash_mru(app.slash_mru.clone());
+        agent.prompt.adopt_command_tags(app.command_tags.clone());
         agent
             .prompt
             .set_contextual_hints(app.contextual_hints.undo, app.contextual_hints.plan_mode);
@@ -828,11 +832,15 @@ pub(in crate::app::dispatch) fn handle_session_created(
         if deferred.is_some() {
             agent.session.model_switch_pending = true;
         }
-        let mut effects = if app.reconnect_pending {
-            vec![]
+        let mut drain = if app.reconnect_pending {
+            QueueDrain {
+                effects: vec![],
+                page_flip_entry: None,
+            }
         } else {
             maybe_drain_queue(agent)
         };
+        let mut effects = std::mem::take(&mut drain.effects);
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {
             agent_id,
@@ -843,7 +851,10 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent_id,
             session_id: session_id_clone.clone(),
         });
-        effects.push(Effect::RefreshAvailableCommands { agent_id, cwd });
+        effects.push(Effect::RefreshAvailableCommands {
+            agent_id,
+            session_id: session_id_clone.clone(),
+        });
         effects.push(Effect::CheckMarketplaceUpdates {
             agent_id,
             session_id: session_id_clone.clone(),
@@ -873,8 +884,11 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 mode_id: acp::SessionModeId::new(mode.as_id()),
             });
         }
-        if std::mem::take(&mut agent.pending_extensions_fetch) && agent.extensions_modal.is_some() {
+        if std::mem::take(&mut agent.pending_extensions_fetch)
+            && let Some(modal) = agent.extensions_modal.as_mut()
+        {
             effects.extend(extensions_modal_tab_fetches(
+                modal,
                 agent_id,
                 session_id_clone.clone(),
             ));
@@ -884,6 +898,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
             cwd: agent.session.cwd.display().to_string(),
         });
         notify_session_ready(&app.notification_service, agent);
+        note_peek_page_flip(app, agent_id, drain.page_flip_entry);
         return effects;
     }
     vec![]
@@ -918,11 +933,15 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         if deferred.is_some() {
             agent.session.model_switch_pending = true;
         }
-        let mut effects = if app.reconnect_pending {
-            vec![]
+        let mut drain = if app.reconnect_pending {
+            QueueDrain {
+                effects: vec![],
+                page_flip_entry: None,
+            }
         } else {
             maybe_drain_queue(agent)
         };
+        let mut effects = std::mem::take(&mut drain.effects);
         agent.session.prompt_history_loading = true;
         effects.push(Effect::FetchPromptHistory {
             agent_id,
@@ -933,7 +952,10 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent_id,
             session_id: session_id_clone.clone(),
         });
-        effects.push(Effect::RefreshAvailableCommands { agent_id, cwd });
+        effects.push(Effect::RefreshAvailableCommands {
+            agent_id,
+            session_id: session_id_clone.clone(),
+        });
         effects.push(Effect::CheckMarketplaceUpdates {
             agent_id,
             session_id: session_id_clone.clone(),
@@ -963,8 +985,11 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 mode_id: acp::SessionModeId::new(mode.as_id()),
             });
         }
-        if std::mem::take(&mut agent.pending_extensions_fetch) && agent.extensions_modal.is_some() {
+        if std::mem::take(&mut agent.pending_extensions_fetch)
+            && let Some(modal) = agent.extensions_modal.as_mut()
+        {
             effects.extend(extensions_modal_tab_fetches(
+                modal,
                 agent_id,
                 session_id_clone.clone(),
             ));
@@ -974,7 +999,74 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             cwd: agent.session.cwd.display().to_string(),
         });
         notify_session_ready(&app.notification_service, agent);
+        note_peek_page_flip(app, agent_id, drain.page_flip_entry);
         return effects;
+    }
+    vec![]
+}
+/// Surface a session-creation failure on the welcome screen (no toast sink).
+fn push_session_create_failure_warning(app: &mut AppView, msg: &str) {
+    if !app.startup_warnings.iter().any(|w| w.message == msg) {
+        app.startup_warnings.push(crate::startup::StartupWarning {
+            severity: crate::startup::WarningSeverity::Warning,
+            message: msg.to_string(),
+            action: None,
+        });
+    }
+}
+/// Failed plain `CreateSession`: drop orphan placeholders, clear the
+/// starting-session spinner, and surface the error (toast when an agent
+/// remains; startup warning on the welcome screen, which has no toast).
+pub(in crate::app::dispatch) fn handle_session_failed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    error: String,
+) -> Vec<Effect> {
+    tracing::error!(agent = ?agent_id, error = %error, "Session creation failed");
+    let msg = format!("Session creation failed: {error}");
+    let is_orphan = app
+        .agents
+        .get(&agent_id)
+        .is_some_and(|a| a.session.session_id.is_none() && a.session.forked_from.is_none());
+    if is_orphan {
+        let failed_was_active = matches!(app.active_view, ActiveView::Agent(id) if id == agent_id);
+        let fallback = app.agents.keys().copied().find(|id| *id != agent_id);
+        remove_agent_and_cleanup(app, agent_id);
+        if let Some(target) = fallback {
+            if failed_was_active {
+                switch_to_agent(app, target, SwitchCause::Picker);
+            }
+            if matches!(app.active_view, ActiveView::Welcome) {
+                push_session_create_failure_warning(app, &msg);
+            } else {
+                app.show_toast(&msg);
+            }
+        } else {
+            show_welcome(app);
+            app.welcome_prompt_focused = true;
+            app.session_picker_entries = None;
+            app.session_picker_loading = false;
+            app.session_picker_state.selected = 0;
+            app.session_picker_content_results = None;
+            app.session_picker_content_loading = false;
+            push_session_create_failure_warning(app, &msg);
+        }
+    } else if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.pending_extensions_fetch = false;
+        agent.session.prompt_history_loading = false;
+        agent.mcp_init_progress = None;
+        agent.session.finish_command();
+        let elapsed = agent.turn_elapsed();
+        agent.mark_turn_finished();
+        agent.pending_first_prompt = None;
+        agent.pending_fork_banner = None;
+        agent.show_toast(&msg);
+        agent
+            .scrollback
+            .push_block(RenderBlock::session_event(SessionEvent::TurnFailed {
+                error,
+                elapsed,
+            }));
     }
     vec![]
 }
@@ -983,14 +1075,12 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     agent_id: AgentId,
     error: String,
 ) -> Vec<Effect> {
-    tracing::error!(
-        agent = ? agent_id, error = % error, "Worktree session creation failed"
-    );
-    let is_orphan_zombie = app
+    tracing::error!(agent = ?agent_id, error = %error, "Worktree session creation failed");
+    let is_orphan = app
         .agents
         .get(&agent_id)
         .is_some_and(|a| a.session.session_id.is_none() && a.session.forked_from.is_none());
-    if is_orphan_zombie {
+    if is_orphan {
         let fallback = app.agents.keys().copied().find(|id| *id != agent_id);
         remove_agent_and_cleanup(app, agent_id);
         if let Some(target) = fallback {
@@ -1015,6 +1105,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     } else if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.pending_extensions_fetch = false;
         agent.session.prompt_history_loading = false;
+        agent.mcp_init_progress = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
         agent.mark_turn_finished();
@@ -1087,7 +1178,9 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 vec![]
             }
         };
-        effects.extend(maybe_drain_queue(agent));
+        let drain = maybe_drain_queue(agent);
+        effects.extend(drain.effects);
+        note_peek_page_flip(app, agent_id, drain.page_flip_entry);
         effects
     } else {
         vec![]

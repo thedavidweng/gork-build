@@ -42,21 +42,7 @@ async fn background_task_reaped_on_quit() {
         "is_background": true
     })
     .to_string();
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_bg",
-            "run_terminal_command",
-            &args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events(
-            "run_terminal_command",
-            &args,
-        )),
-    );
+    let _background_turn = expect_tool_turn(&content, "call_bg", "run_terminal_command", args);
     // Follow-up turns settle to plain text so the session goes idle.
     content.set_response("BG_TASK_STARTED");
 
@@ -117,8 +103,13 @@ async fn background_task_reaped_on_quit() {
     // Both the graceful-quit teardown and the hard-exit tail reap spawned
     // children via the process-global ProcessScope, so the orphan dies either way.
     harness.send_signal(libc::SIGINT).expect("send SIGINT");
-    let code = harness.wait_exit_code(Duration::from_secs(15));
-    assert!(code.is_some(), "pager did not exit after SIGINT");
+    let exit = harness
+        .wait_exit_code(Duration::from_secs(15))
+        .expect("wait after SIGINT");
+    assert!(
+        matches!(exit, PtyExitPoll::Exited(_) | PtyExitPoll::PendingStatus),
+        "pager did not exit after SIGINT: {exit:?}"
+    );
 
     // The fix: no orphaned background process survives the quit. Without it the
     // setsid-detached sleep reparents to init and keeps running -> this times out.

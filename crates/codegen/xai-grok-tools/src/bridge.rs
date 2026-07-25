@@ -141,17 +141,22 @@ impl ToolBridge {
         template: &str,
         placeholders: &serde_json::Value,
     ) -> Option<String> {
-        let registry = &*self.registry;
-        let result;
-        {
-            result = registry
-                .resources
-                .lock()
-                .await
-                .get::<TemplateRenderer>()
-                .and_then(|r| r.render_with_extra(template, placeholders).ok());
-        }
-        result
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .and_then(|renderer| renderer.render_with_extra(template, placeholders).ok())
+    }
+
+    /// Return the finalized template renderer for multi-part prompt assembly.
+    pub async fn template_renderer_snapshot(&self) -> Option<TemplateRenderer> {
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .cloned()
     }
 
     pub async fn register_mcp_tools<T>(
@@ -543,6 +548,34 @@ impl ToolBridge {
         }
     }
 
+    /// Snapshot the session's scheduled tasks; empty when no scheduler is
+    /// registered or the actor has stopped.
+    pub async fn list_scheduled_tasks(
+        &self,
+    ) -> Vec<crate::implementations::grok_build::scheduler::types::ScheduledTask> {
+        use crate::implementations::grok_build::scheduler::types::{
+            SchedulerCommand, SchedulerHandle,
+        };
+        let sender = {
+            let res = self.registry.resources.lock().await;
+            match res.get::<SchedulerHandle>() {
+                Some(handle) => handle.0.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if sender
+            .send(SchedulerCommand::List { reply: reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx
+            .await
+            .map(|snapshot| snapshot.tasks)
+            .unwrap_or_default()
+    }
+
     pub async fn delete_scheduled_task(
         &self,
         task_id: &str,
@@ -568,9 +601,15 @@ impl ToolBridge {
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
             })?;
-        reply_rx.await.map_err(|_| {
-            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor dropped reply")
-        })
+        reply_rx
+            .await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
     }
 
     /// Move a foreground command to background by tool_call_id.
@@ -594,8 +633,12 @@ impl ToolBridge {
 
     /// Drain newly-completed bash background tasks not yet reported.
     /// Marks returned tasks in [`ReportedTaskCompletions`] to prevent
-    /// duplicate reminders from [`TaskCompletionReminder`].
-    pub async fn drain_between_turn_bash_completions(&self) -> Vec<TaskSnapshot> {
+    /// duplicate reminders from [`TaskCompletionReminder`]. Reserved IDs stay
+    /// unreported for a later genuine user turn.
+    pub async fn drain_between_turn_bash_completions(
+        &self,
+        reserved_ids: &[String],
+    ) -> Vec<TaskSnapshot> {
         let tasks = match self.list_tasks().await {
             Some(t) => t,
             None => return Vec::new(),
@@ -625,6 +668,7 @@ impl ToolBridge {
         completed
             .into_iter()
             .filter(|t| task_owned_by_session(t, my_owner.as_deref()))
+            .filter(|t| !reserved_ids.contains(&t.task_id))
             .filter(|t| state.mark_reported(&t.task_id))
             .collect()
     }
@@ -790,6 +834,7 @@ mod tests {
             block_waited: false,
             explicitly_killed: false,
             owner_session_id: owner.map(|s| s.to_string()),
+            description: None,
         }
     }
 
@@ -817,7 +862,7 @@ mod tests {
             terminal: Some(backend),
         };
 
-        let drained = bridge.drain_between_turn_bash_completions().await;
+        let drained = bridge.drain_between_turn_bash_completions(&[]).await;
         let ids: Vec<&str> = drained.iter().map(|t| t.task_id.as_str()).collect();
 
         assert!(ids.contains(&"mine-task"), "own task must drain: {ids:?}");
@@ -828,6 +873,38 @@ mod tests {
         assert!(
             !ids.contains(&"parent-task"),
             "another session's task must NOT leak into this session: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn between_turn_bash_completions_skip_reserved_ids_without_reporting_them() {
+        let toolset = FinalizedToolset::empty_for_test();
+        {
+            let mut res = toolset.resources.lock().await;
+            res.register_state::<ReportedTaskCompletions>();
+        }
+        let backend: Arc<dyn TerminalBackend> = Arc::new(MockTerminal {
+            tasks: vec![completed_task("reserved", None)],
+        });
+        let bridge = ToolBridge {
+            registry: Arc::new(toolset),
+            terminal: Some(backend),
+        };
+
+        assert!(
+            bridge
+                .drain_between_turn_bash_completions(&["reserved".to_string()])
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            bridge
+                .drain_between_turn_bash_completions(&[])
+                .await
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            vec!["reserved".to_string()]
         );
     }
 }

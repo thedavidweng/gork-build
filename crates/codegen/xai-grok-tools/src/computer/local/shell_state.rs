@@ -104,8 +104,10 @@ dump_bash_state() {
   env_vars=$(builtin export -p 2>/dev/null | command grep -viE '_proxy=|GROK_SANDBOX|GROK_AGENT=|SUDO_ASKPASS|GROK_ASKPASS|ELECTRON_RUN_AS_NODE|SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|WAYLAND_DISPLAY|GPG_TTY' || true)
   _emit_encoded "$env_vars" "ENV_VARS_B64"
 
+  # errexit/pipefail here are this function's own `set -euo pipefail` (set is
+  # shell-global in bash); replaying them would abort later user commands.
   local posix_opts
-  posix_opts=$(builtin shopt -po 2>/dev/null | command grep -v '^set -o nounset$' | command grep -v '^set +o nounset$' || true)
+  posix_opts=$(builtin shopt -po 2>/dev/null | command grep -vE '^set [-+]o (nounset|errexit|pipefail)$' || true)
   _emit_encoded "$posix_opts" "POSIX_OPTS_B64"
 
   local bash_opts
@@ -158,8 +160,11 @@ function dump_zsh_state() {
   env_vars=$(builtin typeset -xp 2>/dev/null | command grep -viE '_proxy=|GROK_SANDBOX|GROK_AGENT=|SUDO_ASKPASS|GROK_ASKPASS|ELECTRON_RUN_AS_NODE|SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|WAYLAND_DISPLAY|GPG_TTY' || true)
   _emit_encoded "$env_vars" "ENV_VARS_B64"
 
+  # errreturn/pipefail here are this function's own `emulate -L` options
+  # (setopt lists them while inside); replaying them would abort later user
+  # commands.
   local zsh_opts
-  zsh_opts=$(setopt 2>/dev/null | command grep -v '^nounset$' | command awk '{printf "builtin setopt %s 2>/dev/null || true\n", $0}' || true)
+  zsh_opts=$(setopt 2>/dev/null | command grep -vE '^(nounset|errexit|errreturn|pipefail)$' | command awk '{printf "builtin setopt %s 2>/dev/null || true\n", $0}' || true)
   _emit_encoded "$zsh_opts" "ZSH_OPTS_B64"
 
   local all_functions
@@ -267,6 +272,7 @@ impl ShellState {
     pub async fn init(
         shell: ShellKind,
         cwd: &Path,
+        shell_env_policy: Option<&crate::util::ShellEnvironmentPolicy>,
     ) -> Result<Self, crate::computer::types::ComputerError> {
         let dump_script = shell.dump_script();
         let dump_fn = shell.dump_function_name();
@@ -292,6 +298,21 @@ impl ShellState {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         crate::util::detach_command(&mut cmd);
+        // Apply the policy before the `export -p` snapshot so the replayed state
+        // is already filtered; otherwise the restore would undo it. No-op unless set.
+        //
+        // SECURITY: this filters the base env only. Variables an rc file exports
+        // during login are captured in the replay snapshot and are not
+        // re-filtered by `exclude`/`include_only` on the persistent backend, so
+        // warn when a policy is active. The non-persistent backend has no such
+        // gap (it filters login capture directly).
+        if shell_env_policy.is_some_and(|p| !p.is_noop()) {
+            tracing::warn!(
+                "shell_environment_policy filters the persistent shell's base env only; \
+                 variables exported by rc files enter the replay snapshot unfiltered"
+            );
+        }
+        crate::util::apply_shell_environment_policy(&mut cmd, shell_env_policy);
         cmd.envs(crate::util::pager_env());
         let mut child = cmd.spawn().map_err(|e| {
             crate::computer::types::ComputerError::io(format!(
@@ -361,6 +382,7 @@ impl ShellState {
         user_command: &str,
         cwd_override: Option<&Path>,
         search_shadows: super::SearchShadowConfig,
+        spawn_notice: Option<&str>,
     ) -> std::io::Result<PreparedCommand> {
         let dump_script = self.shell.dump_script();
         let dump_fn = self.shell.dump_function_name();
@@ -408,6 +430,7 @@ impl ShellState {
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
                  builtin shopt -s expand_aliases 2>/dev/null; {sudo_inject}{search_inject}\
+                 builtin printf '%s' \"${{2:-}}\"; \
                  builtin eval \"$1\" 2>&1; }}; \
                  COMMAND_EXIT_CODE=$?; {dump_fn} >&4; builtin exit $COMMAND_EXIT_CODE"
             ),
@@ -423,6 +446,7 @@ impl ShellState {
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
                  builtin setopt aliases 2>/dev/null; {sudo_inject}{search_inject}\
+                 builtin printf '%s' \"${{2:-}}\"; \
                  builtin eval \"$1\" 2>&1; }}; \
                  COMMAND_EXIT_CODE=$?; {dump_fn} >&4; builtin exit $COMMAND_EXIT_CODE"
             ),
@@ -430,7 +454,7 @@ impl ShellState {
 
         let effective_cwd = cwd_override.unwrap_or(&self.cwd);
 
-        let args: Vec<String> = match self.shell {
+        let mut args: Vec<String> = match self.shell {
             ShellKind::Bash => vec![
                 "-O".into(),
                 "extglob".into(),
@@ -441,6 +465,9 @@ impl ShellState {
             ],
             ShellKind::Zsh => vec!["-c".into(), wrapper, "--".into(), user_command.into()],
         };
+        if let Some(notice) = spawn_notice {
+            args.push(notice.into());
+        }
 
         let fd_mappings = vec![
             FdMapping {
@@ -828,7 +855,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
         assert!(state.cwd.is_absolute());
         // The snapshot should contain at least some env var exports
         assert!(
@@ -847,7 +874,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         // Run "export GROK_TEST_VAR=hello" and capture the new state
         let prep = state
@@ -855,6 +882,7 @@ mod tests {
                 "export GROK_TEST_VAR=hello",
                 None,
                 crate::computer::local::SearchShadowConfig::default(),
+                None,
             )
             .unwrap();
 
@@ -914,6 +942,7 @@ mod tests {
                 command,
                 None,
                 crate::computer::local::SearchShadowConfig::default(),
+                None,
             )
             .unwrap();
         let mut cmd = tokio::process::Command::new(&prep.binary);
@@ -951,7 +980,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         // cd to /tmp (macOS resolves to /private/tmp via symlink)
         let (code, _) = run_command(&mut state, "cd /tmp").await;
@@ -974,7 +1003,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         // Export a variable
         let (code, _) = run_command(&mut state, "export MY_TEST_VAR=persistent_value").await;
@@ -993,7 +1022,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         let (code, _) = run_command(&mut state, "export GPG_TTY=/grok-sentinel-tty").await;
         assert_eq!(code, 0);
@@ -1013,7 +1042,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Zsh, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None).await.unwrap();
 
         let (code, _) = run_command(&mut state, "export GPG_TTY=/grok-sentinel-tty").await;
         assert_eq!(code, 0);
@@ -1033,13 +1062,14 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Zsh, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Zsh, &cwd, None).await.unwrap();
 
         let prep = state
             .prepare_command(
                 "true",
                 None,
                 crate::computer::local::SearchShadowConfig::default(),
+                None,
             )
             .unwrap();
         let wrapper = prep
@@ -1077,7 +1107,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         // Define a function
         let (code, _) = run_command(&mut state, "greet() { echo \"hello $1\"; }").await;
@@ -1095,7 +1125,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         // Define an alias
         let (code, _) = run_command(&mut state, "alias ll='ls -la'").await;
@@ -1122,9 +1152,9 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
-        let prep = state.prepare_command("true", None, shadows).unwrap();
+        let prep = state.prepare_command("true", None, shadows, None).unwrap();
         // Shadows enabled → the self-resolving find/grep functions are always
         // installed (they fall back to the OS binary if bfs/ugrep aren't found).
         assert!(
@@ -1161,7 +1191,7 @@ mod tests {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
-        let mut state = ShellState::init(ShellKind::Bash, &cwd).await.unwrap();
+        let mut state = ShellState::init(ShellKind::Bash, &cwd, None).await.unwrap();
 
         // Set up some state
         let (_, _) = run_command(&mut state, "export SURVIVE_TEST=yes").await;

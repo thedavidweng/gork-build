@@ -1,704 +1,602 @@
-//! Trusted success / toast policy for clipboard writes.
+//! Environment-based delivery and toast policy for clipboard writes.
 //!
-//! Writes still multi-fire every backend; this module decides whether we tell
-//! the user it worked based on legs that actually reach the pasteboard they use.
+//! Writes still multi-fire every backend; this module classifies whether a
+//! successful leg is known to reach the destination named by the UI.
 
 use crate::host::{DisplayServer, HostOs};
 use crate::terminal::TerminalName;
 
-use super::{ClipboardToastKind, ClipboardWriteLegs};
+use super::{ClipboardFeedback, ClipboardWriteLegs};
 
-/// True when native legs wrote the **local** OS clipboard (not SSH/container).
-pub(crate) fn trusted_native(
-    legs: &ClipboardWriteLegs,
-    host_os: HostOs,
-    display_server: DisplayServer,
-    remote: bool,
-    container: bool,
-) -> bool {
-    if remote || container || !legs.route_native {
+/// Grok's evidence that a clipboard write reached its intended destination.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum ClipboardDelivery {
+    /// A successful write leg has a destination trusted by the environment policy.
+    Confirmed,
+    /// OSC 52 was emitted, but the outer terminal's clipboard support is unknown.
+    Unverified,
+    /// No usable write leg succeeded, or the destination is known not to support it.
+    Failed,
+}
+
+impl ClipboardDelivery {
+    pub fn is_confirmed(self) -> bool {
+        self == Self::Confirmed
+    }
+
+    pub fn is_failed(self) -> bool {
+        self == Self::Failed
+    }
+
+    pub fn reported_success(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Unverified)
+    }
+
+    pub fn telemetry_label(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// Clipboard-relevant facts about the terminal and host environment.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ClipboardEnvironment {
+    pub brand: TerminalName,
+    pub host_os: HostOs,
+    pub display_server: DisplayServer,
+    pub remote: bool,
+    pub container: bool,
+    pub osc52_sink: bool,
+    pub wayland_data_control: bool,
+    pub wl_copy_available: bool,
+}
+
+/// The terminal's advertised OSC 52 clipboard capability.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum Osc52Capability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl Osc52Capability {
+    #[doc(hidden)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl ClipboardEnvironment {
+    #[doc(hidden)]
+    pub fn osc52_capability(self) -> Osc52Capability {
+        if self.osc52_sink || self.brand.supports_osc52_clipboard() {
+            Osc52Capability::Supported
+        } else if self.brand == TerminalName::Unknown {
+            Osc52Capability::Unknown
+        } else {
+            Osc52Capability::Unsupported
+        }
+    }
+}
+
+/// Native clipboard route evidence available before a copy is attempted.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NativeClipboardPreflight {
+    Disabled,
+    LocalAvailable,
+    RemoteOnly,
+    Unavailable,
+}
+
+fn trusted_wayland_native(wl_copy: bool, arboard: bool, data_control: bool) -> bool {
+    wl_copy || (arboard && data_control)
+}
+
+/// Classify the configured native route without claiming that a write succeeded.
+pub fn native_clipboard_preflight(
+    route_native: bool,
+    environment: ClipboardEnvironment,
+) -> NativeClipboardPreflight {
+    if !route_native {
+        return NativeClipboardPreflight::Disabled;
+    }
+    if environment.remote || environment.container {
+        return NativeClipboardPreflight::RemoteOnly;
+    }
+    match environment.host_os {
+        HostOs::Linux => match environment.display_server {
+            DisplayServer::Wayland
+                if environment.wl_copy_available || environment.wayland_data_control =>
+            {
+                NativeClipboardPreflight::LocalAvailable
+            }
+            DisplayServer::Wayland | DisplayServer::Unknown => {
+                NativeClipboardPreflight::Unavailable
+            }
+            DisplayServer::X11 => NativeClipboardPreflight::LocalAvailable,
+            DisplayServer::Quartz | DisplayServer::Win32 => NativeClipboardPreflight::Unavailable,
+        },
+        HostOs::Macos | HostOs::Windows => NativeClipboardPreflight::LocalAvailable,
+        HostOs::Other => NativeClipboardPreflight::Unavailable,
+    }
+}
+
+/// Classify one emitted OSC 52 write.
+/// Unknown SSH/container boundaries strip brand markers, so missing capability evidence is Unverified rather than Failed.
+pub(crate) fn osc52_delivery(environment: ClipboardEnvironment) -> ClipboardDelivery {
+    match environment.osc52_capability() {
+        Osc52Capability::Supported => ClipboardDelivery::Confirmed,
+        Osc52Capability::Unknown if environment.remote || environment.container => {
+            ClipboardDelivery::Unverified
+        }
+        Osc52Capability::Unknown | Osc52Capability::Unsupported => ClipboardDelivery::Failed,
+    }
+}
+
+/// Expected preflight confidence for an enabled clipboard route.
+pub fn expected_delivery(
+    native: NativeClipboardPreflight,
+    route_tmux: bool,
+    route_osc52: bool,
+    environment: ClipboardEnvironment,
+) -> ClipboardDelivery {
+    if native == NativeClipboardPreflight::LocalAvailable {
+        return ClipboardDelivery::Confirmed;
+    }
+    let osc52 = route_osc52.then(|| osc52_delivery(environment));
+    if osc52 == Some(ClipboardDelivery::Confirmed) || route_tmux {
+        return ClipboardDelivery::Confirmed;
+    }
+    if osc52 == Some(ClipboardDelivery::Unverified) {
+        return ClipboardDelivery::Unverified;
+    }
+    ClipboardDelivery::Failed
+}
+
+/// True when native legs wrote the local OS clipboard rather than a remote host.
+pub(crate) fn trusted_native(legs: &ClipboardWriteLegs, environment: ClipboardEnvironment) -> bool {
+    if environment.remote || environment.container || !legs.route_native {
         return false;
     }
-    match host_os {
-        HostOs::Linux => match display_server {
-            // A verified wl-copy write, or an arboard write that went through
-            // the compositor's data-control protocol (focus-free, no XWayland
-            // bridge). Without data-control, arboard only reached the X11 side
-            // and the Wayland paste may never see it.
-            DisplayServer::Wayland => legs.wl_copy_ok || (legs.arboard_ok && legs.data_control),
+    match environment.host_os {
+        HostOs::Linux => match environment.display_server {
+            DisplayServer::Wayland => {
+                trusted_wayland_native(legs.wl_copy_ok, legs.arboard_ok, legs.data_control)
+            }
             _ => legs.cli_ok || legs.arboard_ok,
         },
         HostOs::Macos | HostOs::Windows | HostOs::Other => legs.cli_ok || legs.arboard_ok,
     }
 }
 
-/// True when an OSC 52 write reaches the user's real clipboard.
-///
-/// Normally this requires the detected terminal brand to natively apply OSC 52
-/// to the system pasteboard (fail closed). Two overrides widen the brand gate:
-///
-/// - `osc52_sink`: when `grok wrap` is capturing this process's output (see
-///   [`super::osc52_sink_active`]) the escape sequence is intercepted upstream
-///   and copied to the *local* clipboard regardless of the (often misdetected,
-///   e.g. over SSH) inner terminal brand, so the copy is trusted.
-/// - `container` + `Unknown` brand: inside a container without a display server
-///   (docker/podman), native legs *cannot* reach the user's pasteboard and the
-///   container runtime does not forward brand env vars (`WT_SESSION`,
-///   `TERM_PROGRAM`, …), so the brand is `Unknown` even when the outer terminal
-///   (Windows Terminal, iTerm2, Ghostty, …) applies OSC 52 fine. Failing closed
-///   here would mis-report *every* container copy as failed (GB report:
-///   "Copy failed" toast in docker from Windows PowerShell while the copy
-///   landed). The `CopiedOscContainer` toast already hedges with a fallback
-///   instruction, so trust the emitted escape. A *detected* non-supporting
-///   brand (env explicitly forwarded) stays fail-closed.
-pub(crate) fn trusted_osc(
-    legs: &ClipboardWriteLegs,
-    brand: TerminalName,
-    container: bool,
-    osc52_sink: bool,
-) -> bool {
-    legs.osc52_ok
-        && (brand.supports_osc52_clipboard()
-            || osc52_sink
-            || (container && brand == TerminalName::Unknown))
-}
-
-/// Toast from legs + env: native → OSC (incl. VS Code remote non-ASCII) → tmux → Failed.
-// Pure decision function over independent environment inputs (host OS, display
-// server, remote/container/sink flags). Bundling them into a struct would only
-// move the argument list elsewhere and churn every call site/test.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_copy_toast(
+/// Resolve the user-visible feedback; each feedback variant owns its delivery state.
+pub(crate) fn resolve_copy_decision(
     legs: &ClipboardWriteLegs,
     text: &str,
-    brand: TerminalName,
-    host_os: HostOs,
-    display_server: DisplayServer,
-    remote: bool,
-    container: bool,
-    osc52_sink: bool,
-) -> ClipboardToastKind {
-    if trusted_native(legs, host_os, display_server, remote, container) {
-        return ClipboardToastKind::Copied;
+    environment: ClipboardEnvironment,
+) -> ClipboardFeedback {
+    if trusted_native(legs, environment) {
+        return ClipboardFeedback::Copied;
     }
-    if trusted_osc(legs, brand, container, osc52_sink) {
-        if remote && brand.is_vscode_family() && !text.is_ascii() {
-            return ClipboardToastKind::VsCodeSshNonAscii;
+    if legs.osc52_ok {
+        match osc52_delivery(environment) {
+            ClipboardDelivery::Confirmed => {
+                if environment.container {
+                    return ClipboardFeedback::CopiedOscContainer;
+                }
+                if environment.remote && environment.brand.is_vscode_family() && !text.is_ascii() {
+                    return ClipboardFeedback::VsCodeSshNonAscii;
+                }
+                if environment.remote {
+                    return ClipboardFeedback::CopiedOscRemote;
+                }
+                return ClipboardFeedback::Copied;
+            }
+            ClipboardDelivery::Unverified if !legs.tmux_ok => {
+                if environment.container {
+                    return ClipboardFeedback::UnverifiedOscContainer;
+                }
+                return ClipboardFeedback::UnverifiedOscRemote;
+            }
+            ClipboardDelivery::Unverified | ClipboardDelivery::Failed => {}
         }
-        // Container before remote (matches prior route-flag toast order).
-        if container {
-            return ClipboardToastKind::CopiedOscContainer;
-        }
-        if remote {
-            return ClipboardToastKind::CopiedOscRemote;
-        }
-        return ClipboardToastKind::Copied;
     }
     if legs.tmux_ok {
-        return ClipboardToastKind::CopiedTmux;
+        return ClipboardFeedback::CopiedTmux;
     }
-    ClipboardToastKind::Failed
+    if environment.remote || environment.container {
+        ClipboardFeedback::FailedRemote
+    } else {
+        ClipboardFeedback::Failed
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clipboard::ClipboardWriteLegs;
 
     fn legs(
-        route_native: bool,
         cli_ok: bool,
         arboard_ok: bool,
+        data_control: bool,
         tmux_ok: bool,
         osc52_ok: bool,
         cli_ok_tools: &str,
     ) -> ClipboardWriteLegs {
         ClipboardWriteLegs {
-            route_native,
+            route_native: true,
             route_label: "test".into(),
             cli_tools_tried: String::new(),
             cli_ok_tools: cli_ok_tools.into(),
-            wl_copy_ok: cli_ok_tools.split('+').any(|t| t == "wl-copy"),
+            wl_copy_ok: cli_ok_tools.split('+').any(|tool| tool == "wl-copy"),
             cli_ok,
             arboard_ok,
-            data_control: false,
+            data_control,
             tmux_ok,
             osc52_ok,
         }
     }
 
-    /// Same as [`legs`] with the Wayland data-control flag set.
-    fn legs_data_control(
-        route_native: bool,
-        cli_ok: bool,
-        arboard_ok: bool,
-        tmux_ok: bool,
-        osc52_ok: bool,
-        cli_ok_tools: &str,
-    ) -> ClipboardWriteLegs {
-        ClipboardWriteLegs {
-            data_control: true,
-            ..legs(
-                route_native,
-                cli_ok,
-                arboard_ok,
-                tmux_ok,
-                osc52_ok,
-                cli_ok_tools,
-            )
+    fn environment(brand: TerminalName) -> ClipboardEnvironment {
+        ClipboardEnvironment {
+            brand,
+            host_os: HostOs::Linux,
+            display_server: DisplayServer::Unknown,
+            remote: false,
+            container: false,
+            osc52_sink: false,
+            wayland_data_control: false,
+            wl_copy_available: false,
         }
     }
 
-    fn resolve(
-        legs: &ClipboardWriteLegs,
-        brand: TerminalName,
-        host_os: HostOs,
-        display_server: DisplayServer,
-        remote: bool,
-        container: bool,
-    ) -> ClipboardToastKind {
-        resolve_copy_toast(
-            legs,
+    #[test]
+    fn telemetry_projection_labels_and_historical_boolean_are_pinned() {
+        for (delivery, label, confirmed, failed, reported_success) in [
+            (ClipboardDelivery::Confirmed, "confirmed", true, false, true),
+            (
+                ClipboardDelivery::Unverified,
+                "unverified",
+                false,
+                false,
+                true,
+            ),
+            (ClipboardDelivery::Failed, "failed", false, true, false),
+        ] {
+            assert_eq!(delivery.telemetry_label(), label);
+            assert_eq!(delivery.is_confirmed(), confirmed);
+            assert_eq!(delivery.is_failed(), failed);
+            assert_eq!(delivery.reported_success(), reported_success);
+        }
+    }
+
+    #[test]
+    fn local_trusted_native_is_confirmed() {
+        let feedback = resolve_copy_decision(
+            &legs(true, false, false, false, false, "pbcopy"),
             "hello",
-            brand,
-            host_os,
-            display_server,
-            remote,
-            container,
-            false,
-        )
-    }
-
-    #[test]
-    fn macos_local_native_ok() {
-        let l = legs(true, true, false, false, false, "pbcopy");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Ghostty,
-                HostOs::Macos,
-                DisplayServer::Quartz,
-                false,
-                false
-            ),
-            ClipboardToastKind::Copied
+            ClipboardEnvironment {
+                host_os: HostOs::Macos,
+                display_server: DisplayServer::Quartz,
+                ..environment(TerminalName::Ghostty)
+            },
         );
+        assert_eq!(feedback, ClipboardFeedback::Copied);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
     #[test]
-    fn macos_apple_terminal_osc_only_fails() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::AppleTerminal,
-                HostOs::Macos,
-                DisplayServer::Quartz,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
+    fn wayland_native_requires_verified_destination() {
+        let environment = ClipboardEnvironment {
+            display_server: DisplayServer::Wayland,
+            ..environment(TerminalName::Vte)
+        };
+        let unverified = legs(false, true, false, false, false, "");
+        assert!(!trusted_native(&unverified, environment));
+        let data_control = legs(false, true, true, false, false, "");
+        assert!(trusted_native(&data_control, environment));
+        let wl_copy = legs(true, false, false, false, false, "wl-copy");
+        assert!(trusted_native(&wl_copy, environment));
+    }
+
+    #[test]
+    fn remote_native_write_only_uses_failed_remote() {
+        let feedback = resolve_copy_decision(
+            &legs(true, true, false, false, false, "xclip"),
+            "hello",
+            ClipboardEnvironment {
+                display_server: DisplayServer::X11,
+                remote: true,
+                ..environment(TerminalName::Ghostty)
+            },
         );
-        assert!(!TerminalName::AppleTerminal.supports_osc52_clipboard());
+        assert_eq!(feedback, ClipboardFeedback::FailedRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Failed);
     }
 
     #[test]
-    fn windows_local_native_ok() {
-        let l = legs(true, false, true, false, false, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::WindowsTerminal,
-                HostOs::Windows,
-                DisplayServer::Win32,
-                false,
-                false
-            ),
-            ClipboardToastKind::Copied
+    fn known_osc_capable_terminal_is_confirmed() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::Ghostty)
+            },
         );
+        assert_eq!(feedback, ClipboardFeedback::CopiedOscRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
     #[test]
-    fn linux_x11_xclip_ok() {
-        let l = legs(true, true, false, false, true, "xclip");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::X11,
-                false,
-                false
-            ),
-            ClipboardToastKind::Copied
+    fn ssh_unknown_brand_osc_is_unverified() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::Unknown)
+            },
         );
+        assert_eq!(feedback, ClipboardFeedback::UnverifiedOscRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Unverified);
     }
 
     #[test]
-    fn linux_wayland_arboard_only_fails() {
-        let l = legs(true, false, true, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
+    fn container_unknown_brand_osc_is_unverified() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                container: true,
+                ..environment(TerminalName::Unknown)
+            },
         );
-    }
-
-    // The enterprise clipboard shape after the fix: no CLI tool installed, but the
-    // arboard write went through the compositor's data-control protocol, so it
-    // is trusted native.
-    #[test]
-    fn linux_wayland_arboard_data_control_ok() {
-        let l = legs_data_control(true, false, true, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                false,
-                false
-            ),
-            ClipboardToastKind::Copied
-        );
-    }
-
-    // Without data-control (GNOME <= 47 or kill-switch), an arboard-only write
-    // keeps the `linux_wayland_arboard_only_fails` semantics.
-    #[test]
-    fn linux_wayland_arboard_without_data_control_still_fails() {
-        let l = legs(true, false, true, false, false, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    // Data-control grants nothing when the arboard write itself failed.
-    #[test]
-    fn linux_wayland_data_control_without_arboard_fails() {
-        let l = legs_data_control(true, false, false, false, false, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
+        assert_eq!(feedback, ClipboardFeedback::UnverifiedOscContainer);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Unverified);
     }
 
     #[test]
-    fn linux_wayland_wl_copy_ok() {
-        let l = legs(true, true, false, false, true, "wl-copy");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                false,
-                false
-            ),
-            ClipboardToastKind::Copied
-        );
-    }
-
-    #[test]
-    fn linux_wayland_xclip_only_not_trusted_native() {
-        let l = legs(true, true, true, false, true, "xclip");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Wayland,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    #[test]
-    fn linux_vte_osc_only_fails() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::X11,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    #[test]
-    fn ssh_vte_osc_only_fails() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    #[test]
-    fn ssh_ghostty_osc_only_remote_toast() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Ghostty,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false
-            ),
-            ClipboardToastKind::CopiedOscRemote
-        );
-    }
-
-    #[test]
-    fn ssh_iterm2_osc_only_remote_toast() {
-        // Guards the OSC-52 membership invariant the fix depends on.
-        assert!(TerminalName::Iterm2.supports_osc52_clipboard());
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Iterm2,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false
-            ),
-            ClipboardToastKind::CopiedOscRemote
-        );
-    }
-
-    #[test]
-    fn local_ghostty_osc_only_copied() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Ghostty,
-                HostOs::Linux,
-                DisplayServer::X11,
-                false,
-                false
-            ),
-            ClipboardToastKind::Copied
-        );
-    }
-
-    #[test]
-    fn tmux_only_ok() {
-        let l = legs(true, false, false, true, false, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::X11,
-                false,
-                false
-            ),
-            ClipboardToastKind::CopiedTmux
-        );
-    }
-
-    #[test]
-    fn vscode_ssh_ascii_trusted_osc_remote() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::VsCode,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false
-            ),
-            ClipboardToastKind::CopiedOscRemote
-        );
-    }
-
-    #[test]
-    fn vscode_ssh_non_ascii_trusted_osc() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve_copy_toast(
-                &l,
-                "café",
-                TerminalName::VsCode,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                false,
-            ),
-            ClipboardToastKind::VsCodeSshNonAscii
-        );
-    }
-
-    #[test]
-    fn vscode_ssh_non_ascii_untrusted_osc_fails() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve_copy_toast(
-                &l,
-                "café",
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                false,
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    #[test]
-    fn all_fail() {
-        let l = legs(true, false, false, false, false, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Ghostty,
-                HostOs::Linux,
-                DisplayServer::X11,
-                false,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-        assert!(!ClipboardToastKind::Failed.reported_success());
-    }
-
-    #[test]
-    fn ssh_remote_native_not_trusted_without_osc() {
-        let l = legs(true, true, true, false, false, "xclip");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::X11,
-                true,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    #[test]
-    fn container_ghostty_osc_container_toast() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Ghostty,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                false,
-                true
-            ),
-            ClipboardToastKind::CopiedOscContainer
-        );
-    }
-
-    #[test]
-    fn remote_and_container_prefers_container_toast() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Ghostty,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                true
-            ),
-            ClipboardToastKind::CopiedOscContainer
-        );
-    }
-
-    // `grok wrap` sink: a brand that does NOT natively support OSC 52 (the
-    // common SSH case where the inner terminal is misdetected as Vte/Unknown)
-    // is still trusted when an upstream OSC 52 sink is capturing our output.
-    #[test]
-    fn wrapped_ssh_vte_osc_trusted_via_sink() {
-        let l = legs(true, false, false, false, true, "");
-        // Without the sink: untrusted brand over SSH → Failed.
-        assert_eq!(
-            resolve_copy_toast(
-                &l,
+    fn known_unsupported_terminal_osc_is_failed_remote() {
+        for (brand, remote, container) in [
+            (TerminalName::AppleTerminal, true, false),
+            (TerminalName::Vte, true, false),
+            (TerminalName::AppleTerminal, true, true),
+        ] {
+            let feedback = resolve_copy_decision(
+                &legs(false, false, false, false, true, ""),
                 "hello",
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                false,
-            ),
-            ClipboardToastKind::Failed
+                ClipboardEnvironment {
+                    remote,
+                    container,
+                    ..environment(brand)
+                },
+            );
+            assert_eq!(feedback, ClipboardFeedback::FailedRemote, "{brand:?}");
+            assert_eq!(feedback.delivery(), ClipboardDelivery::Failed, "{brand:?}");
+        }
+    }
+
+    #[test]
+    fn container_with_detected_unsupported_brand_is_failed_remote() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                container: true,
+                ..environment(TerminalName::AppleTerminal)
+            },
         );
-        // With the sink active: trusted → success toast.
-        assert_eq!(
-            resolve_copy_toast(
-                &l,
+        assert_eq!(feedback, ClipboardFeedback::FailedRemote);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Failed);
+    }
+
+    #[test]
+    fn active_wrap_sink_with_osc_is_confirmed_for_any_brand() {
+        for brand in [TerminalName::Unknown, TerminalName::AppleTerminal] {
+            let feedback = resolve_copy_decision(
+                &legs(false, false, false, false, true, ""),
                 "hello",
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                true,
-            ),
-            ClipboardToastKind::CopiedOscRemote
+                ClipboardEnvironment {
+                    remote: true,
+                    osc52_sink: true,
+                    ..environment(brand)
+                },
+            );
+            assert!(feedback.delivery().is_confirmed(), "{brand:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_sink_without_osc_write_is_failed_remote() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, false, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                osc52_sink: true,
+                ..environment(TerminalName::Unknown)
+            },
+        );
+        assert_eq!(feedback, ClipboardFeedback::FailedRemote);
+    }
+
+    #[test]
+    fn tmux_success_wins_over_unverified_osc() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, true, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::Unknown)
+            },
+        );
+        assert_eq!(feedback, ClipboardFeedback::CopiedTmux);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
+    }
+
+    #[test]
+    fn no_successful_local_leg_is_failed() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, false, ""),
+            "hello",
+            environment(TerminalName::Ghostty),
+        );
+        assert_eq!(feedback, ClipboardFeedback::Failed);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Failed);
+    }
+
+    #[test]
+    fn remote_and_container_prefer_container_feedback_and_telemetry_branch() {
+        let confirmed = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                container: true,
+                ..environment(TerminalName::Ghostty)
+            },
+        );
+        assert_eq!(confirmed, ClipboardFeedback::CopiedOscContainer);
+        assert_eq!(
+            Into::<&'static str>::into(confirmed),
+            "copied_osc_container"
+        );
+
+        let unverified = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "hello",
+            ClipboardEnvironment {
+                remote: true,
+                container: true,
+                ..environment(TerminalName::Unknown)
+            },
+        );
+        assert_eq!(unverified, ClipboardFeedback::UnverifiedOscContainer);
+        assert_eq!(
+            Into::<&'static str>::into(unverified),
+            "unverified_osc_container"
         );
     }
 
-    // Sink trust still requires an actual OSC 52 write to have happened
-    // (`osc52_ok`); it never fabricates success when no leg fired.
     #[test]
-    fn wrapped_sink_without_osc_write_still_fails() {
-        let l = legs(true, false, false, false, false, "");
-        assert!(!trusted_osc(&l, TerminalName::Vte, false, true));
-        assert_eq!(
-            resolve_copy_toast(
-                &l,
-                "hello",
-                TerminalName::Vte,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false,
-                true,
-            ),
-            ClipboardToastKind::Failed
+    fn vscode_ssh_non_ascii_stays_confirmed_with_warning_toast() {
+        let feedback = resolve_copy_decision(
+            &legs(false, false, false, false, true, ""),
+            "café",
+            ClipboardEnvironment {
+                remote: true,
+                ..environment(TerminalName::VsCode)
+            },
         );
+        assert_eq!(feedback, ClipboardFeedback::VsCodeSshNonAscii);
+        assert_eq!(feedback.delivery(), ClipboardDelivery::Confirmed);
     }
 
-    // Docker/podman from Windows PowerShell / cmd (or any host terminal):
-    // brand env vars are not forwarded into the container, so the brand is
-    // Unknown; native legs cannot work (no display server). The emitted
-    // OSC 52 is the copy path and must be trusted → hedged container toast,
-    // not "Copy failed" (regression test for the false-failure report).
     #[test]
-    fn container_unknown_brand_osc_trusted() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Unknown,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                false,
-                true
-            ),
-            ClipboardToastKind::CopiedOscContainer
-        );
+    fn native_preflight_matches_observed_wayland_trust_matrix() {
+        for (data_control, wl_copy, expected) in [
+            (false, false, NativeClipboardPreflight::Unavailable),
+            (false, true, NativeClipboardPreflight::LocalAvailable),
+            (true, false, NativeClipboardPreflight::LocalAvailable),
+            (true, true, NativeClipboardPreflight::LocalAvailable),
+        ] {
+            assert_eq!(
+                native_clipboard_preflight(
+                    true,
+                    ClipboardEnvironment {
+                        display_server: DisplayServer::Wayland,
+                        wayland_data_control: data_control,
+                        wl_copy_available: wl_copy,
+                        ..environment(TerminalName::Vte)
+                    },
+                ),
+                expected,
+                "data_control={data_control} wl_copy={wl_copy}"
+            );
+        }
+        for (remote, container) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                native_clipboard_preflight(
+                    true,
+                    ClipboardEnvironment {
+                        display_server: DisplayServer::Wayland,
+                        remote,
+                        container,
+                        wayland_data_control: true,
+                        wl_copy_available: true,
+                        ..environment(TerminalName::Vte)
+                    },
+                ),
+                NativeClipboardPreflight::RemoteOnly,
+                "remote={remote} container={container}"
+            );
+        }
     }
 
-    // Container trust never fabricates success: no OSC 52 write → Failed.
     #[test]
-    fn container_unknown_brand_without_osc_write_fails() {
-        let l = legs(true, false, false, false, false, "");
-        assert!(!trusted_osc(&l, TerminalName::Unknown, true, false));
+    fn expected_delivery_matches_preflight_routes() {
+        let unknown_remote = ClipboardEnvironment {
+            remote: true,
+            ..environment(TerminalName::Unknown)
+        };
         assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Unknown,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                false,
-                true
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    // A *detected* non-supporting brand stays fail-closed even in a container
-    // (env was explicitly forwarded, so the detection is authoritative).
-    #[test]
-    fn container_detected_nonsupporting_brand_fails() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::AppleTerminal,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                false,
-                true
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    // Unknown brand over SSH (not container) keeps failing closed — the
-    // container override is deliberately narrow; `grok wrap` is the SSH path.
-    #[test]
-    fn ssh_unknown_brand_osc_only_still_fails() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve(
-                &l,
-                TerminalName::Unknown,
-                HostOs::Linux,
-                DisplayServer::Unknown,
-                true,
-                false
-            ),
-            ClipboardToastKind::Failed
-        );
-    }
-
-    // Sink in a container (no display) → container OSC toast.
-    #[test]
-    fn wrapped_container_osc_trusted_via_sink() {
-        let l = legs(true, false, false, false, true, "");
-        assert_eq!(
-            resolve_copy_toast(
-                &l,
-                "hello",
-                TerminalName::Unknown,
-                HostOs::Linux,
-                DisplayServer::Unknown,
+            expected_delivery(
+                NativeClipboardPreflight::RemoteOnly,
                 false,
                 true,
-                true,
+                unknown_remote,
             ),
-            ClipboardToastKind::CopiedOscContainer
+            ClipboardDelivery::Unverified
+        );
+        assert_eq!(
+            expected_delivery(
+                NativeClipboardPreflight::RemoteOnly,
+                false,
+                true,
+                ClipboardEnvironment {
+                    remote: true,
+                    ..environment(TerminalName::Vte)
+                },
+            ),
+            ClipboardDelivery::Failed
+        );
+        assert_eq!(
+            expected_delivery(
+                NativeClipboardPreflight::RemoteOnly,
+                false,
+                true,
+                ClipboardEnvironment {
+                    remote: true,
+                    osc52_sink: true,
+                    ..environment(TerminalName::Vte)
+                },
+            ),
+            ClipboardDelivery::Confirmed
+        );
+        assert_eq!(
+            expected_delivery(
+                NativeClipboardPreflight::RemoteOnly,
+                true,
+                false,
+                unknown_remote,
+            ),
+            ClipboardDelivery::Confirmed
+        );
+        assert_eq!(
+            expected_delivery(
+                NativeClipboardPreflight::Unavailable,
+                false,
+                false,
+                environment(TerminalName::Vte),
+            ),
+            ClipboardDelivery::Failed
         );
     }
 }
