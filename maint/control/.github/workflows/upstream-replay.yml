@@ -205,7 +205,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # ── Write: push branch + draft PR / conflict issue ────────────────────────
+  # ── Write: push branch + sync-merge PR (auto-merge) / conflict issue ──────
   publish-sync:
     name: Publish sync PR
     needs: replay-and-test
@@ -217,6 +217,10 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      # Dispatch required-check workflows onto the sync-merge branch: PRs and
+      # pushes made with GITHUB_TOKEN never fire pull_request/push events, so
+      # the branch-protection contexts must be started explicitly.
+      actions: write
     steps:
       - name: Checkout (for gh + metadata only)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -241,11 +245,49 @@ jobs:
           git fetch artifacts/sync.bundle "HEAD:refs/heads/${BRANCH}"
           git push -u origin "refs/heads/${BRANCH}:refs/heads/${BRANCH}" --force
 
-      - name: Open or update draft PR
+      # Sync branches share no mergeable diff with main (both sides carry the
+      # patch series on different upstream bases), so a raw PR from the sync
+      # branch would conflict. Instead publish a wholesale-tree merge commit:
+      # parents (main, sync-tip), tree = sync-tip's tree — main becomes exactly
+      # the validated sync tree on merge, and the PR is conflict-free by
+      # construction.
+      - name: Build sync-merge branch
+        id: syncmerge
         if: needs.replay-and-test.outputs.conflict != 'true'
+        env:
+          BRANCH: ${{ needs.replay-and-test.outputs.branch }}
+          UPSTREAM_VERSION: ${{ needs.replay-and-test.outputs.version }}
+          UPSTREAM_SHA: ${{ needs.replay-and-test.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "gork-ci"
+          git config user.email "gork-ci@users.noreply.github.com"
+          SYNC_TIP=$(git rev-parse "refs/heads/${BRANCH}")
+          git fetch origin main
+          MAIN=$(git rev-parse origin/main)
+          if [[ "$(git rev-parse "${SYNC_TIP}^{tree}")" == "$(git rev-parse "${MAIN}^{tree}")" ]]; then
+            echo "sync tree identical to main — nothing to merge"
+            echo "noop=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          MERGE_BRANCH="sync-merge/${UPSTREAM_VERSION}-${UPSTREAM_SHA:0:7}"
+          MERGE=$(git commit-tree "${SYNC_TIP}^{tree}" -p "$MAIN" -p "$SYNC_TIP" \
+            -m "Merge ${BRANCH}: product ${UPSTREAM_VERSION} + privacy patches" \
+            -m "Upstream: ${UPSTREAM_SHA}
+          Sync-Branch-Tip: ${SYNC_TIP}
+          Tree taken wholesale from the sync branch (patches + overlays + control plane).")
+          git push origin "${MERGE}:refs/heads/${MERGE_BRANCH}" --force
+          echo "noop=false" >> "$GITHUB_OUTPUT"
+          echo "merge_branch=${MERGE_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "merge_sha=${MERGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update sync PR
+        if: needs.replay-and-test.outputs.conflict != 'true' && steps.syncmerge.outputs.noop != 'true'
+        id: syncpr
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           BRANCH: ${{ needs.replay-and-test.outputs.branch }}
+          MERGE_BRANCH: ${{ steps.syncmerge.outputs.merge_branch }}
           UPSTREAM_SHA: ${{ needs.replay-and-test.outputs.sha }}
           UPSTREAM_VERSION: ${{ needs.replay-and-test.outputs.version }}
           SOURCE_REV: ${{ needs.replay-and-test.outputs.source_rev }}
@@ -255,10 +297,12 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const branch = process.env.BRANCH;
+            const branch = process.env.MERGE_BRANCH;
             const branding = process.env.BRANDING === 'true';
+            const contractsOk = process.env.CONTRACTS_OK === 'success';
+            const autoMerge = contractsOk && !branding;
             const sensitive = Number(process.env.SENSITIVE || '0');
-            const labels = [];
+            const labels = ['upstream-sync'];
             if (branding) labels.push('branding-required');
             if (sensitive > 0) labels.push('security-review-required');
 
@@ -268,23 +312,28 @@ jobs:
             } catch (_) {}
 
             const body = [
-              '## Upstream sync (automated draft)',
+              '## Upstream sync (automated)',
               '',
               '| Field | Value |',
               '| --- | --- |',
               `| Upstream version | \`${process.env.UPSTREAM_VERSION}\` |`,
               `| Upstream commit | \`${process.env.UPSTREAM_SHA}\` |`,
               `| SOURCE_REV | \`${process.env.SOURCE_REV || '(empty)'}\` |`,
-              `| Privacy contracts | ${process.env.CONTRACTS_OK === 'success' ? 'passed (--skip-expensive)' : 'FAILED or incomplete'} |`,
+              `| Privacy contracts | ${contractsOk ? 'passed (--skip-expensive)' : 'FAILED or incomplete'} |`,
               `| Branding skipped | ${branding ? 'yes — see branding-required' : 'no'} |`,
               `| Sensitive paths | ${sensitive} |`,
+              `| Sync branch | \`${process.env.BRANCH}\` |`,
+              `| Auto-merge | ${autoMerge ? 'enabled — merges when the required checks pass' : 'NOT enabled — needs a human (contracts failed or branding skipped)'} |`,
               '',
               '### Notes',
               '',
-              '- Opened by `upstream-replay.yml` **publish-sync** job. **Do not auto-merge.**',
-              '- Critical patches applied with `git am --3way` (fail-closed).',
-              '- Trailing non-critical branding patches may be skipped.',
-              '- Lock + patch queue finalized in this PR via `patchctl finalize-sync`.',
+              '- Opened by `upstream-replay.yml` **publish-sync**. Head is a wholesale-tree',
+              '  merge commit (tree = sync branch tip), so merging makes `main` exactly the',
+              '  validated sync tree.',
+              '- Critical patches applied with `git am --3way` (fail-closed on conflict).',
+              '- Lock + patch queue finalized via `patchctl finalize-sync`.',
+              '- Required checks are dispatched onto this branch by the same job',
+              '  (GITHUB_TOKEN PRs never fire pull_request events).',
               '',
               '### Sensitive upstream diff',
               '',
@@ -311,22 +360,16 @@ jobs:
               head: `${context.repo.owner}:${branch}`,
               state: 'open',
             });
+            let prNumber;
             if (prs.length) {
+              prNumber = prs[0].number;
               await github.rest.pulls.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: prs[0].number,
+                pull_number: prNumber,
                 body,
               });
-              if (labels.length) {
-                await github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prs[0].number,
-                  labels,
-                });
-              }
-              core.info(`Updated existing PR #${prs[0].number}`);
+              core.info(`Updated existing PR #${prNumber}`);
             } else {
               const { data: pr } = await github.rest.pulls.create({
                 owner: context.repo.owner,
@@ -334,19 +377,89 @@ jobs:
                 title: `sync: upstream ${process.env.UPSTREAM_VERSION} (${process.env.UPSTREAM_SHA.slice(0, 7)})`,
                 head: branch,
                 base: 'main',
-                draft: true,
+                draft: false,
                 body,
               });
-              if (labels.length) {
-                await github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: pr.number,
-                  labels,
-                });
-              }
-              core.info(`Opened draft PR #${pr.number}`);
+              prNumber = pr.number;
+              core.info(`Opened PR #${prNumber}`);
             }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              labels,
+            });
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('auto_merge', autoMerge ? 'true' : 'false');
+
+            // A successful replay supersedes older automation state:
+            // close stale sync-conflict issues and older sync-merge PRs.
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync',
+              per_page: 100,
+            });
+            for (const issue of openIssues) {
+              if (issue.pull_request) continue;
+              if (!issue.title.startsWith('sync conflict:')) continue;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Superseded: upstream ${process.env.UPSTREAM_VERSION} (${process.env.UPSTREAM_SHA.slice(0, 7)}) replayed cleanly in #${prNumber}.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.info(`Closed superseded conflict issue #${issue.number}`);
+            }
+            const { data: openPrs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            for (const pr of openPrs) {
+              if (pr.number === prNumber) continue;
+              if (!pr.head.ref.startsWith('sync-merge/')) continue;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `Superseded by #${prNumber} (upstream ${process.env.UPSTREAM_VERSION}).`,
+              });
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                state: 'closed',
+              });
+              core.info(`Closed superseded sync PR #${pr.number}`);
+            }
+
+      # Start the branch-protection contexts on the merge branch, then arm
+      # auto-merge. GitHub performs the merge once all required checks pass;
+      # any red check leaves the PR open (fail-closed).
+      - name: Dispatch required checks and enable auto-merge
+        if: >-
+          needs.replay-and-test.outputs.conflict != 'true' &&
+          steps.syncmerge.outputs.noop != 'true' &&
+          steps.syncpr.outputs.auto_merge == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_BRANCH: ${{ steps.syncmerge.outputs.merge_branch }}
+          PR_NUMBER: ${{ steps.syncpr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh workflow run gork-privacy.yml --ref "${MERGE_BRANCH}"
+          gh workflow run patch-roundtrip.yml --ref "${MERGE_BRANCH}"
+          gh pr merge "${PR_NUMBER}" --auto --merge
 
       - name: Open conflict issue (dedupe)
         if: needs.replay-and-test.outputs.conflict == 'true'

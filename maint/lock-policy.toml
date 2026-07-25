@@ -7,11 +7,11 @@ mode = "inherit-upstream"
 
 # Run after successful apply (before contracts). Fail-closed if any command fails.
 post_apply_commands = [
+  # Security minimum-version floors (maint/security-floors.toml): bump only
+  # when the upstream-inherited lock is below a floor; no-op once upstream
+  # catches up. Keeps the cargo-audit gate green without decoupling the
+  # lockfile from upstream.
+  ["python3", "maint/scripts/apply_security_floors.py"],
   # Validate lockfile is coherent with the tree (does not rewrite it).
   ["cargo", "metadata", "--format-version", "1", "--no-deps"],
 ]
-
-# Optional: pin security bumps that Gork must carry (uncomment and set precise versions).
-# cargo_update_pins = [
-#   ["cargo", "update", "-p", "quinn-proto", "--precise", "X.Y.Z"],
-# ]
