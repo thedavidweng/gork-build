@@ -58,29 +58,36 @@ async fn verb_group_header_drag_copy_pty() {
         std::fs::write(&path, "hello drag copy\n").expect("write fixture file");
         paths.push(dunce::canonicalize(&path).unwrap_or(path));
     }
-    for (i, p) in paths.iter().enumerate() {
-        enqueue_tool_turn(
-            &content,
-            &format!("call_d{i}"),
-            "read_file",
-            json!({ "target_file": p.to_string_lossy() }).to_string(),
-        );
-    }
+    let _tool_turns: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            expect_tool_turn(
+                &content,
+                &format!("call_d{i}"),
+                "read_file",
+                json!({ "target_file": p.to_string_lossy() }).to_string(),
+            )
+        })
+        .collect();
     content.set_response(DONE_SENTINEL);
 
     let binary = pager_binary().expect("resolve pager binary");
     // SSH_CONNECTION so macOS routes the copy through OSC 52 (readback path);
     // same pattern as read_tool_header_selection_copies_path_only_pty.
-    let mut env = content.env_for_pager();
-    env.push((
+    let overrides: Vec<(String, String)> = vec![(
         "SSH_CONNECTION".into(),
         "scripted-test 1 127.0.0.1 2".into(),
-    ));
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut harness = PtyHarness::new_in_dir(
+    )];
+    let env_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let mut harness = PtyHarness::spawn_with_content_env_in_dir(
         &binary,
         DEFAULT_ROWS,
         DEFAULT_COLS,
+        &content,
         &[],
         &env_refs,
         Some(content.home()),

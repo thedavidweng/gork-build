@@ -20,11 +20,11 @@ Gork-Risk: medium
  .../npm/grok-win32-x64/README.md              | 10 ++-
  .../npm/grok-win32-x64/package.json           |  4 +-
  .../codegen/xai-grok-pager/npm/grok/README.md | 67 +++++++------------
- .../codegen/xai-grok-pager/npm/grok/bin/grok  | 12 ++--
- .../npm/grok/bin/postinstall.js               | 18 ++---
+ .../codegen/xai-grok-pager/npm/grok/bin/grok  |  8 +--
+ .../npm/grok/bin/postinstall.js               | 16 ++---
  .../xai-grok-pager/npm/grok/package.json      | 17 ++---
  .../scripts/assemble-platform-packages.js     |  2 +-
- 17 files changed, 86 insertions(+), 114 deletions(-)
+ 17 files changed, 83 insertions(+), 111 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
 index b8cbeaf5506095bb68f37cca5302c87fdb4f8594..b67043e186b1afe0c975d2fad221e4e1b501c433 100644
@@ -322,21 +322,15 @@ index b70910e6f298d3964133f3ec6bb9594d9c03119e..022c6c8ae78f2bc5787729df00782a5e
 -Run `/feedback` inside Grok to report issues or send feedback directly.
 +Apache-2.0 — see the repository `LICENSE` and `NOTICE`.
 diff --git a/crates/codegen/xai-grok-pager/npm/grok/bin/grok b/crates/codegen/xai-grok-pager/npm/grok/bin/grok
-index c033ab622dda5c1920ac93faa3fbd262c655135b..dcd54d9207f142fee10e898a34ecac8073c67e9a 100755
+index 22837c4cce4d0bc27d53d34e2a81c3607b4cbc7d..f49f28d2d00bc401994c3ca10c320125b86603f5 100755
 --- a/crates/codegen/xai-grok-pager/npm/grok/bin/grok
 +++ b/crates/codegen/xai-grok-pager/npm/grok/bin/grok
-@@ -7,18 +7,18 @@
+@@ -9,14 +9,14 @@
+ //      payload in place under node_modules and exec that
  //
- // Binary location strategy (in priority order):
- //   1. ~/.grok/bin/grok        — canonical versioned symlink (postinstall.js)
--//   2. @xai-official/grok-<platform>/bin/grok[.exe]      — decompressed sibling
--//   3. @xai-official/grok-<platform>/bin/grok[.exe].br   — brotli-compressed
-+//   2. @gork-build/gork-<platform>/bin/grok[.exe]      — decompressed sibling
-+//   3. @gork-build/gork-<platform>/bin/grok[.exe].br   — brotli-compressed
- //
- // Per-platform binaries are shipped brotli-compressed to stay well under
--// npm's ~200 MB tarball ceiling. See sibling packages @xai-official/grok-*.
-+// npm's ~200 MB tarball ceiling. See sibling packages @gork-build/gork-*.
+ // Per-platform binaries ship brotli-compressed to stay under npm's ~200 MB
+-// tarball ceiling. See sibling packages @xai-official/grok-*.
++// tarball ceiling. See sibling packages @gork-build/gork-*.
  const { spawn } = require('child_process');
  const path = require('path');
  const fs = require('fs');
@@ -348,7 +342,7 @@ index c033ab622dda5c1920ac93faa3fbd262c655135b..dcd54d9207f142fee10e898a34ecac80
  const IS_WINDOWS = process.platform === 'win32';
  const EXE = IS_WINDOWS ? '.exe' : '';
  const BIN_NAME = `grok${EXE}`;
-@@ -33,7 +33,7 @@ function readLocalVersion() {
+@@ -38,7 +38,7 @@ function readLocalVersion() {
  // matching optional dependency wasn't installed (unsupported platform, or
  // npm refused to install optionalDependencies).
  function resolvePlatformPackageDir() {
@@ -357,7 +351,7 @@ index c033ab622dda5c1920ac93faa3fbd262c655135b..dcd54d9207f142fee10e898a34ecac80
      try {
          return path.dirname(require.resolve(`${platformPkg}/package.json`));
      } catch {
-@@ -97,7 +97,7 @@ function resolveBinary() {
+@@ -112,7 +112,7 @@ function resolveBinary() {
      const platformDir = resolvePlatformPackageDir();
      if (!platformDir) {
          console.error(`${pkgName}: no platform binary installed for ${process.platform}-${process.arch}.`);
@@ -367,7 +361,7 @@ index c033ab622dda5c1920ac93faa3fbd262c655135b..dcd54d9207f142fee10e898a34ecac80
          console.error(`  or the platform is not supported.`);
          process.exit(1);
 diff --git a/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js b/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
-index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93ac8967510 100644
+index 469d7c496c265467231315f3a0d83532f3b8a0da..1c1f2c033d9b991862dd7638495b5361357c6a7d 100644
 --- a/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
 +++ b/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
 @@ -1,6 +1,6 @@
@@ -378,7 +372,7 @@ index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93a
  // and installs it to ~/.grok/bin/ using versioned filenames:
  //
  //   Unix:    grok-<version>  +  grok  (symlink)
-@@ -28,7 +28,7 @@ const SUPPORTED = new Set([
+@@ -36,7 +36,7 @@ const SUPPORTED = new Set([
      'win32-arm64',
  ]);
  if (!SUPPORTED.has(key)) {
@@ -387,7 +381,7 @@ index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93a
      process.exit(0);
  }
  
-@@ -37,7 +37,7 @@ if (!SUPPORTED.has(key)) {
+@@ -45,7 +45,7 @@ if (!SUPPORTED.has(key)) {
  // other five are silently skipped. If the matching one is missing, npm was
  // likely invoked with --no-optional or the platform is unsupported.
  function resolvePlatformPackageDir() {
@@ -396,7 +390,7 @@ index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93a
      try {
          return path.dirname(require.resolve(`${platformPkg}/package.json`));
      } catch {
-@@ -48,7 +48,7 @@ function resolvePlatformPackageDir() {
+@@ -56,7 +56,7 @@ function resolvePlatformPackageDir() {
  let version;
  try { version = require('../package.json').version; } catch {}
  if (!version) {
@@ -405,16 +399,7 @@ index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93a
      process.exit(0);
  }
  
-@@ -75,7 +75,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
-     } else if (fs.existsSync(rawPath)) {
-         vendoredBinPath = rawPath;
-     } else {
--        console.error(`@xai-official/grok: missing binary at ${brPath}`);
-+        console.error(`@gork-build/gork: missing binary at ${brPath}`);
-         return false;
-     }
- 
-@@ -115,7 +115,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
+@@ -119,7 +119,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
                      throw copyErr;
                  }
              } catch (e2) {
@@ -423,7 +408,7 @@ index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93a
                  console.error('Close all running grok processes and try again.');
                  return false;
              }
-@@ -165,9 +165,9 @@ function cleanupOldVersions(binName) {
+@@ -180,9 +180,9 @@ function cleanupOldVersions(binName) {
  
  const platformDir = resolvePlatformPackageDir();
  if (!platformDir) {
@@ -435,7 +420,7 @@ index 142e45eca714aa3a4f8d186819006aecedc5f183..ef91d2976859cbcf3e4231ea2426d93a
      process.exit(0);
  }
  
-@@ -188,7 +188,7 @@ const npmRegistry = process.env.GROK_NPM_REGISTRY
+@@ -203,7 +203,7 @@ const npmRegistry = process.env.GROK_NPM_REGISTRY
      || (() => {
          try {
              const resolved = execSync(
@@ -493,16 +478,16 @@ index f64800f9e92b786f7b0c666ed873ab95a42e50f0..dcfa846321cedde3496f237bd25b44e9
  // `os` + `cpu` filters.
  //
 
-base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
-prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
+base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
+prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
-prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
-prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
+prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
+prerequisite-patch-id: a52276cc5d5a3f41e35f0a9442966519c69eef05
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
-prerequisite-patch-id: a000f6df974f25e40aa21215faf38fef93c7f02c
+prerequisite-patch-id: 742adf9b103b4657a0cbcac11f7fba3256bff784
 -- 
 2.50.1 (Apple Git-155)
 

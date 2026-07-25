@@ -23,6 +23,15 @@ pub async fn set_show_timeline(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.show_timeline = Some(value)).await
 }
 
+pub async fn set_page_flip_on_send(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.page_flip_on_send = Some(value)).await
+}
+
+/// Persist `[ui].combine_queued_prompts` via `update_config`.
+pub async fn set_combine_queued_prompts(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.combine_queued_prompts = Some(value)).await
+}
+
 /// Persist `[ui].simple_mode` via `update_config`. Same `Option<bool>`
 /// shape as `show_timestamps`.
 pub async fn set_simple_mode(value: bool) -> Result<()> {
@@ -58,6 +67,11 @@ pub async fn set_contextual_hint_small_screen(value: bool) -> Result<()> {
 /// Persist `[ui.contextual_hints].word_select` via `update_config`.
 pub async fn set_contextual_hint_word_select(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.contextual_hints.word_select = Some(value)).await
+}
+
+/// Persist `[ui.contextual_hints].ssh_wrap` via `update_config`.
+pub async fn set_contextual_hint_ssh_wrap(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.contextual_hints.ssh_wrap = Some(value)).await
 }
 
 /// Persist `[ui].theme` via `update_config`. Caller must pass the
@@ -100,6 +114,14 @@ pub async fn set_default_model(value: String) -> Result<()> {
         if value.is_empty() { None } else { Some(value) },
         None,
     )
+    .await
+}
+
+/// Persist `[privacy].privacy_banner_acked` (RFC 3339 UTC dismiss time).
+pub async fn set_privacy_banner_acked(acked_at_rfc3339: String) -> Result<()> {
+    update_config(|cfg| {
+        cfg.privacy.privacy_banner_acked = Some(acked_at_rfc3339);
+    })
     .await
 }
 
@@ -241,6 +263,12 @@ pub async fn set_voice_capture_mode(value: String) -> Result<()> {
 /// locale, falling back to English).
 pub async fn set_voice_stt_language(value: String) -> Result<()> {
     update_config(|cfg| cfg.ui.voice_stt_language = Some(value)).await
+}
+
+/// Persist `[ui].voice_keybind_enabled` via `update_config`. When `false` the
+/// Ctrl+Space / F8 voice chord is ignored (`/voice` still works).
+pub async fn set_voice_keybind_enabled(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.voice_keybind_enabled = Some(value)).await
 }
 
 /// Persist `[ui].default_selected_permission` via `update_config`. Value is

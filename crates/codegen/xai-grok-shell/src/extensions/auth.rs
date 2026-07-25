@@ -19,6 +19,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/setApiKey" => handle_set_api_key(args),
         "x.ai/auth/submit_code" => handle_submit_code(agent, args),
         "x.ai/auth/get_url" => handle_get_url(agent).await,
+        "x.ai/auth/cancel" => handle_cancel(agent, args),
         "x.ai/auth/logout" => handle_logout(agent, args).await,
         "x.ai/auth/info" => handle_info(agent),
         "x.ai/auth/check_subscription" => handle_check_subscription(agent).await,
@@ -26,15 +27,38 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     }
 }
 
+/// Stop an in-flight interactive login (device poll / loopback wait).
+/// Idempotent: no-op when nothing is waiting.
+///
+/// When `request_seq` is present, only that attempt is cancelled — a delayed
+/// cancel cannot tear down a successor login that already replaced it.
+fn handle_cancel(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    struct CancelParams {
+        #[serde(default)]
+        request_seq: Option<u64>,
+    }
+    let params: CancelParams =
+        serde_json::from_str(args.params.get()).unwrap_or(CancelParams { request_seq: None });
+    match params.request_seq {
+        Some(seq) => agent.interactive_auth.cancel_for_client_seq(seq),
+        None => agent.interactive_auth.cancel(),
+    }
+    to_raw_response(&serde_json::json!({ "cancelled": true }))
+}
+
 async fn handle_get_bearer_token(agent: &MvpAgent) -> ExtResult {
+    // Fail closed for session tokens: desktop resume treats non-null as success.
+    // Never return a hard-expired AT. Still surface wire-valid session ATs and
+    // static/BYOK keys (process model key / env / disk api_key) so non-session
+    // sessions keep working when AuthManager has no OIDC entry.
     let token = match agent.auth_manager.get_valid_token().await {
         Ok(token) => Some(token),
         Err(_) => agent
-            .sampling_config
-            .borrow()
-            .api_key
-            .clone()
-            .or_else(|| agent.auth_manager.current().map(|a| a.key)),
+            .auth_manager
+            .current_wire_valid()
+            .map(|a| a.key)
+            .or_else(|| agent.auth_manager.static_api_key_for_export()),
     };
     ExtMethodResult::success(serde_json::json!({ "token": token }))
         .to_ext_response()
@@ -85,20 +109,20 @@ fn handle_submit_code(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let params: SubmitCodeParams = serde_json::from_str(args.params.get())
         .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
 
-    let auth_code_tx = agent.auth_code_tx.borrow();
-    if let Some(ref tx) = *auth_code_tx {
-        tx.try_send(params.code).map_err(|e| {
-            acp::Error::internal_error().data(format!("failed to submit auth code: {e}"))
-        })?;
-        to_raw_response(&serde_json::json!({ "submitted": true }))
-    } else {
-        Err(acp::Error::invalid_params().data("no pending auth session"))
+    match agent.interactive_auth.submit_code(params.code) {
+        Ok(()) => to_raw_response(&serde_json::json!({ "submitted": true })),
+        Err(crate::auth::single_flight::SubmitCodeError::SendFailed(e)) => {
+            Err(acp::Error::internal_error().data(format!("failed to submit auth code: {e}")))
+        }
+        Err(crate::auth::single_flight::SubmitCodeError::NoPendingAttempt) => {
+            Err(acp::Error::invalid_params().data("no pending auth session"))
+        }
     }
 }
 
 /// Awaits the auth URL from the oneshot channel (blocks until ready).
 async fn handle_get_url(agent: &MvpAgent) -> ExtResult {
-    let rx = agent.auth_url_rx.borrow_mut().take();
+    let rx = agent.interactive_auth.take_url_rx();
     // `None` when no URL was sent (cached creds, early error, second poll):
     // report mode as `null` rather than mislabeling it `loopback`.
     let (auth_url, mode) = match rx {
@@ -124,6 +148,9 @@ async fn handle_logout(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
     let params: LogoutParams = serde_json::from_str(args.params.get())
         .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
+
+    // Stop any in-flight login so it cannot write credentials back after logout.
+    agent.interactive_auth.cancel();
 
     let result = crate::auth::perform_logout(&agent.auth_manager, params.scope.as_deref())
         .map_err(|e| acp::Error::internal_error().data(format!("failed to logout: {e}")))?;
@@ -185,7 +212,7 @@ fn handle_info(agent: &MvpAgent) -> ExtResult {
         .load()
         .as_ref()
         .map(|m| m.0.to_string());
-    let auth = agent.auth_manager.current();
+    let auth = agent.auth_manager.current_or_expired();
     let raw_asset_id = auth.as_ref().and_then(|a| a.profile_image_asset_id.clone());
 
     // Return a grok-asset:// URL that the Electron renderer resolves at
@@ -218,8 +245,11 @@ fn handle_info(agent: &MvpAgent) -> ExtResult {
             .as_ref()
             .map(|a| a.team_blocked_reasons.clone())
             .unwrap_or_default(),
+        // No credential ⇒ unknown privacy state: report opted-out (fail closed),
+        // matching `AuthManager::allows_data_collection` / GrokAuth Default.
         coding_data_retention_opt_out: auth
             .as_ref()
-            .is_some_and(|a| a.coding_data_retention_opt_out),
+            .map(|a| a.coding_data_retention_opt_out)
+            .unwrap_or_else(crate::auth::default_coding_data_retention_opt_out),
     })
 }

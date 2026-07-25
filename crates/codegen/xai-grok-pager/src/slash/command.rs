@@ -28,6 +28,13 @@ pub struct ScheduledTaskPreview {
     pub tag: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoctorRequest {
+    Report,
+    ListFixes,
+    Fix(crate::diagnostics::DiagnosticId),
+}
+
 /// Result of running a slash command.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -38,6 +45,8 @@ pub enum CommandResult {
     /// Command handled but was a no-op (e.g., model already selected).
     /// Included for TUI parity. Dispatch treats it identically to Handled.
     HandledNoOp,
+    /// Build or act on TUI doctor state from live app/session inputs.
+    Doctor(DoctorRequest),
     /// Command failed with an error message.
     Error(String),
     /// Command produced a user-visible message.
@@ -99,6 +108,9 @@ pub struct AppCtx<'a> {
     pub cwd: &'a std::path::Path,
     /// Session announcements (critical or promo) exist (gates `/announcements` visibility).
     pub has_session_announcements: bool,
+    /// Consumer billing surface (`AppView::usage_visible`). Gates `/usage` subcommands.
+    pub billing_surface_visible: bool,
+    pub workflows_available: bool,
     /// Effective render mode of this process (gates `/minimal` and
     /// `/fullscreen` visibility). Same source of truth as
     /// [`CommandExecCtx::screen_mode`], carried by the owning
@@ -115,6 +127,8 @@ pub struct CommandExecCtx<'a> {
     pub session_id: Option<&'a acp::SessionId>,
     pub bundle_state: &'a BundleState,
     pub(crate) screen_mode: crate::app::ScreenMode,
+    /// Consumer billing surface (`AppView::usage_visible`). Gates `/usage` subcommands.
+    pub billing_surface_visible: bool,
     /// Snapshot of the active agent's PAGER-owned settings, built at
     /// command-build time by the dispatcher. Slash commands like
     /// `/multiline` read this to compute `!current` and dispatch a
@@ -147,6 +161,16 @@ pub trait SlashCommand: Send + Sync {
     /// Whether the command accepts arguments at all.
     fn takes_args(&self) -> bool {
         false
+    }
+
+    /// Runtime args contract (e.g. subcommands only for some auth modes).
+    /// Defaults to [`Self::takes_args`]. Dropdown/completion paths only:
+    /// insert text (trailing space), the args-phase snapshot, and argument
+    /// suggestions. Enter-completeness ([`crate::slash::is_command_complete`])
+    /// keys off the static [`Self::takes_args`] / [`Self::args_required`] pair.
+    #[allow(unused_variables)]
+    fn takes_args_now(&self, ctx: &AppCtx) -> bool {
+        self.takes_args()
     }
 
     /// Whether arguments are required for execution.
@@ -226,12 +250,13 @@ pub trait SlashCommand: Send + Sync {
     /// mode (`gork --minimal`).
     ///
     /// Minimal mode deletes the interactive fullscreen scrollback pane, the
-    /// in-app mouse selection/copy path, and the agent dashboard, handing
-    /// scroll / search / selection back to the terminal (K7). Commands that
-    /// drive those deleted surfaces — `/find`, `/copy`, `/dashboard` — have
-    /// nothing to act on, so the central dispatch gate refuses them with a
-    /// "/<x> is not available in minimal mode" message (committed as a system
-    /// block).
+    /// in-app mouse selection path, and the agent dashboard, handing scroll /
+    /// search / selection back to the terminal (K7). Commands that drive those
+    /// deleted surfaces — `/find`, `/dashboard` — have nothing to act on, so
+    /// the central dispatch gate refuses them with a "/<x> is not available in
+    /// minimal mode" message (committed as a system block). Clipboard helpers
+    /// like `/copy` stay available: they read scrollback state and do not need
+    /// the fullscreen pane.
     ///
     /// Defaults to `true` — a **denylist, not an allowlist**: the many
     /// mode-agnostic commands keep working and new commands are available in

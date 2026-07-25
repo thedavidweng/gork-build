@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::rs;
+use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
 use crate::types::{
     ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage, FinishReason,
     ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition, TraceContext,
@@ -114,6 +115,12 @@ pub enum SyntheticReason {
     /// Scheduled task (`/loop`) prompt fired by the scheduler.  Wakes the
     /// agent.
     SchedulerFired,
+    /// Feedback from a `Stop`/`SubagentStop` hook that blocked the agent from
+    /// stopping. Injected in-turn so the model keeps working within the same turn.
+    StopHookFeedback,
+    /// Working-directory switch context appended after a session relocation.
+    /// Carries a generation marker so recovery can detect an existing append.
+    WorkingDirectorySwitch,
     /// Catch-all for unknown/future variants.  Preserves forward compatibility
     /// so older clients can deserialize sessions written by newer versions.
     #[serde(other)]
@@ -148,6 +155,8 @@ impl SyntheticReason {
             | Self::AutoRecovery
             | Self::Interjection
             | Self::GoalSummary
+            | Self::StopHookFeedback
+            | Self::WorkingDirectorySwitch
             | Self::Unknown => false,
         }
     }
@@ -195,6 +204,10 @@ pub struct UserItem {
     /// deserialize correctly (`serde(default)` fills in `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic_reason: Option<SyntheticReason>,
+    /// Relocation generation for a working-directory switch reminder.
+    /// Structural metadata keeps recovery dedup independent of reminder text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_generation: Option<u64>,
     /// Set on a genuine user message that directly follows a user-interrupted
     /// turn (see [`PriorTurnInterrupt`]). `None` for synthetic messages and for
     /// real messages that did not follow an interrupt. `skip_serializing_if`
@@ -471,30 +484,52 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
-/// A tool that the backend executes server-side during inference.
-/// The client sends these as native Responses API tool types (not Function).
-/// The backend's agentic sampler handles execution and streams results back.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostedTool {
-    /// Web search executed server-side by the backend's agentic sampler.
-    WebSearch {
-        /// Optional domain allowlist for search results.
-        allowed_domains: Option<Vec<String>>,
-    },
-    /// X (Twitter) search executed server-side by the backend's agentic sampler.
-    /// This is xAI-specific — not part of the OpenAI Responses API, so it's
-    /// injected as raw JSON into the request body by the sampler client.
-    XSearch,
+    WebSearch { options: Option<WebSearchOptions> },
+    XSearch { options: Option<XSearchOptions> },
 }
 
 impl HostedTool {
-    /// The name the backend registers this tool under server-side.
     pub fn wire_name(&self) -> &'static str {
         match self {
             HostedTool::WebSearch { .. } => "web_search",
-            HostedTool::XSearch => "x_search",
+            HostedTool::XSearch { .. } => "x_search",
         }
     }
+}
+
+/// Resolve `overrides` onto the hosted tools in place so the serialized request matches the returned
+/// echo. Empty options normalize to absent (via `drop_empty`), so a stray `{}` never clears a seeded
+/// bound. Returns the applied overrides.
+pub fn apply_tool_overrides(
+    tools: &mut [HostedTool],
+    overrides: Option<&ToolOverrides>,
+) -> ToolOverrides {
+    let mut applied = ToolOverrides::default();
+    for tool in tools.iter_mut() {
+        match tool {
+            HostedTool::XSearch { options } => {
+                if let Some(x) = drop_empty(
+                    overrides.and_then(|o| o.x_search.clone()),
+                    XSearchOptions::is_empty,
+                ) {
+                    *options = Some(x);
+                }
+                applied.x_search = drop_empty(options.clone(), XSearchOptions::is_empty);
+            }
+            HostedTool::WebSearch { options } => {
+                if let Some(w) = drop_empty(
+                    overrides.and_then(|o| o.web_search.clone()),
+                    WebSearchOptions::is_empty,
+                ) {
+                    *options = Some(w);
+                }
+                applied.web_search = drop_empty(options.clone(), WebSearchOptions::is_empty);
+            }
+        }
+    }
+    applied
 }
 
 impl From<ToolDefinition> for ToolSpec {
@@ -546,6 +581,8 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// JSON Schema for structured output (strict mode).
     pub json_schema: Option<serde_json::Value>,
+    /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ConversationRequest {
@@ -861,6 +898,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: None,
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -873,6 +911,7 @@ impl ConversationItem {
         Self::User(UserItem {
             content: parts,
             synthetic_reason: None,
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -889,6 +928,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::CompactionMeta),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -906,9 +946,23 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SystemReminder),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
+    }
+
+    /// Return the working-directory generation carried by this switch reminder.
+    pub fn working_directory_switch_generation(&self) -> Option<u64> {
+        match self {
+            Self::User(user)
+                if user.synthetic_reason.as_ref()
+                    == Some(&SyntheticReason::WorkingDirectorySwitch) =>
+            {
+                user.cwd_generation
+            }
+            _ => None,
+        }
     }
 
     /// User message containing project instructions (AGENTS.md / CLAUDE.md),
@@ -921,6 +975,20 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::ProjectInstructions),
+            cwd_generation: None,
+            prior_turn_interrupt: None,
+            prompt_index: None,
+        })
+    }
+
+    /// Working-directory switch reminder with a structural generation marker.
+    pub fn working_directory_switch(content: impl Into<String>, cwd_generation: u64) -> Self {
+        Self::User(UserItem {
+            content: vec![ContentPart::Text {
+                text: Arc::<str>::from(content.into()),
+            }],
+            synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
+            cwd_generation: Some(cwd_generation),
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -937,6 +1005,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::AutoContinue),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -953,6 +1022,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::AutoRecovery),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -970,6 +1040,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::Interjection),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -982,6 +1053,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::TaskCompleted),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -994,6 +1066,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SubagentCompleted),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -1006,6 +1079,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::NotificationDrain),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -1018,6 +1092,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::GoalSummary),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -1034,6 +1109,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -1046,6 +1122,20 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SchedulerFired),
+            cwd_generation: None,
+            prior_turn_interrupt: None,
+            prompt_index: None,
+        })
+    }
+
+    /// See [`SyntheticReason::StopHookFeedback`].
+    pub fn stop_hook_feedback(content: impl Into<String>) -> Self {
+        Self::User(UserItem {
+            content: vec![ContentPart::Text {
+                text: Arc::<str>::from(content.into()),
+            }],
+            synthetic_reason: Some(SyntheticReason::StopHookFeedback),
+            cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
         })
@@ -2145,7 +2235,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             parallel_tool_calls: None,
             previous_response_id: None,
             prompt: None,
-            prompt_cache_key: None,
+            prompt_cache_key: req.prompt_cache_key.clone(),
             prompt_cache_retention: None,
             reasoning: Some(rs::Reasoning {
                 effort: req.reasoning_effort.map(|e| e.to_responses_api()),
@@ -2386,11 +2476,14 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
 
     for hosted in &req.hosted_tools {
         match hosted {
-            HostedTool::WebSearch { allowed_domains } => {
-                let filters = allowed_domains
+            HostedTool::WebSearch { options } => {
+                // An empty allowlist is unbounded, so it emits no filter.
+                let filters = options
                     .as_ref()
+                    .and_then(|o| o.allowed_domains.as_deref())
+                    .filter(|domains| !domains.is_empty())
                     .map(|domains| rs::WebSearchToolFilters {
-                        allowed_domains: Some(domains.clone()),
+                        allowed_domains: Some(domains.to_vec()),
                     });
                 tools.push(rs::Tool::WebSearch(rs::WebSearchTool {
                     filters,
@@ -2399,7 +2492,7 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
             }
             // XSearch is xAI-specific — not in async_openai's rs::Tool enum.
             // Injected as raw JSON by the sampler client after serialization.
-            HostedTool::XSearch => {}
+            HostedTool::XSearch { .. } => {}
         }
     }
 
@@ -2411,19 +2504,21 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
 ///
 /// The sampler client injects these into the serialized request body's
 /// `tools` array before sending to the API.
-pub fn extra_raw_tools(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value> {
-    let mut raw = Vec::new();
+pub fn extra_tool_entries(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
     for tool in hosted_tools {
         match tool {
-            // WebSearch is handled natively via rs::Tool::WebSearch in
-            // build_responses_tools() — no raw JSON injection needed.
+            // WebSearch ships natively (rs::Tool::WebSearch), so no JSON entry here.
             HostedTool::WebSearch { .. } => {}
-            HostedTool::XSearch => {
-                raw.push(serde_json::json!({"type": "x_search"}));
+            HostedTool::XSearch { options } => {
+                entries.push(match options {
+                    Some(o) => o.to_tool_entry(),
+                    None => XSearchOptions::default().to_tool_entry(),
+                });
             }
         }
     }
-    raw
+    entries
 }
 
 // ============================================================================
@@ -3449,6 +3544,7 @@ mod compaction_item_bridge_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_overrides::*;
     use assert_matches::assert_matches;
 
     #[test]
@@ -3588,9 +3684,7 @@ mod tests {
                     parameters: serde_json::json!({"type": "object"}),
                 },
             ]);
-        req.hosted_tools = vec![HostedTool::WebSearch {
-            allowed_domains: None,
-        }];
+        req.hosted_tools = vec![HostedTool::WebSearch { options: None }];
 
         let responses_req: rs::CreateResponse = (&req).into();
         let tools = responses_req.tools.expect("tools should be set");
@@ -3625,13 +3719,166 @@ mod tests {
                 description: None,
                 parameters: serde_json::json!({"type": "object"}),
             }]);
-        req.hosted_tools = vec![HostedTool::XSearch];
+        req.hosted_tools = vec![HostedTool::XSearch { options: None }];
 
         let responses_req: rs::CreateResponse = (&req).into();
         let tools = responses_req.tools.unwrap_or_default();
         assert!(tools.is_empty(), "expected no tools, got: {tools:?}");
-        let raw = extra_raw_tools(&req.hosted_tools);
-        assert_eq!(raw, vec![serde_json::json!({"type": "x_search"})]);
+        let entries = extra_tool_entries(&req.hosted_tools);
+        assert_eq!(entries, vec![serde_json::json!({"type": "x_search"})]);
+    }
+
+    #[test]
+    fn x_search_serializes_to_the_tool_entry() {
+        // A full bound reaches the flat snake_case entry; an empty or `None` bound emits the bare entry.
+        let dated = extra_tool_entries(&[HostedTool::XSearch {
+            options: Some(XSearchOptions {
+                date_bound: Some(
+                    SearchDateBound::new(Some("2024-01-01".into()), Some("2024-03-15".into()))
+                        .unwrap(),
+                ),
+            }),
+        }]);
+        assert_eq!(
+            dated,
+            vec![serde_json::json!({
+                "type": "x_search",
+                "from_date": "2024-01-01",
+                "to_date": "2024-03-15",
+            })]
+        );
+        let bare = vec![serde_json::json!({"type": "x_search"})];
+        assert_eq!(
+            extra_tool_entries(&[HostedTool::XSearch {
+                options: Some(XSearchOptions {
+                    date_bound: Some(SearchDateBound::new(None, None).unwrap()),
+                }),
+            }]),
+            bare
+        );
+        assert_eq!(
+            extra_tool_entries(&[HostedTool::XSearch { options: None }]),
+            bare
+        );
+    }
+
+    #[test]
+    fn tool_overrides_update_apply_merges_tristate() {
+        let x = XSearchOptions {
+            date_bound: Some(SearchDateBound::new(None, Some("2024-03-15".into())).unwrap()),
+        };
+        let w = WebSearchOptions {
+            allowed_domains: Some(vec!["x.com".into()]),
+        };
+
+        // set: an object sets that tool's options.
+        let base = ToolOverridesUpdate {
+            x_search: Some(Some(x.clone())),
+            web_search: None,
+        }
+        .apply(None);
+        assert_eq!(
+            base.as_ref().and_then(|o| o.x_search.clone()),
+            Some(x.clone())
+        );
+
+        // leave: an absent field keeps the base's entry; a set field updates only itself.
+        let merged = ToolOverridesUpdate {
+            x_search: None,
+            web_search: Some(Some(w.clone())),
+        }
+        .apply(base.clone());
+        assert_eq!(merged.as_ref().and_then(|o| o.x_search.clone()), Some(x));
+        assert_eq!(merged.and_then(|o| o.web_search), Some(w));
+
+        // clear: `null` clears just that tool; clearing the last remaining tool
+        // empties the override to `None`.
+        let cleared = ToolOverridesUpdate {
+            x_search: Some(None),
+            web_search: None,
+        }
+        .apply(base);
+        assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn empty_per_turn_override_never_clears_a_seeded_cutoff() {
+        use serde_json::json;
+        // A stray empty `{}` carries no instruction, so a definition-seeded cutoff must survive it
+        // (only an explicit bound changes the window; `null` reverts to the seed).
+        let update = ToolOverridesUpdate::parse(&json!({"xSearch": {}}))
+            .unwrap()
+            .apply(None);
+        let mut tools = vec![HostedTool::XSearch {
+            options: Some(XSearchOptions {
+                date_bound: Some(SearchDateBound::new(None, Some("2024-01-01".into())).unwrap()),
+            }),
+        }];
+        let applied = apply_tool_overrides(&mut tools, update.as_ref());
+        assert_eq!(
+            applied
+                .x_search
+                .and_then(|x| x.date_bound)
+                .and_then(|b| b.to_date().map(str::to_owned)),
+            Some("2024-01-01".to_string()),
+            "an empty override must not widen a seeded cutoff"
+        );
+
+        let mut tools = vec![HostedTool::XSearch {
+            options: Some(XSearchOptions {
+                date_bound: Some(SearchDateBound::new(None, Some("2024-01-01".into())).unwrap()),
+            }),
+        }];
+        let direct = ToolOverrides::parse(&json!({"xSearch": {}})).unwrap();
+        let applied = apply_tool_overrides(&mut tools, Some(&direct));
+        assert_eq!(
+            applied
+                .x_search
+                .and_then(|x| x.date_bound)
+                .and_then(|b| b.to_date().map(str::to_owned)),
+            Some("2024-01-01".to_string()),
+            "an empty override leaves the seeded bound, which stays attested"
+        );
+    }
+
+    #[test]
+    fn search_date_bound_validation() {
+        // Non-canonical dates: unpadded is NotZeroPadded; a five-digit year and year 0 (below the
+        // minimum year 1) are InvalidDate; a valid padded window is accepted.
+        assert!(matches!(
+            SearchDateBound::new(Some("2024-3-5".into()), None),
+            Err(SearchDateBoundError::NotZeroPadded { .. })
+        ));
+        assert!(matches!(
+            SearchDateBound::new(Some("10000-01-01".into()), None),
+            Err(SearchDateBoundError::InvalidDate { .. })
+        ));
+        assert!(matches!(
+            SearchDateBound::new(Some("0000-01-01".into()), None),
+            Err(SearchDateBoundError::InvalidDate { .. })
+        ));
+        assert!(SearchDateBound::new(Some("0001-01-01".into()), Some("0099-12-31".into())).is_ok());
+
+        // Inverted window is rejected with the typed error; equal and ordered windows are accepted.
+        assert!(matches!(
+            SearchDateBound::new(Some("2024-03-15".into()), Some("2024-01-01".into())),
+            Err(SearchDateBoundError::InvertedWindow { .. })
+        ));
+        assert!(SearchDateBound::new(Some("2024-01-01".into()), Some("2024-01-01".into())).is_ok());
+        assert!(SearchDateBound::new(Some("2024-01-01".into()), Some("2024-01-02".into())).is_ok());
+
+        // The rejection also holds through parse and the composed aggregate wire type, so a client
+        // cannot smuggle an inverted window past the outer types.
+        let inverted = serde_json::json!({"fromDate": "2024-03-15", "toDate": "2024-01-01"});
+        let err = SearchDateBound::parse(&inverted)
+            .expect_err("inverted window must fail parse")
+            .to_string();
+        assert!(err.contains("on or before"), "unhelpful error: {err}");
+        assert!(
+            ToolOverridesUpdate::parse(&serde_json::json!({"xSearch": {"dateBound": &inverted}}))
+                .is_err(),
+            "inverted window must fail through the aggregate wire type"
+        );
     }
 
     #[test]
@@ -5077,7 +5324,8 @@ mod tests {
             (crate::ReasoningEffort::Low, "low"),
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
-            (crate::ReasoningEffort::Xhigh, "max"),
+            (crate::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::ReasoningEffort::Max, "max"),
         ] {
             let req = messages_test_request(Some(variant));
             let msgs = build_messages_request(&req);
@@ -5126,6 +5374,7 @@ mod tests {
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::ReasoningEffort::Max, "max"),
         ] {
             let req = ConversationRequest::from_items(vec![ConversationItem::user("hi")])
                 .with_model("test");
@@ -5165,6 +5414,7 @@ mod tests {
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
             (crate::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::ReasoningEffort::Max, "max"),
         ] {
             let req = ConversationRequest {
                 reasoning_effort: Some(variant),
@@ -7808,6 +8058,30 @@ mod tests {
         } else {
             panic!("expected User variant");
         }
+    }
+
+    #[test]
+    fn working_directory_switch_round_trips_generation() {
+        let item = ConversationItem::working_directory_switch("moved", 7);
+        let json = serde_json::to_value(&item).expect("serialize");
+        assert_eq!(json["synthetic_reason"], "working_directory_switch");
+        assert_eq!(json["cwd_generation"], 7);
+        let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.working_directory_switch_generation(), Some(7));
+    }
+
+    #[test]
+    fn legacy_user_defaults_cwd_generation_to_none() {
+        let item: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "synthetic_reason": "system_reminder"
+        }))
+        .expect("deserialize legacy user");
+        let ConversationItem::User(user) = item else {
+            panic!("expected user");
+        };
+        assert!(user.cwd_generation.is_none());
     }
 
     /// `synthetic_reason` round-trips through JSON.  Old sessions that omit

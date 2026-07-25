@@ -5,6 +5,16 @@
 //! 48 kHz stereo F32 on macOS) and downmixes + resamples to 16 kHz mono for the
 //! STT API. cpal streams are not `Send` on all platforms; capture runs on a
 //! dedicated std thread and forwards PCM chunks through a sync channel.
+//!
+//! # Two roles: in-process backend and `__mic-capture` child
+//!
+//! On Windows this module is the capture backend itself (WASAPI's in-process
+//! memory cost is modest). On macOS, opening CoreAudio in-process permanently
+//! dirties several MB that the OS never returns after the stream drops, so
+//! [`super::capture_subprocess`] re-execs the binary as a short-lived
+//! `__mic-capture` helper instead; this module provides that child
+//! ([`run_capture_child_cli`]) and the in-process fallback for when self-exec
+//! is unavailable (e.g. the on-disk binary was replaced by an update).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -109,6 +119,29 @@ pub fn spawn_pcm_capture(
     })
 }
 
+/// Default cpal input device, or a config error when the host has none.
+fn default_input_device() -> Result<cpal::Device, VoiceError> {
+    cpal::default_host()
+        .default_input_device()
+        .ok_or_else(|| VoiceError::Config("no default input audio device".into()))
+}
+
+/// Default input device without opening a stream ([`crate::probe::input_device_info`]).
+pub fn input_device_info() -> Result<crate::probe::InputDeviceInfo, VoiceError> {
+    let device = default_input_device()?;
+    let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let detail = match device.default_input_config() {
+        Ok(c) => format!(
+            "{} Hz, {} ch, {:?}",
+            c.sample_rate().0,
+            c.channels(),
+            c.sample_format()
+        ),
+        Err(e) => format!("default config unavailable: {e}"),
+    };
+    Ok(crate::probe::InputDeviceInfo { name, detail })
+}
+
 /// Record mono PCM16 LE for a fixed duration (probe / diagnostics).
 pub fn capture_pcm_for_duration(
     sample_rate: u32,
@@ -198,16 +231,13 @@ fn run_capture_loop(
 /// Open the input device, build, and start the cpal capture stream. All
 /// device/config/permission failures surface here as a `VoiceError` so the
 /// caller can report them before entering the steady-state loop.
-fn open_capture_stream(
+pub(super) fn open_capture_stream(
     sample_rate: u32,
     sync_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,
 ) -> Result<(cpal::Stream, String), VoiceError> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| VoiceError::Config("no default input audio device".into()))?;
+    let device = default_input_device()?;
 
     let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
 
@@ -371,17 +401,7 @@ where
                 if pcm.is_empty() {
                     return;
                 }
-                let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                // Never block the real-time audio thread: shed load if the
-                // consumer is behind. Dropped chunks are counted and logged by
-                // `run_capture_loop`.
-                match sync_tx.try_send(bytes) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Disconnected(_)) => {}
-                }
+                send_pcm(&pcm, &sync_tx, &dropped);
             },
             |err| {
                 tracing::warn!(error = %err, "voice capture stream error");
@@ -391,6 +411,19 @@ where
         .map_err(|e| VoiceError::Config(format!("build input stream: {e}")))?;
 
     Ok(stream)
+}
+
+/// Non-blocking send from the real-time audio callback: shed load (and count
+/// it) rather than ever blocking the device thread.
+fn send_pcm(pcm: &[i16], sync_tx: &std::sync::mpsc::SyncSender<Vec<u8>>, dropped: &AtomicUsize) {
+    let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+    match sync_tx.try_send(bytes) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
 }
 
 fn frames_to_mono_i16<T>(data: &[T], channels: usize) -> Vec<i16>
@@ -443,9 +476,185 @@ fn resample_mono_i16(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<
     output
 }
 
+// ---------------------------------------------------------------------------
+// `__mic-capture` child mode (see the module docs and `capture_subprocess`).
+// ---------------------------------------------------------------------------
+
+/// Run the `__mic-capture` helper child. `args` is argv after the subcommand:
+/// `--rate <N>` streams PCM16 mono LE at `N` Hz to stdout; `--device-info`
+/// prints the default input device instead (one line, no stream opened).
+///
+/// Wire protocol (stdout): one status header line, then raw PCM.
+/// - `READY <device>\n` followed by the PCM byte stream, or
+/// - `INFO <name>\t<detail>\n` for `--device-info`, or
+/// - `ERR <message>\n` and a non-zero exit on any failure.
+///
+/// The child exits when its stdout write fails (parent closed the pipe or
+/// died) or when the parent kills it — it never outlives the capture session.
+pub(crate) fn run_capture_child_cli(args: Vec<String>) -> i32 {
+    // Route the child's tracing (device open info, cpal warnings) to stderr,
+    // which the parent drains into its debug log — plain text, since the
+    // reader is a pipe, not a terminal. Stdout is the protocol channel and
+    // must stay clean.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .try_init();
+
+    match parse_child_args(&args) {
+        Ok(ChildMode::DeviceInfo) => run_device_info_child(),
+        Ok(ChildMode::Capture { rate }) => run_capture_child(rate),
+        Err(msg) => {
+            emit_header(&super::protocol::err_line(&msg));
+            2
+        }
+    }
+}
+
+/// Write a header line to stdout without panicking: `println!` aborts on
+/// EPIPE, and a helper whose parent died must exit quietly, not crash.
+fn emit_header(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// What the helper child was asked to do (parsed from its argv).
+#[derive(Debug, PartialEq, Eq)]
+enum ChildMode {
+    Capture { rate: u32 },
+    DeviceInfo,
+}
+
+/// Parse the helper argv. Pure so the contract is unit-testable.
+fn parse_child_args(args: &[String]) -> Result<ChildMode, String> {
+    let mut rate: u32 = crate::config::DEFAULT_SAMPLE_RATE;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--device-info" => return Ok(ChildMode::DeviceInfo),
+            "--rate" => {
+                i += 1;
+                rate = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|r| *r > 0)
+                    .ok_or_else(|| "bad --rate".to_string())?;
+            }
+            other => return Err(format!("unknown mic-capture arg: {other}")),
+        }
+        i += 1;
+    }
+    Ok(ChildMode::Capture { rate })
+}
+
+fn run_device_info_child() -> i32 {
+    match input_device_info() {
+        Ok(info) => {
+            emit_header(&super::protocol::info_line(&info.name, &info.detail));
+            0
+        }
+        Err(e) => {
+            emit_header(&super::protocol::err_line(&e.to_string()));
+            1
+        }
+    }
+}
+
+fn run_capture_child(rate: u32) -> i32 {
+    use std::io::Write;
+
+    let (sync_tx, sync_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stream = match open_capture_stream(
+        rate,
+        sync_tx,
+        Arc::clone(&stop),
+        Arc::new(AtomicUsize::new(0)),
+    ) {
+        Ok((stream, device_name)) => {
+            emit_header(&super::protocol::ready_line(&device_name));
+            stream
+        }
+        Err(e) => {
+            emit_header(&super::protocol::err_line(&e.to_string()));
+            return 1;
+        }
+    };
+
+    let mut out = std::io::stdout().lock();
+    // Flush per chunk: chunks are small (~10 ms of PCM) and streaming STT
+    // wants them promptly, not batched by the stdout buffer.
+    loop {
+        match sync_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(chunk) => {
+                if out.write_all(&chunk).and_then(|()| out.flush()).is_err() {
+                    break; // parent closed the pipe / died → stop capturing
+                }
+            }
+            // A silent device produces no writes, so parent death would go
+            // unnoticed and orphan this child; poll for reparenting (the
+            // parent normally kills us long before this fires).
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(unix)]
+                if std::os::unix::process::parent_id() == 1 {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    stop.store(true, Ordering::Release);
+    drop(stream);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_args_default_to_capture_at_default_rate() {
+        assert_eq!(
+            parse_child_args(&[]),
+            Ok(ChildMode::Capture {
+                rate: crate::config::DEFAULT_SAMPLE_RATE
+            })
+        );
+        let args = vec!["--rate".to_string(), "24000".to_string()];
+        assert_eq!(
+            parse_child_args(&args),
+            Ok(ChildMode::Capture { rate: 24000 })
+        );
+    }
+
+    #[test]
+    fn child_args_reject_bad_rate_and_unknown_flags() {
+        assert!(parse_child_args(&["--rate".to_string()]).is_err());
+        assert!(parse_child_args(&["--rate".to_string(), "0".to_string()]).is_err());
+        assert!(parse_child_args(&["--rate".to_string(), "x".to_string()]).is_err());
+        assert!(parse_child_args(&["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn child_args_device_info_wins() {
+        assert_eq!(
+            parse_child_args(&["--device-info".to_string()]),
+            Ok(ChildMode::DeviceInfo)
+        );
+    }
+
+    #[test]
+    fn send_pcm_counts_shed_chunks() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let dropped = AtomicUsize::new(0);
+
+        send_pcm(&[100], &tx, &dropped); // fills the channel
+        send_pcm(&[200], &tx, &dropped); // shed
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn resample_halves_rate() {

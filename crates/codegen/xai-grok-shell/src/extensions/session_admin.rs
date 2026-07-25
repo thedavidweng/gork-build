@@ -45,6 +45,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             handle_reload_project_mcp_servers(agent, args).await
         }
         "x.ai/internal/reload_skills" => handle_reload_skills(agent),
+        "x.ai/internal/reload_workflows" => handle_reload_workflows(agent),
         "x.ai/internal/reload_models" => handle_reload_models(agent),
         "x.ai/internal/reload_models_cache" => handle_reload_models_cache(agent),
         "x.ai/internal/auth_cleared" => handle_auth_cleared(agent),
@@ -373,15 +374,16 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
 // internal/reload_skills
 
 /// Reload skills for ALL active sessions. Called by the skills file watcher
-/// (via ACP injection from `app.rs`) when `SKILL.md` files change.
 fn handle_reload_skills(agent: &MvpAgent) -> ExtResult {
-    let session_ids: Vec<acp::SessionId> = agent.sessions.borrow().keys().cloned().collect();
-    for sid in &session_ids {
-        if let Some(handle) = agent.sessions.borrow().get(sid).cloned() {
-            let _ = handle.cmd_tx.send(SessionCommand::ReloadSkills);
-        }
-    }
-    ExtMethodResult::success(serde_json::json!({ "reloaded": session_ids.len() }))
+    let reloaded = agent.reload_skills_all_sessions();
+    ExtMethodResult::success(serde_json::json!({ "reloaded": reloaded }))
+        .to_ext_response()
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
+fn handle_reload_workflows(agent: &MvpAgent) -> ExtResult {
+    let reloaded = agent.advertise_commands_all_sessions();
+    ExtMethodResult::success(serde_json::json!({ "reloaded": reloaded }))
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
@@ -415,23 +417,14 @@ async fn handle_reload_all_mcp_servers(agent: &MvpAgent) -> ExtResult {
         // `load_mcp_servers()` output here was redundant — and silently
         // dropped client servers that exist in no on-disk config, tearing
         // them down on every config hot-reload.
-        let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
-            handle.initial_client_mcp_servers.clone(),
+        if crate::session::managed_mcp::merge_and_send_managed_mcp_update(
+            &handle.cmd_tx,
             &cwd,
+            handle.initial_client_mcp_servers.clone(),
             &managed,
             agent.plugin_registry_handle().snapshot().as_deref(),
             &compat,
-        );
-
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        if handle
-            .cmd_tx
-            .send(SessionCommand::UpdateMcpServers {
-                mcp_servers: merged,
-                respond_to: tx,
-            })
-            .is_ok()
-        {
+        ) {
             updated += 1;
         }
     }
@@ -586,6 +579,7 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     let merged_config = agent.cfg.borrow().clone();
 
     agent.models_manager.apply_config(merged_config);
+    agent.sync_process_static_api_key(None);
 
     let count = agent.models_manager.models().len();
     tracing::info!(count, "model list reloaded from config.toml");
@@ -608,6 +602,7 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
 /// rather than rebuilding the catalog and notifying clients mid-flight.
 fn handle_reload_models_cache(agent: &MvpAgent) -> ExtResult {
     agent.models_manager.reload_from_disk_cache();
+    agent.sync_process_static_api_key(None);
     ExtMethodResult::success(serde_json::json!({ "reloaded": true }))
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
@@ -658,6 +653,18 @@ async fn handle_plugins_reload(agent: &MvpAgent) -> ExtResult {
 async fn handle_commands_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let req: crate::session::slash_commands::ListCommandsRequest = parse_params(args)?;
 
+    if let Some(session_id) = req.session_id.as_ref() {
+        let Some(handle) = agent.session_handle_waiting_for_load(session_id).await else {
+            return Err(
+                acp::Error::invalid_request().data(format!("unknown session id: {}", session_id.0))
+            );
+        };
+        let response = handle.list_available_commands().await;
+        return Ok(acp::ExtResponse::new(Arc::from(
+            serde_json::value::to_raw_value(&response)?,
+        )));
+    }
+
     let skills_config = agent.cfg.borrow().skills.clone();
     let compat = agent.cfg.borrow().compat_resolved;
     let availability = agent.command_availability();
@@ -707,6 +714,7 @@ async fn handle_commands_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
         plugin_reg.as_deref(),
         availability,
         compat,
+        false,
     )
     .await;
     Ok(acp::ExtResponse::new(Arc::from(

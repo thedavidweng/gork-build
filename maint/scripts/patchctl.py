@@ -803,6 +803,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
             p = root / artifact
             if p.exists():
                 p.unlink()
+        # Python bytecode from running patchctl itself must never be committed.
+        shutil.rmtree(root / "maint" / "scripts" / "__pycache__", ignore_errors=True)
         git(["add", "-A"], cwd=root)
         status = git(["status", "--porcelain"], cwd=root, capture=True)
         if status.stdout.strip():

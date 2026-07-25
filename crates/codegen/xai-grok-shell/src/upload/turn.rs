@@ -18,10 +18,12 @@ pub(crate) struct SyntheticTurnTraceRequest {
 }
 /// Outcome of a session-state upload with categorized failure reason.
 pub(crate) enum UploadOutcome {
+    #[allow(dead_code)]
     Confirmed,
     /// Not confirmed within the flush deadline; the upload continues in the
     /// live queue worker. Not `Confirmed`: cloud restorability is unobserved,
     /// so `restorable_turn_number` must not advance on it.
+    #[allow(dead_code)]
     Deferred,
     Failed {
         reason: &'static str,
@@ -49,7 +51,6 @@ pub(crate) enum UploadWait {
     Defer { deadline: tokio::time::Instant },
 }
 /// Why trace uploads are enabled or disabled for a given prompt.
-/// Recorded on the `agent.prompt` span as `upload_reason` for log queries.
 pub(crate) use xai_grok_telemetry::session_metrics::TraceUploadReason;
 /// Per-turn context for trace artifact uploads.
 #[derive(Clone)]
@@ -90,7 +91,9 @@ where
                     "unknown panic".to_string()
                 };
                 tracing::error!(
-                    task = task_name, panic = % panic_msg, "Upload task panicked"
+                    task = task_name,
+                    panic = %panic_msg,
+                    "Upload task panicked"
                 );
             }
         }
@@ -207,11 +210,10 @@ pub(crate) async fn complete_prompt_trace(
     if let Some(capture) = streaming_partial.as_ref() {
         super::trace::upload_streaming_partial(&ctx, capture, wait).await;
     }
-    let (upload_outcome, _, _, _) = futures::join!(
+    let (upload_outcome, _, _) = futures::join!(
         super::trace::upload_session_state(&ctx, "after", session_copy_rx, wait),
         super::trace::upload_permission_events(&ctx, &permission_events, wait),
         super::trace::upload_memory_state(&ctx),
-        super::trace::upload_unified_log(&ctx, wait),
     );
     let artifacts_confirmed = upload_outcome.is_confirmed();
     let gated_artifact_failure: Option<(String, Option<u16>)> = None;
@@ -289,14 +291,14 @@ pub(crate) fn parse_agent_profile_from_meta(
         return match xai_grok_agent::AgentDefinition::from_json(value) {
             Ok(def) => {
                 tracing::info!(
-                    agent_name = % def.name,
+                    agent_name = %def.name,
                     "Using ACP agent profile from _meta.agentProfile (JSON object)"
                 );
                 Some(def)
             }
             Err(e) => {
                 tracing::error!(
-                    error = % e,
+                    error = %e,
                     "Failed to parse _meta.agentProfile JSON object, falling back to default agent"
                 );
                 None
@@ -305,7 +307,8 @@ pub(crate) fn parse_agent_profile_from_meta(
     }
     if let Some(name) = value.as_str() {
         tracing::info!(
-            agent_name = % name, "Resolving agent from _meta.agentProfile (string name)"
+            agent_name = %name,
+            "Resolving agent from _meta.agentProfile (string name)"
         );
         return xai_grok_agent::discovery::by_name(name);
     }
@@ -443,7 +446,7 @@ mod tests {
     }
     #[test]
     fn parse_ask_user_question_returns_false_when_disabled() {
-        let meta = serde_json::json!({ "askUserQuestion" : false });
+        let meta = serde_json::json!({ "askUserQuestion": false });
         assert_eq!(
             parse_ask_user_question_from_meta(meta.as_object()),
             Some(false)
@@ -451,7 +454,7 @@ mod tests {
     }
     #[test]
     fn parse_ask_user_question_returns_true_when_enabled() {
-        let meta = serde_json::json!({ "askUserQuestion" : true });
+        let meta = serde_json::json!({ "askUserQuestion": true });
         assert_eq!(
             parse_ask_user_question_from_meta(meta.as_object()),
             Some(true)
@@ -459,7 +462,7 @@ mod tests {
     }
     #[test]
     fn parse_ask_user_question_returns_none_when_absent() {
-        let meta = serde_json::json!({ "agentProfile" : "grok-build-plan" });
+        let meta = serde_json::json!({ "agentProfile": "grok-build-plan" });
         assert_eq!(parse_ask_user_question_from_meta(meta.as_object()), None);
     }
     #[test]
@@ -471,7 +474,7 @@ mod tests {
     /// on malformed input).
     #[test]
     fn parse_ask_user_question_ignores_non_bool() {
-        let meta = serde_json::json!({ "askUserQuestion" : "no" });
+        let meta = serde_json::json!({ "askUserQuestion": "no" });
         assert_eq!(parse_ask_user_question_from_meta(meta.as_object()), None);
     }
     #[tokio::test]

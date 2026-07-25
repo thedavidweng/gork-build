@@ -9,6 +9,22 @@ own OpenTelemetry collector, so platform teams can monitor adoption, token
 consumption, tool-permission decisions, and errors across the fleet — without
 any data flowing to vendor product-analytics endpoints.
 
+## Related settings
+
+These knobs are independent of each other (and of this guide's external OTEL stream):
+
+| Setting | How to set it |
+|---------|---------------|
+| Telemetry master switch | `[features] telemetry` / `GROK_TELEMETRY_ENABLED` |
+| `/privacy` | `/privacy opt-in` / `/privacy opt-out`, or Settings |
+| Trace upload | `[telemetry] trace_upload` / `GROK_TELEMETRY_TRACE_UPLOAD` |
+| External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*` (this guide) |
+
+See also [Authentication](02-authentication.md#related-settings) and
+[Configuration](05-configuration.md#telemetry).
+
+## External OTEL stream
+
 The external stream is:
 
 - **Off by default**, and requires a *double opt-in* (a master switch **and**

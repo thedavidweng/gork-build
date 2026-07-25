@@ -206,17 +206,32 @@ fn render_diff_hunks_core(
         let layout = gutter_layout(hunk, config);
         let indent_width = if config.indent { INDENT.len() } else { 0 };
         let content_width = (width as usize).saturating_sub(layout.total);
-        // Fresh per-hunk highlighter, same as the hunk-only phase always did.
-        let mut highlighter = syntect.highlight_lines_by_file_path(path);
+        // A diff interleaves two file versions; give each side its own highlighter
+        // so a multi-line construct can't leak across sides. Equal lines render on
+        // the new side and advance both.
+        let mut old_highlighter = syntect.highlight_lines_by_file_path(path);
+        let mut new_highlighter = syntect.highlight_lines_by_file_path(path);
         for line in hunk {
             let trimmed = line.text.trim_end_matches(['\r', '\n']);
-            let raw_text = expand_tabs(trimmed);
+            let text = expand_tabs(trimmed);
             // Cold spans render unconditionally so Delete lines and any map
             // miss (text drift) paint exactly like the hunk-only phase.
-            let mut content_spans =
-                render_content_spans(&raw_text, line.tag, theme, &mut highlighter, syntect);
+            let mut content_spans = match line.tag {
+                ChangeTag::Delete => {
+                    render_content_spans(&text, line.tag, theme, &mut old_highlighter, syntect)
+                }
+                ChangeTag::Insert => {
+                    render_content_spans(&text, line.tag, theme, &mut new_highlighter, syntect)
+                }
+                ChangeTag::Equal => {
+                    let spans =
+                        render_content_spans(&text, line.tag, theme, &mut new_highlighter, syntect);
+                    advance_highlighter(&mut old_highlighter, &text, syntect);
+                    spans
+                }
+            };
             if let Some(map) = by_new_line
-                && let Some(spans) = map_spans_for_line(line, &raw_text, map, theme)
+                && let Some(spans) = map_spans_for_line(line, &text, map, theme)
             {
                 content_spans = spans;
             }
@@ -647,6 +662,16 @@ fn painted(text: &str, style: Style) -> Span<'static> {
     Span::styled(text.to_string(), style)
 }
 
+fn advance_highlighter(
+    highlighter: &mut Option<HighlightLines<'_>>,
+    content: &str,
+    syntect: &Syntect,
+) {
+    if let Some(hl) = highlighter.as_mut() {
+        let _ = hl.highlight_line(&format!("{content}\n"), &syntect.syntax_set);
+    }
+}
+
 /// Render content spans with syntax highlighting.
 fn render_content_spans(
     content: &str,
@@ -720,6 +745,7 @@ pub struct EditToolCallBlock {
     pub elapsed_ms: Option<i64>,
     /// Header prefix (e.g. "Edit " or "Creating ").
     pub prefix: &'static str,
+    pub display_name: Option<String>,
     /// One-liner summary can't be trusted: the call touched multiple files
     /// (apply_patch emits one Diff per file, only the first becomes hunks) or
     /// the path fell back to the tool title. Suppresses the diffstat suffix;
@@ -731,6 +757,21 @@ pub struct EditToolCallBlock {
     pub highlight: EditHighlightPhase,
 }
 
+fn workflow_script_name(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.extension().is_none_or(|e| e != "rhai") {
+        return None;
+    }
+    if !p
+        .ancestors()
+        .skip(1)
+        .any(|a| a.file_name().is_some_and(|n| n == "workflows"))
+    {
+        return None;
+    }
+    Some(p.file_stem()?.to_string_lossy().into_owned())
+}
+
 impl EditToolCallBlock {
     /// Create a new edit block.
     ///
@@ -738,25 +779,35 @@ impl EditToolCallBlock {
     /// is `None`. Timing is only set for blocks that enter a running UI
     /// state (via `set_last_running(true)` in `ScrollbackState`).
     pub fn new(path: impl Into<String>, hunks: Vec<DiffHunk>) -> Self {
+        let path = path.into();
         let edit_count = hunks.len().max(1);
         let change_counts = Self::compute_changes(&hunks);
+        let display_name = workflow_script_name(&path);
         Self {
-            path: path.into(),
+            path,
             hunks,
             edit_count,
             error: None,
             started_at: None,
             elapsed_ms: None,
-            prefix: "Edit ",
+            prefix: if display_name.is_some() {
+                "Editing workflow "
+            } else {
+                "Edit "
+            },
+            display_name,
             summary_untrusted: false,
             change_counts,
             highlight: EditHighlightPhase::HunkOnly,
         }
     }
 
-    /// Set the header prefix (e.g. "Creating " for write).
     pub fn with_prefix(mut self, prefix: &'static str) -> Self {
-        self.prefix = prefix;
+        self.prefix = if self.display_name.is_some() && prefix == "Creating " {
+            "Creating workflow "
+        } else {
+            prefix
+        };
         self
     }
 
@@ -921,13 +972,16 @@ impl EditToolCallBlock {
             .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
 
-        let path = crate::render::tool_paths::path_for_tool_surface(
-            &self.path,
-            surface,
-            cwd,
-            width,
-            prefix.len() + suffix_width,
-        );
+        let path = match &self.display_name {
+            Some(name) => name.clone(),
+            None => crate::render::tool_paths::path_for_tool_surface(
+                &self.path,
+                surface,
+                cwd,
+                width,
+                prefix.len() + suffix_width,
+            ),
+        };
 
         let mut spans = vec![
             Span::styled(prefix, bold_style),
@@ -1510,6 +1564,51 @@ mod tests {
         );
         let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "Edit main.rs (3 edits)");
+    }
+
+    #[test]
+    fn workflow_script_header_hides_rhai_path() {
+        let theme = Theme::current();
+        let block = EditToolCallBlock::new(".grok/workflows/cc-deep-research.rhai", vec![]);
+        let header = block.header_line(
+            &theme,
+            false,
+            false,
+            false,
+            ToolPathSurface::Expanded,
+            None,
+            None,
+        );
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Editing workflow cc-deep-research");
+        assert!(
+            block
+                .path_link_target(Some(Path::new("/repo")))
+                .and_then(|target| crate::render::osc8::resolve_link_target(&target))
+                .and_then(|resolved| resolved.osc8_url)
+                .is_some_and(|u| u.contains("cc-deep-research.rhai")),
+        );
+
+        let block =
+            EditToolCallBlock::new(".grok/workflows/triage.rhai", vec![]).with_prefix("Creating ");
+        let header = block.header_line(
+            &theme,
+            false,
+            false,
+            false,
+            ToolPathSurface::Expanded,
+            None,
+            None,
+        );
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Creating workflow triage");
+
+        let block = EditToolCallBlock::new("scripts/build.rhai", vec![]);
+        assert_eq!(block.prefix, "Edit ");
+        assert!(block.display_name.is_none());
+
+        let block = EditToolCallBlock::new("workflows/wf_0199abc/script.rhai", vec![]);
+        assert_eq!(block.display_name.as_deref(), Some("script"));
     }
 
     #[test]
@@ -2532,6 +2631,57 @@ class ProcessQueueItem(BaseModel):
         assert_ne!(
             let_rgb, str_rgb,
             "keyword and string must not share syntect FG; styles={styles:?}"
+        );
+    }
+
+    /// Regression: a `"""` opened on a removed line must not change how the
+    /// added line highlights. The two diff sides are highlighted independently.
+    #[test]
+    fn delete_side_multiline_string_does_not_leak_into_insert() {
+        let _guard = pin_groknight_syntect();
+        let path = Path::new("probe.py");
+        let config = DiffRenderConfig::default();
+        let theme = Theme::groknight();
+
+        // Content spans of the added `def` line, given the removed line above it.
+        let added_def = |removed: &str| -> Vec<(ratatui::style::Color, String)> {
+            let hunk = vec![
+                DiffLine {
+                    text: format!("{removed}\n"),
+                    lo: 1,
+                    ln: 0,
+                    tag: ChangeTag::Delete,
+                },
+                DiffLine {
+                    text: "def parse(x: str) -> int:\n".into(),
+                    lo: 0,
+                    ln: 1,
+                    tag: ChangeTag::Insert,
+                },
+            ];
+            let rows = render_diff_hunk_highlighted(&hunk, path, &theme, 120, &config);
+            let insert = rows.last().expect("insert row");
+            insert.line.spans[insert.gutter_span_count..]
+                .iter()
+                .map(|span| {
+                    (
+                        span.style.fg.unwrap_or(ratatui::style::Color::Reset),
+                        span.content.to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        let after_open_docstring = added_def("    \"\"\"Old docstring opener");
+        let after_plain_code = added_def("    x = 1");
+        assert_eq!(
+            after_open_docstring, after_plain_code,
+            "added line must be highlighted independently of the removed side",
+        );
+        // Under the bug the added line is one string span; the fix keeps it code.
+        assert!(
+            after_open_docstring.len() > 1,
+            "added def line should be syntax highlighted"
         );
     }
 

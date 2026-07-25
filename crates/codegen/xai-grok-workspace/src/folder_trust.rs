@@ -233,8 +233,8 @@ pub fn persist_trust(store: &mut TrustStore, key: &Path) {
     }
 }
 
-/// Whether any repo-local code-exec config is present for `cwd`. When none are
-/// present there is nothing to gate, so we skip the prompt entirely.
+/// Whether any repo-local trust-sensitive config is present for `cwd`. When none
+/// are present there is nothing to gate, so we skip the prompt entirely.
 ///
 /// Thin wrapper over [`collect_repo_config_kinds`] with `first_only = true`, so
 /// the gate and the display-only [`repo_config_kinds`] enumerate the EXACT same
@@ -244,14 +244,59 @@ pub fn repo_configs_present(cwd: &Path) -> bool {
     !collect_repo_config_kinds(cwd, true).is_empty()
 }
 
-/// Display-only: which repo-local code-exec config KINDS are present for `cwd`
-/// (`mcp`, `plugins`, `lsp`, `envrc`, `claude`, `hooks`, `agents`), deduped in
-/// cheap→expensive marker order. Single source with [`repo_configs_present`]
-/// (which is `!repo_config_kinds(cwd).is_empty()`), so a folder that the gate
-/// fired on always has a non-empty, accurate kind list — no `[plugins].paths` /
-/// `.claude` / `.grok/agents` / subdir-launch gaps. NOT itself the trust gate.
+/// Display-only: which repo-local trust-sensitive config KINDS are present for
+/// `cwd` (`mcp`, `plugins`, `permission`, `lsp`, `envrc`, `claude`, `hooks`,
+/// `agents`, `roles`, `personas`, `workflows`), deduped in cheap→expensive
+/// marker order. Single source with [`repo_configs_present`] (which is
+/// `!repo_config_kinds(cwd).is_empty()`), so a folder that the gate fired on
+/// always has a non-empty, accurate kind list — no `[plugins].paths` /
+/// `[permission]` / `.claude` / `.grok/agents` / subdir-launch gaps. NOT itself
+/// the trust gate.
 pub fn repo_config_kinds(cwd: &Path) -> Vec<&'static str> {
     collect_repo_config_kinds(cwd, false)
+}
+
+/// Whether a project `.grok/config.toml` `[permission]` value would contribute
+/// rules to the permission resolver. Mirrors the compact/verbose shapes that
+/// `permission::resolution` loads: non-empty `allow`/`deny`/`ask` string arrays,
+/// or a non-empty verbose `rules` array. Empty arrays / empty tables do not gate
+/// (same as empty `[mcp_servers]` / empty `[plugins].paths`).
+fn config_toml_permission_contributes(permission_value: &TomlValue) -> bool {
+    let Some(table) = permission_value.as_table() else {
+        // Non-table `[permission]` fails config load elsewhere; treat as a
+        // marker so a malicious non-table still trips the gate rather than
+        // resolving trusted.
+        return true;
+    };
+    for key in ["deny", "allow", "ask"] {
+        if table
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            return true;
+        }
+    }
+    table
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
+fn path_present_or_uncertain(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn directory_present_or_uncertain(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 /// Shared scanner behind [`repo_configs_present`] and [`repo_config_kinds`]. With
@@ -285,11 +330,13 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     if !crate::project_config::find_mcp_json_files_in(&chain.dirs).is_empty() {
         hit!("mcp");
     }
-    // Project `.grok/config.toml` declaring repo-controlled code-exec: a
-    // non-empty `[mcp_servers]` table OR a non-empty `[plugins].paths` array.
-    // `[plugins].paths` loads as auto-trusted ConfigPath plugins, so a clone
-    // whose ONLY repo-local config is `[plugins].paths` must still be gated
-    // (else it resolves Trusted and the paths merge runs ungated => RCE).
+    // Project `.grok/config.toml` declaring repo-controlled code-exec or
+    // permission policy: a non-empty `[mcp_servers]` table, a non-empty
+    // `[plugins].paths` array, OR a contributing `[permission]` section.
+    // `[plugins].paths` loads as auto-trusted ConfigPath plugins; `[permission]`
+    // allow/deny/ask rules auto-approve or block tools — a clone whose ONLY
+    // repo-local config is either must still be gated (else it resolves Trusted
+    // and the loader runs ungated).
     for path in crate::project_config::find_project_configs_in(&chain.dirs) {
         let Ok(root) = xai_grok_config::load_config_file(&path) else {
             continue;
@@ -303,11 +350,17 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
             .and_then(|v| v.get("paths"))
             .and_then(|v| v.as_array())
             .is_some_and(|a| !a.is_empty());
+        let has_permission = root
+            .get("permission")
+            .is_some_and(config_toml_permission_contributes);
         if has_mcp_servers {
             hit!("mcp");
         }
         if has_plugin_paths {
             hit!("plugins");
+        }
+        if has_permission {
+            hit!("permission");
         }
     }
     // Project `.grok/lsp.json`.
@@ -346,7 +399,7 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     // resolve trusted and run ungated. Presence mirrors discovery's "something to
     // gate" check.
     let hook_root = chain.git_root.as_deref().unwrap_or(cwd);
-    if hook_root.join(".grok").join("hooks").is_dir()
+    if path_present_or_uncertain(&hook_root.join(".grok").join("hooks"))
         || hook_root.join(".cursor").join("hooks.json").is_file()
     {
         hit!("hooks");
@@ -367,6 +420,17 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     // can't drift from agent discovery — same pattern as the plugin line above.
     if !xai_grok_agent::discovery::project_agent_dirs_in(&chain.dirs).is_empty() {
         hit!("agents");
+    }
+    // Presence matches exact-cwd discovery without parsing repository content.
+    let grok = cwd.join(".grok");
+    if directory_present_or_uncertain(&grok.join("roles")) {
+        hit!("roles");
+    }
+    if directory_present_or_uncertain(&grok.join("personas")) {
+        hit!("personas");
+    }
+    if directory_present_or_uncertain(&hook_root.join(".grok").join("workflows")) {
+        hit!("workflows");
     }
     // `~/.claude.json` `projects.<cwd>.mcpServers`.
     if claude_project_mcp_present(cwd) {
@@ -588,6 +652,74 @@ mod tests {
     }
 
     #[test]
+    fn repo_configs_present_detects_project_roles() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".grok").join("roles")).unwrap();
+
+        assert!(repo_configs_present(tmp.path()));
+        assert!(repo_config_kinds(tmp.path()).contains(&"roles"));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_project_personas() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".grok").join("personas")).unwrap();
+
+        assert!(repo_configs_present(tmp.path()));
+        assert!(repo_config_kinds(tmp.path()).contains(&"personas"));
+    }
+
+    #[test]
+    fn project_subagent_marker_regular_file_is_absent() {
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(grok.join("roles"), "not a directory").unwrap();
+        assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn project_subagent_marker_at_repo_root_is_absent_from_subdir() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".grok/roles")).unwrap();
+        let subdir = tmp.path().join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(!repo_configs_present(&subdir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_subagent_marker_symlink_to_directory_is_present() {
+        let tmp = repo_tmp();
+        let target = tmp.path().join("target-roles");
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&grok).unwrap();
+        std::os::unix::fs::symlink(&target, grok.join("roles")).unwrap();
+        assert!(repo_configs_present(tmp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_project_subagent_marker_is_absent() {
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::os::unix::fs::symlink("missing", grok.join("personas")).unwrap();
+        assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_project_workflows_from_subdir() {
+        let tmp = repo_tmp();
+        std::fs::create_dir_all(tmp.path().join(".grok").join("workflows")).unwrap();
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(repo_configs_present(&subdir));
+        assert!(repo_config_kinds(&subdir).contains(&"workflows"));
+    }
+
+    #[test]
     fn repo_configs_present_detects_claude_settings_from_subdir() {
         // A `.claude/settings.json` `env` in a SUBDIR (no other repo config),
         // launched from that subdir, must be detected: the env loader walks
@@ -608,6 +740,29 @@ mod tests {
         let tmp = repo_tmp();
         std::fs::create_dir_all(tmp.path().join(".grok").join("hooks")).unwrap();
         assert!(repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_project_hooks_file() {
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(grok.join("hooks"), "{}").unwrap();
+
+        assert!(repo_configs_present(tmp.path()));
+        assert!(repo_config_kinds(tmp.path()).contains(&"hooks"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_configs_present_detects_dangling_project_hooks_symlink() {
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::os::unix::fs::symlink("missing-hooks", grok.join("hooks")).unwrap();
+
+        assert!(repo_configs_present(tmp.path()));
+        assert!(repo_config_kinds(tmp.path()).contains(&"hooks"));
     }
 
     #[test]
@@ -673,6 +828,48 @@ mod tests {
         let grok = tmp.path().join(".grok");
         std::fs::create_dir_all(&grok).unwrap();
         std::fs::write(grok.join("config.toml"), "[plugins]\npaths = []\n").unwrap();
+        assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_grok_config_permission() {
+        // A repo whose ONLY repo-local config is a contributing `[permission]`
+        // section (no MCP/plugins/hooks) must still be gated: those allow rules
+        // auto-approve tool calls, so an ungated clone loads the attacker's
+        // policy. Also covers subdir launch (cwd→git-root walk).
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[permission]\nallow = [\"Bash(*)\"]\n",
+        )
+        .unwrap();
+        assert!(repo_configs_present(tmp.path()));
+        assert!(
+            repo_config_kinds(tmp.path()).contains(&"permission"),
+            "permission-only repo must report the permission kind"
+        );
+        let subdir = tmp.path().join("crates").join("inner");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(
+            repo_configs_present(&subdir),
+            "permission-only config at git root must gate subdir launches"
+        );
+    }
+
+    #[test]
+    fn repo_configs_present_false_for_empty_permission() {
+        // Empty allow/deny/ask arrays contribute no rules, so they must not
+        // trip the gate (mirrors empty `[mcp_servers]` / empty `[plugins].paths`).
+        let tmp = repo_tmp();
+        let grok = tmp.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            "[permission]\nallow = []\ndeny = []\n",
+        )
+        .unwrap();
         assert!(!repo_configs_present(tmp.path()));
     }
 

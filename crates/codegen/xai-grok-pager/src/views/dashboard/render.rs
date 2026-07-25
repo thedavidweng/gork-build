@@ -5,11 +5,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
 use super::layout::{MIN_DASHBOARD_WIDTH, compute_layout};
 use super::row::{DashboardRow, RowBadge, build_rows_with_roster};
 use super::state::{
-    DashboardState, Filter, Focusable, Grouping, LocationPickerState, RowState, SectionKey,
+    DashboardRowId, DashboardState, Filter, Focusable, Grouping, LocationPickerState, RenameDraft,
+    RowState, SectionKey,
 };
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
@@ -31,6 +33,32 @@ const NEEDS_INPUT_BLINK_DIVISOR: u64 = 10;
 // sibling activity views (which use circles). Filled marks the non-working states that
 // need a strong visual presence (needs-input, completed, failed, blocked);
 // hollow marks idle rows.
+
+fn ensure_peek_viewport_lifecycle(
+    state: &mut DashboardState,
+    agents: &mut IndexMap<AgentId, AgentView>,
+) {
+    if state.attached_agent.is_some() {
+        return;
+    }
+    // Peek row → begin/keep lease; else restore agent viewport.
+    let Some(row) = state.peek.as_ref().map(|p| p.row.clone()) else {
+        state.restore_peek_viewport(agents);
+        return;
+    };
+    if state
+        .peek_viewport
+        .as_ref()
+        .is_some_and(|lease| lease.row == row)
+    {
+        return;
+    }
+    if super::state::scrollback_available_for_row(&row, agents) {
+        state.begin_peek_viewport(row, agents);
+    } else {
+        state.restore_peek_viewport(agents);
+    }
+}
 
 // The thin left vertical bar marking the active/selected row
 // (`crate::glyphs::selection_bar()`, with a `│` CP437 fallback on legacy
@@ -71,7 +99,7 @@ pub fn render_dashboard(
     buf: &mut Buffer,
     area: Rect,
     state: &mut DashboardState,
-    agents: &IndexMap<AgentId, AgentView>,
+    agents: &mut IndexMap<AgentId, AgentView>,
     registry: &crate::actions::ActionRegistry,
     // App-level double-press confirmation hint (e.g. "press again to
     // quit" for Ctrl+Q / Ctrl+C / Ctrl+D). Threaded to the footer so the
@@ -88,8 +116,6 @@ pub fn render_dashboard(
     // Promo upgrade CTA to paint in the header after the location label
     // (`None` = no CTA); field meanings live on [`HeaderUpgradeCta`].
     upgrade_cta: Option<HeaderUpgradeCta<'_>>,
-    // `_compact` removed in this version. Hide-chrome / shortened
-    // activity strings are a Phase 5 polish item.
 ) -> Option<(u16, u16)> {
     // Cache whether a pinned (non-dismissible) promo CTA is live so the key
     // handler can steal Ctrl+O for it; the dispatch re-resolves the gate.
@@ -168,99 +194,90 @@ pub fn render_dashboard(
         return None;
     }
 
-    // The peek panel is shown by DEFAULT whenever an agent row is
-    // selected: it replaces the new-session dispatch box, follows the
-    // selection cursor, and surfaces live status + the last response (or
-    // a pending permission / ask question). With no selection (the
-    // `[+ New Agent]` button focused, or after Esc) the peek closes and
-    // the new-session input shows instead.
-    //
-    // `apply_fields` preserves the in-progress reply draft (held by the
-    // dashboard-owned `peek_reply` widget), reporting a row change so
-    // the draft is cleared only when the peeked row changes. The panel
-    // only opens when the terminal is tall enough to render it;
-    // otherwise the dispatch box shows even with a row selected. Done
-    // BEFORE the layout so the box can size to live content.
+    // Peek: list-first allocation (see layout::allocate_peek /
+    // docs/internal/33-dashboard-peek-responsive-layout.md). Provisional
+    // layout gives dispatch width for reply wrapping before we decide
+    // whether peek fits.
+    let mut layout = compute_layout(area, false);
+    let fixed = super::layout::chrome_overhead(area);
+    let reply_text_w = layout.dispatch.width.saturating_sub(6);
+
     match state.selected.clone() {
-        Some(sel) if area.height >= super::layout::MIN_PEEK_HEIGHT => {
-            match super::peek::compute_peek_fields(&sel, agents) {
-                Some(fields) => {
-                    // Record the peeked agent's cwd so the reply's `@`
-                    // picker can lazily retarget to it on first compose
-                    // (the retarget itself is deferred — see
-                    // `DashboardState::ensure_peek_reply_cwd`).
+        Some(sel) => match super::peek::compute_peek_fields(&sel, agents) {
+            Some(fields) => {
+                let question = fields.question.is_some();
+                let peek_min = if question {
+                    super::layout::PEEK_MIN_BOX_QUESTION
+                } else {
+                    super::layout::PEEK_MIN_BOX_LIVE_TAIL
+                };
+                let content_rows = if question {
+                    1 + fields.options.len().min(9) as u16
+                } else {
+                    let reply_rows = super::peek::reply_row_count(
+                        &state.peek_reply,
+                        reply_text_w,
+                        super::peek::MAX_REPLY_ROWS,
+                    );
+                    let max_content = super::layout::max_peek_content_rows(area);
+                    // Middle content width ≈ dispatch box minus borders + insets.
+                    let middle_w = layout.dispatch.width.saturating_sub(4);
+                    let (body_measured, pin_user) =
+                        super::state::scrollback_mut_for_row(&sel, agents)
+                            .map(|sb| {
+                                (
+                                    super::peek_tail::densified_body_line_count(sb, middle_w),
+                                    super::peek_tail::scrollback_has_last_user(sb),
+                                )
+                            })
+                            .unwrap_or((0, false));
+                    super::layout::peek_live_tail_desired_content(
+                        max_content,
+                        reply_rows,
+                        body_measured,
+                        pin_user,
+                    )
+                    .content_rows
+                };
+                let alloc =
+                    super::layout::allocate_peek(area.height, fixed, content_rows, peek_min);
+                if alloc.show_peek {
                     state.set_peek_reply_target_cwd(peeked_agent_cwd(&sel, agents));
-                    // Live model + mode for the bottom-border config badge.
-                    // Read before `sel` is moved into the panel below.
                     let badge = super::peek::peek_model_and_mode(&sel, agents);
                     match state.peek.as_mut() {
                         Some(p) => {
                             if p.apply_fields(sel, fields) {
-                                // Row changed under an open panel — a
-                                // half-typed reply must not be sent to the
-                                // newly-peeked agent (clears undo history too,
-                                // so Ctrl+Z can't resurrect it onto the new row).
                                 state.clear_peek_reply();
                             }
                         }
                         None => state.set_peek(Some(super::peek::PeekPanelState::new(sel, fields))),
                     }
-                    // `apply_fields` / `new` carry only the display snapshot;
-                    // the config badge is set live here so a `/model` switch
-                    // or yolo toggle reflects immediately.
                     if let Some(p) = state.peek.as_mut() {
                         p.model_name = badge.model;
                         p.auto_approve = badge.yolo;
                         p.auto = badge.auto;
                         p.plan_mode = badge.plan;
                     }
-                }
-                // Selected agent vanished — nothing to peek.
-                None => {
+                    layout = super::layout::compute_layout_with_peek_box(area, alloc.peek_box_h);
+                } else {
                     state.set_peek_reply_target_cwd(None);
                     state.set_peek(None);
                 }
             }
-        }
-        // No selection (or too short to render) → new-session input.
-        _ => {
+            None => {
+                state.set_peek_reply_target_cwd(None);
+                state.set_peek(None);
+            }
+        },
+        None => {
             state.set_peek_reply_target_cwd(None);
             state.set_peek(None);
         }
     }
 
-    // Compute the layout. Both the dispatch box and the peek reply grow
-    // vertically for multi-line input (Shift+Enter / Alt+Enter
-    // newlines); the peek box also sizes to its wrapped response. Both
-    // keep the row list usable.
-    let mut layout = compute_layout(area, state.peek.is_some());
-    if let Some(panel) = state.peek.as_ref() {
-        // Size the peek box to its content. When a permission / ask
-        // question is pending the box holds the question (1) + its
-        // options and the `❯ reply` row is hidden; otherwise it holds
-        // status (1) + wrapped response (≤ MAX_RESPONSE_ROWS) + a blank
-        // breathing row (1) + the reply (which GROWS with multi-line
-        // drafts, ≤ MAX_REPLY_ROWS). The box width is independent of its
-        // height, so the wrap widths are read from the first layout pass:
-        // the response uses `dispatch.width − 4` (2 border + 2 inset);
-        // the reply text loses a further 2 for the `❯ ` prefix (− 6).
-        let content_rows = if panel.question.is_some() {
-            1 + panel.options.len().min(9) as u16
-        } else {
-            let inner_w = layout.dispatch.width.saturating_sub(4) as usize;
-            let resp =
-                super::peek::response_row_count(panel, inner_w, super::peek::MAX_RESPONSE_ROWS);
-            let reply_text_w = layout.dispatch.width.saturating_sub(6);
-            let reply_rows = super::peek::reply_row_count(
-                &state.peek_reply,
-                reply_text_w,
-                super::peek::MAX_REPLY_ROWS,
-            );
-            // status(1) + response(resp) + blank(1) + reply(reply_rows)
-            resp as u16 + 2 + reply_rows
-        };
-        layout = super::layout::compute_layout_with_dispatch(area, true, content_rows);
-    } else if area.height > 8 && !state.dispatch.text().is_empty() {
+    ensure_peek_viewport_lifecycle(state, agents);
+
+    if state.peek.is_none() && area.height > 8 && !state.dispatch.text().is_empty() {
         let rows = dispatch_text_rows(state, layout.dispatch.width, area.height);
         if rows > 1 {
             layout = super::layout::compute_layout_with_dispatch(area, false, rows);
@@ -270,16 +287,13 @@ pub fn render_dashboard(
     // Header.
     render_header(buf, layout.header, &theme, &rows, state, upgrade_cta);
 
-    // Body.
-    //
-    // Three distinct branches:
-    //  (a) no agents at all → "no agents yet" hint
-    //  (b) agents exist but filter hides all → "no match" hint
-    //  (c) otherwise → render rows
-    if agents.is_empty() {
-        render_empty_state(buf, layout.list, &theme, dashboard_sessions_loading);
-    } else if rows.is_empty() {
-        render_no_match(buf, layout.list, &theme, &state.filter);
+    // Body: key off visible rows (local agents + roster), not the local map alone.
+    if rows.is_empty() {
+        if state.filter.is_active() {
+            render_no_match(buf, layout.list, &theme, &state.filter);
+        } else {
+            render_empty_state(buf, layout.list, &theme, dashboard_sessions_loading);
+        }
     } else if area.width < MIN_DASHBOARD_WIDTH {
         render_narrow_rows(buf, layout.list, &theme, &rows, state);
     } else {
@@ -314,25 +328,56 @@ pub fn render_dashboard(
         let voice_listening = state.voice_listening;
         let voice_interim = state.voice_interim.clone();
         let multiline = state.multiline_mode;
-        let DashboardState {
-            peek, peek_reply, ..
-        } = state;
-        let render = peek
-            .as_ref()
-            .map(|panel| {
-                super::peek::render_peek_panel(
-                    buf,
-                    layout.dispatch,
-                    panel,
-                    peek_reply,
-                    &theme,
-                    voice_listening,
-                    voice_interim.as_deref(),
-                    multiline,
-                    Some(layout.list).filter(|r| r.area() > 0),
-                )
-            })
-            .unwrap_or_default();
+        let peeked_row = state.peek.as_ref().map(|p| p.row.clone());
+        let question_pending = state.peek.as_ref().is_some_and(|p| p.question.is_some());
+        let (empty_hint, has_scrollback) = match peeked_row.as_ref() {
+            Some(DashboardRowId::Subagent {
+                parent,
+                child_session_id,
+            }) => {
+                let parent_ok = agents
+                    .get(parent)
+                    .is_some_and(|p| p.subagent_sessions.contains_key(child_session_id));
+                let loaded = agents
+                    .get(parent)
+                    .is_some_and(|p| p.subagent_views.contains_key(child_session_id));
+                if parent_ok && !loaded {
+                    (Some("Subagent not loaded"), false)
+                } else {
+                    (None, loaded)
+                }
+            }
+            Some(row) => (
+                None,
+                super::state::scrollback_available_for_row(row, agents),
+            ),
+            None => (None, false),
+        };
+        let render = if let Some(panel) = state.peek.as_ref() {
+            let live_tail = if !question_pending && has_scrollback {
+                peeked_row
+                    .as_ref()
+                    .and_then(|row| super::state::scrollback_mut_for_row(row, agents))
+                    .map(|scrollback| super::peek::PeekLiveTailArgs { scrollback })
+            } else {
+                None
+            };
+            super::peek::render_peek_panel(
+                buf,
+                layout.dispatch,
+                panel,
+                &mut state.peek_reply,
+                &theme,
+                voice_listening,
+                voice_interim.as_deref(),
+                multiline,
+                Some(layout.list).filter(|r| r.area() > 0),
+                live_tail,
+                empty_hint,
+            )
+        } else {
+            Default::default()
+        };
         state.peek_reply_rect = render.reply_rect;
         let cursor = render.caret;
         // The reply is a full PromptWidget, so its `@` file-context
@@ -433,63 +478,80 @@ pub fn render_dashboard(
         return None;
     }
 
-    // Return a visible cursor for the dispatch input
-    // / rename overlay so the user sees where typing lands.
-    // Rename takes precedence — it paints over the row list.
-    //
-    // Cursor width is computed from the SANITISED
-    // draft (matching what the renderer paints). The previous
-    // `rn.draft.as_str()` form drifted right of the actual end of
-    // typed text when the draft contained control characters.
-    //
-    // Clamp `cx` to the row's right edge so a
-    // wider-than-rect draft doesn't park the cursor off the row.
+    // An active rename replaces the dispatch caret with its row-local editor caret.
     if let Some(pos) = rename_cursor_pos(state, &rows) {
         return Some(pos);
     }
     dispatch_cursor
 }
 
-/// Cursor position for the in-flight rename overlay: one cell past the
-/// end of the typed draft, on the renamed row's title line. `None` when
-/// no rename is active (or its row isn't on screen).
-///
-/// The overlay paints `rename: {draft}` at the title's own column —
-/// past the marker (1) + gap (1) + indent + icon + gap (1) chrome — in
-/// BOTH layouts (`render_row` / `render_narrow_rows` share the
-/// formula). The cursor mirrors that chrome math; anything else parks
-/// it over the `rename:` prefix or past the typed text. Indent and
-/// icon width come from the live row so a Working spinner or a
-/// (future) indented renameable row can't drift the formula.
-///
-/// Width is computed from the SANITISED draft (matching
-/// what the renderer paints). Clamped to the row's right
-/// edge so a wider-than-rect draft doesn't park the cursor off the row.
+const RENAME_PREFIX: &str = "rename: ";
+
+fn rename_editor_view(draft: &RenameDraft, width: u16) -> (&str, u16) {
+    let prefix_width = UnicodeWidthStr::width(RENAME_PREFIX) as u16;
+    let editor_width = width.saturating_sub(prefix_width);
+    let viewport = draft.viewport(editor_width as usize);
+    let visible = &draft.text()[viewport.visible_byte_range];
+    let cursor_offset = prefix_width
+        .saturating_add(viewport.cursor_display_column as u16)
+        .min(width.saturating_sub(1));
+    (visible, cursor_offset)
+}
+
+fn render_rename_editor(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    style: Style,
+    draft: &RenameDraft,
+) {
+    if width == 0 {
+        return;
+    }
+    let prefix_width = UnicodeWidthStr::width(RENAME_PREFIX) as u16;
+    buf.set_span(
+        x,
+        y,
+        &Span::styled(RENAME_PREFIX, style),
+        prefix_width.min(width),
+    );
+    let (visible, _) = rename_editor_view(draft, width);
+    if !visible.is_empty() && prefix_width < width {
+        buf.set_span(
+            x + prefix_width,
+            y,
+            &Span::styled(visible, style),
+            width - prefix_width,
+        );
+    }
+}
+
+/// Return the in-flight rename caret when its row is visible.
 fn rename_cursor_pos(state: &DashboardState, rows: &[DashboardRow]) -> Option<(u16, u16)> {
-    use unicode_width::UnicodeWidthStr;
     let rn = state.rename.as_ref()?;
     let (_, rect) = state.row_rects.iter().find(|(id, _)| *id == rn.row)?;
-    let safe_draft = crate::views::session_title::sanitize_display_text(&rn.draft);
-    let prefix_w = UnicodeWidthStr::width("rename: ") as u16;
-    let draft_w = UnicodeWidthStr::width(safe_draft.as_ref()) as u16;
-    let (indent_w, icon_w) = rows
-        .iter()
-        .find(|r| r.id == rn.row)
+    let row = rows.iter().find(|r| r.id == rn.row);
+    let (marker_width, indent_width, icon_width) = row
         .map(|r| {
             (
+                UnicodeWidthStr::width(crate::glyphs::selection_bar()) as u16,
                 (r.indent as u16) * 2,
                 UnicodeWidthStr::width(state_icon(r.state, state.spinner_tick)) as u16,
             )
         })
-        .unwrap_or((0, 1));
-    let chrome_w = 1 + 1 + indent_w + icon_w + 1;
-    let unbounded_cx = rect
-        .x
-        .saturating_add(chrome_w)
-        .saturating_add(prefix_w)
-        .saturating_add(draft_w);
-    let cx_max = rect.x.saturating_add(rect.width.saturating_sub(1));
-    Some((unbounded_cx.min(cx_max), rect.y))
+        .unwrap_or((1, 0, 1));
+    let chrome_width = marker_width + 1 + indent_width + icon_width + 1;
+    let content_x = rect.x.saturating_add(chrome_width);
+    let content_width = rect.x.saturating_add(rect.width).saturating_sub(content_x);
+    let (_, cursor_offset) = rename_editor_view(rn, content_width);
+    let cursor_x = content_x
+        .saturating_add(cursor_offset)
+        .min(rect.x.saturating_add(rect.width.saturating_sub(1)));
+    // Mirror `render_row`'s vertical centering so the caret lands on
+    // the title line (narrow-mode single-line rects yield offset 0).
+    let title_y = rect.y + row.map_or(0, |r| row_content_offset(rect.height, r));
+    Some((cursor_x, title_y))
 }
 
 /// Render the compact dashboard "banner" used when an agent is
@@ -638,7 +700,6 @@ fn render_header(
     upgrade_cta: Option<HeaderUpgradeCta<'_>>,
 ) {
     use ratatui::text::{Line, Span};
-    use unicode_width::UnicodeWidthStr;
 
     use crate::views::agent_status::AgentStatusBar;
 
@@ -957,7 +1018,8 @@ fn render_location_picker(
         ModalSizing, ModalWindowConfig, Shortcut, push_vim_nav_search_hint, render_modal_window,
     };
     use crate::views::picker::{
-        PickerEntry, PickerRow, render_divider, render_picker_content, render_search_bar_with_label,
+        PickerEntry, PickerRow, render_divider, render_picker_content,
+        render_picker_search_bar_with_label,
     };
 
     let mut shortcuts = vec![
@@ -1043,17 +1105,16 @@ fn render_location_picker(
         } else {
             (content_area.width, None)
         };
-        render_search_bar_with_label(
+        render_picker_search_bar_with_label(
             buf,
             content_area.x,
             content_area.y,
             path_w,
             theme,
             " path: ",
-            &modal.picker.query,
+            &modal.picker,
             /* active */ false,
             /* show_hint */ false,
-            modal.picker.query_cursor,
             Some(theme.bg_base),
         );
         modal.worktree_hit.set(wt_rect);
@@ -1129,7 +1190,6 @@ fn render_location_picker(
     // `render_picker_row`'s layout (fold prefix 2, gap 2, trailing 1); the
     // `-1` conservatively reserves a scrollbar column.
     let details: Vec<String> = {
-        use unicode_width::UnicodeWidthStr;
         const PREFIX: u16 = 2;
         const GAP: u16 = 2;
         const TRAILING: u16 = 1;
@@ -1495,7 +1555,7 @@ fn render_rows(
     }
 
     // Rows are 3 visual cells tall (title + secondary
-    // + breathing gap) and headers are 2 cells tall (label + gap).
+    // + padding) and headers are 2 cells tall (label + gap).
     // Viewport scrolling works on cumulative cell offsets so partial
     // rows can't peek out at the top / bottom of the list. The
     // clamp helper still operates in "1 unit = 1 cell" — we just
@@ -1587,6 +1647,10 @@ fn render_rows(
     let body_width = area.width;
     let max_y = area.y + area.height;
 
+    // Content background per visible line (`None` = spacer), consumed
+    // by the half-block halo pass after the items are painted.
+    let mut line_bg: Vec<Option<Color>> = vec![None; viewport_h];
+
     let mut cell_y: usize = 0;
     for (line, &h) in lines.iter().zip(heights.iter()) {
         let next_cell_y = cell_y + h as usize;
@@ -1614,6 +1678,14 @@ fn render_rows(
             width: body_width,
             height: render_h,
         };
+        // `line_bg` records each visible line's CONTENT background
+        // (`None` = spacer line) for the half-block halo pass below.
+        let mark = |line_bg: &mut Vec<Option<Color>>, dy: u16, bg: Color| {
+            let idx = (y - area.y + dy) as usize;
+            if let Some(slot) = line_bg.get_mut(idx) {
+                *slot = Some(bg);
+            }
+        };
         match line {
             DashboardLine::PinnedHeader { count } => {
                 let key = SectionKey::Pinned;
@@ -1623,12 +1695,16 @@ fn render_rows(
                 render_group_header(
                     buf, line_rect, theme, "Pinned", *count, collapsed, selected, hovered,
                 );
+                mark(&mut line_bg, 0, theme.bg_base);
+                // Full-height hit rect (label + trailing gap) — no
+                // hover/click dead zone between items.
                 state
                     .section_rects
-                    .push((key, Rect::new(area.x, y, body_width, 1)));
+                    .push((key, Rect::new(area.x, y, body_width, render_h)));
             }
             DashboardLine::Divider => {
                 render_divider(buf, line_rect, theme);
+                mark(&mut line_bg, 0, theme.bg_base);
             }
             DashboardLine::Header { state: rs, count } => {
                 // Headers only paint into the first cell; the
@@ -1647,22 +1723,31 @@ fn render_rows(
                     selected,
                     hovered,
                 );
+                mark(&mut line_bg, 0, theme.bg_base);
+                // Full-height hit rect (label + trailing gap) — no
+                // hover/click dead zone between items.
                 state
                     .section_rects
-                    .push((key, Rect::new(area.x, y, body_width, 1)));
+                    .push((key, Rect::new(area.x, y, body_width, render_h)));
             }
             DashboardLine::Row(row) => {
                 render_row(buf, line_rect, theme, row, state);
+                let bg = row_bg(theme, state, row);
+                let content_top = row_content_offset(render_h, row);
+                let content_h = row_content_height(row).min(render_h);
+                for dy in content_top..(content_top + content_h).min(render_h) {
+                    mark(&mut line_bg, dy, bg);
+                }
                 if !row.is_more_placeholder {
-                    // Hit rect covers the two content cells so a
-                    // click on the secondary line still selects the
-                    // row. The trailing gap (if any) stays outside.
-                    let hit_h = render_h.min(2);
+                    // Full-height hit rect (content + spacer lines) —
+                    // no hover/click dead zone between items; the
+                    // highlight covers the content plus half-cell
+                    // halos on the neighbouring spacer lines.
                     let hit = Rect {
                         x: area.x,
                         y,
                         width: body_width,
-                        height: hit_h,
+                        height: render_h,
                     };
                     state.row_rects.push((row.id.clone(), hit));
                 }
@@ -1677,14 +1762,59 @@ fn render_rows(
                     state.selected_idle_overflow,
                     state.hovered_idle_overflow,
                 );
-                state.idle_overflow_rect = Some(Rect::new(area.x, y, body_width, 1));
+                mark(&mut line_bg, 0, theme.bg_base);
+                // Full-height hit rect (label + trailing gap) — no
+                // hover/click dead zone below the overflow row.
+                state.idle_overflow_rect = Some(Rect::new(area.x, y, body_width, render_h));
             }
         }
         cell_y = next_cell_y;
     }
 
+    render_spacer_halos(buf, area, body_width, &line_bg, theme.bg_base);
+
     if needs_scrollbar {
         render_scrollbar(buf, area, offset, viewport_h, total_cells, theme);
+    }
+}
+
+/// Paint the spacer lines between items as half-cell "halos" so a
+/// highlighted row reads as vertically centered: the spacer below a
+/// highlighted block shows the highlight in its TOP half, and the
+/// spacer above shows it in its BOTTOM half. Implemented with the
+/// upper-half-block glyph (`▀`, CP437 `0xDF` — safe on legacy
+/// consoles): fg paints the top half with the colour of the content
+/// line above, bg paints the bottom half with the colour of the
+/// content line below. Spacers between two `bg_base` neighbours are
+/// left untouched.
+fn render_spacer_halos(
+    buf: &mut Buffer,
+    area: Rect,
+    body_width: u16,
+    line_bg: &[Option<Color>],
+    base: Color,
+) {
+    for (i, slot) in line_bg.iter().enumerate() {
+        if slot.is_some() {
+            continue;
+        }
+        let above = if i > 0 {
+            line_bg[i - 1].unwrap_or(base)
+        } else {
+            base
+        };
+        let below = line_bg.get(i + 1).copied().flatten().unwrap_or(base);
+        if above == base && below == base {
+            continue;
+        }
+        let y = area.y + i as u16;
+        if above == below {
+            let fill = " ".repeat(body_width as usize);
+            buf.set_string(area.x, y, &fill, Style::default().bg(above));
+        } else {
+            let fill = "\u{2580}".repeat(body_width as usize);
+            buf.set_string(area.x, y, &fill, Style::default().fg(above).bg(below));
+        }
     }
 }
 
@@ -1710,7 +1840,6 @@ fn render_group_header(
     selected: bool,
     hovered: bool,
 ) {
-    use unicode_width::UnicodeWidthStr;
     let bg = Style::default().bg(theme.bg_base);
     let fill = " ".repeat(rect.width as usize);
     buf.set_string(rect.x, rect.y, fill, bg);
@@ -1969,10 +2098,38 @@ fn snap_offset_to_line_boundary(offset: usize, heights: &[u16]) -> usize {
     snapped
 }
 
-/// Render a row as a 2-line block (`rect.height` is
-/// expected to be `>= 2`; the caller — `render_rows` — sizes the
-/// rect to either 2 or 3 lines depending on whether the trailing
-/// breathing-room gap is in budget).
+/// Number of content lines a row renders: title + optional secondary.
+fn row_content_height(row: &DashboardRow) -> u16 {
+    if row.secondary_line.as_deref().is_some_and(|s| !s.is_empty()) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Vertical offset of a row's content block within its rect. The
+/// 1- or 2-line content is centered at cell granularity: a title-only
+/// row in a 3-cell rect gets one padding line above and below, while
+/// a title+secondary row stays top-aligned ((3 - 2) / 2 = 0).
+fn row_content_offset(height: u16, row: &DashboardRow) -> u16 {
+    height.saturating_sub(row_content_height(row)) / 2
+}
+
+/// The row's background: keyboard selection wins over mouse hover.
+fn row_bg(theme: &Theme, state: &DashboardState, row: &DashboardRow) -> Color {
+    if state.selected.as_ref().is_some_and(|s| *s == row.id) {
+        theme.bg_highlight
+    } else if state.hovered_row.as_ref().is_some_and(|h| *h == row.id) {
+        theme.bg_hover
+    } else {
+        theme.bg_base
+    }
+}
+
+/// Render a row as a 2-line block plus a trailing padding line
+/// (`rect.height` is expected to be `>= 2`; the caller —
+/// `render_rows` — sizes the rect to either 2 or 3 lines depending
+/// on whether the padding is in budget).
 ///
 /// Visual:
 ///
@@ -1986,9 +2143,15 @@ fn snap_offset_to_line_boundary(offset: usize, heights: &[u16]) -> usize {
 /// tool call, the last assistant message, or a `Pending: …` preview
 /// of the front-most permission request.
 ///
-/// Selection / hover backgrounds cover both content rows (the
-/// trailing gap row, if any, stays on `bg_base` so consecutive
-/// selected rows still look distinct).
+/// The content block is vertically centered within the rect (see
+/// [`row_content_offset`]): a title-only row in a 3-cell rect renders
+/// as padding + title + padding.
+///
+/// Selection / hover backgrounds fill the CONTENT lines; the spacer
+/// lines around them are painted afterwards by `render_rows`'s
+/// half-block pass (see `render_spacer_halos`), which extends the
+/// highlight half a cell above and below so it reads as centered on
+/// the text.
 fn render_row(
     buf: &mut Buffer,
     rect: Rect,
@@ -1996,26 +2159,20 @@ fn render_row(
     row: &DashboardRow,
     state: &DashboardState,
 ) {
-    use unicode_width::UnicodeWidthStr;
     if rect.area() == 0 {
         return;
     }
     let selected = state.selected.as_ref().is_some_and(|s| *s == row.id);
-    let hovered = state.hovered_row.as_ref().is_some_and(|h| *h == row.id);
     let renaming = state.rename.as_ref().is_some_and(|r| r.row == row.id);
-    let bg = if selected {
-        theme.bg_highlight
-    } else if hovered {
-        theme.bg_hover
-    } else {
-        theme.bg_base
-    };
+    let bg = row_bg(theme, state, row);
 
-    // Paint both content rows with the same background so selection
-    // reads as a single block.
-    let content_h = rect.height.min(2);
+    // Paint the content lines with the row background. Spacer lines
+    // keep `bg_base` here; the halo pass splits them between the
+    // neighbouring items.
+    let content_top = row_content_offset(rect.height, row);
+    let content_h = row_content_height(row).min(rect.height);
     let fill = " ".repeat(rect.width as usize);
-    for dy in 0..content_h {
+    for dy in content_top..(content_top + content_h).min(rect.height) {
         buf.set_string(rect.x, rect.y + dy, &fill, Style::default().bg(bg));
     }
 
@@ -2039,8 +2196,11 @@ fn render_row(
     let icon_w = UnicodeWidthStr::width(icon) as u16;
     // Title-row paint cursor (no leading 1-col gap before the marker
     // — the marker IS the leftmost cell, mirroring the wide-mode
-    // header which starts flush-left at col 0).
-    let title_y = rect.y;
+    // header which starts flush-left at col 0). The content block is
+    // vertically centered within the rect at cell granularity:
+    // title-only rows sit padded above and below, while 2-line rows
+    // stay top-aligned (2 lines cannot center in a 3-cell row).
+    let title_y = rect.y + row_content_offset(rect.height, row);
     let content_start_x = rect.x + marker_w + 1 + indent_w + icon_w + 1;
 
     // Rename overlay: keep the row's chrome (marker + state icon) in
@@ -2057,14 +2217,14 @@ fn render_row(
                 .fg(theme.accent_user)
                 .add_modifier(Modifier::BOLD),
         );
-        // Keep the left bar continuous on secondary lines even while
-        // the rename overlay is active on the title line.
-        if selected && content_h >= 2 {
+        // Keep the left bar continuous on every content line even
+        // while the rename overlay is active on the title line.
+        if selected {
             let bar_style = Style::default()
                 .bg(bg)
                 .fg(theme.accent_user)
                 .add_modifier(Modifier::BOLD);
-            for dy in 1..content_h {
+            for dy in content_top..(content_top + content_h).min(rect.height) {
                 buf.set_string(
                     rect.x,
                     rect.y + dy,
@@ -2080,19 +2240,17 @@ fn render_row(
             icon,
             Style::default().fg(icon_color).bg(bg),
         );
-        let prefix = "rename: ";
-        let safe_draft = crate::views::session_title::sanitize_display_text(&rn.draft).into_owned();
-        let line = format!("{prefix}{safe_draft}");
-        let avail = (rect.x + rect.width).saturating_sub(content_start_x + 1);
-        let truncated = truncate_str(&line, avail as usize);
-        buf.set_string(
+        let available = (rect.x + rect.width).saturating_sub(content_start_x);
+        render_rename_editor(
+            buf,
             content_start_x,
             title_y,
-            truncated,
+            available,
             Style::default()
                 .fg(theme.accent_user)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
+            rn,
         );
         return;
     }
@@ -2109,16 +2267,15 @@ fn render_row(
     );
 
     // For the active selection, extend the thin left bar down every
-    // content line of the row (title + secondary) so it forms one
-    // continuous vertical rule along the full height of the selected
-    // item. Hover and normal states keep their marker only on the
-    // title line.
-    if selected && content_h >= 2 {
+    // content line of the row so it forms one continuous vertical rule
+    // along the highlighted text. Hover and normal states keep their
+    // marker only on the title line.
+    if selected {
         let bar_style = Style::default()
             .bg(bg)
             .fg(theme.accent_user)
             .add_modifier(Modifier::BOLD);
-        for dy in 1..content_h {
+        for dy in content_top..(content_top + content_h).min(rect.height) {
             buf.set_string(
                 rect.x,
                 rect.y + dy,
@@ -2251,7 +2408,7 @@ fn render_row(
         && let Some(secondary) = row.secondary_line.as_deref()
         && !secondary.is_empty()
     {
-        let sec_y = rect.y + 1;
+        let sec_y = title_y + 1;
         let avail = rect
             .width
             .saturating_sub(content_start_x - rect.x)
@@ -2311,7 +2468,6 @@ fn render_narrow_rows(
     // form would push too many rows off-screen on a 40-col terminal).
     // We still emit group headers and the selection marker so the
     // visual vocabulary stays consistent.
-    use unicode_width::UnicodeWidthStr;
     let lines = build_dashboard_lines(
         rows,
         state.grouping,
@@ -2439,18 +2595,16 @@ fn render_narrow_rows(
                 &chrome,
                 Style::default().fg(theme.text_primary).bg(bg),
             );
-            let safe_draft =
-                crate::views::session_title::sanitize_display_text(&rn.draft).into_owned();
-            let line = format!("rename: {safe_draft}");
-            let truncated = truncate_str(&line, body_width.saturating_sub(chrome_w) as usize);
-            buf.set_string(
+            render_rename_editor(
+                buf,
                 area.x + chrome_w,
                 y,
-                truncated,
+                body_width.saturating_sub(chrome_w),
                 Style::default()
                     .fg(theme.accent_user)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
+                rn,
             );
         } else {
             let marker = if selected {
@@ -2574,8 +2728,6 @@ fn paint_dispatch_feedback_badge(
     theme: &Theme,
     error_toast: Option<&str>,
 ) {
-    use unicode_width::UnicodeWidthStr;
-
     let Some(err) = error_toast else {
         return;
     };
@@ -2699,7 +2851,6 @@ fn render_dispatch(
     overlay_area: Option<Rect>,
 ) -> Option<(u16, u16)> {
     use ratatui::widgets::{Block, BorderType, Borders, Widget};
-    use unicode_width::UnicodeWidthStr;
 
     use crate::views::prompt_widget::PromptStyle;
 
@@ -2759,7 +2910,7 @@ fn render_dispatch(
             height: 1,
         }
     };
-    if content.width < 4 {
+    if content.width == 0 {
         return None;
     }
 
@@ -2770,46 +2921,70 @@ fn render_dispatch(
     if state.search_mode {
         let prefix = "Search: ";
         let prefix_w = UnicodeWidthStr::width(prefix) as u16;
-        buf.set_string(
+        let painted_prefix_w = prefix_w.min(content.width);
+        buf.set_span(
             content.x,
             content.y,
-            prefix,
-            Style::default()
-                .fg(theme.warning)
-                .bg(theme.bg_base)
-                .add_modifier(Modifier::BOLD),
+            &Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme.warning)
+                    .bg(theme.bg_base)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            painted_prefix_w,
         );
-        let avail = content.width.saturating_sub(prefix_w);
-        let (to_show, style) = if state.dispatch.text().is_empty() {
-            (
-                "Type to filter sessions\u{2026}".to_string(),
-                Style::default().fg(theme.gray_dim).bg(theme.bg_base),
-            )
+        let editor_x = content.x + painted_prefix_w;
+        let avail = content.width - painted_prefix_w;
+        let cursor_column = if state.dispatch.text().is_empty() {
+            if avail > 0 {
+                let placeholder = truncate_str("Type to filter sessions\u{2026}", avail as usize);
+                buf.set_string(
+                    editor_x,
+                    content.y,
+                    placeholder,
+                    Style::default().fg(theme.gray_dim).bg(theme.bg_base),
+                );
+            }
+            0
         } else {
-            (
-                state.dispatch.text().to_string(),
-                Style::default().fg(theme.text_primary).bg(theme.bg_base),
+            let viewport = xai_ratatui_textarea::EditBuffer::from_parts(
+                state.dispatch.text(),
+                state.dispatch.cursor(),
             )
+            .single_line_viewport(avail as usize);
+            let visible = &state.dispatch.text()[viewport.visible_byte_range];
+            if avail > 0 {
+                buf.set_span(
+                    editor_x,
+                    content.y,
+                    &Span::styled(
+                        visible,
+                        Style::default().fg(theme.text_primary).bg(theme.bg_base),
+                    ),
+                    (UnicodeWidthStr::width(visible) as u16).min(avail),
+                );
+            }
+            viewport.cursor_display_column as u16
         };
-        let trunc = truncate_str(&to_show, avail as usize);
-        buf.set_string(content.x + prefix_w, content.y, trunc, style);
-        let text_disp_w: u16 = UnicodeWidthStr::width(state.dispatch.text())
-            .try_into()
-            .unwrap_or(u16::MAX);
-        let cx = content.x + prefix_w + text_disp_w.min(avail.saturating_sub(1));
+        let cursor_offset = painted_prefix_w
+            .saturating_add(cursor_column)
+            .min(content.width - 1);
+        let cx = content.x + cursor_offset;
         return input_focused.then_some((cx, content.y));
+    }
+
+    if content.width < 4 {
+        return None;
     }
 
     let prefix = "\u{276F} ";
     let prefix_w = UnicodeWidthStr::width(prefix) as u16;
 
-    // Voice overlay: stream the interim transcript into the box and hide the
-    // caret while listening. When active we render through `PromptWidget::draw`
-    // (below) even on an empty buffer, so the manual empty-state branch is
-    // skipped in that case.
+    // When voice is active, draw through PromptWidget even on an empty buffer
+    // so the manual empty-state branch is skipped.
     let voice_overlay = (state.voice_listening || state.voice_interim.is_some()).then_some(
         crate::views::prompt_widget::VoicePromptOverlay {
-            listening: state.voice_listening,
             interim: state.voice_interim.as_deref(),
             color: theme.accent_running,
         },
@@ -3778,7 +3953,6 @@ pub fn render_popup_overlay(
 
     let title_text = format!(" \u{2771} {title_label} ");
 
-    use unicode_width::UnicodeWidthStr;
     let close_label = crate::glyphs::ballot_x_button();
     let close_w = UnicodeWidthStr::width(close_label) as u16;
     // Reserve close-affordance width + a 1-cell gap on the right;
@@ -4000,8 +4174,6 @@ fn paint_session_title_bar(
     left_inset: u16,
     right_inset: u16,
 ) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
-    use unicode_width::UnicodeWidthStr;
-
     // `‹` / `›` / `✗` are all painted as plain bracketed text
     // (no button background fills). Hover only changes the fg
     // color (`text_primary` vs `gray`) for subtle clickability
@@ -4217,6 +4389,51 @@ mod tests {
         assert!(
             content.contains("No agents yet, type a prompt to start one."),
             "expected empty-state hint, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn render_dashboard_shows_roster_when_local_agents_empty() {
+        use crate::app::roster::{RosterActivity, RosterEntry, RosterOrigin};
+
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        let mut agents: IndexMap<AgentId, AgentView> = IndexMap::new();
+        let mut state = DashboardState::new();
+        let registry = crate::actions::ActionRegistry::defaults();
+        let roster = [RosterEntry {
+            session_id: "sess-fleet-1".into(),
+            title: Some("Fix fleet dashboard".into()),
+            cwd: "/repo/work".into(),
+            is_worktree: false,
+            model_id: None,
+            yolo: false,
+            activity: RosterActivity::Working,
+            resident: true,
+            last_change_unix_ms: 1_725_000_000_000,
+            origin: RosterOrigin::default(),
+        }];
+
+        let _ = render_dashboard(
+            &mut buf,
+            area,
+            &mut state,
+            &mut agents,
+            &registry,
+            None,
+            &roster,
+            false,
+            None,
+        );
+
+        let content = buf_to_text(&buf);
+        assert!(
+            content.contains("Fix fleet dashboard"),
+            "roster-only working session must paint when local agents are empty, got: {content:?}"
+        );
+        assert!(
+            !content.contains("No agents yet"),
+            "must not show empty-state while roster rows exist, got: {content:?}"
         );
     }
 
@@ -4954,6 +5171,112 @@ mod tests {
         assert!(!state.row_rects.is_empty());
     }
 
+    /// Wide-mode hit rects include each item's trailing gap line and
+    /// tile the list contiguously, so hover/click never falls into a
+    /// dead zone between items.
+    #[test]
+    fn render_rows_hit_rects_leave_no_dead_zones() {
+        let rows = vec![
+            header_test_row(1, RowState::Working, "alpha"),
+            header_test_row(2, RowState::Working, "beta"),
+            header_test_row(3, RowState::Idle, "gamma"),
+        ];
+        let area = Rect::new(0, 0, 60, 30);
+        let mut buf = Buffer::empty(area);
+        let mut state = DashboardState::new();
+        state.grouping = Grouping::State;
+        let theme = Theme::current();
+        render_rows(&mut buf, area, &theme, &rows, &mut state);
+
+        assert_eq!(state.row_rects.len(), 3);
+        for (id, rect) in &state.row_rects {
+            assert_eq!(rect.height, ROW_HEIGHT, "row {id:?} must be full-height");
+        }
+        assert_eq!(state.section_rects.len(), 2);
+        for (key, rect) in &state.section_rects {
+            assert_eq!(
+                rect.height, GROUP_HEADER_HEIGHT,
+                "section {key:?} must be full-height",
+            );
+        }
+
+        // Each hit rect starts exactly where the previous one ended.
+        let mut rects: Vec<Rect> = state
+            .row_rects
+            .iter()
+            .map(|(_, r)| *r)
+            .chain(state.section_rects.iter().map(|(_, r)| *r))
+            .collect();
+        rects.sort_by_key(|r| r.y);
+        for pair in rects.windows(2) {
+            assert_eq!(
+                pair[0].y + pair[0].height,
+                pair[1].y,
+                "hit rects must tile without gaps: {pair:?}",
+            );
+        }
+
+        // Hovering a row highlights its content line fully and paints
+        // half-cell halos on the spacer lines above and below, so the
+        // highlight reads as centered on the text. These rows are
+        // title-only, so the content line is the middle of the 3-cell
+        // rect. Use an unquantized theme: `Theme::current()` in the
+        // test environment collapses `bg_hover` onto `bg_base`, which
+        // (correctly) suppresses the halos.
+        let theme = Theme::groknight();
+        assert_ne!(theme.bg_hover, theme.bg_base);
+        let (id, rect) = state.row_rects[0].clone();
+        state.hovered_row = Some(id);
+        render_rows(&mut buf, area, &theme, &rows, &mut state);
+        let title_y = rect.y + 1;
+        assert_eq!(
+            buf[(rect.x, title_y)].style().bg,
+            Some(theme.bg_hover),
+            "hovered row must highlight its content line",
+        );
+        let above = &buf[(rect.x, title_y - 1)];
+        assert_eq!(above.symbol(), "\u{2580}", "spacer above must be a halo");
+        assert_eq!(
+            above.style().bg,
+            Some(theme.bg_hover),
+            "halo above must show the hover colour in its bottom half",
+        );
+        let below = &buf[(rect.x, title_y + 1)];
+        assert_eq!(below.symbol(), "\u{2580}", "spacer below must be a halo");
+        assert_eq!(
+            below.style().fg,
+            Some(theme.bg_hover),
+            "halo below must show the hover colour in its top half",
+        );
+    }
+
+    /// A row's content is vertically centered within its 3-cell rect:
+    /// a title-only row renders padding + title + padding, while a
+    /// title + secondary row stays top-aligned (2 lines cannot center
+    /// in 3 cells).
+    #[test]
+    fn render_row_centers_title_only_content() {
+        let theme = Theme::current();
+        let state = DashboardState::new();
+
+        // Title-only → centered on the middle line.
+        let row = header_test_row(1, RowState::Idle, "solo");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
+        render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &state);
+        assert_eq!(buf[(4, 1)].symbol(), "s", "title must sit on line 1");
+        assert_eq!(buf[(4, 0)].symbol(), " ", "line 0 must be padding");
+        assert_eq!(buf[(4, 2)].symbol(), " ", "line 2 must be padding");
+
+        // Title + secondary → top-aligned.
+        let mut row = header_test_row(2, RowState::Working, "pair");
+        row.secondary_line = Some("Responding".to_string());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
+        render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &state);
+        assert_eq!(buf[(4, 0)].symbol(), "p", "title must sit on line 0");
+        assert_eq!(buf[(4, 1)].symbol(), "R", "secondary must sit on line 1");
+        assert_eq!(buf[(4, 2)].symbol(), " ", "line 2 must be padding");
+    }
+
     /// Empty area is a quick exit.
     #[test]
     fn render_empty_state_zero_area_is_no_op() {
@@ -5338,13 +5661,10 @@ mod tests {
         );
     }
 
-    /// The in-flight rename overlay sanitises the
-    /// draft before painting so a smuggled ANSI escape never lands in
-    /// the buffer (test wide-mode and narrow-mode separately).
+    /// RenameDraft sanitation keeps control characters out of both render paths.
     #[test]
-    fn render_rename_overlay_strips_control_chars_from_live_draft() {
+    fn sanitized_rename_draft_is_safe_in_both_render_paths() {
         use crate::app::agent::AgentId;
-        use crate::views::dashboard::state::RenameDraft;
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
@@ -5373,10 +5693,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 3));
             let mut state = DashboardState::new();
             state.selected = Some(id.clone());
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "a\x1b[31m".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "a\x1b[31m"));
             render_rows(&mut buf, Rect::new(0, 0, 80, 3), &theme, &rows, &mut state);
             let content = buf_to_text(&buf);
             assert!(
@@ -5394,10 +5711,7 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 30, 3));
             let mut state = DashboardState::new();
             state.selected = Some(id.clone());
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "a\x1b[31m".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "a\x1b[31m"));
             render_narrow_rows(&mut buf, Rect::new(0, 0, 30, 3), &theme, &rows, &mut state);
             let content = buf_to_text(&buf);
             assert!(
@@ -5411,13 +5725,10 @@ mod tests {
         }
     }
 
-    /// The rename overlay keeps the row's chrome (state icon) and paints
-    /// `rename:` at the title's own column, so the editing row stays
-    /// aligned with its neighbours (wide and narrow layouts).
+    /// Rename rendering preserves row chrome and title alignment in both layouts.
     #[test]
     fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
         use crate::app::agent::AgentId;
-        use crate::views::dashboard::state::RenameDraft;
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
@@ -5444,7 +5755,9 @@ mod tests {
             (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()
         };
 
-        // Wide path: title row sits 2 below the group header (header + gap).
+        // Wide path: this title-only row centers its title within its
+        // 3-cell rect, so the title sits 3 below the group header
+        // (header + gap + row top padding).
         // `title_byte` is a byte offset (for `str::find` comparisons);
         // `title_col` is the display column (the icon glyph is
         // multi-byte UTF-8, so the two differ) for cursor math.
@@ -5452,26 +5765,23 @@ mod tests {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
             let mut state = DashboardState::new();
             render_rows(&mut buf, Rect::new(0, 0, 80, 5), &theme, &rows, &mut state);
-            let line = row_text(&buf, 2, 80);
+            let line = row_text(&buf, 3, 80);
             let byte = line.find("row label").expect("title must render");
             (byte, line[..byte].chars().count() as u16)
         };
         {
             let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
             let mut state = DashboardState::new();
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "new name".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "new name"));
             render_rows(&mut buf, Rect::new(0, 0, 80, 5), &theme, &rows, &mut state);
-            let line = row_text(&buf, 2, 80);
+            let line = row_text(&buf, 3, 80);
             assert_eq!(
                 line.find("rename: new name"),
                 Some(title_byte),
                 "wide: `rename:` must start at the title column, got: {line:?}",
             );
             assert_eq!(
-                buf[(2, 2)].symbol(),
+                buf[(2, 3)].symbol(),
                 crate::glyphs::diamond_hollow(),
                 "wide: the state icon must stay in place while renaming",
             );
@@ -5481,18 +5791,15 @@ mod tests {
             let draft_w = "new name".len() as u16;
             assert_eq!(
                 rename_cursor_pos(&state, &rows),
-                Some((title_col + prefix_w + draft_w, 2)),
+                Some((title_col + prefix_w + draft_w, 3)),
                 "cursor must sit one cell past the draft text",
             );
             // With an empty draft the cursor sits immediately after
             // `rename: ` (the position typing lands at).
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: String::new(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), ""));
             assert_eq!(
                 rename_cursor_pos(&state, &rows),
-                Some((title_col + prefix_w, 2)),
+                Some((title_col + prefix_w, 3)),
                 "empty draft: cursor must sit right after `rename: `",
             );
         }
@@ -5509,10 +5816,7 @@ mod tests {
         {
             let mut buf = Buffer::empty(Rect::new(0, 0, 30, 3));
             let mut state = DashboardState::new();
-            state.rename = Some(RenameDraft {
-                row: id.clone(),
-                draft: "nn".to_string(),
-            });
+            state.rename = Some(RenameDraft::new(id.clone(), "nn"));
             render_narrow_rows(&mut buf, Rect::new(0, 0, 30, 3), &theme, &rows, &mut state);
             let line = row_text(&buf, 1, 30);
             assert_eq!(
@@ -5525,6 +5829,97 @@ mod tests {
                 crate::glyphs::diamond_hollow(),
                 "narrow: the state icon must stay in place while renaming",
             );
+        }
+    }
+
+    #[test]
+    fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
+        use crate::app::agent::AgentId;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let id = DashboardRowId::TopLevel(AgentId(7));
+        let row = DashboardRow {
+            id: id.clone(),
+            label: "row label".to_string(),
+            subtitle: None,
+            state: RowState::Idle,
+            activity: None,
+            secondary_line: None,
+            cwd_display: String::new(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_change_at: std::time::SystemTime::now(),
+            pinned: false,
+            is_active: false,
+            badges: Vec::new(),
+            context_pct: None,
+            indent: 0,
+            parent_label: None,
+            is_more_placeholder: false,
+            more_count: 0,
+        };
+        let rows = vec![row];
+        let text = format!("{}中e\u{301}👩🏽\u{200d}💻", "x".repeat(90));
+        let theme = Theme::current();
+        let registry = crate::actions::ActionRegistry::defaults();
+
+        for (width, narrow, row_y) in [(80, false, 3), (30, true, 1)] {
+            let area = Rect::new(0, 0, width, if narrow { 3 } else { 5 });
+            let mut buffer = Buffer::empty(area);
+            let mut state = DashboardState::new();
+            state.rename = Some(RenameDraft::new(id.clone(), text.clone()));
+            if narrow {
+                render_narrow_rows(&mut buffer, area, &theme, &rows, &mut state);
+            } else {
+                render_rows(&mut buffer, area, &theme, &rows, &mut state);
+            }
+            let line = (0..width)
+                .map(|x| buffer[(x, row_y)].symbol().to_string())
+                .collect::<String>();
+            assert!(line.contains('中'), "CJK tail missing: {line:?}");
+            assert!(line.contains("e\u{301}"), "combining tail split: {line:?}");
+            assert!(line.contains("👩🏽\u{200d}💻"), "ZWJ tail split: {line:?}",);
+            let end_cursor = rename_cursor_pos(&state, &rows).expect("end cursor");
+
+            let _ = state.handle_input(
+                &Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+                &registry,
+            );
+            for _ in 0..20 {
+                let _ = state.handle_input(
+                    &Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                    &registry,
+                );
+            }
+            let mut middle_buffer = Buffer::empty(area);
+            if narrow {
+                render_narrow_rows(&mut middle_buffer, area, &theme, &rows, &mut state);
+            } else {
+                render_rows(&mut middle_buffer, area, &theme, &rows, &mut state);
+            }
+            let middle_cursor = rename_cursor_pos(&state, &rows).expect("middle cursor");
+            assert_ne!(
+                state.rename.as_ref().expect("rename draft").cursor_byte(),
+                text.len()
+            );
+            if !narrow {
+                assert_ne!(middle_cursor, end_cursor);
+            }
+            let prefix_x = (0..width)
+                .find(|x| middle_buffer[(*x, row_y)].symbol() == "r")
+                .expect("rename prefix");
+            let row_rect = state
+                .row_rects
+                .iter()
+                .find(|(row_id, _)| row_id == &id)
+                .map(|(_, rect)| *rect)
+                .expect("rename row rect");
+            let editor_x = prefix_x + RENAME_PREFIX.len() as u16;
+            let editor_width = row_rect
+                .x
+                .saturating_add(row_rect.width)
+                .saturating_sub(editor_x);
+            let expected_cursor = editor_x + 20u16.min(editor_width.saturating_sub(1));
+            assert_eq!(middle_cursor, (expected_cursor, row_y));
         }
     }
 
@@ -5549,6 +5944,52 @@ mod tests {
             content.contains('\u{276F}'),
             "dispatch must paint ❯ prefix inside the box, got: {content:?}",
         );
+    }
+
+    #[test]
+    fn render_search_mode_uses_textarea_cursor_not_text_end() {
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::current();
+        let mut state = DashboardState::new();
+        state.search_mode = true;
+        state.dispatch.set_text("abcdef");
+        state.dispatch.set_cursor(2);
+
+        let cursor = render_dispatch(&mut buffer, area, &theme, &mut state, None)
+            .expect("focused search cursor");
+        let prefix_x = (0..area.width)
+            .find(|x| buffer[(*x, cursor.1)].symbol() == "S")
+            .expect("Search prefix");
+        assert_eq!(cursor.0, prefix_x + "Search: ".len() as u16 + 2);
+    }
+
+    #[test]
+    fn render_search_mode_clips_prefix_and_cursor_at_widths_one_through_nine() {
+        let theme = Theme::current();
+        for width in 1..=9 {
+            let full = Rect::new(0, 0, 14, 1);
+            let area = Rect::new(2, 0, width, 1);
+            let mut buffer = Buffer::empty(full);
+            buffer.set_string(0, 0, "#".repeat(full.width as usize), Style::default());
+            let mut state = DashboardState::new();
+            state.search_mode = true;
+            state.dispatch.set_text("abcdef");
+            state.dispatch.set_cursor(2);
+
+            let cursor = render_dispatch(&mut buffer, area, &theme, &mut state, None)
+                .expect("focused narrow search cursor");
+            assert!(cursor.0 >= area.x && cursor.0 < area.x + area.width);
+            for x in 0..full.width {
+                if x < area.x || x >= area.x + area.width {
+                    assert_eq!(
+                        buffer[(x, 0)].symbol(),
+                        "#",
+                        "width {width} wrote outside at column {x}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6612,8 +7053,9 @@ mod tests {
     /// Group header (section title) leads with a disclosure glyph at
     /// col 0, then the label at col 2, within the list area. Row content
     /// below is indented (marker col 0, gap col 1, icon col 2). The
-    /// header is 2 visual cells tall (label + gap) so the row's title
-    /// sits 2 rows below the header in this fixture.
+    /// header is 2 visual cells tall (label + gap) and the title-only
+    /// row centers its title, so the title sits 3 rows below the
+    /// header in this fixture.
     #[test]
     fn render_group_header_leads_with_disclosure_glyph() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 8));
@@ -6636,12 +7078,13 @@ mod tests {
             "section title `Idle …` must start after the disclosure glyph, got: {header_label_x:?}",
         );
 
-        // Header gap → row 1 is blank. Row's title row starts at y=2
-        // (after the 2-cell header). Rows still render their marker/icon
-        // in the left chrome columns.
-        let row_col0 = buf[(0, 2)].symbol().to_string();
-        let row_col1 = buf[(1, 2)].symbol().to_string();
-        let row_col2 = buf[(2, 2)].symbol().to_string();
+        // Header gap → row 1 is blank. The title-only row centers its
+        // title within its 3-cell rect (y=2..5), so the title sits at
+        // y=3. Rows still render their marker/icon in the left chrome
+        // columns.
+        let row_col0 = buf[(0, 3)].symbol().to_string();
+        let row_col1 = buf[(1, 3)].symbol().to_string();
+        let row_col2 = buf[(2, 3)].symbol().to_string();
         assert_eq!(
             row_col0, " ",
             "row's col 0 must be the marker space when nothing selected, got: {row_col0:?}",
@@ -6731,7 +7174,7 @@ mod tests {
     #[test]
     fn render_rows_subagents_do_not_trigger_their_own_headers() {
         use crate::app::agent::AgentId;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 20));
         let mut state = DashboardState::new();
         let parent = DashboardRow {
             id: DashboardRowId::TopLevel(AgentId(1)),
@@ -6880,14 +7323,14 @@ mod tests {
         let seed = ratatui::style::Color::Rgb(0xFF, 0x00, 0xFF);
         buf.set_style(area, Style::default().bg(seed));
 
-        let agents: IndexMap<AgentId, AgentView> = IndexMap::new();
+        let mut agents: IndexMap<AgentId, AgentView> = IndexMap::new();
         let mut state = DashboardState::new();
         let registry = crate::actions::ActionRegistry::defaults();
         let _ = render_dashboard(
             &mut buf,
             area,
             &mut state,
-            &agents,
+            &mut agents,
             &registry,
             None,
             &[],
@@ -7293,8 +7736,7 @@ mod tests {
             std::path::PathBuf::from("/base"),
             std::collections::HashMap::new(),
         );
-        modal.picker.query = "/tmp/zzz".to_string();
-        modal.picker.query_cursor = modal.picker.query.len();
+        modal.picker.set_query("/tmp/zzz");
         render_location_picker(&mut buf, area, &theme, &mut modal);
         let content = buf_to_text(&buf);
         assert!(
@@ -7645,8 +8087,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".into(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: None,
                 options: Vec::new(),
                 request_id: None,
@@ -7688,8 +8128,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".into(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: None,
                 options: Vec::new(),
                 request_id: None,
@@ -7740,8 +8178,6 @@ mod tests {
                 time_ago: String::new(),
                 response_type: "Idle".into(),
                 last_user_message: None,
-                last_agent_lines: Vec::new(),
-                last_response_truncated: false,
                 question: None,
                 options: Vec::new(),
                 request_id: None,
@@ -7791,8 +8227,6 @@ mod tests {
                     time_ago: String::new(),
                     response_type: "NeedsInput".into(),
                     last_user_message: None,
-                    last_agent_lines: Vec::new(),
-                    last_response_truncated: false,
                     question: Some("Allow?".into()),
                     options: vec![
                         ("allow".into(), "Allow".into()),
@@ -7875,8 +8309,6 @@ mod tests {
                     time_ago: String::new(),
                     response_type: "NeedsInput".into(),
                     last_user_message: None,
-                    last_agent_lines: Vec::new(),
-                    last_response_truncated: false,
                     question: Some("Allow?".into()),
                     options: vec![
                         ("allow".into(), "Allow".into()),
@@ -8218,21 +8650,16 @@ mod tests {
         );
     }
 
-    /// An in-flight rename swaps the footer for its two actions —
-    /// Enter saves, Esc cancels — and hides the normal nav/stop chips.
+    /// Rename mode shows only save and cancel actions.
     #[test]
     fn render_footer_rename_shows_save_and_cancel() {
         use crate::app::agent::AgentId;
-        use crate::views::dashboard::state::RenameDraft;
         let theme = Theme::current();
         let registry = crate::actions::ActionRegistry::defaults();
         let mut state = DashboardState::new();
         let id = DashboardRowId::TopLevel(AgentId(0));
         state.focus_row(id.clone());
-        state.rename = Some(RenameDraft {
-            row: id,
-            draft: String::new(),
-        });
+        state.rename = Some(RenameDraft::new(id, ""));
         let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
         render_footer(
             &mut buf,

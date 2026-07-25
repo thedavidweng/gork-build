@@ -26,6 +26,7 @@ fn signed_verdict_overrides_marker_both_ways() {
     // Signed says NOT compromised → proceed, overriding the marker's tamper signal.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         false,
         Some(&cache),
         home,
@@ -39,6 +40,7 @@ fn signed_verdict_overrides_marker_both_ways() {
     };
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Compromised,
+        || false,
         false,
         Some(&intact),
         home,
@@ -65,6 +67,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     // opted-in cache.
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         true, // deploy-key fingerprint mismatch
         Some(&opted_in),
         home,
@@ -73,6 +76,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     // A matching fingerprint trusts the signed verdict as before.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         false,
         Some(&opted_in),
         home,
@@ -87,6 +91,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Trusted,
+        || false,
         true,
         Some(&opted_out),
         home,
@@ -96,6 +101,7 @@ fn signed_verdict_does_not_skip_deploy_key_fingerprint() {
     // this opted-OUT marker.
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Compromised,
+        || false,
         true,
         Some(&opted_out),
         home,
@@ -122,6 +128,7 @@ fn unreadable_sidecar_falls_back_to_marker() {
     assert!(
         !managed_policy_compromised_decision(
             SignedVerdict::SidecarUnreadable,
+            || false,
             false,
             Some(&served_fail_closed),
             home,
@@ -133,6 +140,7 @@ fn unreadable_sidecar_falls_back_to_marker() {
     std::fs::remove_file(home.join("requirements.toml")).unwrap();
     assert!(managed_policy_compromised_decision(
         SignedVerdict::SidecarUnreadable,
+        || false,
         false,
         Some(&served_fail_closed),
         home,
@@ -159,6 +167,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     assert!(
         managed_policy_compromised_decision(
             SignedVerdict::NoAuthenticSidecar,
+            || false,
             false,
             Some(&served_fail_closed),
             home,
@@ -174,6 +183,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::NoAuthenticSidecar,
+        || false,
         false,
         Some(&served_nothing),
         home,
@@ -188,6 +198,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::NoAuthenticSidecar,
+        || false,
         false,
         Some(&opted_out),
         home,
@@ -196,6 +207,7 @@ fn missing_sidecar_under_fail_closed_marker_refuses() {
     // No marker at all → nothing to enforce.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::NoAuthenticSidecar,
+        || false,
         false,
         None,
         home,
@@ -219,6 +231,7 @@ fn inactive_verdict_falls_through_to_marker() {
     };
     assert!(managed_policy_compromised_decision(
         SignedVerdict::Inactive,
+        || false,
         false,
         Some(&missing),
         home,
@@ -233,6 +246,7 @@ fn inactive_verdict_falls_through_to_marker() {
     };
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Inactive,
+        || false,
         false,
         Some(&optout),
         home,
@@ -241,6 +255,7 @@ fn inactive_verdict_falls_through_to_marker() {
     // No marker at all → nothing to enforce.
     assert!(!managed_policy_compromised_decision(
         SignedVerdict::Inactive,
+        || false,
         false,
         None,
         home,
@@ -1147,3 +1162,205 @@ fn cache_identity_mismatch_ignores_whitespace_only_diffs() {
     let empty = ManagedConfigCache::default();
     assert!(cache_identity_mismatch(&empty, &team("team-a")));
 }
+
+/// Tick raises an existing floor, never lowers it, and never creates a marker.
+#[test]
+fn rollback_floor_ticks_up_never_down_and_never_creates_a_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let floor = |home: &Path| read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+
+    raise_rollback_floor(home, 5_000);
+    assert!(
+        read_managed_config_cache(home).is_none(),
+        "the tick must not create a marker"
+    );
+
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: false,
+            had_requirements: false,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    let base = floor(home);
+    assert!(
+        base >= 1_700_000_000,
+        "a fetch seeds the floor at the wall clock"
+    );
+
+    raise_rollback_floor(home, base + 1_000);
+    assert_eq!(floor(home), base + 1_000);
+    raise_rollback_floor(home, base);
+    assert_eq!(floor(home), base + 1_000, "the tick never lowers the floor");
+}
+
+/// The floor RMW preserves marker fields this binary doesn't know (mixed-version homes).
+#[test]
+fn floor_bump_preserves_unknown_marker_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        r#"{"synced_at":1700000000,"rollback_floor":1700000000,"from_the_future":true}"#,
+    )
+    .unwrap();
+    raise_rollback_floor(home, 1_700_000_100);
+    let marker = std::fs::read_to_string(home.join(MANAGED_CONFIG_CACHE_FILE)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&marker).unwrap();
+    assert_eq!(v["rollback_floor"].as_u64(), Some(1_700_000_100));
+    assert_eq!(
+        v["from_the_future"],
+        serde_json::Value::Bool(true),
+        "the RMW must not strip fields a newer binary wrote: {marker}"
+    );
+}
+
+/// Successful fetch resets (never maxes) an inflated floor to the wall clock.
+#[test]
+fn fetch_resets_an_inflated_rollback_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        r#"{"rollback_floor":9999999999}"#,
+    )
+    .unwrap();
+
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: false,
+            had_requirements: false,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    let floor = read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+    assert!(
+        (1_700_000_000..9_999_999_999).contains(&floor),
+        "the fetch must reset the inflated floor to the wall clock, got {floor}"
+    );
+}
+
+/// Dark build: public tick is a no-op over an existing marker.
+#[test]
+fn bump_rollback_floor_is_inert_when_dark() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    mark_managed_config_synced_at(
+        home,
+        SyncMarker {
+            principal: Some("team-a"),
+            had_managed_config: false,
+            had_requirements: false,
+            key_fingerprint: None,
+            fail_closed: false,
+        },
+    );
+    let floor = |home: &Path| read_managed_config_cache(home).map_or(0, |c| c.rollback_floor);
+    let base = floor(home);
+    assert!(!crate::signed_policy::verification_active());
+    bump_rollback_floor_with_now(home, base + 10_000);
+    assert_eq!(
+        floor(home),
+        base,
+        "dark build: the tick must not move the floor"
+    );
+}
+
+/// Far-future `synced_at` is stale; modest forward skew stays fresh.
+#[test]
+fn managed_config_stale_for_far_future_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // ~year 3000: beyond the skew allowance.
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        "{\"synced_at\":32503680000}",
+    )
+    .unwrap();
+    assert!(
+        managed_config_stale_at(Some(home), &ServingIdentity::None),
+        "a far-future synced_at must not freeze the refetch timer"
+    );
+
+    // Past `SystemTime`'s range: must read stale, not panic (would kill the sync task).
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        format!("{{\"synced_at\":{}}}", u64::MAX),
+    )
+    .unwrap();
+    assert!(
+        managed_config_stale_at(Some(home), &ServingIdentity::None),
+        "an out-of-range synced_at reads stale"
+    );
+
+    let in_a_minute = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+    std::fs::write(
+        home.join(MANAGED_CONFIG_CACHE_FILE),
+        format!("{{\"synced_at\":{in_a_minute}}}"),
+    )
+    .unwrap();
+    assert!(
+        !managed_config_stale_at(Some(home), &ServingIdentity::None),
+        "a minute of genuine clock skew still reads fresh"
+    );
+}
+
+/// Unreadable requirements (PermissionDenied) with no fail_closed marker must
+/// still arm the gate so clear_orphan cannot wipe policy that may still be
+/// fail_closed on disk.
+#[test]
+#[cfg(unix)]
+fn unreadable_requirements_treats_fail_closed_as_armed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let req = home.join(crate::loader::REQUIREMENTS_FILENAME);
+    std::fs::write(&req, "fail_closed = true\n").unwrap();
+    assert!(
+        fail_closed_policy_armed_at(home),
+        "readable fail_closed requirements must arm the gate"
+    );
+
+    // Drop read perms so read_to_string fails with PermissionDenied (not NotFound).
+    std::fs::set_permissions(&req, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Restore on drop so tempfile cleanup can remove the file.
+    struct RestorePerms<'a>(&'a std::path::Path);
+    impl Drop for RestorePerms<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let _restore = RestorePerms(&req);
+
+    assert!(
+        fail_closed_policy_armed_at(home),
+        "unreadable requirements must treat fail_closed as armed (no wipe)"
+    );
+}
+
+/// Absent requirements + no fail_closed marker → not armed (safe to clear).
+#[test]
+fn missing_requirements_and_marker_not_armed() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        !fail_closed_policy_armed_at(dir.path()),
+        "NotFound requirements with no marker must not arm fail_closed"
+    );
+}
+
+// The is-managed claim gate tests live in a sibling child module (this file is
+// past the 1k-line mark); same private access via the #[path] include below.
+#[path = "claim_tests.rs"]
+mod claim_tests;

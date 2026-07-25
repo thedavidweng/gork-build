@@ -50,6 +50,12 @@ enum ServerEvent {
     Registered(ClientId, ClientMode, ClientCapabilities, String),
     Message(ClientId, ClientMessage),
 }
+enum LeaderServerPoll {
+    Cancelled,
+    Accept(std::io::Result<LeaderStream>),
+    Event(ServerEvent),
+    Response(String),
+}
 /// A live notification buffered during an in-flight `session/load`: the
 /// shared payload plus its `event_seq` (computed at buffer time, when the
 /// message is already parsed, so the post-load flush never re-parses).
@@ -837,11 +843,15 @@ fn inject_client_identity_into_yolo_notification(
 /// Returns `None` for notifications (no `id`) — those are silently dropped.
 fn make_leader_starting_error(json: &serde_json::Value) -> Option<String> {
     let id = json.get("id").filter(|v| !v.is_null()).cloned()?;
-    let response = serde_json::json!(
-        { "jsonrpc" : "2.0", "id" : id, "error" : { "code" : - 32002, "message" :
-        "leader_starting", "data" :
-        "Leader is still initializing (auth/prefetch in progress). Retry shortly." } }
-    );
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32002,
+            "message": "leader_starting",
+            "data": "Leader is still initializing (auth/prefetch in progress). Retry shortly."
+        }
+    });
     Some(response.to_string())
 }
 /// Choose the bytes forwarded to the agent: the re-serialized `json` when an
@@ -878,7 +888,7 @@ fn patch_initialize_response_model(
     if needs_patch {
         json["result"]["meta"]["modelState"]["currentModelId"] =
             serde_json::Value::String(model.clone());
-        debug!(patched_model = % model, "Patched initialize response currentModelId");
+        debug!(patched_model = %model, "Patched initialize response currentModelId");
         return true;
     }
     false
@@ -970,12 +980,19 @@ async fn wait_for_leader_auth(
     cancel: &CancellationToken,
 ) -> Result<Arc<dyn AuthProvider>, ControlError> {
     let mut rx = ws.auth.subscribe();
-    tokio::select! {
-        result = rx.wait_for(| v | v.is_some()) => match result { Ok(guard) => Ok(guard
-        .clone().expect("waited for Some")), Err(_) =>
-        Err(workspace_err("leader is shutting down; cannot expose workspace to the hub",)),
-        }, _ = cancel.cancelled() =>
-        Err(workspace_err("leader is shutting down; cannot expose workspace to the hub",)),
+    let result = tokio::select! {
+        result = rx.wait_for(|v| v.is_some()) => result,
+        _ = cancel.cancelled() => {
+            return Err(workspace_err(
+                "leader is shutting down; cannot expose workspace to the hub",
+            ));
+        }
+    };
+    match result {
+        Ok(guard) => Ok(guard.clone().expect("waited for Some")),
+        Err(_) => Err(workspace_err(
+            "leader is shutting down; cannot expose workspace to the hub",
+        )),
     }
 }
 fn workspace_server_id() -> String {
@@ -1079,10 +1096,11 @@ async fn handle_workspace_start(
     let alpha_test_key = None;
     let auth = wait_for_leader_auth(ws, &cancel).await?;
     let server_id = workspace_server_id();
-    let metadata = serde_json::json!(
-        { "source" : "grok-workspace", "hostname" : gethostname::gethostname()
-        .to_string_lossy(), "cwd" : cwd_path.display().to_string(), }
-    );
+    let metadata = serde_json::json!({
+        "source": "grok-workspace",
+        "hostname": gethostname::gethostname().to_string_lossy(),
+        "cwd": cwd_path.display().to_string(),
+    });
     let upload_queue_enabled =
         std::env::var("GROK_WORKSPACE_UPLOAD_QUEUE_ENABLED").as_deref() != Ok("false");
     crate::agent::folder_trust::resolve_and_record(&cwd_path, None, false);
@@ -1254,7 +1272,7 @@ async fn handle_stop_cpu_profile(
     let result = result.map_err(|join_error| ControlError {
         code: ControlErrorCode::InternalError,
         message: "CPU profile stop task failed".to_string(),
-        details: Some(serde_json::json!({ "error" : join_error.to_string() })),
+        details: Some(serde_json::json!({ "error": join_error.to_string() })),
     })??;
     Ok(ControlPayload::CpuProfileStopped {
         pid,
@@ -1271,10 +1289,7 @@ async fn finalize_cpu_profile_on_shutdown(control_state: LeaderServerControlStat
         let stop_handle = match manager.take_shutdown_stop_handle() {
             Ok(stop_handle) => stop_handle,
             Err(error) => {
-                warn!(
-                    error = % error,
-                    "Failed to prepare active CPU profile for leader shutdown"
-                );
+                warn!(error = %error, "Failed to prepare active CPU profile for leader shutdown");
                 return;
             }
         };
@@ -1304,19 +1319,20 @@ async fn finalize_cpu_profile_on_shutdown(control_state: LeaderServerControlStat
     match result {
         Ok(Ok(result)) => {
             info!(
-                path = % result.svg_path.display(), started_at = % result.started_at,
-                stopped_at = % result.stopped_at,
+                path = %result.svg_path.display(),
+                started_at = %result.started_at,
+                stopped_at = %result.stopped_at,
                 "Finalized active CPU profile during leader shutdown"
             );
         }
         Ok(Err(error)) => {
-            warn!(
-                error = % error,
-                "Failed to finalize active CPU profile during leader shutdown"
-            );
+            warn!(error = %error, "Failed to finalize active CPU profile during leader shutdown");
         }
         Err(join_error) => {
-            warn!(error = % join_error, "CPU profile shutdown finalization task failed");
+            warn!(
+                error = %join_error,
+                "CPU profile shutdown finalization task failed"
+            );
         }
     }
 }
@@ -1349,7 +1365,8 @@ fn decide_relaunch_for_update(
     let leader_version = control_state.metadata.leader_binary_version.clone();
     if !super::leader_is_older_than(&leader_version, &to_version) {
         debug!(
-            from_version = % leader_version, to_version = % to_version,
+            from_version = %leader_version,
+            to_version = %to_version,
             "RelaunchForUpdate declined: target is not strictly newer (or unparseable)"
         );
         return Ok(ControlPayload::RelaunchDeclined {
@@ -1362,8 +1379,9 @@ fn decide_relaunch_for_update(
         });
     }
     info!(
-        from_version = % leader_version, to_version = % to_version, grace_ms =
-        RELAUNCH_TOTAL_GRACE.as_millis() as u64,
+        from_version = %leader_version,
+        to_version = %to_version,
+        grace_ms = RELAUNCH_TOTAL_GRACE.as_millis() as u64,
         "RelaunchForUpdate accepted; draining before relaunch onto new binary"
     );
     Ok(ControlPayload::Relaunching {
@@ -1395,8 +1413,9 @@ fn spawn_relaunch_drain(
                 break;
             }
             tokio::select! {
-                _ = cancel.cancelled() => return, _ =
-                tokio::time::sleep(RELAUNCH_GRACE_POLL) => {}
+                // Another path already triggered shutdown — let it own the exit.
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(RELAUNCH_GRACE_POLL) => {}
             }
         }
         agent_activity
@@ -1426,14 +1445,18 @@ fn make_version_mismatch_notification(
         return None;
     }
     Some(
-        serde_json::json!(
-            { "jsonrpc" : "2.0", "method" : "x.ai/leader/version_mismatch", "params" : {
-            "clientVersion" : client_version, "leaderVersion" : leader_version, "message"
-            :
-            format!("Client version {client_version} differs from leader version \
-                     {leader_version}. Restart the grok binary to use the same version.")
-            } }
-        )
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "x.ai/leader/version_mismatch",
+            "params": {
+                "clientVersion": client_version,
+                "leaderVersion": leader_version,
+                "message": format!(
+                    "Client version {client_version} differs from leader version \
+                     {leader_version}. Restart the grok binary to use the same version."
+                )
+            }
+        })
         .to_string(),
     )
 }
@@ -1526,297 +1549,754 @@ pub async fn run_leader_server(
     let mut pending_requests: usize = 0;
     let relaunching = Arc::new(AtomicBool::new(false));
     loop {
-        tokio::select! {
-            biased; _ = cancel.cancelled() => { let reason = shutdown_reason_rx.borrow()
-            .clone(); info!(? reason, "Leader server shutting down (cancelled)"); if
-            pending_requests > 0 { debug!(pending_requests,
-            "Resetting agent_busy on shutdown"); agent_busy.store(false,
-            Ordering::Relaxed); } broadcast_shutdown(& clients, reason). await; break; }
-            accept_result = listener.accept() => { match accept_result { Ok((stream, _))
-            => { had_clients = true; let client_id = ClientId::new(); let (tx, rx) =
-            kanal::unbounded_async(); clients.insert(client_id, ClientState { tx, mode :
-            ClientMode::Stdio, capabilities : ClientCapabilities::default(), client_type
-            : String::new(), initialize_seen : false, patch_initialize_model : false,
-            registered : false, }); spawn_client_handler(client_id, stream, rx, event_tx
-            .clone(), cancel.child_token(), ready_rx.clone(), control_state.clone(),); }
-            Err(e) => error!(error = % e, "Accept failed"), } } Ok(event) = event_rx
-            .recv() => { match event { ServerEvent::Registered(id, mode, capabilities,
-            client_type) => { if let Some(client) = clients.get_mut(& id) { client.mode =
-            mode; client.capabilities = capabilities; client.client_type = client_type;
-            client.registered = true; client_count.fetch_add(1, Ordering::Relaxed);
-            debug!(client_id = id.0, ? mode, yolo_mode = client.capabilities.yolo_mode,
-            client_type = % client.client_type, "Client registered");
-            xai_grok_telemetry::unified_log::info("leader.client.registered", None,
-            Some(serde_json::json!({ "client_id" : id.0, "client_type" : client
-            .client_type, })),); if mode == ClientMode::Headless { let newly_demanded =
-            relay_demand_tx.send_if_modified(| demanded | { let changed = !* demanded; *
-            demanded = true; changed }); if newly_demanded { info!(client_id = id.0,
-            "First headless client registered; signalling relay demand"); } } let
-            effective_leader_version = leader_version_override.unwrap_or(LEADER_VERSION);
-            if let Some(ref cv) = client.capabilities.client_version && let Some(payload)
-            = make_version_mismatch_notification(cv.as_str(), effective_leader_version,)
-            { warn!(client_id = id.0, client_version = cv.as_str(), leader_version =
-            effective_leader_version,
-            "Version mismatch: client binary differs from leader binary"); let _ = client
-            .tx.try_send(ClientOutbound::Acp(payload.into())); } } }
-            ServerEvent::Disconnected(id) => { let was_registered = clients.get(& id)
-            .is_some_and(| c | c.registered); clients.remove(& id); if was_registered {
-            client_count.fetch_sub(1, Ordering::Relaxed);
-            xai_grok_telemetry::unified_log::info("leader.client.disconnected", None,
-            Some(serde_json::json!({ "client_id" : id.0 })),); } pending_load_by_req
-            .retain(| _, (c, _) | * c != id); load_live_buffer.retain(| (c, _), _ | * c
-            != id); load_replay_max_seq.retain(| (c, _), _ | * c != id); let mut
-            detached_sessions : Vec < String > = Vec::new(); let viewed : Vec < String >
-            = session_subscribers.iter().filter(| (_, subs) | subs.contains(& id)).map(|
-            (sid, _) | sid.clone()).collect(); for sid in viewed { let now_empty = if let
-            Some(subs) = session_subscribers.get_mut(& sid) { subs.remove(& id); subs
-            .is_empty() } else { true }; if now_empty { session_subscribers.remove(&
-            sid); session_driver.remove(& sid); detached_sessions.push(sid); } else if
-            session_driver.get(& sid) == Some(& id) { if let Some(& next) =
-            session_subscribers.get(& sid).and_then(| s | s.iter().next()) {
-            session_driver.insert(sid.clone(), next); debug!(session_id = % sid,
-            old_driver = id.0, new_driver = next.0,
-            "Transferred session driver after disconnect"); } else { session_driver
-            .remove(& sid); } } } if last_active_client == Some(id) { last_active_client
-            = None; } if ! detached_sessions.is_empty() { let evict_notification =
-            serde_json::json!({ "jsonrpc" : "2.0", "method" :
-            "x.ai/internal/evict_sessions", "params" : { "sessionIds" : detached_sessions
-            } }); let _ = acp_tx.send(evict_notification.to_string()); info!(client_id =
-            id.0, session_count = detached_sessions.len(),
-            "Sent client-disconnect detach notification for disconnected client"); }
-            debug!(client_id = id.0, "Client removed"); if clients.is_empty() &&
-            had_clients && ! no_exit_on_disconnect {
-            info!("Leader server shutting down (all clients disconnected)"); break; } }
-            ServerEvent::Message(id, ClientMessage::Control { request_id, command }) => {
-            if let Some(client) = clients.get(& id) { let client_tx = client.tx.clone();
-            let control_state = control_state.clone(); let cancel = cancel.clone(); let
-            shutdown_tx = shutdown_tx.clone(); let agent_busy = agent_busy.clone(); let
-            agent_activity = agent_activity.clone(); let relaunching = relaunching
-            .clone(); tokio::spawn(async move { let result = match command {
-            ControlCommand::StopCpuProfile => { handle_stop_cpu_profile(control_state).
-            await } ControlCommand::WorkspaceStart { hub_url, cwd } => {
-            handle_workspace_start(control_state, hub_url, cwd, cancel.clone(),). await }
-            ControlCommand::WorkspacePause => { handle_workspace_pause(control_state).
-            await } ControlCommand::WorkspaceResume => {
-            handle_workspace_resume(control_state). await } ControlCommand::WorkspaceStop
-            => { handle_workspace_stop(control_state). await }
-            ControlCommand::WorkspaceStatus => { handle_workspace_status(control_state).
-            await } ControlCommand::RelaunchForUpdate { to_version } => {
-            decide_relaunch_for_update(& control_state, to_version, & relaunching,) }
-            other => handle_control_command(& control_state, other), }; let arm_relaunch
-            = matches!(result, Ok(ControlPayload::Relaunching { .. })); if let Err(e) =
-            client_tx.send(ServerMessage::ControlResult { request_id, result } .into()).
-            await { warn!(client_id = id.0, error = % e,
-            "Failed to send control response to client"); } if arm_relaunch {
-            spawn_relaunch_drain(shutdown_tx, cancel, agent_busy, agent_activity,); } });
-            } } ServerEvent::Message(id, ClientMessage::Acp { payload }) => { let mut
-            json : Option < serde_json::Value > = serde_json::from_str(& payload).ok();
-            let mut payload_mutated = false; if !* ready_rx.borrow() { if let
-            Some(error_payload) = json.as_ref().and_then(make_leader_starting_error) { if
-            let Some(client) = clients.get(& id) { let _ = client.tx
-            .try_send(ClientOutbound::Acp(error_payload.into())); } trace!(client_id = id
-            .0, "Returned leader_starting error (not yet ready)"); } else {
-            trace!(client_id = id.0,
-            "Dropped pre-ready notification (leader not yet ready)"); } continue; } if
-            let Some(client) = clients.get(& id) && client.mode == ClientMode::Stdio {
-            last_active_client = Some(id); } if let Some(session_id) = json.as_ref()
-            .and_then(extract_session_id) { session_subscribers.entry(session_id.clone())
-            .or_default().insert(id); session_driver.entry(session_id.clone())
-            .or_insert(id); backfill_child_routes(& session_id, id, & child_sessions, &
-            mut session_subscribers, & mut session_driver,); } if let (Some(json),
-            Some(client)) = (json.as_ref(), clients.get_mut(& id)) { if let
-            Some(yolo_mode) = extract_yolo_mode_change(json) { client.capabilities
-            .yolo_mode = yolo_mode; debug!(client_id = id.0, yolo_mode,
-            "Updated client yolo_mode from notification"); } if let Some(auto_mode) =
-            extract_auto_mode_change(json) { client.capabilities.auto_mode = auto_mode;
-            debug!(client_id = id.0, auto_mode,
-            "Updated client auto_mode from notification"); } if let Some(new_model) =
-            extract_model_id_from_set_model(json) { debug!(client_id = id.0, model = %
-            new_model, "Updated client default_model from session/setModel"); client
-            .capabilities.default_model = Some(new_model); } } if let (Some(json),
-            Some(client)) = (json.as_mut(), clients.get_mut(& id)) { if ! client
-            .initialize_seen { let (injected, was_initialize) =
-            inject_client_identity_into_initialize(json, & client.client_type);
-            payload_mutated |= injected; if was_initialize { client.initialize_seen =
-            true; if client.capabilities.default_model.as_ref().is_some_and(| m | ! m
-            .is_empty()) { client.patch_initialize_model = true; } } } payload_mutated |=
-            inject_capabilities_into_session_new(json, & client.capabilities, & client
-            .client_type, id); payload_mutated |=
-            inject_client_identity_into_yolo_notification(json, & client.client_type); }
-            let rewritten = json.as_mut().and_then(| j | rewrite_request_id(j, id));
-            payload_mutated |= rewritten.is_some(); if let Some(json) = json.as_ref() &&
-            is_session_load_request(json) && let Some(load_sid) =
-            extract_session_id(json) && let Some((ns_id, _)) = rewritten.as_ref() {
-            pending_load_by_req.insert(ns_id.clone(), (id, load_sid.clone()));
-            load_live_buffer.entry((id, load_sid)).or_default(); } if rewritten.is_some()
-            { pending_requests += 1; agent_busy.store(true, Ordering::Relaxed); } let
-            outbound = select_outbound_payload(json.as_ref(), payload_mutated, payload);
-            let _ = acp_tx.send(outbound); } ServerEvent::Message(_, _) => {} } }
-            Some(payload) = response_rx.recv() => { let mut json : Option <
-            serde_json::Value > = serde_json::from_str(& payload).ok(); let
-            parsed_response = json.as_mut().and_then(parse_response_id); if
-            parsed_response.is_some() { pending_requests = pending_requests
-            .saturating_sub(1); agent_busy.store(pending_requests > 0,
-            Ordering::Relaxed); } if let Some((orphan_client, ref orphan_req_id)) =
-            parsed_response && ! clients.contains_key(& orphan_client) { warn!(client_id
-            = orphan_client.0, request_id = orphan_req_id.as_str(),
-            "Dropping RPC response: requesting client disconnected (response orphaned)");
-            xai_grok_telemetry::unified_log::warn("leader.response.orphaned", None,
-            Some(serde_json::json!({ "client_id" : orphan_client.0, "request_id" :
-            orphan_req_id, })),); } if let Some((client_id, ref raw_response_id)) =
-            parsed_response && let Some(client) = clients.get_mut(& client_id) && let
-            Some(json) = json.as_mut() { if let Some(session_id) =
-            extract_session_id_from_result(json) { session_subscribers.entry(session_id
-            .clone()).or_default().insert(client_id); session_driver.entry(session_id
-            .clone()).or_insert(client_id); backfill_child_routes(& session_id,
-            client_id, & child_sessions, & mut session_subscribers, & mut
-            session_driver,); trace!(client_id = client_id.0, session_id,
-            "Subscribed client to session from response"); } if client
-            .patch_initialize_model { client.patch_initialize_model = false;
-            patch_initialize_response_model(json, & client.capabilities.default_model); }
-            let restored_payload : Arc < str > = json.to_string().into(); match client.tx
-            .try_send(ClientOutbound::Acp(restored_payload)) { Ok(true) => {
-            trace!(client_id = client_id.0, "Routed response via request ID"); }
-            Ok(false) => { warn!(client_id = client_id.0,
-            "Failed to send response to client (channel full)");
-            xai_grok_telemetry::unified_log::warn("leader.response.send_failed", None,
-            Some(serde_json::json!({ "client_id" : client_id.0, "reason" :
-            "channel_full", })),); } Err(e) => { warn!(client_id = client_id.0, error = %
-            e, "Failed to send response to client (channel closed)");
-            xai_grok_telemetry::unified_log::warn("leader.response.send_failed", None,
-            Some(serde_json::json!({ "client_id" : client_id.0, "reason" :
-            "channel_closed", })),); } } if let Some((buf_client, buf_sid)) =
-            pending_load_by_req.remove(raw_response_id) { let replay_cutoff : Option <
-            u64 > = load_replay_max_seq.remove(& (buf_client, buf_sid.clone())); if let
-            Some(buffered) = load_live_buffer.remove(& (buf_client, buf_sid.clone())) &&
-            let Some(target) = clients.get(& buf_client) { let mut count = 0usize; let
-            mut deduped = 0usize; for (buffered_payload, buffered_seq) in buffered { if
-            let Some(cutoff) = replay_cutoff && buffered_seq.is_some_and(| s | s <=
-            cutoff) { deduped += 1; continue; } if let Err(e) = target.tx
-            .try_send(ClientOutbound::Acp(buffered_payload)) { warn!(client_id =
-            buf_client.0, error = % e,
-            "Failed to flush buffered live notification after load (channel closed)");
-            break; } count += 1; } if count > 0 || deduped > 0 { trace!(client_id =
-            buf_client.0, count, deduped,
-            "Flushed buffered live notifications after load (replay-overlap dropped)"); }
-            } if let Some(cached) = interaction_requests.get(buf_sid.as_str()) && let
-            Some(target) = clients.get(& buf_client) { let count = cached.len(); for req
-            in cached.values() { if let Err(e) = target.tx
-            .try_send(ClientOutbound::Acp(req.clone())) { warn!(client_id = buf_client.0,
-            error = % e,
-            "Failed to replay interaction request after load (channel closed)"); break; }
-            } if count > 0 { trace!(client_id = buf_client.0, count, session_id = buf_sid
-            .as_str(), "Replayed pending interaction modals to newly-attached client"); }
-            } } continue; } let payload : Arc < str > = payload.into(); let json = json;
-            if json.as_ref().is_some_and(is_machine_wide_broadcast_notification) { for
-            client in clients.values() { let _ = client.tx
-            .try_send(ClientOutbound::Acp(payload.clone())); }
-            trace!("Broadcast machine-wide notification to all clients"); continue; } if
-            let Some(target) = json.as_ref().and_then(extract_target_client_id) { if let
-            Some(client) = clients.get(& target) { match json.as_ref()
-            .and_then(extract_child_session_event) {
-            Some(ChildSessionEvent::Spawned(child_sid)) => { if let Some(parent) = json
-            .as_ref().and_then(extract_session_id) { child_sessions.entry(parent)
-            .or_default().insert(child_sid.clone()); } debug!(client_id = target.0,
-            child_session_id = % child_sid,
-            "Registered child route from replayed SubagentSpawned"); session_subscribers
-            .entry(child_sid).or_default().insert(target); }
-            Some(ChildSessionEvent::Finished(child_sid)) => { let emptied =
-            session_subscribers.get_mut(& child_sid).is_some_and(| subs | { subs.remove(&
-            target); subs.is_empty() }); if emptied { prune_child_route(& child_sid, &
-            mut session_subscribers, & mut session_driver, & mut child_sessions,); } }
-            None => {} } let replay_seq = json.as_ref().and_then(extract_session_id)
-            .zip(json.as_ref().and_then(event_seq_of)); match client.tx
-            .try_send(ClientOutbound::Acp(payload)) { Ok(true) => { if let Some((sid,
-            seq)) = replay_seq { let entry = load_replay_max_seq.entry((target, sid))
-            .or_insert(0); * entry = (* entry).max(seq); } trace!(client_id = target.0,
-            "Unicast replay notification to loading client"); } Ok(false) => {
-            warn!(client_id = target.0,
-            "Replay notification dropped: loading client channel full (not counted toward flush cutoff)");
-            } Err(e) => { warn!(client_id = target.0, error = % e,
-            "Failed to unicast replay notification to loading client (channel closed)");
-            } } } else { if let Some(ChildSessionEvent::Finished(child_sid)) = json
-            .as_ref().and_then(extract_child_session_event) && session_subscribers.get(&
-            child_sid).is_none_or(| subs | subs.is_empty()) { prune_child_route(&
-            child_sid, & mut session_subscribers, & mut session_driver, & mut
-            child_sessions,); } if orphan_replay_warned.insert(target) { warn!(client_id
-            = target.0,
-            "Dropping targeted replay notification: loading client disconnected mid-replay (rest of burst logged at trace)");
-            } else { trace!(client_id = target.0,
-            "Dropping targeted replay notification: loading client disconnected mid-replay");
-            } } continue; } let session_id = json.as_ref().and_then(extract_session_id)
-            .or_else(|| json.as_ref().and_then(extract_session_id_from_prompt_complete));
-            if let Some(ref sid) = session_id && let Some(tcid) = json.as_ref()
-            .and_then(extract_interaction_resolved_tool_call_id) && let Some(map) =
-            interaction_requests.get_mut(sid.as_str()) { map.remove(& tcid); if map
-            .is_empty() { interaction_requests.remove(sid.as_str()); } } let
-            is_reverse_request = json.as_ref().is_some_and(| j | j.get("id").is_some() &&
-            j.get("method").is_some()); let is_inject_prompt = json.as_ref()
-            .is_some_and(is_scheduled_task_inject_prompt); let is_interaction =
-            is_reverse_request && json.as_ref().is_some_and(is_interaction_request); if
-            is_interaction && let Some(ref sid) = session_id && let Some(tcid) = json
-            .as_ref().and_then(extract_interaction_tool_call_id) { interaction_requests
-            .entry(sid.clone()).or_default().insert(tcid, payload.clone()); } if let
-            Some(ref sid) = session_id && session_subscribers.contains_key(sid.as_str())
-            { let child_event = json.as_ref().and_then(extract_child_session_event); let
-            event_seq = json.as_ref().and_then(event_seq_of); if (is_reverse_request && !
-            is_interaction) || is_inject_prompt { if let Some(& driver_id) =
-            session_driver.get(sid.as_str()) { if let Some(client) = clients.get(&
-            driver_id) { if let Err(e) = client.tx.try_send(ClientOutbound::Acp(payload
-            .clone())) { warn!(client_id = driver_id.0, session_id = sid.as_str(),
-            is_inject = is_inject_prompt, error = % e,
-            "Failed to route driver-only message (channel closed)"); } else {
-            trace!(client_id = driver_id.0, session_id = sid.as_str(), is_inject =
-            is_inject_prompt, "Routed driver-only message to driver"); } } else {
-            trace!(session_id = sid.as_str(), is_inject = is_inject_prompt,
-            "Dropping driver-only message: no live driver"); } } else { trace!(session_id
-            = sid.as_str(), is_inject = is_inject_prompt,
-            "Dropping driver-only message: session has no driver"); } } else if let
-            Some(subs) = session_subscribers.get(sid.as_str()) { for & cid in subs.iter()
-            { if let Some(buf) = load_live_buffer.get_mut(& (cid, sid.clone())) { if buf
-            .len() < MAX_BUFFERED_LIVE_PER_LOAD { buf.push((payload.clone(), event_seq));
-            trace!(client_id = cid.0, session_id = sid.as_str(),
-            "Buffered live notification during in-flight load"); continue; }
-            warn!(client_id = cid.0, session_id = sid.as_str(),
-            "Live buffer for in-flight load exceeded cap; forwarding live (ordering not guaranteed)");
-            } if let Some(client) = clients.get(& cid) { if let Err(e) = client.tx
-            .try_send(ClientOutbound::Acp(payload.clone())) { warn!(client_id = cid.0,
-            session_id = sid.as_str(), error = % e,
-            "Failed to broadcast notification to subscriber (channel closed)"); } else {
-            trace!(client_id = cid.0, session_id = sid.as_str(),
-            "Broadcast notification to subscriber"); } } } } match child_event {
-            Some(ChildSessionEvent::Spawned(child_sid)) => { let parent_subs =
-            session_subscribers.get(sid.as_str()).cloned().unwrap_or_default();
-            info!(child_session_id = % child_sid, subscriber_count = parent_subs.len(),
-            "Registered child session from SubagentSpawned"); session_subscribers
-            .insert(child_sid.clone(), parent_subs); if let Some(& driver_id) =
-            session_driver.get(sid.as_str()) { session_driver.insert(child_sid.clone(),
-            driver_id); } child_sessions.entry(sid.clone()).or_default()
-            .insert(child_sid); } Some(ChildSessionEvent::Finished(child_sid)) => {
-            debug!(child_session_id = % child_sid,
-            "Deregistered child session from SubagentFinished"); prune_child_route(&
-            child_sid, & mut session_subscribers, & mut session_driver, & mut
-            child_sessions,); } None => {} } continue; } let is_notification = json
-            .as_ref().is_some_and(| j | j.get("id").is_none()); let
-            is_relay_session_notification = is_notification && session_id.as_ref()
-            .is_some_and(| s | ! session_subscribers.contains_key(s.as_str())); if !
-            is_notification {
-            trace!("Dropping non-routable response (likely relay-originated)"); } else if
-            is_relay_session_notification { if let
-            Some(ChildSessionEvent::Finished(child_sid)) = json.as_ref()
-            .and_then(extract_child_session_event) && session_subscribers.get(&
-            child_sid).is_none_or(| subs | subs.is_empty()) { prune_child_route(&
-            child_sid, & mut session_subscribers, & mut session_driver, & mut
-            child_sessions,); }
-            trace!("Dropping notification for relay-owned session (already delivered via WS)");
-            } else if let Some(client_id) = last_active_client && let Some(client) =
-            clients.get(& client_id) { debug!(client_id = client_id.0,
-            "Using fallback routing to last active client"); if let Err(e) = client.tx
-            .try_send(ClientOutbound::Acp(payload)) { warn!(client_id = client_id.0,
-            error = % e,
-            "Failed to send notification via fallback routing (channel closed)"); } }
-            else {
-            debug!("No client available for notification routing, message dropped"); } }
+        let poll = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => LeaderServerPoll::Cancelled,
+            accept_result = listener.accept() => {
+                LeaderServerPoll::Accept(accept_result.map(|(stream, _)| stream))
+            }
+            Ok(event) = event_rx.recv() => LeaderServerPoll::Event(event),
+            Some(payload) = response_rx.recv() => LeaderServerPoll::Response(payload),
+        };
+        match poll {
+            LeaderServerPoll::Cancelled => {
+                let reason = shutdown_reason_rx.borrow().clone();
+                info!(?reason, "Leader server shutting down (cancelled)");
+                if pending_requests > 0 {
+                    debug!(pending_requests, "Resetting agent_busy on shutdown");
+                    agent_busy.store(false, Ordering::Relaxed);
+                }
+                broadcast_shutdown(&clients, reason).await;
+                break;
+            }
+            LeaderServerPoll::Accept(accept_result) => match accept_result {
+                Ok(stream) => {
+                    had_clients = true;
+                    let client_id = ClientId::new();
+                    let (tx, rx) = kanal::unbounded_async();
+                    clients.insert(
+                        client_id,
+                        ClientState {
+                            tx,
+                            mode: ClientMode::Stdio,
+                            capabilities: ClientCapabilities::default(),
+                            client_type: String::new(),
+                            initialize_seen: false,
+                            patch_initialize_model: false,
+                            registered: false,
+                        },
+                    );
+                    spawn_client_handler(
+                        client_id,
+                        stream,
+                        rx,
+                        event_tx.clone(),
+                        cancel.child_token(),
+                        ready_rx.clone(),
+                        control_state.clone(),
+                    );
+                }
+                Err(e) => error!(error = %e, "Accept failed"),
+            },
+            LeaderServerPoll::Event(event) => match event {
+                ServerEvent::Registered(id, mode, capabilities, client_type) => {
+                    if let Some(client) = clients.get_mut(&id) {
+                        client.mode = mode;
+                        client.capabilities = capabilities;
+                        client.client_type = client_type;
+                        client.registered = true;
+                        client_count.fetch_add(1, Ordering::Relaxed);
+                        debug!(client_id = id.0, ?mode, yolo_mode = client.capabilities.yolo_mode, client_type = %client.client_type, "Client registered");
+                        xai_grok_telemetry::unified_log::info(
+                            "leader.client.registered",
+                            None,
+                            Some(serde_json::json!({
+                                "client_id": id.0,
+                                "client_type": client.client_type,
+                            })),
+                        );
+                        if mode == ClientMode::Headless {
+                            let newly_demanded = relay_demand_tx.send_if_modified(|demanded| {
+                                let changed = !*demanded;
+                                *demanded = true;
+                                changed
+                            });
+                            if newly_demanded {
+                                info!(
+                                    client_id = id.0,
+                                    "First headless client registered; signalling relay demand"
+                                );
+                            }
+                        }
+                        let effective_leader_version =
+                            leader_version_override.unwrap_or(LEADER_VERSION);
+                        if let Some(ref cv) = client.capabilities.client_version
+                            && let Some(payload) = make_version_mismatch_notification(
+                                cv.as_str(),
+                                effective_leader_version,
+                            )
+                        {
+                            warn!(
+                                client_id = id.0,
+                                client_version = cv.as_str(),
+                                leader_version = effective_leader_version,
+                                "Version mismatch: client binary differs from leader binary"
+                            );
+                            let _ = client.tx.try_send(ClientOutbound::Acp(payload.into()));
+                        }
+                    }
+                }
+                ServerEvent::Disconnected(id) => {
+                    let was_registered = clients.get(&id).is_some_and(|c| c.registered);
+                    clients.remove(&id);
+                    if was_registered {
+                        client_count.fetch_sub(1, Ordering::Relaxed);
+                        xai_grok_telemetry::unified_log::info(
+                            "leader.client.disconnected",
+                            None,
+                            Some(serde_json::json!({ "client_id": id.0 })),
+                        );
+                    }
+                    pending_load_by_req.retain(|_, (c, _)| *c != id);
+                    load_live_buffer.retain(|(c, _), _| *c != id);
+                    load_replay_max_seq.retain(|(c, _), _| *c != id);
+                    let mut detached_sessions: Vec<String> = Vec::new();
+                    let viewed: Vec<String> = session_subscribers
+                        .iter()
+                        .filter(|(_, subs)| subs.contains(&id))
+                        .map(|(sid, _)| sid.clone())
+                        .collect();
+                    for sid in viewed {
+                        let now_empty = if let Some(subs) = session_subscribers.get_mut(&sid) {
+                            subs.remove(&id);
+                            subs.is_empty()
+                        } else {
+                            true
+                        };
+                        if now_empty {
+                            session_subscribers.remove(&sid);
+                            session_driver.remove(&sid);
+                            detached_sessions.push(sid);
+                        } else if session_driver.get(&sid) == Some(&id) {
+                            if let Some(&next) =
+                                session_subscribers.get(&sid).and_then(|s| s.iter().next())
+                            {
+                                session_driver.insert(sid.clone(), next);
+                                debug!(
+                                    session_id = %sid,
+                                    old_driver = id.0,
+                                    new_driver = next.0,
+                                    "Transferred session driver after disconnect"
+                                );
+                            } else {
+                                session_driver.remove(&sid);
+                            }
+                        }
+                    }
+                    if last_active_client == Some(id) {
+                        last_active_client = None;
+                    }
+                    if !detached_sessions.is_empty() {
+                        let evict_notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "x.ai/internal/evict_sessions",
+                            "params": { "sessionIds": detached_sessions }
+                        });
+                        let _ = acp_tx.send(evict_notification.to_string());
+                        info!(
+                            client_id = id.0,
+                            session_count = detached_sessions.len(),
+                            "Sent client-disconnect detach notification for disconnected client"
+                        );
+                    }
+                    debug!(client_id = id.0, "Client removed");
+                    if clients.is_empty() && had_clients && !no_exit_on_disconnect {
+                        info!("Leader server shutting down (all clients disconnected)");
+                        break;
+                    }
+                }
+                ServerEvent::Message(
+                    id,
+                    ClientMessage::Control {
+                        request_id,
+                        command,
+                    },
+                ) => {
+                    if let Some(client) = clients.get(&id) {
+                        let client_tx = client.tx.clone();
+                        let control_state = control_state.clone();
+                        let cancel = cancel.clone();
+                        let shutdown_tx = shutdown_tx.clone();
+                        let agent_busy = agent_busy.clone();
+                        let agent_activity = agent_activity.clone();
+                        let relaunching = relaunching.clone();
+                        tokio::spawn(async move {
+                            let result = match command {
+                                ControlCommand::StopCpuProfile => {
+                                    handle_stop_cpu_profile(control_state).await
+                                }
+                                ControlCommand::WorkspaceStart { hub_url, cwd } => {
+                                    handle_workspace_start(
+                                        control_state,
+                                        hub_url,
+                                        cwd,
+                                        cancel.clone(),
+                                    )
+                                    .await
+                                }
+                                ControlCommand::WorkspacePause => {
+                                    handle_workspace_pause(control_state).await
+                                }
+                                ControlCommand::WorkspaceResume => {
+                                    handle_workspace_resume(control_state).await
+                                }
+                                ControlCommand::WorkspaceStop => {
+                                    handle_workspace_stop(control_state).await
+                                }
+                                ControlCommand::WorkspaceStatus => {
+                                    handle_workspace_status(control_state).await
+                                }
+                                ControlCommand::RelaunchForUpdate { to_version } => {
+                                    decide_relaunch_for_update(
+                                        &control_state,
+                                        to_version,
+                                        &relaunching,
+                                    )
+                                }
+                                other => handle_control_command(&control_state, other),
+                            };
+                            let arm_relaunch =
+                                matches!(result, Ok(ControlPayload::Relaunching { .. }));
+                            if let Err(e) = client_tx
+                                .send(ServerMessage::ControlResult { request_id, result }.into())
+                                .await
+                            {
+                                warn!(client_id = id.0, error = %e, "Failed to send control response to client");
+                            }
+                            if arm_relaunch {
+                                spawn_relaunch_drain(
+                                    shutdown_tx,
+                                    cancel,
+                                    agent_busy,
+                                    agent_activity,
+                                );
+                            }
+                        });
+                    }
+                }
+                ServerEvent::Message(id, ClientMessage::Acp { payload }) => {
+                    let mut json: Option<serde_json::Value> = serde_json::from_str(&payload).ok();
+                    let mut payload_mutated = false;
+                    if !*ready_rx.borrow() {
+                        if let Some(error_payload) =
+                            json.as_ref().and_then(make_leader_starting_error)
+                        {
+                            if let Some(client) = clients.get(&id) {
+                                let _ = client
+                                    .tx
+                                    .try_send(ClientOutbound::Acp(error_payload.into()));
+                            }
+                            trace!(
+                                client_id = id.0,
+                                "Returned leader_starting error (not yet ready)"
+                            );
+                        } else {
+                            trace!(
+                                client_id = id.0,
+                                "Dropped pre-ready notification (leader not yet ready)"
+                            );
+                        }
+                        continue;
+                    }
+                    if let Some(client) = clients.get(&id)
+                        && client.mode == ClientMode::Stdio
+                    {
+                        last_active_client = Some(id);
+                    }
+                    if let Some(session_id) = json.as_ref().and_then(extract_session_id) {
+                        session_subscribers
+                            .entry(session_id.clone())
+                            .or_default()
+                            .insert(id);
+                        session_driver.entry(session_id.clone()).or_insert(id);
+                        backfill_child_routes(
+                            &session_id,
+                            id,
+                            &child_sessions,
+                            &mut session_subscribers,
+                            &mut session_driver,
+                        );
+                    }
+                    if let (Some(json), Some(client)) = (json.as_ref(), clients.get_mut(&id)) {
+                        if let Some(yolo_mode) = extract_yolo_mode_change(json) {
+                            client.capabilities.yolo_mode = yolo_mode;
+                            debug!(
+                                client_id = id.0,
+                                yolo_mode, "Updated client yolo_mode from notification"
+                            );
+                        }
+                        if let Some(auto_mode) = extract_auto_mode_change(json) {
+                            client.capabilities.auto_mode = auto_mode;
+                            debug!(
+                                client_id = id.0,
+                                auto_mode, "Updated client auto_mode from notification"
+                            );
+                        }
+                        if let Some(new_model) = extract_model_id_from_set_model(json) {
+                            debug!(client_id = id.0, model = %new_model, "Updated client default_model from session/setModel");
+                            client.capabilities.default_model = Some(new_model);
+                        }
+                    }
+                    if let (Some(json), Some(client)) = (json.as_mut(), clients.get_mut(&id)) {
+                        if !client.initialize_seen {
+                            let (injected, was_initialize) =
+                                inject_client_identity_into_initialize(json, &client.client_type);
+                            payload_mutated |= injected;
+                            if was_initialize {
+                                client.initialize_seen = true;
+                                if client
+                                    .capabilities
+                                    .default_model
+                                    .as_ref()
+                                    .is_some_and(|m| !m.is_empty())
+                                {
+                                    client.patch_initialize_model = true;
+                                }
+                            }
+                        }
+                        payload_mutated |= inject_capabilities_into_session_new(
+                            json,
+                            &client.capabilities,
+                            &client.client_type,
+                            id,
+                        );
+                        payload_mutated |= inject_client_identity_into_yolo_notification(
+                            json,
+                            &client.client_type,
+                        );
+                    }
+                    let rewritten = json.as_mut().and_then(|j| rewrite_request_id(j, id));
+                    payload_mutated |= rewritten.is_some();
+                    if let Some(json) = json.as_ref()
+                        && is_session_load_request(json)
+                        && let Some(load_sid) = extract_session_id(json)
+                        && let Some((ns_id, _)) = rewritten.as_ref()
+                    {
+                        pending_load_by_req.insert(ns_id.clone(), (id, load_sid.clone()));
+                        load_live_buffer.entry((id, load_sid)).or_default();
+                    }
+                    if rewritten.is_some() {
+                        pending_requests += 1;
+                        agent_busy.store(true, Ordering::Relaxed);
+                    }
+                    let outbound = select_outbound_payload(json.as_ref(), payload_mutated, payload);
+                    let _ = acp_tx.send(outbound);
+                }
+                ServerEvent::Message(_, _) => {}
+            },
+            LeaderServerPoll::Response(payload) => {
+                let mut json: Option<serde_json::Value> = serde_json::from_str(&payload).ok();
+                let parsed_response = json.as_mut().and_then(parse_response_id);
+                if parsed_response.is_some() {
+                    pending_requests = pending_requests.saturating_sub(1);
+                    agent_busy.store(pending_requests > 0, Ordering::Relaxed);
+                }
+                if let Some((orphan_client, ref orphan_req_id)) = parsed_response
+                    && !clients.contains_key(&orphan_client)
+                {
+                    warn!(
+                        client_id = orphan_client.0,
+                        request_id = orphan_req_id.as_str(),
+                        "Dropping RPC response: requesting client disconnected (response orphaned)"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "leader.response.orphaned",
+                        None,
+                        Some(serde_json::json!({
+                            "client_id": orphan_client.0,
+                            "request_id": orphan_req_id,
+                        })),
+                    );
+                }
+                if let Some((client_id, ref raw_response_id)) = parsed_response
+                    && let Some(client) = clients.get_mut(&client_id)
+                    && let Some(json) = json.as_mut()
+                {
+                    if let Some(session_id) = extract_session_id_from_result(json) {
+                        session_subscribers
+                            .entry(session_id.clone())
+                            .or_default()
+                            .insert(client_id);
+                        session_driver
+                            .entry(session_id.clone())
+                            .or_insert(client_id);
+                        backfill_child_routes(
+                            &session_id,
+                            client_id,
+                            &child_sessions,
+                            &mut session_subscribers,
+                            &mut session_driver,
+                        );
+                        trace!(
+                            client_id = client_id.0,
+                            session_id, "Subscribed client to session from response"
+                        );
+                    }
+                    if client.patch_initialize_model {
+                        client.patch_initialize_model = false;
+                        patch_initialize_response_model(json, &client.capabilities.default_model);
+                    }
+                    let restored_payload: Arc<str> = json.to_string().into();
+                    match client.tx.try_send(ClientOutbound::Acp(restored_payload)) {
+                        Ok(true) => {
+                            trace!(client_id = client_id.0, "Routed response via request ID");
+                        }
+                        Ok(false) => {
+                            warn!(
+                                client_id = client_id.0,
+                                "Failed to send response to client (channel full)"
+                            );
+                            xai_grok_telemetry::unified_log::warn(
+                                "leader.response.send_failed",
+                                None,
+                                Some(serde_json::json!({
+                                    "client_id": client_id.0,
+                                    "reason": "channel_full",
+                                })),
+                            );
+                        }
+                        Err(e) => {
+                            warn!(client_id = client_id.0, error = %e, "Failed to send response to client (channel closed)");
+                            xai_grok_telemetry::unified_log::warn(
+                                "leader.response.send_failed",
+                                None,
+                                Some(serde_json::json!({
+                                    "client_id": client_id.0,
+                                    "reason": "channel_closed",
+                                })),
+                            );
+                        }
+                    }
+                    if let Some((buf_client, buf_sid)) = pending_load_by_req.remove(raw_response_id)
+                    {
+                        let replay_cutoff: Option<u64> =
+                            load_replay_max_seq.remove(&(buf_client, buf_sid.clone()));
+                        if let Some(buffered) =
+                            load_live_buffer.remove(&(buf_client, buf_sid.clone()))
+                            && let Some(target) = clients.get(&buf_client)
+                        {
+                            let mut count = 0usize;
+                            let mut deduped = 0usize;
+                            for (buffered_payload, buffered_seq) in buffered {
+                                if let Some(cutoff) = replay_cutoff
+                                    && buffered_seq.is_some_and(|s| s <= cutoff)
+                                {
+                                    deduped += 1;
+                                    continue;
+                                }
+                                if let Err(e) =
+                                    target.tx.try_send(ClientOutbound::Acp(buffered_payload))
+                                {
+                                    warn!(client_id = buf_client.0, error = %e, "Failed to flush buffered live notification after load (channel closed)");
+                                    break;
+                                }
+                                count += 1;
+                            }
+                            if count > 0 || deduped > 0 {
+                                trace!(
+                                    client_id = buf_client.0,
+                                    count,
+                                    deduped,
+                                    "Flushed buffered live notifications after load (replay-overlap dropped)"
+                                );
+                            }
+                        }
+                        if let Some(cached) = interaction_requests.get(buf_sid.as_str())
+                            && let Some(target) = clients.get(&buf_client)
+                        {
+                            let count = cached.len();
+                            for req in cached.values() {
+                                if let Err(e) = target.tx.try_send(ClientOutbound::Acp(req.clone()))
+                                {
+                                    warn!(client_id = buf_client.0, error = %e, "Failed to replay interaction request after load (channel closed)");
+                                    break;
+                                }
+                            }
+                            if count > 0 {
+                                trace!(
+                                    client_id = buf_client.0,
+                                    count,
+                                    session_id = buf_sid.as_str(),
+                                    "Replayed pending interaction modals to newly-attached client"
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let payload: Arc<str> = payload.into();
+                let json = json;
+                if json
+                    .as_ref()
+                    .is_some_and(is_machine_wide_broadcast_notification)
+                {
+                    for client in clients.values() {
+                        let _ = client.tx.try_send(ClientOutbound::Acp(payload.clone()));
+                    }
+                    trace!("Broadcast machine-wide notification to all clients");
+                    continue;
+                }
+                if let Some(target) = json.as_ref().and_then(extract_target_client_id) {
+                    if let Some(client) = clients.get(&target) {
+                        match json.as_ref().and_then(extract_child_session_event) {
+                            Some(ChildSessionEvent::Spawned(child_sid)) => {
+                                if let Some(parent) = json.as_ref().and_then(extract_session_id) {
+                                    child_sessions
+                                        .entry(parent)
+                                        .or_default()
+                                        .insert(child_sid.clone());
+                                }
+                                debug!(client_id = target.0, child_session_id = %child_sid, "Registered child route from replayed SubagentSpawned");
+                                session_subscribers
+                                    .entry(child_sid)
+                                    .or_default()
+                                    .insert(target);
+                            }
+                            Some(ChildSessionEvent::Finished(child_sid)) => {
+                                let emptied =
+                                    session_subscribers.get_mut(&child_sid).is_some_and(|subs| {
+                                        subs.remove(&target);
+                                        subs.is_empty()
+                                    });
+                                if emptied {
+                                    prune_child_route(
+                                        &child_sid,
+                                        &mut session_subscribers,
+                                        &mut session_driver,
+                                        &mut child_sessions,
+                                    );
+                                }
+                            }
+                            None => {}
+                        }
+                        let replay_seq = json
+                            .as_ref()
+                            .and_then(extract_session_id)
+                            .zip(json.as_ref().and_then(event_seq_of));
+                        match client.tx.try_send(ClientOutbound::Acp(payload)) {
+                            Ok(true) => {
+                                if let Some((sid, seq)) = replay_seq {
+                                    let entry =
+                                        load_replay_max_seq.entry((target, sid)).or_insert(0);
+                                    *entry = (*entry).max(seq);
+                                }
+                                trace!(
+                                    client_id = target.0,
+                                    "Unicast replay notification to loading client"
+                                );
+                            }
+                            Ok(false) => {
+                                warn!(
+                                    client_id = target.0,
+                                    "Replay notification dropped: loading client channel full (not counted toward flush cutoff)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(client_id = target.0, error = %e, "Failed to unicast replay notification to loading client (channel closed)");
+                            }
+                        }
+                    } else {
+                        if let Some(ChildSessionEvent::Finished(child_sid)) =
+                            json.as_ref().and_then(extract_child_session_event)
+                            && session_subscribers
+                                .get(&child_sid)
+                                .is_none_or(|subs| subs.is_empty())
+                        {
+                            prune_child_route(
+                                &child_sid,
+                                &mut session_subscribers,
+                                &mut session_driver,
+                                &mut child_sessions,
+                            );
+                        }
+                        if orphan_replay_warned.insert(target) {
+                            warn!(
+                                client_id = target.0,
+                                "Dropping targeted replay notification: loading client disconnected mid-replay (rest of burst logged at trace)"
+                            );
+                        } else {
+                            trace!(
+                                client_id = target.0,
+                                "Dropping targeted replay notification: loading client disconnected mid-replay"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let session_id = json.as_ref().and_then(extract_session_id).or_else(|| {
+                    json.as_ref()
+                        .and_then(extract_session_id_from_prompt_complete)
+                });
+                if let Some(ref sid) = session_id
+                    && let Some(tcid) = json
+                        .as_ref()
+                        .and_then(extract_interaction_resolved_tool_call_id)
+                    && let Some(map) = interaction_requests.get_mut(sid.as_str())
+                {
+                    map.remove(&tcid);
+                    if map.is_empty() {
+                        interaction_requests.remove(sid.as_str());
+                    }
+                }
+                let is_reverse_request = json
+                    .as_ref()
+                    .is_some_and(|j| j.get("id").is_some() && j.get("method").is_some());
+                let is_inject_prompt = json.as_ref().is_some_and(is_scheduled_task_inject_prompt);
+                let is_interaction =
+                    is_reverse_request && json.as_ref().is_some_and(is_interaction_request);
+                if is_interaction
+                    && let Some(ref sid) = session_id
+                    && let Some(tcid) = json.as_ref().and_then(extract_interaction_tool_call_id)
+                {
+                    interaction_requests
+                        .entry(sid.clone())
+                        .or_default()
+                        .insert(tcid, payload.clone());
+                }
+                if let Some(ref sid) = session_id
+                    && session_subscribers.contains_key(sid.as_str())
+                {
+                    let child_event = json.as_ref().and_then(extract_child_session_event);
+                    let event_seq = json.as_ref().and_then(event_seq_of);
+                    if (is_reverse_request && !is_interaction) || is_inject_prompt {
+                        if let Some(&driver_id) = session_driver.get(sid.as_str()) {
+                            if let Some(client) = clients.get(&driver_id) {
+                                if let Err(e) =
+                                    client.tx.try_send(ClientOutbound::Acp(payload.clone()))
+                                {
+                                    warn!(client_id = driver_id.0, session_id = sid.as_str(), is_inject = is_inject_prompt, error = %e, "Failed to route driver-only message (channel closed)");
+                                } else {
+                                    trace!(
+                                        client_id = driver_id.0,
+                                        session_id = sid.as_str(),
+                                        is_inject = is_inject_prompt,
+                                        "Routed driver-only message to driver"
+                                    );
+                                }
+                            } else {
+                                trace!(
+                                    session_id = sid.as_str(),
+                                    is_inject = is_inject_prompt,
+                                    "Dropping driver-only message: no live driver"
+                                );
+                            }
+                        } else {
+                            trace!(
+                                session_id = sid.as_str(),
+                                is_inject = is_inject_prompt,
+                                "Dropping driver-only message: session has no driver"
+                            );
+                        }
+                    } else if let Some(subs) = session_subscribers.get(sid.as_str()) {
+                        for &cid in subs.iter() {
+                            if let Some(buf) = load_live_buffer.get_mut(&(cid, sid.clone())) {
+                                if buf.len() < MAX_BUFFERED_LIVE_PER_LOAD {
+                                    buf.push((payload.clone(), event_seq));
+                                    trace!(
+                                        client_id = cid.0,
+                                        session_id = sid.as_str(),
+                                        "Buffered live notification during in-flight load"
+                                    );
+                                    continue;
+                                }
+                                warn!(
+                                    client_id = cid.0,
+                                    session_id = sid.as_str(),
+                                    "Live buffer for in-flight load exceeded cap; forwarding live (ordering not guaranteed)"
+                                );
+                            }
+                            if let Some(client) = clients.get(&cid) {
+                                if let Err(e) =
+                                    client.tx.try_send(ClientOutbound::Acp(payload.clone()))
+                                {
+                                    warn!(client_id = cid.0, session_id = sid.as_str(), error = %e, "Failed to broadcast notification to subscriber (channel closed)");
+                                } else {
+                                    trace!(
+                                        client_id = cid.0,
+                                        session_id = sid.as_str(),
+                                        "Broadcast notification to subscriber"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    match child_event {
+                        Some(ChildSessionEvent::Spawned(child_sid)) => {
+                            let parent_subs = session_subscribers
+                                .get(sid.as_str())
+                                .cloned()
+                                .unwrap_or_default();
+                            info!(child_session_id = %child_sid, subscriber_count = parent_subs.len(), "Registered child session from SubagentSpawned");
+                            session_subscribers.insert(child_sid.clone(), parent_subs);
+                            if let Some(&driver_id) = session_driver.get(sid.as_str()) {
+                                session_driver.insert(child_sid.clone(), driver_id);
+                            }
+                            child_sessions
+                                .entry(sid.clone())
+                                .or_default()
+                                .insert(child_sid);
+                        }
+                        Some(ChildSessionEvent::Finished(child_sid)) => {
+                            debug!(child_session_id = %child_sid, "Deregistered child session from SubagentFinished");
+                            prune_child_route(
+                                &child_sid,
+                                &mut session_subscribers,
+                                &mut session_driver,
+                                &mut child_sessions,
+                            );
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
+                let is_notification = json.as_ref().is_some_and(|j| j.get("id").is_none());
+                let is_relay_session_notification = is_notification
+                    && session_id
+                        .as_ref()
+                        .is_some_and(|s| !session_subscribers.contains_key(s.as_str()));
+                if !is_notification {
+                    trace!("Dropping non-routable response (likely relay-originated)");
+                } else if is_relay_session_notification {
+                    if let Some(ChildSessionEvent::Finished(child_sid)) =
+                        json.as_ref().and_then(extract_child_session_event)
+                        && session_subscribers
+                            .get(&child_sid)
+                            .is_none_or(|subs| subs.is_empty())
+                    {
+                        prune_child_route(
+                            &child_sid,
+                            &mut session_subscribers,
+                            &mut session_driver,
+                            &mut child_sessions,
+                        );
+                    }
+                    trace!(
+                        "Dropping notification for relay-owned session (already delivered via WS)"
+                    );
+                } else if let Some(client_id) = last_active_client
+                    && let Some(client) = clients.get(&client_id)
+                {
+                    debug!(
+                        client_id = client_id.0,
+                        "Using fallback routing to last active client"
+                    );
+                    if let Err(e) = client.tx.try_send(ClientOutbound::Acp(payload)) {
+                        warn!(client_id = client_id.0, error = %e, "Failed to send notification via fallback routing (channel closed)");
+                    }
+                } else {
+                    debug!("No client available for notification routing, message dropped");
+                }
+            }
         }
     }
     finalize_workspace_on_shutdown(control_state.clone()).await;
@@ -1845,7 +2325,7 @@ fn spawn_client_handler(
         )
         .await;
         if let Err(e) = &result {
-            debug!(client_id = client_id.0, error = % e, "Client session ended");
+            debug!(client_id = client_id.0, error = %e, "Client session ended");
         }
         let _ = event_tx.send(ServerEvent::Disconnected(client_id)).await;
     });
@@ -1864,7 +2344,7 @@ async fn run_client_session(
         match tokio::time::timeout(REGISTRATION_TIMEOUT, read_message(&mut reader)).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(e)) => {
-                warn!(client_id = client_id.0, error = % e, "Registration failed");
+                warn!(client_id = client_id.0, error = %e, "Registration failed");
                 return Err(e);
             }
             Err(_) => {
@@ -1925,11 +2405,18 @@ async fn run_client_session(
         );
         while !*ready_rx.borrow() {
             tokio::select! {
-                biased; _ = cancel.cancelled() => { for _ in 0..10 { if ! server_rx
-                .is_empty() { break; } tokio::task::yield_now(). await; } while let
-                Ok(Some(msg)) = server_rx.try_recv() { if write_outbound(& mut writer, &
-                msg). await .is_err() { break; } } return Ok(()); } result = ready_rx
-                .changed() => { if result.is_err() { return Ok(()); } }
+                biased;
+                _ = cancel.cancelled() => {
+                    drain_client_outbound_on_cancel(&server_rx, &mut writer).await;
+                    return Ok(());
+                }
+                result = ready_rx.changed() => {
+                    if result.is_err() {
+                        // Watch sender was dropped (leader shutting down without ready).
+                        return Ok(());
+                    }
+                    // Loop re-checks *ready_rx.borrow() at top; no Ref held across await.
+                }
             }
         }
         write_message(&mut writer, &ServerMessage::LeaderReady).await?;
@@ -1946,31 +2433,99 @@ async fn run_client_session(
             client_type.clone(),
         ))
         .await;
-    info!(
-        client_id = client_id.0, client_type = % client_type, ? mode, yolo_mode =
-        capabilities.yolo_mode, client_version = ? capabilities.client_version,
-        "Client registered"
-    );
+    info!(client_id = client_id.0, client_type = %client_type, ?mode, yolo_mode = capabilities.yolo_mode, client_version = ?capabilities.client_version, "Client registered");
     loop {
         tokio::select! {
-            biased; _ = cancel.cancelled() => { for _ in 0..10 { if ! server_rx
-            .is_empty() { break; } tokio::task::yield_now(). await; } while let
-            Ok(Some(msg)) = server_rx.try_recv() { if write_outbound(& mut writer, & msg)
-            . await .is_err() { break; } } break; } Ok(msg) = server_rx.recv() => { if
-            write_outbound(& mut writer, & msg). await .is_err() { break; } } msg_result
-            = read_message::< _, ClientMessage > (& mut reader) => { match msg_result {
-            Ok(msg @ (ClientMessage::Acp { .. } | ClientMessage::Control { .. })) => {
-            let _ = event_tx.send(ServerEvent::Message(client_id, msg)). await; }
-            Ok(ClientMessage::Ping) => { write_message(& mut writer, &
-            ServerMessage::Pong). await ?; } Ok(ClientMessage::Disconnect) |
-            Err(ProtocolError::ConnectionClosed) => { info!(client_id = client_id.0,
-            "Client disconnected"); break; } Ok(ClientMessage::Register { .. }) => {
-            write_message(& mut writer, & ServerMessage::Error { code : 2, message :
-            "Already registered".into(), }). await ?; } Err(e) => { warn!(client_id =
-            client_id.0, error = % e, "Protocol error"); break; } } }
+            biased;
+
+            _ = cancel.cancelled() => {
+                drain_client_outbound_on_cancel(&server_rx, &mut writer).await;
+                break;
+            }
+
+            Ok(msg) = server_rx.recv() => {
+                if write_outbound(&mut writer, &msg).await.is_err() {
+                    break;
+                }
+            }
+
+            msg_result = read_message::<_, ClientMessage>(&mut reader) => {
+                match handle_client_inbound_message(
+                    msg_result,
+                    client_id,
+                    &event_tx,
+                    &mut writer,
+                )
+                .await?
+                {
+                    ClientSessionAction::Continue => {}
+                    ClientSessionAction::Break => break,
+                }
+            }
         }
     }
     Ok(())
+}
+enum ClientSessionAction {
+    Continue,
+    Break,
+}
+async fn drain_client_outbound_on_cancel<W>(
+    server_rx: &AsyncReceiver<ClientOutbound>,
+    writer: &mut W,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..10 {
+        if !server_rx.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    while let Ok(Some(msg)) = server_rx.try_recv() {
+        if write_outbound(writer, &msg).await.is_err() {
+            break;
+        }
+    }
+}
+async fn handle_client_inbound_message<W>(
+    msg_result: Result<ClientMessage, ProtocolError>,
+    client_id: ClientId,
+    event_tx: &AsyncSender<ServerEvent>,
+    writer: &mut W,
+) -> Result<ClientSessionAction, ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match msg_result {
+        Ok(msg @ (ClientMessage::Acp { .. } | ClientMessage::Control { .. })) => {
+            let _ = event_tx.send(ServerEvent::Message(client_id, msg)).await;
+            Ok(ClientSessionAction::Continue)
+        }
+        Ok(ClientMessage::Ping) => {
+            write_message(writer, &ServerMessage::Pong).await?;
+            Ok(ClientSessionAction::Continue)
+        }
+        Ok(ClientMessage::Disconnect) | Err(ProtocolError::ConnectionClosed) => {
+            info!(client_id = client_id.0, "Client disconnected");
+            Ok(ClientSessionAction::Break)
+        }
+        Ok(ClientMessage::Register { .. }) => {
+            write_message(
+                writer,
+                &ServerMessage::Error {
+                    code: 2,
+                    message: "Already registered".into(),
+                },
+            )
+            .await?;
+            Ok(ClientSessionAction::Continue)
+        }
+        Err(e) => {
+            warn!(client_id = client_id.0, error = %e, "Protocol error");
+            Ok(ClientSessionAction::Break)
+        }
+    }
 }
 /// Broadcast a planned shutdown to all connected clients.
 ///
@@ -2075,7 +2630,7 @@ pub async fn spawn_leader_server(socket_path: PathBuf) -> Result<ServerHandle, S
         )
         .await
         {
-            error!(error = % e, "Leader server error");
+            error!(error = %e, "Leader server error");
         }
     });
     Ok(ServerHandle {
@@ -2366,9 +2921,11 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
             if json.get("method").and_then(|m| m.as_str()) == Some("session/load") {
                 let id = json.get("id").cloned().unwrap();
-                let response = serde_json::json!(
-                    { "jsonrpc" : "2.0", "id" : id, "result" : { "models" : [] }, }
-                );
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "models": [] },
+                });
                 response_tx.send(response.to_string()).unwrap();
                 return;
             }
@@ -2508,12 +3065,19 @@ mod tests {
         .await
         .unwrap();
         let response: ServerMessage = read_message(&mut reader).await.unwrap();
-        assert!(
-            matches!(response, ServerMessage::ControlResult { request_id, result :
-            Ok(ControlPayload::CpuProfileStatus { active : false, stopping : false,
-            started_at : None, svg_path : None, frequency_hz : None, }), } if request_id
-            == "status-1")
-        );
+        assert!(matches!(
+            response,
+            ServerMessage::ControlResult {
+                request_id,
+                result: Ok(ControlPayload::CpuProfileStatus {
+                    active: false,
+                    stopping: false,
+                    started_at: None,
+                    svg_path: None,
+                    frequency_hz: None,
+                }),
+            } if request_id == "status-1"
+        ));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), handle.acp_rx.recv())
                 .await
@@ -2831,19 +3395,25 @@ mod tests {
     #[test]
     fn extract_interaction_tool_call_id_handles_direct_and_nested() {
         assert_eq!(
-            extract_interaction_tool_call_id(&
-            pv(r#"{"id":1,"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-q"}}"#))
-            .as_deref(), Some("tc-q")
+            extract_interaction_tool_call_id(&pv(
+                r#"{"id":1,"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-q"}}"#
+            ))
+            .as_deref(),
+            Some("tc-q")
         );
         assert_eq!(
-            extract_interaction_tool_call_id(&
-            pv(r#"{"id":1,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"tc-p"}}}"#))
-            .as_deref(), Some("tc-p")
+            extract_interaction_tool_call_id(&pv(
+                r#"{"id":1,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"tc-p"}}}"#
+            ))
+            .as_deref(),
+            Some("tc-p")
         );
         assert_eq!(
-            extract_interaction_tool_call_id(&
-            pv(r#"{"id":1,"method":"_x.ai/ask_user_question","params":{"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-w"}}}"#))
-            .as_deref(), Some("tc-w")
+            extract_interaction_tool_call_id(&pv(
+                r#"{"id":1,"method":"_x.ai/ask_user_question","params":{"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-w"}}}"#
+            ))
+            .as_deref(),
+            Some("tc-w")
         );
         assert_eq!(
             extract_interaction_tool_call_id(&pv(r#"{"params":{}}"#)),
@@ -2853,14 +3423,18 @@ mod tests {
     #[test]
     fn extract_interaction_resolved_tool_call_id_matches_only_resolved() {
         assert_eq!(
-            extract_interaction_resolved_tool_call_id(&
-            pv(r#"{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-r"}}}"#))
-            .as_deref(), Some("tc-r")
+            extract_interaction_resolved_tool_call_id(&pv(
+                r#"{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-r"}}}"#
+            ))
+            .as_deref(),
+            Some("tc-r")
         );
         assert_eq!(
-            extract_interaction_resolved_tool_call_id(&
-            pv(r#"{"method":"_x.ai/session_notification","params":{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-rw"}}}}"#))
-            .as_deref(), Some("tc-rw")
+            extract_interaction_resolved_tool_call_id(&pv(
+                r#"{"method":"_x.ai/session_notification","params":{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-rw"}}}}"#
+            ))
+            .as_deref(),
+            Some("tc-rw")
         );
         assert_eq!(
             extract_interaction_resolved_tool_call_id(&pv(
@@ -4779,9 +5353,11 @@ mod tests {
             early.is_err(),
             "live broadcast must be buffered until the load response, got {early:?}"
         );
-        let response = serde_json::json!(
-            { "jsonrpc" : "2.0", "id" : load_id, "result" : { "models" : [] }, }
-        );
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": load_id,
+            "result": { "models": [] },
+        });
         response_tx.send(response.to_string()).unwrap();
         let first = next_acp_payload(&mut reader).await;
         assert!(
@@ -6117,9 +6693,9 @@ mod tests {
         response_tx
             .send(
                 format!(
-                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"x.ai/leaderClientId":{}}}}}}}"#,
-                    id_a
-                ),
+                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"x.ai/leaderClientId":{}}}}}}}"#,
+                id_a
+            ),
             )
             .unwrap();
         let msg = tokio::time::timeout(Duration::from_millis(200), read_message(&mut reader_a))
@@ -6172,17 +6748,17 @@ mod tests {
         response_tx
             .send(
                 format!(
-                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}"#,
-                    id_a
-                ),
+                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}"#,
+                id_a
+            ),
             )
             .unwrap();
         response_tx
             .send(
                 format!(
-                    r#"{{"jsonrpc":"2.0","method":"_x.ai/session/update","params":{{"params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"hook_annotation","message":"m"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}}}"#,
-                    id_a
-                ),
+                r#"{{"jsonrpc":"2.0","method":"_x.ai/session/update","params":{{"params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"hook_annotation","message":"m"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}}}"#,
+                id_a
+            ),
             )
             .unwrap();
         let timeout_result: Result<Result<ServerMessage, _>, _> =

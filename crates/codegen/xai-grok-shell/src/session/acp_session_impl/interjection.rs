@@ -73,6 +73,8 @@ impl SessionActor {
             verbatim: false,
             json_schema: None,
             origin: super::super::PromptOrigin::User,
+            task_wake_fallback: None,
+            tool_overrides_update: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
@@ -246,7 +248,8 @@ impl SessionActor {
         // Availability without `command_availability()`'s goal-reconciliation
         // side effects — this runs mid-turn inside the drain.
         let tool_names = self.registered_tool_names().await;
-        let availability = self.build_command_availability(&tool_names);
+        let has_workflow_runs = !self.workflow_tracker().await.lock().list().is_empty();
+        let availability = self.build_command_availability(&tool_names, has_workflow_runs);
         let parsed = slash_commands::parse_skill_references(text, &slash_skills, availability)?;
         // Deliberately lighter telemetry than turn start: no `skill.activated`
         // span, `PluginUsed`, or `active_skill` stamp — those attribute the

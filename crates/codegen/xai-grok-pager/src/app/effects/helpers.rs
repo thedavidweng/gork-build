@@ -7,9 +7,10 @@ use super::actions::{PermissionModePersist, SubagentKillOutcome, TaskResult};
 use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
-    RATE_LIMITED_ERROR_CODE, rate_limited_user_message,
+    RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
 };
 use xai_grok_shell::session::ExtMethodResult;
+use xai_grok_shell::session::unified_list::ListScope;
 /// Typed progress message for session restore.
 /// Keeps the progress channel from accepting arbitrary `TaskResult` variants.
 pub(crate) struct RestoreProgressMsg {
@@ -27,7 +28,7 @@ pub(super) fn log_prompt_result(
             ulog::error(
                 "agent response failed",
                 Some(sid),
-                Some(serde_json::json!({ "error" : e.to_string() })),
+                Some(serde_json::json!({"error": e.to_string()})),
             )
         }
     }
@@ -52,9 +53,10 @@ pub(super) async fn fetch_plugin_cta_mcps(
     plugin_name: String,
     tx: AcpAgentTx,
 ) -> TaskResult {
-    let params = serde_json::json!(
-        { "sessionId" : session_id.0.to_string(), "cache" : false, }
-    );
+    let params = serde_json::json!({
+        "sessionId": session_id.0.to_string(),
+        "cache": false,
+    });
     let req = acp::ExtRequest::new(
         "x.ai/mcp/list",
         serde_json::value::to_raw_value(&params)
@@ -72,7 +74,9 @@ pub(super) async fn fetch_plugin_cta_mcps(
                 .map(crate::views::mcps_modal::convert_list_response)
                 .map_err(|_| "couldn't load server list".to_string())
         }
-        Err(e) => Err(sanitize_user_error(&format!("couldn't load server list: {e}"))),
+        Err(e) => Err(sanitize_user_error(&format!(
+            "couldn't load server list: {e}"
+        ))),
     };
     TaskResult::PluginCtaMcpsLoaded {
         agent_id,
@@ -81,18 +85,19 @@ pub(super) async fn fetch_plugin_cta_mcps(
     }
 }
 /// Convert an ACP error to a user-friendly string for display.
-/// Rate-limit errors get auth-aware copy instead of the raw server error.
+/// Rate-limit errors: free-usage paywall, else server detail (with API-key
+/// rewrite when the body pushes personal SuperGrok), else auth-aware fallback
+/// (see [`format_rate_limited_user_message`]).
 /// All other errors are sanitized to remove internal service names and jargon.
 pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> String {
     if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
-        if super::dispatch::acp_error_is_free_usage_exhausted(err) {
-            return super::dispatch::FREE_USAGE_USER_MESSAGE.into();
-        }
-        return rate_limited_user_message(is_api_key_auth).into();
+        let detail = err.data.as_ref().and_then(error_detail_from_data);
+        return sanitize_user_error(
+            &format_rate_limited_user_message(detail.as_deref(), is_api_key_auth),
+        );
     }
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
-        && let Some(msg) = xai_grok_shell::sampling::error::error_detail_from_data(data)
-        && !msg.is_empty()
+        && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
         return msg;
     }
@@ -163,15 +168,19 @@ pub(crate) fn parse_session_load_running_prompt_id(
         .and_then(|v| v.as_str())
         .map(String::from)
 }
+/// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
+fn is_disk_full_error(raw: &str) -> bool {
+    raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
+        || raw.contains(xai_fast_worktree::ENOSPC_OS_MESSAGE)
+        || raw.contains("Disk quota exceeded") || raw.contains("Out of disk space")
+}
 /// Sanitize an error string before showing it to the user.
 ///
 /// Strips protocol jargon (ACP, JSON-RPC) and other technical noise that would
 /// be meaningless in a toast, and collapses known disk-full markers.
 pub(crate) fn sanitize_user_error(raw: &str) -> String {
-    if raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
-        || raw.contains(xai_fast_worktree::ENOSPC_OS_MESSAGE)
-    {
-        return "Out of disk space.".to_string();
+    if is_disk_full_error(raw) {
+        return xai_fast_worktree::ENOSPC_OS_MESSAGE.to_string();
     }
     static REPLACEMENTS: &[(&str, &str)] = &[
         ("cli-chat-proxy", "server"),
@@ -251,6 +260,10 @@ pub(crate) struct SessionFlags {
     /// Active auth is API key (not OAuth/session). Drives rate-limit copy in
     /// `format_acp_error`. Default `false` (OAuth copy) for tests.
     pub is_api_key_auth: bool,
+    /// Startup resume target deferred to the worktree handler after missing
+    /// local id/title resolution. Worktree failure messages append the
+    /// no-match hint only when the failing target equals this value.
+    pub resume_local_miss: Option<String>,
 }
 impl SessionFlags {
     /// Resolve the agent profile name from the flags.
@@ -294,7 +307,7 @@ impl SessionFlags {
             meta.insert("agentProfile".into(), serde_json::json!(profile));
         }
         if self.chat_mode {
-            meta.insert("x.ai/session".into(), serde_json::json!({ "kind" : "chat" }));
+            meta.insert("x.ai/session".into(), serde_json::json!({ "kind": "chat" }));
         }
         if !self.ask_user {
             meta.insert("askUserQuestion".into(), serde_json::json!(false));
@@ -302,9 +315,10 @@ impl SessionFlags {
         meta.insert("yoloMode".into(), serde_json::json!(self.yolo_mode));
         meta.insert(
             "autoMode".into(),
-            serde_json::json!(
-                super::dispatch::effective_auto(self.yolo_mode, self.auto_mode)
-            ),
+            serde_json::json!(super::dispatch::effective_auto(
+                self.yolo_mode,
+                self.auto_mode
+            )),
         );
         if meta.is_empty() { None } else { Some(meta) }
     }
@@ -319,7 +333,7 @@ pub(super) const CHAT_FORBIDDEN_WORKSPACE_BIND_KEYS: &[&str] = &[
 /// Stamp `_meta["x.ai/session"].kind = "chat"` and strip Build `agentProfile` (K12).
 pub(super) fn apply_chat_kind_meta(meta: &mut Option<acp::Meta>) {
     let obj = meta.get_or_insert_with(acp::Meta::new);
-    obj.insert("x.ai/session".into(), serde_json::json!({ "kind" : "chat" }));
+    obj.insert("x.ai/session".into(), serde_json::json!({ "kind": "chat" }));
     obj.remove("agentProfile");
 }
 /// Remove client workspace-bind keys from chat create/load meta (defense in depth).
@@ -339,6 +353,9 @@ pub(crate) struct EffectMeta {
     /// install this into `AppView.auth_state` if the current auth state
     /// still matches the sequence.
     pub auth_abort_handle: Option<(u64, tokio::task::AbortHandle)>,
+    /// Auth URL poll abort handle + request sequence (installed on
+    /// `AppView.auth_url_poll_handle` when the seq still matches).
+    pub auth_url_poll_handle: Option<(u64, tokio::task::AbortHandle)>,
 }
 /// Extract the first user prompt text from a session's `chat_history.jsonl`.
 ///
@@ -441,6 +458,18 @@ pub(super) fn parse_session_list_partial(
             _ => ConversationsPartial::Error,
         },
     )
+}
+/// Reads `_meta["x.ai/listScope"]` from a session-list payload.
+pub(super) fn parse_session_list_scope(payload: &serde_json::Value) -> ListScope {
+    match payload
+        .get("_meta")
+        .and_then(|m| m.get("x.ai/listScope"))
+        .and_then(|v| v.as_str())
+    {
+        Some("repo") => ListScope::Repo,
+        Some("all") => ListScope::All,
+        _ => ListScope::Cwd,
+    }
 }
 /// Parse the `x.ai/session/list` response payload (the unwrapped
 /// `{ "sessions": [...] }` object) into [`SessionPickerEntry`] rows.
@@ -636,8 +665,25 @@ pub(super) async fn send_logout(tx: &AcpAgentTx) {
             .into(),
     );
     if let Err(e) = acp_send(req, tx).await {
-        tracing::warn!(error = % e, "logout failed");
+        tracing::warn!(error = %e, "logout failed");
     }
+}
+/// Best-effort `x.ai/auth/cancel`: stops the shell's device/loopback wait so a
+/// later login is single-flight. Errors are ignored — UI already left
+/// `Authenticating`. `request_seq` scopes the cancel to the abandoned attempt.
+pub(super) async fn send_auth_cancel(tx: &AcpAgentTx, request_seq: u64) -> TaskResult {
+    let req = acp::ExtRequest::new(
+        "x.ai/auth/cancel",
+        serde_json::value::to_raw_value(
+                &serde_json::json!({ "request_seq": request_seq }),
+            )
+            .expect("serialize auth/cancel params")
+            .into(),
+    );
+    if let Err(e) = acp_send(req, tx).await {
+        tracing::debug!(error = %e, "auth cancel ext request failed (ignored)");
+    }
+    TaskResult::AuthCancelComplete
 }
 pub(super) async fn send_check_subscription(
     tx: &AcpAgentTx,
@@ -660,11 +706,14 @@ pub(super) async fn send_check_subscription(
             }
         }
         Err(e) => {
-            tracing::warn!(error = % e, "check_subscription failed");
+            tracing::warn!(error = %e, "check_subscription failed");
             crate::unified_log::warn(
                 "subscription.check.rpc_failed",
                 None,
-                Some(serde_json::json!({ "verify" : verify, "error" : e.to_string(), })),
+                Some(serde_json::json!({
+                    "verify": verify,
+                    "error": e.to_string(),
+                })),
             );
             TaskResult::CheckSubscriptionComplete {
                 verify,
@@ -698,7 +747,7 @@ pub(super) async fn send_credit_limit_recheck(
             }
         }
         Err(e) => {
-            tracing::warn!(error = % e, "credit_limit_recheck failed");
+            tracing::warn!(error = %e, "credit_limit_recheck failed");
             TaskResult::CreditLimitRecheckComplete {
                 agent_id,
                 meta: None,
@@ -713,7 +762,10 @@ pub(super) async fn send_authenticate(
     use_oauth: bool,
     force_interactive: bool,
 ) -> TaskResult {
-    let mut meta = serde_json::json!({ "use_oauth" : use_oauth });
+    let mut meta = serde_json::json!({
+        "use_oauth": use_oauth,
+        "request_seq": request_seq,
+    });
     if force_interactive {
         meta["force_interactive"] = serde_json::json!(true);
     }
@@ -731,7 +783,7 @@ pub(super) async fn send_authenticate(
             ulog::error(
                 "auth failed",
                 None,
-                Some(serde_json::json!({ "error" : & error })),
+                Some(serde_json::json!({"error": &error})),
             );
             TaskResult::AuthFailed {
                 request_seq,
@@ -766,6 +818,22 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("show_timestamps", "Bool", &value));
             };
             xai_grok_shell::util::config::set_show_timestamps(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "page_flip_on_send" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("page_flip_on_send", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_page_flip_on_send(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "combine_queued_prompts" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("combine_queued_prompts", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_combine_queued_prompts(b)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -836,6 +904,14 @@ pub(crate) async fn persist_setting(
                 );
             };
             xai_grok_shell::util::config::set_contextual_hint_word_select(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "contextual_hints.ssh_wrap" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("contextual_hints.ssh_wrap", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_contextual_hint_ssh_wrap(b)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1038,6 +1114,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "voice_keybind_enabled" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("voice_keybind_enabled", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_voice_keybind_enabled(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "voice_capture_mode" => {
             let SettingValue::Enum(s) = value else {
                 return Err(kind_mismatch("voice_capture_mode", "Enum", &value));
@@ -1111,10 +1195,11 @@ pub(crate) async fn persist_permission_mode_and_notify(
     let disk_outcome: Result<(), String> = disk_result.map_err(|e| e.to_string());
     if should_send_yolo_acp_notification(&disk_outcome, persist) && session_id.is_some()
     {
-        let params = serde_json::json!(
-            { "yolo_mode" : enabled, "auto_mode" : auto_mode, "permission_mode" :
-            config_str, }
-        );
+        let params = serde_json::json!({
+            "yolo_mode": enabled,
+            "auto_mode": auto_mode,
+            "permission_mode": config_str,
+        });
         let notification = acp::ExtNotification::new(
             "x.ai/yolo_mode_changed",
             serde_json::value::to_raw_value(&params)
@@ -1219,9 +1304,7 @@ pub(super) fn route_permission_mode_result(
             }
         }
         (Err(e), PermissionModePersist::WithRollback(prev_canonical)) => {
-            tracing::warn!(
-                "failed to save permission mode preference: {e} — rolling back"
-            );
+            tracing::warn!("failed to save permission mode preference: {e} — rolling back");
             TaskResult::SettingPersistFailed {
                 key: "permission_mode",
                 rollback_value: crate::settings::SettingValue::Enum(prev_canonical),
@@ -1229,9 +1312,7 @@ pub(super) fn route_permission_mode_result(
             }
         }
         (Err(e), PermissionModePersist::BestEffort) => {
-            tracing::warn!(
-                "failed to save permission mode preference (best-effort): {e}"
-            );
+            tracing::warn!("failed to save permission mode preference (best-effort): {e}");
             TaskResult::SettingPersistFailedBestEffort {
                 key: "permission_mode",
                 error: e,
@@ -1399,11 +1480,11 @@ pub(super) fn unregister_active_session_best_effort_in(
         Ok(true) => {}
         Ok(false) => {
             tracing::debug!(
-                session_id = % session_id.0,
-                "Skipped active-session unregister under lock contention; \
+            session_id = %session_id.0,
+            "Skipped active-session unregister under lock contention; \
              reaped by collect_crashed on next launch"
-            )
+        )
         }
-        Err(e) => tracing::warn!(? e, "Failed to unregister active session"),
+        Err(e) => tracing::warn!(?e, "Failed to unregister active session"),
     }
 }

@@ -14,6 +14,27 @@ pub struct GoalDeliverableInfo {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowPhaseInfo {
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowAgentInfo {
+    pub agent_id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub state: String,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
 /// xAI-specific session notification (parallel to acp::SessionNotification)
 /// This wraps an XaiSessionUpdate with session context for persistence and replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -341,9 +362,18 @@ pub fn attach_result_usage_fail_closed(result: &mut serde_json::Value, usage: &s
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "status")]
 pub enum HookRunStatusDto {
-    Success { elapsed_ms: u64 },
+    Success {
+        elapsed_ms: u64,
+    },
     Skipped,
-    Failed { error: String, elapsed_ms: u64 },
+    Failed {
+        error: String,
+        elapsed_ms: u64,
+        /// Stop-gate block (the hook's decision, not a failure). Rides `failed`
+        /// so old pagers keep rendering it. TODO: promote to a dedicated status.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        blocked: bool,
+    },
 }
 
 /// A single hook run entry (wire format).
@@ -461,7 +491,6 @@ pub enum SessionUpdate {
     HookExecution {
         /// The hook event name ("pre_tool_use" or "post_tool_use").
         event_name: String,
-        /// The tool name this hook is associated with.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
         /// The prompt turn this batch belongs to, when known; lets the
@@ -469,7 +498,6 @@ pub enum SessionUpdate {
         /// turn's marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
-        /// Individual hook run results.
         runs: Vec<HookRunEntryDto>,
     },
     /// Hooks registry changed (after reload or trust/untrust).
@@ -543,10 +571,10 @@ pub enum SessionUpdate {
     /// Task completed notification
     TaskCompleted {
         task_snapshot: TaskSnapshot,
-        /// Whether an auto-wake prompt follows this completion. The pager
-        /// skips its between-turns status line when set — the wake turn's
-        /// end marker carries the fresh counts instead. Missing (old
-        /// shells) reads as `false`: emit the line.
+        /// Advisory: an auto-wake prompt follows this completion. The
+        /// first-party TUI no longer consumes it (remaining background work
+        /// is surfaced by its persistent "watching" status row); kept for
+        /// wire compatibility and other clients. Missing reads as `false`.
         #[serde(default)]
         will_wake: bool,
     },
@@ -592,6 +620,8 @@ pub enum SessionUpdate {
         /// ID of the source subagent this session was resumed from.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed_from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_run_id: Option<String>,
     },
     /// Periodic progress update for a running subagent.
     ///
@@ -648,10 +678,10 @@ pub enum SessionUpdate {
         /// Final output text from the subagent (if completed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
-        /// Whether an auto-wake prompt follows this completion. The pager
-        /// skips its between-turns status line when set — the wake turn's
-        /// end marker carries the fresh counts instead. Missing (old
-        /// shells) reads as `false`: emit the line.
+        /// Advisory: an auto-wake prompt follows this completion. The
+        /// first-party TUI no longer consumes it (remaining background work
+        /// is surfaced by its persistent "watching" status row); kept for
+        /// wire compatibility and other clients. Missing reads as `false`.
         #[serde(default)]
         will_wake: bool,
     },
@@ -691,6 +721,8 @@ pub enum SessionUpdate {
         prompt: String,
         human_schedule: String,
         next_fire_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_id: Option<String>,
     },
     /// A scheduled task was deleted/cancelled.
     ScheduledTaskDeleted { task_id: String },
@@ -761,6 +793,47 @@ pub enum SessionUpdate {
     ImageDropped { notes: Vec<String> },
     /// Memory file listing for the pager's /memory modal.
     MemoryFiles { files: Vec<MemoryFileInfo> },
+    WorkflowUpdated {
+        run_id: String,
+        #[serde(default)]
+        revision: u64,
+        name: String,
+        objective: String,
+        status: String,
+        #[serde(default)]
+        foreground: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        phases: Vec<WorkflowPhaseInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_phase: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_budget: Option<u64>,
+        #[serde(default)]
+        agents_used: u64,
+        #[serde(default)]
+        agents_reserved: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agents_remaining: Option<u64>,
+        #[serde(default)]
+        agent_usage_incomplete: bool,
+        elapsed_ms: u64,
+        #[serde(default)]
+        active_agents: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_agent_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agents: Vec<WorkflowAgentInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_event: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_event_detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_event_timestamp: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pause_message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_summary: Option<String>,
+    },
     /// Goal mode orchestration progress update.
     ///
     /// Sent on the parent session's notification channel at phase transitions
@@ -1420,6 +1493,7 @@ mod tests {
             role: None,
             model: None,
             resumed_from: None,
+            workflow_run_id: None,
         })
         .unwrap();
         let progress = serde_json::to_value(SessionUpdate::SubagentProgress {

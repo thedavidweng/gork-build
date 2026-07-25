@@ -62,7 +62,7 @@ const CHUNK_DELAY: Duration = Duration::from_millis(30);
 async fn wheel_overscroll_at_bottom_reengages_follow_mid_stream() {
     // Gated, paced, provably mid-turn transcript with setup guards taken,
     // spawned under the forced-wheel pricing env (see the header).
-    let (mut harness, content, top_start) = spawn_streaming_marker_turn(
+    let (mut harness, _content, mut turn, top_start) = spawn_streaming_marker_turn(
         MARKER_COUNT,
         TAIL_WORDS,
         CHUNK_DELAY,
@@ -119,8 +119,9 @@ async fn wheel_overscroll_at_bottom_reengages_follow_mid_stream() {
         Duration::ZERO,
     );
     harness.update(Duration::from_millis(800));
+    let running = harness.is_running().expect("poll pager liveness");
     assert!(
-        harness.is_running() && !harness.contains_text("panicked"),
+        running && !harness.contains_text("panicked"),
         "pager broke during the wheel dance\nscreen:\n{}",
         harness.screen_contents()
     );
@@ -146,16 +147,19 @@ async fn wheel_overscroll_at_bottom_reengages_follow_mid_stream() {
         });
 
     // Release the gate and let the turn complete: the dance didn't wedge it.
-    content.release_agent_completions();
+    turn.release();
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     while harness.contains_text("Responding") {
         assert!(
             std::time::Instant::now() < deadline,
-            "turn never completed after releasing the gate\nscreen:\n{}",
+            "turn never completed after releasing its expectation\nscreen:\n{}",
             harness.screen_contents()
         );
         harness.update(Duration::from_millis(200));
     }
+    tokio::time::timeout(Duration::from_secs(10), turn.wait_satisfied())
+        .await
+        .expect("streaming marker expectation satisfied");
 
     harness.quit().expect("clean quit");
 }

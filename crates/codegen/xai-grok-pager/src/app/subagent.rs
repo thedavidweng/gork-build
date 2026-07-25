@@ -25,6 +25,7 @@ pub struct SubagentInfo {
     pub resumed_from: Option<Arc<str>>,
     /// "read-only", "read-write", "execute", or "all".
     pub capability_mode: Option<Arc<str>>,
+    pub workflow_run_id: Option<Arc<str>>,
     /// Whether the context was normalized into `<background_context>`.
     pub context_normalized: bool,
     pub parent_prompt_id: Option<Arc<str>>,
@@ -107,8 +108,8 @@ struct SubagentMetaSlice {
     worktree_path: Option<String>,
 }
 thread_local! {
-    static REPLAY_GROK_HOME : std::cell::RefCell < Option < std::path::PathBuf >> = const
-    { std::cell::RefCell::new(None) };
+    static REPLAY_GROK_HOME: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 /// Override grok home for disk-replay unit tests (thread-local; production never sets this).
 #[cfg(test)]
@@ -145,14 +146,14 @@ fn enrich_from_meta_with_home(
     let content = match std::fs::read_to_string(&meta_path) {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!(error = % e, "meta.json not found");
+            tracing::debug!(error = %e, "meta.json not found");
             return;
         }
     };
     let meta: SubagentMetaSlice = match serde_json::from_str(&content) {
         Ok(m) => m,
         Err(e) => {
-            tracing::debug!(error = % e, "meta.json parse failed");
+            tracing::debug!(error = %e, "meta.json parse failed");
             return;
         }
     };
@@ -171,19 +172,17 @@ pub(crate) fn replay_inherited_updates(
     child_session_id: &str,
 ) {
     let home = effective_grok_home();
-    let updates =
-        match xai_grok_shell::session::storage::load_updates_for_replay_at(child_session_id, &home)
-        {
-            Ok(Some(u)) => u,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::debug!(
-                    session_id = % child_session_id, error = % e,
-                    "failed to load updates for replay"
-                );
-                return;
-            }
-        };
+    let updates = match xai_grok_shell::session::storage::load_updates_for_replay_at(
+        child_session_id,
+        &home,
+    ) {
+        Ok(Some(u)) => u,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!(session_id = %child_session_id, error = %e, "failed to load updates for replay");
+            return;
+        }
+    };
     let replay_meta = crate::acp::meta::NotificationMeta {
         is_replay: true,
         ..Default::default()
@@ -512,6 +511,7 @@ mod tests {
             context_source: None,
             resumed_from: None,
             capability_mode: None,
+            workflow_run_id: None,
             context_normalized: false,
             parent_prompt_id: None,
             started_at: Instant::now(),
@@ -574,6 +574,7 @@ mod tests {
             bg_tool_call_to_task: HashMap::new(),
             scheduled_tasks: HashMap::new(),
             in_flight_prompt: None,
+            compact_held_prompt: None,
             current_prompt_id: None,
             created_via_new: false,
         };
@@ -687,6 +688,7 @@ mod tests {
             .join(urlencoding::encode("/tmp").as_ref())
             .join(child_sid);
         std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
         let tool_line = format!(
             r#"{{"method":"session/update","params":{{"sessionId":"{child_sid}","update":{{"sessionUpdate":"tool_call","toolCallId":"tc1","title":"Read foo","kind":"read","locations":[{{"path":"/tmp/foo"}}]}}}}}}"#
         );
@@ -741,6 +743,7 @@ mod tests {
             .join(urlencoding::encode("/tmp").as_ref())
             .join(empty_sid);
         std::fs::create_dir_all(&empty_dir).unwrap();
+        std::fs::write(empty_dir.join("summary.json"), "{}").unwrap();
         std::fs::write(empty_dir.join("updates.jsonl"), "").unwrap();
         parent
             .subagent_views
@@ -1114,7 +1117,7 @@ mod tests {
             title,
             description: None,
         });
-        let expected_prefix = "Running: ".to_string() + &"a".repeat(40);
+        let expected_prefix = "Running: ".to_string() + "a".repeat(40).as_str();
         assert!(result.starts_with(&expected_prefix));
         assert!(result.ends_with('\u{2026}'), "truncated with ellipsis");
     }

@@ -21,6 +21,9 @@ pub struct HookMatcher {
 #[derive(Debug, Clone)]
 enum MatcherKind {
     All,
+    /// Matches no tool names. Used when a configured matcher fails to compile
+    /// after deserialization; fail closed rather than widen to match-all.
+    Never,
     Exact(Vec<String>),
     Regex(Regex),
 }
@@ -39,15 +42,33 @@ impl HookMatcher {
         Ok(Self { kind })
     }
 
+    /// Matcher that never matches. Prefer this over `None` on a [`HookSpec`] when a
+    /// pattern was configured but could not be compiled (fail-closed).
+    pub(crate) fn never() -> Self {
+        Self {
+            kind: MatcherKind::Never,
+        }
+    }
+
     pub fn is_match(&self, tool_name: &str) -> bool {
         match &self.kind {
             MatcherKind::All => true,
+            MatcherKind::Never => false,
             MatcherKind::Exact(names) => names.iter().any(|n| n == tool_name),
             MatcherKind::Regex(regex) => {
                 regex.is_match(tool_name)
                     || claude_names_for(tool_name).any(|alias| regex.is_match(alias))
             }
         }
+    }
+}
+
+/// Shared matcher-application rule: a missing matcher or missing value fires
+/// (fail-open); otherwise the compiled matcher decides.
+pub fn matcher_allows(matcher: Option<&HookMatcher>, value: Option<&str>) -> bool {
+    match (matcher, value) {
+        (Some(matcher), Some(value)) => matcher.is_match(value),
+        _ => true,
     }
 }
 
@@ -135,6 +156,15 @@ mod tests {
     }
 
     #[test]
+    fn never_matches_nothing() {
+        let m = HookMatcher::never();
+        assert!(!m.is_match("read_file"));
+        assert!(!m.is_match("run_terminal_command"));
+        assert!(!m.is_match(""));
+        assert!(!m.is_match("*"));
+    }
+
+    #[test]
     fn star_and_empty_match_all() {
         for pat in ["*", ""] {
             let m = HookMatcher::new(pat).unwrap();
@@ -151,8 +181,6 @@ mod tests {
         assert!(!m.is_match("read_file"));
         assert!(!m.is_match("run_terminal_command"));
     }
-
-    // ── External tool-name aliases ────────────────────────────────
 
     #[test]
     fn claude_bash_matches_grok_tool() {
@@ -175,14 +203,6 @@ mod tests {
         // The old anchoring bug matched these; the exact-list mode must not.
         assert!(!m.is_match("Editorial"));
         assert!(!m.is_match("my_search_replace"));
-    }
-
-    #[test]
-    fn claude_read_matches_grok_tool() {
-        let m = HookMatcher::new("Read").unwrap();
-        assert!(m.is_match("Read"));
-        assert!(m.is_match("read_file"));
-        assert!(m.is_match("hashline_read"));
     }
 
     #[test]

@@ -1,12 +1,13 @@
 [package]
 license = "Apache-2.0"
 name = "xai-grok-shell"
-version = "0.2.101"
+version = "0.2.111"
 edition.workspace = true
 
 [features]
 default = []
 unstable = []
+dhat-heap = ["dep:dhat"]
 default-bazel = []
 
 [dependencies]
@@ -106,6 +107,7 @@ arc-swap = { workspace = true }
 infer = "0.15"
 image = { workspace = true, features = ["png", "jpeg", "gif", "webp"] }
 moka = { workspace = true, features = ["future"] }
+dhat = { workspace = true, optional = true }
 base64 = { workspace = true }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 sha2 = { workspace = true }
@@ -135,6 +137,7 @@ xai-token-estimation = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-grok-tools = { path = "../xai-grok-tools" }
 xai-tty-utils = { workspace = true }
+xai-workflow = { path = "../xai-workflow" }
 xai-system-power = { workspace = true }
 xai-grok-workspace = { workspace = true }
 xai-grok-subagent-resolution = { path = "../xai-grok-subagent-resolution" }

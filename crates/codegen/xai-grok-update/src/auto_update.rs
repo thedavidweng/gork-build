@@ -193,43 +193,56 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     };
 
     match get_latest_version(inst, update_config).await {
-        Ok(latest_version) => {
-            let mut error = None;
-            // --check reports upgrades only; a rolled-back pointer isn't a "new version" to advertise here (auto-update converges separately).
-            let allow_downgrade = false;
-            let update_available =
-                match needs_update(&current_version, &latest_version, &channel, allow_downgrade) {
+        // --check shares the updater's decision, so it never advertises a version
+        // the policy would skip, clamp away, or can't satisfy.
+        Ok(latest) => match plan_for(&config::VersionPolicy::resolve(), latest) {
+            UpdatePlan::Install { target, .. } => {
+                let mut error = None;
+                let update_available = match needs_update(
+                    &current_version,
+                    &target,
+                    &channel,
+                    false,
+                ) {
                     Some(value) => value,
                     None => {
-                        // Distinguish parse failure from unsupported channel for clearer diagnostics.
+                        // Distinguish parse failure from unsupported channel.
                         let parse_ok = semver::Version::parse(&current_version).is_ok()
-                            && semver::Version::parse(&latest_version).is_ok();
+                            && semver::Version::parse(&target).is_ok();
                         error = Some(if parse_ok {
                             format!(
-                                "Unsupported release channel '{}' (current={}, latest={}). \
-                             Supported channels: stable, alpha, enterprise.",
-                                channel, current_version, latest_version
+                                "Unsupported release channel '{channel}' (current={current_version}, latest={target}). \
+                                     Supported channels: stable, alpha, enterprise."
                             )
                         } else {
                             format!(
-                                "Failed to parse versions (current={}, latest={})",
-                                current_version, latest_version
+                                "Failed to parse versions (current={current_version}, latest={target})"
                             )
                         });
                         false
                     }
                 };
-
-            UpdateStatus {
+                UpdateStatus {
+                    current_version,
+                    latest_version: Some(target),
+                    update_available,
+                    installer,
+                    channel,
+                    auto_update,
+                    error,
+                }
+            }
+            // Policy skips (anti-downgrade) or can't satisfy the floor: no upgrade.
+            UpdatePlan::Skip { latest } | UpdatePlan::Unavailable { latest, .. } => UpdateStatus {
                 current_version,
-                latest_version: Some(latest_version),
-                update_available,
+                latest_version: Some(latest),
+                update_available: false,
                 installer,
                 channel,
                 auto_update,
-                error,
-            }
-        }
+                error: None,
+            },
+        },
         Err(err) => UpdateStatus {
             current_version,
             latest_version: None,
@@ -242,6 +255,49 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     }
 }
 
+enum UpdatePlan {
+    /// Anti-downgrade skip; `latest` is reported to the user.
+    Skip {
+        latest: String,
+    },
+    /// A hard `required_minimum` exceeds the latest release, so nothing satisfies it.
+    Unavailable {
+        latest: String,
+        target: String,
+    },
+    Install {
+        latest: String,
+        target: String,
+    },
+}
+
+/// Classify a fetched `latest` release under `policy`. Pure; `fetch_update_plan`
+/// is the IO wrapper. `--check` shares this so it can't diverge from the updater.
+fn plan_for(policy: &config::VersionPolicy, latest: String) -> UpdatePlan {
+    let Some(target) = policy.resolve_target(&latest) else {
+        return UpdatePlan::Skip { latest };
+    };
+    // A hard `required_minimum` can clamp above the latest release; that version
+    // doesn't exist.
+    if matches!(
+        (semver::Version::parse(&target), semver::Version::parse(&latest)),
+        (Ok(t), Ok(l)) if t > l
+    ) {
+        UpdatePlan::Unavailable { latest, target }
+    } else {
+        UpdatePlan::Install { latest, target }
+    }
+}
+
+async fn fetch_update_plan(
+    installer: &str,
+    update_config: &UpdateConfig,
+    policy: &config::VersionPolicy,
+) -> Result<UpdatePlan> {
+    let latest = fetch_latest_version(installer, update_config).await?;
+    Ok(plan_for(policy, latest))
+}
+
 /// Installer + version the leader/background path should converge to: an
 /// upgrade OR an authoritative-installer rollback. `None` means stay put. Gates
 /// on the installer (via `installer_allows_downgrade`) so npm is never
@@ -252,15 +308,21 @@ pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'stati
     }
     let installer = get_installer().await?;
     let current = get_installed_grok_version();
-    let latest = fetch_latest_version(installer, update_config).await.ok()?;
+    let policy = config::VersionPolicy::resolve();
+    let UpdatePlan::Install { target, .. } = fetch_update_plan(installer, update_config, &policy)
+        .await
+        .ok()?
+    else {
+        return None;
+    };
     needs_update(
         &current,
-        &latest,
+        &target,
         &update_config.channel,
         installer_allows_downgrade(installer),
     )
     .unwrap_or(false)
-    .then_some((installer, latest))
+    .then_some((installer, target))
 }
 
 /// Outcome of [`ensure_latest_on_disk`].
@@ -304,21 +366,27 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
     let Some(installer) = get_installer().await else {
         return Ok(outcome);
     };
+    heal_managed_install(installer).await;
     let allow_downgrade = installer_allows_downgrade(installer);
-    let latest = fetch_latest_version(installer, update_config).await?;
+    let policy = config::VersionPolicy::resolve();
+    let UpdatePlan::Install { target, .. } =
+        fetch_update_plan(installer, update_config, &policy).await?
+    else {
+        return Ok(outcome);
+    };
 
     let effective_current =
         disk_version_for_installer(installer).unwrap_or_else(get_installed_grok_version);
     if needs_update(
         &effective_current,
-        &latest,
+        &target,
         &update_config.channel,
         allow_downgrade,
     )
     .unwrap_or(false)
     {
-        run_install_script(installer, Some(&latest), update_config).await?;
-        outcome.installed = Some(latest.clone());
+        run_install_script(installer, Some(&target), update_config).await?;
+        outcome.installed = Some(target.clone());
     }
 
     // Relaunch when the running binary differs from what's on disk in the
@@ -472,6 +540,8 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
         return BackgroundUpdateCheck::none();
     };
 
+    heal_managed_install(installer).await;
+
     if is_version_cache_fresh().await {
         return BackgroundUpdateCheck::none();
     }
@@ -488,22 +558,25 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     }
 
     let current_version = get_installed_grok_version();
-    let latest_version = match fetch_latest_version(installer, update_config).await {
-        Ok(v) => v,
-        Err(_) => return BackgroundUpdateCheck::none(),
+    let policy = config::VersionPolicy::resolve();
+    let target_version = match fetch_update_plan(installer, update_config, &policy).await {
+        Ok(UpdatePlan::Install { target, .. }) => target,
+        Ok(UpdatePlan::Skip { .. } | UpdatePlan::Unavailable { .. }) | Err(_) => {
+            return BackgroundUpdateCheck::none();
+        }
     };
 
     let allow_downgrade = installer_allows_downgrade(installer);
     if !needs_update(
         &current_version,
-        &latest_version,
+        &target_version,
         &update_config.channel,
         allow_downgrade,
     )
     .unwrap_or(false)
     {
         let stable_ptr = try_fetch_stable_pointer().await;
-        write_version_cache(&latest_version, stable_ptr.as_deref()).await;
+        write_version_cache(&target_version, stable_ptr.as_deref()).await;
         return BackgroundUpdateCheck::none();
     }
 
@@ -516,7 +589,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     let disk_needs_download = match disk_version_for_installer(installer) {
         Some(disk) => needs_update(
             &disk,
-            &latest_version,
+            &target_version,
             &update_config.channel,
             allow_downgrade,
         )
@@ -536,14 +609,16 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
         }
     } else {
         tracing::info!(
-            latest_version = %latest_version,
+            target_version = %target_version,
             "Background update: target already on disk, skipping download"
         );
         None
     };
 
     BackgroundUpdateCheck {
-        update: Some(UpdateAvailable { latest_version }),
+        update: Some(UpdateAvailable {
+            latest_version: target_version,
+        }),
         download,
     }
 }
@@ -554,11 +629,12 @@ pub async fn run_update_if_available(
     interactive: bool,
     update_config: &UpdateConfig,
 ) -> Result<bool> {
-    let installer = get_installer().await;
-    if installer.is_none() {
+    let Some(inst) = get_installer().await else {
         // Skip update check if no known installer.
         return Ok(false);
-    }
+    };
+
+    heal_managed_install(inst).await;
 
     if is_version_cache_fresh().await {
         return Ok(false);
@@ -577,14 +653,13 @@ pub async fn run_update_if_available(
     let auto_update = true;
 
     let current_version = get_installed_grok_version();
-    // installer is guaranteed Some by the guard at the top of this function.
-    let inst = installer.unwrap();
-    // Fetch without writing version.json — we only cache after confirming the
-    // update is not needed or after a successful blocking install. This prevents
-    // a failed background download from suppressing retries for the TTL window.
-    let latest_version = match fetch_latest_version(inst, update_config).await {
-        Ok(v) => v,
-        Err(_) => return Ok(false),
+    let policy = config::VersionPolicy::resolve();
+    // Don't write version.json here; only cache after confirming no update is
+    // needed or after a successful install, so a failed background download
+    // doesn't suppress retries for the TTL window.
+    let latest_version = match fetch_update_plan(inst, update_config, &policy).await {
+        Ok(UpdatePlan::Install { target, .. }) => target,
+        Ok(UpdatePlan::Skip { .. } | UpdatePlan::Unavailable { .. }) | Err(_) => return Ok(false),
     };
     if !needs_update(
         &current_version,
@@ -1946,6 +2021,104 @@ async fn cleanup_old_downloads(dir: &std::path::Path, bin_prefix: &str, current_
     }
 }
 
+fn installer_manages_bin_entrypoints(installer: &str) -> bool {
+    matches!(installer, "internal" | "gh-release")
+}
+
+#[cfg_attr(not(any(unix, windows)), allow(clippy::unused_async))]
+async fn heal_managed_install(installer: &str) {
+    if !installer_manages_bin_entrypoints(installer) {
+        return;
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let bin_dir = grok_home().join("bin");
+
+        #[cfg(unix)]
+        reconcile_agent_to_grok(&bin_dir).await;
+
+        #[cfg(windows)]
+        reconcile_agent_exe_to_grok(&bin_dir).await;
+    }
+}
+
+#[cfg(unix)]
+async fn reconcile_agent_to_grok(bin_dir: &std::path::Path) {
+    let grok_link = bin_dir.join("grok");
+    let agent_link = bin_dir.join("agent");
+
+    let Ok(grok_target) = tokio::fs::read_link(&grok_link).await else {
+        return;
+    };
+    if tokio::fs::metadata(&grok_link).await.is_err() {
+        return;
+    }
+    if let Ok(agent_target) = tokio::fs::read_link(&agent_link).await
+        && agent_target == grok_target
+    {
+        return;
+    }
+    match atomic_symlink_swap(&grok_target, &agent_link).await {
+        Ok(()) => tracing::info!(
+            grok_target = %grok_target.display(),
+            "reconciled agent bin symlink to grok target"
+        ),
+        Err(e) => tracing::warn!("failed to reconcile agent bin symlink: {e:#}"),
+    }
+}
+
+#[cfg(windows)]
+async fn reconcile_agent_exe_to_grok(bin_dir: &std::path::Path) {
+    let grok_exe = bin_dir.join("grok.exe");
+    let agent_exe = bin_dir.join("agent.exe");
+
+    if tokio::fs::metadata(&grok_exe).await.is_err() {
+        return;
+    }
+    match agent_exe_differs(&grok_exe, &agent_exe).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::debug!("agent.exe reconcile: compare failed: {e:#}");
+            return;
+        }
+    }
+    match windows_replace_exe(&grok_exe, &agent_exe).await {
+        Ok(()) => tracing::info!("reconciled agent.exe to grok.exe"),
+        Err(e) => tracing::warn!("failed to reconcile agent.exe to grok.exe: {e:#}"),
+    }
+}
+
+#[cfg(windows)]
+async fn agent_exe_differs(
+    grok: &std::path::Path,
+    agent: &std::path::Path,
+) -> std::io::Result<bool> {
+    use tokio::io::{AsyncReadExt, BufReader};
+    let grok_len = tokio::fs::metadata(grok).await?.len();
+    match tokio::fs::metadata(agent).await {
+        Ok(m) if m.len() != grok_len => return Ok(true),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    }
+    let mut rg = BufReader::new(tokio::fs::File::open(grok).await?);
+    let mut ra = BufReader::new(tokio::fs::File::open(agent).await?);
+    let mut bg = [0u8; 64 * 1024];
+    let mut ba = [0u8; 64 * 1024];
+    loop {
+        let n = rg.read(&mut bg).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        ra.read_exact(&mut ba[..n]).await?;
+        if bg[..n] != ba[..n] {
+            return Ok(true);
+        }
+    }
+}
+
 /// Download a single asset from a GitHub release via `gh release download`.
 async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -> Result<()> {
     let pb = ProgressBar::new_spinner();
@@ -2275,11 +2448,14 @@ pub async fn run_update(
         .await;
     }
 
+    heal_managed_install(installer).await;
+
     let current_version = get_installed_grok_version();
+    let policy = config::VersionPolicy::resolve();
 
     // When --version is given, skip the latest-version check and install directly
     if let Some(version) = pinned_version {
-        if let Err(e) = crate::minimum_version::check_install_target(version) {
+        if let Err(e) = crate::version_policy::check_install_target(&policy, version) {
             anyhow::bail!("{e}");
         }
         eprintln!(
@@ -2308,18 +2484,33 @@ pub async fn run_update(
             .unwrap(),
     );
     pb.enable_steady_tick(Duration::from_millis(100));
-    let latest_version = fetch_latest_version(installer, update_config).await?;
+    let plan = fetch_update_plan(installer, update_config, &policy).await?;
     pb.finish_and_clear();
 
-    let install_target = match crate::minimum_version::apply_floor(&latest_version) {
-        Ok(t) => t,
-        Err(e) => anyhow::bail!("{e}"),
+    let (latest_version, install_target) = match plan {
+        UpdatePlan::Skip { latest } => {
+            // Cache so an explicit `grok update` doesn't re-prompt every run.
+            let stable_ptr = try_fetch_stable_pointer().await;
+            write_version_cache(&latest, stable_ptr.as_deref()).await;
+            eprintln!(
+                "The latest release ({latest}) is not an allowed update; \
+                 keeping the current version ({current_version})."
+            );
+            refresh_deployment_config().await;
+            return Ok(None);
+        }
+        UpdatePlan::Unavailable { latest, target } => {
+            anyhow::bail!(
+                "The required minimum version ({target}) is newer than the latest \
+                 available release ({latest}). Contact your administrator."
+            );
+        }
+        UpdatePlan::Install { latest, target } => (latest, target),
     };
     if install_target != latest_version {
         eprintln!(
-            "Latest available is {} but the configured minimum is higher; \
-             installing {} instead.",
-            latest_version, install_target
+            "Latest available is {latest_version}, but your configured version range \
+             allows {install_target}; installing that instead."
         );
     }
 
@@ -2665,6 +2856,138 @@ mod tests {
         atomic_symlink_swap(&target_v2, &link).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "v2");
+    }
+
+    #[cfg(unix)]
+    fn managed_layout() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let downloads = dir.path().join("downloads");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        (dir, bin, downloads)
+    }
+
+    #[test]
+    fn test_installer_manages_bin_entrypoints_gate() {
+        assert!(installer_manages_bin_entrypoints("internal"));
+        assert!(installer_manages_bin_entrypoints("gh-release"));
+        assert!(!installer_manages_bin_entrypoints("npm"));
+        assert!(!installer_manages_bin_entrypoints("unknown"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reconcile_agent_repoints_diverged_agent() {
+        let (_dir, bin, downloads) = managed_layout();
+        std::fs::write(downloads.join("grok-0.2.101-macos-aarch64"), "new").unwrap();
+        std::fs::write(downloads.join("grok-0.1.199-macos-aarch64"), "old").unwrap();
+
+        std::os::unix::fs::symlink("../downloads/grok-0.2.101-macos-aarch64", bin.join("grok"))
+            .unwrap();
+        std::os::unix::fs::symlink("../downloads/grok-0.1.199-macos-aarch64", bin.join("agent"))
+            .unwrap();
+
+        reconcile_agent_to_grok(&bin).await;
+
+        assert_eq!(
+            std::fs::read_link(bin.join("agent")).unwrap(),
+            std::path::PathBuf::from("../downloads/grok-0.2.101-macos-aarch64"),
+        );
+        assert_eq!(std::fs::read_to_string(bin.join("agent")).unwrap(), "new");
+        assert!(downloads.join("grok-0.1.199-macos-aarch64").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reconcile_agent_heals_legacy_unversioned_agent() {
+        let (_dir, bin, downloads) = managed_layout();
+        std::fs::write(downloads.join("grok-0.2.101-macos-aarch64"), "new").unwrap();
+        std::fs::write(downloads.join("grok-macos-aarch64"), "legacy").unwrap();
+
+        std::os::unix::fs::symlink("../downloads/grok-0.2.101-macos-aarch64", bin.join("grok"))
+            .unwrap();
+        std::os::unix::fs::symlink("../downloads/grok-macos-aarch64", bin.join("agent")).unwrap();
+
+        reconcile_agent_to_grok(&bin).await;
+
+        assert_eq!(
+            std::fs::read_link(bin.join("agent")).unwrap(),
+            std::path::PathBuf::from("../downloads/grok-0.2.101-macos-aarch64"),
+        );
+        assert_eq!(std::fs::read_to_string(bin.join("agent")).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reconcile_agent_creates_missing_agent() {
+        let (_dir, bin, downloads) = managed_layout();
+        std::fs::write(downloads.join("grok-0.2.101-macos-aarch64"), "new").unwrap();
+        std::os::unix::fs::symlink("../downloads/grok-0.2.101-macos-aarch64", bin.join("grok"))
+            .unwrap();
+
+        reconcile_agent_to_grok(&bin).await;
+
+        assert!(bin.join("agent").is_symlink());
+        assert_eq!(std::fs::read_to_string(bin.join("agent")).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reconcile_agent_noop_when_consistent() {
+        let (_dir, bin, downloads) = managed_layout();
+        std::fs::write(downloads.join("grok-0.2.101-macos-aarch64"), "new").unwrap();
+        let target = "../downloads/grok-0.2.101-macos-aarch64";
+        std::os::unix::fs::symlink(target, bin.join("grok")).unwrap();
+        std::os::unix::fs::symlink(target, bin.join("agent")).unwrap();
+
+        reconcile_agent_to_grok(&bin).await;
+
+        assert_eq!(
+            std::fs::read_link(bin.join("agent")).unwrap(),
+            std::path::PathBuf::from(target),
+        );
+        let leftovers = std::fs::read_dir(&bin)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-link"))
+            .count();
+        assert_eq!(leftovers, 0, "no temp links from a no-op reconcile");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reconcile_agent_skips_when_grok_dangling() {
+        let (_dir, bin, downloads) = managed_layout();
+        std::os::unix::fs::symlink("../downloads/grok-0.2.101-macos-aarch64", bin.join("grok"))
+            .unwrap();
+        std::fs::write(downloads.join("grok-0.1.199-macos-aarch64"), "old").unwrap();
+        std::os::unix::fs::symlink("../downloads/grok-0.1.199-macos-aarch64", bin.join("agent"))
+            .unwrap();
+
+        reconcile_agent_to_grok(&bin).await;
+
+        assert_eq!(
+            std::fs::read_link(bin.join("agent")).unwrap(),
+            std::path::PathBuf::from("../downloads/grok-0.1.199-macos-aarch64"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reconcile_agent_skips_when_grok_not_symlink() {
+        let (_dir, bin, downloads) = managed_layout();
+        std::fs::write(bin.join("grok"), "copy-binary").unwrap();
+        std::fs::write(downloads.join("grok-0.1.199-macos-aarch64"), "old").unwrap();
+        std::os::unix::fs::symlink("../downloads/grok-0.1.199-macos-aarch64", bin.join("agent"))
+            .unwrap();
+
+        reconcile_agent_to_grok(&bin).await;
+
+        assert_eq!(
+            std::fs::read_link(bin.join("agent")).unwrap(),
+            std::path::PathBuf::from("../downloads/grok-0.1.199-macos-aarch64"),
+        );
     }
 
     #[cfg(unix)]

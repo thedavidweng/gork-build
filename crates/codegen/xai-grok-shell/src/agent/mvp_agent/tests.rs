@@ -760,10 +760,10 @@ fn resolve_agent_definition_acp_profile_wins_for_explicit_grok_build_family() {
         std::env::remove_var("GROK_AGENT");
     }
     let tmp = tempfile::tempdir().unwrap();
-    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!(
-        { "name" : "custom-devbox-profile", "description" :
-        "Custom devbox profile", }
-    ))
+    let acp_profile = xai_grok_agent::AgentDefinition::from_json(&serde_json::json!({
+        "name": "custom-devbox-profile",
+        "description": "Custom devbox profile",
+    }))
     .expect("agent definition must parse");
     for family_variant in ["grok-build", "grok-build-plan", "grok-build-concise"] {
         let def = MvpAgent::resolve_agent_definition(
@@ -869,8 +869,8 @@ fn resolve_agent_definition_agent_profile_with_model_override() {
 }
 #[test]
 fn read_session_or_init_meta_str_prefers_session_meta() {
-    let session = serde_json::json!({ "rules" : "from-session" });
-    let init = serde_json::json!({ "rules" : "from-init" });
+    let session = serde_json::json!({ "rules": "from-session" });
+    let init = serde_json::json!({ "rules": "from-init" });
     assert_eq!(
         read_session_or_init_meta_str(session.as_object(), init.as_object(), "rules"),
         Some("from-session"),
@@ -878,8 +878,8 @@ fn read_session_or_init_meta_str_prefers_session_meta() {
 }
 #[test]
 fn read_session_or_init_meta_str_falls_back_to_init_meta() {
-    let session = serde_json::json!({ "other" : "x" });
-    let init = serde_json::json!({ "rules" : "from-init" });
+    let session = serde_json::json!({ "other": "x" });
+    let init = serde_json::json!({ "rules": "from-init" });
     assert_eq!(
         read_session_or_init_meta_str(session.as_object(), init.as_object(), "rules"),
         Some("from-init"),
@@ -896,10 +896,15 @@ fn parse_session_plugin_dirs_filters_and_dedupes() {
     std::fs::create_dir(&dir).unwrap();
     let file = tmp.path().join("file.txt");
     std::fs::write(&file, "x").unwrap();
-    let meta = serde_json::json!(
-        { "pluginDirs" : [dir.to_string_lossy(), dir.to_string_lossy(), file
-        .to_string_lossy(), "relative/path", 42,] }
-    );
+    let meta = serde_json::json!({
+        "pluginDirs": [
+            dir.to_string_lossy(),          // kept
+            dir.to_string_lossy(),          // duplicate → deduped
+            file.to_string_lossy(),         // not a directory → skipped
+            "relative/path",                // not absolute → skipped
+            42,                             // not a string → skipped
+        ]
+    });
     assert_eq!(parse_session_plugin_dirs(meta.as_object()), vec![dir]);
     assert!(parse_session_plugin_dirs(None).is_empty());
     assert!(parse_session_plugin_dirs(serde_json::json!({}).as_object()).is_empty());
@@ -907,7 +912,7 @@ fn parse_session_plugin_dirs_filters_and_dedupes() {
 #[test]
 fn read_session_or_init_meta_str_returns_none_when_absent() {
     assert_eq!(read_session_or_init_meta_str(None, None, "rules"), None,);
-    let session = serde_json::json!({ "other" : "x" });
+    let session = serde_json::json!({ "other": "x" });
     assert_eq!(
         read_session_or_init_meta_str(session.as_object(), None, "rules"),
         None,
@@ -915,8 +920,8 @@ fn read_session_or_init_meta_str_returns_none_when_absent() {
 }
 #[test]
 fn read_session_or_init_meta_str_ignores_non_string_values() {
-    let session = serde_json::json!({ "rules" : 42 });
-    let init = serde_json::json!({ "rules" : "from-init" });
+    let session = serde_json::json!({ "rules": 42 });
+    let init = serde_json::json!({ "rules": "from-init" });
     assert_eq!(
         read_session_or_init_meta_str(session.as_object(), init.as_object(), "rules"),
         Some("from-init"),
@@ -924,8 +929,8 @@ fn read_session_or_init_meta_str_ignores_non_string_values() {
 }
 #[test]
 fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
-    let session = serde_json::json!({ "systemPromptOverride" : "from session" });
-    let init = serde_json::json!({ "systemPromptOverride" : "from init" });
+    let session = serde_json::json!({ "systemPromptOverride": "from session" });
+    let init = serde_json::json!({ "systemPromptOverride": "from init" });
     assert_eq!(
         system_prompt_override_from_meta(session.as_object(), init.as_object()),
         Some("from session")
@@ -934,7 +939,7 @@ fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
         system_prompt_override_from_meta(None, init.as_object()),
         Some("from init")
     );
-    let empty = serde_json::json!({ "systemPromptOverride" : "" });
+    let empty = serde_json::json!({ "systemPromptOverride": "" });
     assert_eq!(
         system_prompt_override_from_meta(empty.as_object(), None),
         None
@@ -945,8 +950,8 @@ fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
 fn enqueue_replace_system_prompt_override_sends_when_present() {
     use crate::session::SessionCommand;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let session = serde_json::json!({ "systemPromptOverride" : "from session" });
-    let init = serde_json::json!({ "systemPromptOverride" : "from init" });
+    let session = serde_json::json!({ "systemPromptOverride": "from session" });
+    let init = serde_json::json!({ "systemPromptOverride": "from init" });
     enqueue_replace_system_prompt_override(&tx, session.as_object(), init.as_object());
     match rx.try_recv() {
         Ok(SessionCommand::ReplaceSystemPrompt { system_prompt }) => {
@@ -960,7 +965,7 @@ fn enqueue_replace_system_prompt_override_noop_when_absent_or_empty() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     enqueue_replace_system_prompt_override(
         &tx,
-        serde_json::json!({ "systemPromptOverride" : "" }).as_object(),
+        serde_json::json!({ "systemPromptOverride": "" }).as_object(),
         None,
     );
     enqueue_replace_system_prompt_override(&tx, serde_json::json!({}).as_object(), None);
@@ -1069,6 +1074,7 @@ async fn file_toolset_override_e2e_to_finalized_toolset() {
         session_env: std::sync::Arc::new(std::collections::HashMap::new()),
         notification_handle: ToolNotificationHandle::noop(),
         owner_session_id: None,
+        subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
         state_path: tmp.path().join("state.json"),
@@ -1140,6 +1146,7 @@ fn make_test_handle(
             cwd: "/tmp".to_string(),
         },
         max_turns: None,
+        resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
@@ -1465,7 +1472,7 @@ fn parse_code_nav_capability_present_and_true() {
     let mut meta = serde_json::Map::new();
     meta.insert(
         "x.ai/codeNavigation".to_string(),
-        serde_json::json!({ "enabled" : true }),
+        serde_json::json!({ "enabled": true }),
     );
     let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
         acp::ClientCapabilities::new()
@@ -1489,7 +1496,7 @@ fn parse_code_nav_capability_false_returns_false() {
     let mut meta = serde_json::Map::new();
     meta.insert(
         "x.ai/codeNavigation".to_string(),
-        serde_json::json!({ "enabled" : false }),
+        serde_json::json!({ "enabled": false }),
     );
     let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
         acp::ClientCapabilities::new()
@@ -1599,6 +1606,77 @@ async fn ext_method_routes_auth_cleared_and_refreshes_resident_sessions() {
         })
         .await;
 }
+/// Fresh managed catalog sync must push UpdateMcpServers with the injected
+/// managed connector. The `search_tool` rebuild is a SEPARATE broadcast
+/// (`refresh_mcp_search_index_in_sessions`), so it is not asserted here.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_fresh_managed_mcp_pushes_update() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let agent = build_agent_with_auth(crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            });
+            let sid = acp::SessionId::new("sess-managed-sync");
+            let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+            agent.sessions.borrow_mut().insert(sid, handle);
+            let managed = vec![crate::session::managed_mcp::ManagedMcpConfig {
+                name: "Linear".into(),
+                endpoint: "https://mcp.example.com/linear".into(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".into(),
+                    "Bearer tok".into(),
+                )]),
+                token_expires_at: None,
+                scope: None,
+                scope_id: None,
+                scope_name: None,
+            }];
+            agent.sync_fresh_managed_mcp_to_sessions(&managed);
+            let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .expect("UpdateMcpServers should be sent")
+                .expect("channel should stay open");
+            let SessionCommand::UpdateMcpServers { mcp_servers, .. } = first else {
+                panic!("expected UpdateMcpServers as the first synced command");
+            };
+            let managed_name = crate::session::managed_mcp::to_managed_name("Linear");
+            let linear = mcp_servers
+                .iter()
+                .find_map(|s| match s {
+                    acp::McpServer::Http(http) if http.name == managed_name => Some(http),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("merged catalog must contain managed HTTP server {managed_name}")
+                });
+            assert!(
+                linear
+                    .headers
+                    .iter()
+                    .any(|h| h.name == "Authorization" && h.value == "Bearer tok"),
+                "managed server must carry the injected Authorization header"
+            );
+        })
+        .await;
+}
+/// The gateway-catalog refresh broadcast pushes `RefreshMcpSearchIndex` to every
+/// live session (independent of the legacy managed-connector sync).
+#[tokio::test(flavor = "current_thread")]
+async fn refresh_mcp_search_index_broadcasts_to_sessions() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-search-index");
+    let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    agent.sessions.borrow_mut().insert(sid, handle);
+    agent.refresh_mcp_search_index_in_sessions();
+    let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("RefreshMcpSearchIndex should be sent")
+        .expect("channel should stay open");
+    assert!(matches!(cmd, SessionCommand::RefreshMcpSearchIndex));
+}
 /// Build a minimal MvpAgent suitable for testing extension methods.
 fn build_minimal_agent_for_tests() -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
@@ -1610,6 +1688,38 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let gateway = GatewaySender::new(tx);
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
+}
+fn session_usage_request(session_id: &str) -> acp::ExtRequest {
+    acp::ExtRequest::new(
+        "x.ai/session/usage",
+        serde_json::value::to_raw_value(&serde_json::json!({ "sessionId": session_id }))
+            .unwrap()
+            .into(),
+    )
+}
+#[tokio::test(flavor = "current_thread")]
+async fn session_usage_unknown_session_is_resource_not_found() {
+    let agent = build_minimal_agent_for_tests();
+    let err = crate::extensions::usage::handle(&agent, &session_usage_request("no-such-session"))
+        .await
+        .expect_err("unknown session");
+    assert_eq!(
+        err.code,
+        acp::Error::resource_not_found(None::<String>).code
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn session_usage_dead_chat_state_actor_fails_closed() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("usage-dead-actor-sess");
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    agent.sessions.borrow_mut().insert(sid, handle);
+    let err =
+        crate::extensions::usage::handle(&agent, &session_usage_request("usage-dead-actor-sess"))
+            .await
+            .expect_err("dead chat-state actor");
+    assert_eq!(err.code, acp::Error::internal_error().code);
 }
 /// Build a minimal MvpAgent with pre-loaded auth for gate tests.
 fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
@@ -2093,6 +2203,8 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             api_backend: crate::sampling::ApiBackend::default(),
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            env_http_headers: IndexMap::new(),
             context_window: std::num::NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
@@ -2114,6 +2226,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
         },
         api_key: None,
         env_key: None,
+        auth_provider: None,
         api_base_url: None,
     };
     let mut models = indexmap::IndexMap::new();
@@ -2252,10 +2365,10 @@ fn orphaned_tasks_filters_rewind_dead_branches() {
 }
 #[test]
 fn allow_access_from_remote_settings() {
-    let json = serde_json::json!({ "allow_access" : true });
+    let json = serde_json::json!({ "allow_access": true });
     let rs: crate::util::config::RemoteSettings = serde_json::from_value(json).unwrap();
     assert_eq!(rs.allow_access, Some(true));
-    let json = serde_json::json!({ "allow_access" : false });
+    let json = serde_json::json!({ "allow_access": false });
     let rs: crate::util::config::RemoteSettings = serde_json::from_value(json).unwrap();
     assert_eq!(rs.allow_access, Some(false));
     let json = serde_json::json!({});
@@ -2264,7 +2377,7 @@ fn allow_access_from_remote_settings() {
 }
 #[test]
 fn on_demand_enabled_from_remote_settings() {
-    let json = serde_json::json!({ "on_demand_enabled" : false });
+    let json = serde_json::json!({ "on_demand_enabled": false });
     let rs: crate::util::config::RemoteSettings = serde_json::from_value(json).unwrap();
     assert_eq!(rs.on_demand_enabled, Some(false));
     let json = serde_json::json!({});
@@ -2497,6 +2610,21 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     };
     assert!(zdr_video_output_s3.as_ref().is_some_and(|c| c.is_valid()));
 }
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_video_gen_config_respects_feature_flag() {
+    use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
+    let agent = build_minimal_agent_for_tests();
+    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    assert!(matches!(
+        agent.prepare_video_gen_config(),
+        VideoGenConfig::Enabled { .. }
+    ));
+    agent.cfg.borrow_mut().features.video_gen = Some(false);
+    assert!(matches!(
+        agent.prepare_video_gen_config(),
+        VideoGenConfig::Disabled
+    ));
+}
 /// The imagine tier gate fails **open**: with no resolved auth we can't confirm
 /// a restricted personal tier, so the tools stay advertised and un-flagged (the
 /// server 429 remains the authoritative backstop). Guards against accidentally
@@ -2516,6 +2644,70 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
         !tier_restricted,
         "no resolved auth ⇒ fail open (tools not tier-restricted)"
     );
+}
+/// The imagine tools bypass cli-chat-proxy (direct API calls), so the server
+/// can only scope the coding data-retention opt-out (`/privacy opt-out`) to
+/// Build traffic via the `x-grok-client-identifier` header. If this header is
+/// dropped, opted-out users' imagine prompts are logged/retained server-side.
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_image_gen_config_sends_client_identifier_header() {
+    use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
+    let agent = build_minimal_agent_for_tests();
+    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    let ImageGenConfig::Enabled { extra_headers, .. } = agent.prepare_image_gen_config() else {
+        panic!("expected Enabled");
+    };
+    assert_eq!(
+        extra_headers
+            .get("x-grok-client-identifier")
+            .map(String::as_str),
+        Some(crate::http::process_client_identifier().as_str()),
+        "imagine API calls must carry the client identifier so the server \
+         applies the coding ZDR opt-out to Build traffic"
+    );
+}
+/// Same contract for video generation (also a direct API call).
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_video_gen_config_sends_client_identifier_header() {
+    use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
+    let agent = build_minimal_agent_for_tests();
+    agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
+    let VideoGenConfig::Enabled { extra_headers, .. } = agent.prepare_video_gen_config() else {
+        panic!("expected Enabled");
+    };
+    assert_eq!(
+        extra_headers
+            .get("x-grok-client-identifier")
+            .map(String::as_str),
+        Some(crate::http::process_client_identifier().as_str()),
+        "video gen API calls must carry the client identifier so the server \
+         applies the coding ZDR opt-out to Build traffic"
+    );
+}
+/// Regression: `x.ai/auth/info` must return profile fields even when the
+/// access token is expired — profile data does not expire with the token,
+/// and hiding it made the desktop render "Signed in" with no identity.
+#[tokio::test]
+async fn auth_info_returns_profile_when_token_expired() {
+    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+        email: Some("user@example.com".into()),
+        first_name: Some("Test".into()),
+        refresh_token: Some("rt".into()),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        ..crate::auth::GrokAuth::test_default()
+    });
+    let resp = crate::extensions::auth::handle(
+        &agent,
+        &acp::ExtRequest::new(
+            "x.ai/auth/info",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&serde_json::json!({})).unwrap()),
+        ),
+    )
+    .await
+    .expect("auth/info must succeed with an expired token");
+    let info: serde_json::Value = serde_json::from_str(resp.0.get()).unwrap();
+    assert_eq!(info["email"], "user@example.com");
+    assert_eq!(info["firstName"], "Test");
 }
 #[tokio::test]
 async fn data_collection_disabled_for_normal_user_in_privacy_build() {
@@ -2779,22 +2971,22 @@ fn parse_session_kind_matrix() {
     let cases: &[(&str, serde_json::Value, SessionKind)] = &[
         (
             "chat",
-            json!({ "x.ai/session" : { "kind" : "chat" } }),
+            json!({"x.ai/session": {"kind": "chat"}}),
             SessionKind::Chat,
         ),
         (
             "build",
-            json!({ "x.ai/session" : { "kind" : "build" } }),
+            json!({"x.ai/session": {"kind": "build"}}),
             SessionKind::Build,
         ),
         (
             "chat_malformed_sibling",
-            json!({ "x.ai/session" : { "kind" : "chat", "facets" : "not-a-map" } }),
+            json!({"x.ai/session": {"kind": "chat", "facets": "not-a-map"}}),
             SessionKind::Chat,
         ),
         (
             "unknown_kind",
-            json!({ "x.ai/session" : { "kind" : "frob" } }),
+            json!({"x.ai/session": {"kind": "frob"}}),
             SessionKind::Build,
         ),
         ("absent", json!({}), SessionKind::Build),
@@ -2969,7 +3161,7 @@ fn ext_method_rewind_uses_local_dispatch_without_bridge() {
     let _env = crate::env::EnvVarGuard::remove(crate::env::GROK_DISABLE_CUSTOM_BRIDGE_ENV);
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
-        let params = serde_json::json!({ "sessionId" : "sess-local" });
+        let params = serde_json::json!({ "sessionId": "sess-local" });
         let err = agent
             .ext_method(acp::ExtRequest::new(
                 "x.ai/rewind/points",
@@ -3002,6 +3194,58 @@ fn cancel_does_not_forward_to_bridge_in_local_mode() {
         assert!(
             saw_local_cancel,
             "local-mode cancel dispatches the local SessionCommand::Cancel with no bridge attached"
+        );
+    });
+}
+/// Regression (post-cancel slot hang, first bad release 0.2.101; see
+/// `dispatch_locks`). SDK e2e shape:
+/// `test_cancel_ends_in_flight_turn_and_frees_slot` (grok-agent-sdk).
+#[test]
+fn cancel_never_overtakes_in_flight_prompt_intake() {
+    use crate::session::SessionCommand;
+    use acp::Agent as _;
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-cancel-intake-race");
+        let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        let order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (intake_parked_tx, intake_parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let driver_order = order.clone();
+        tokio::task::spawn_local(async move {
+            let mut intake_parked_tx = Some(intake_parked_tx);
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    SessionCommand::GetCurrentPromptMode { .. } => {
+                        if let Some(tx) = intake_parked_tx.take() {
+                            let _ = tx.send(());
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                    SessionCommand::Prompt { .. } => driver_order.borrow_mut().push("prompt"),
+                    SessionCommand::Cancel { .. } => driver_order.borrow_mut().push("cancel"),
+                    _ => {}
+                }
+            }
+        });
+        let prompt_fut = agent.prompt(acp::PromptRequest::new(
+            sid.clone(),
+            vec![acp::ContentBlock::from("hi")],
+        ));
+        let cancel_fut = async {
+            intake_parked_rx
+                .await
+                .expect("prompt intake reaches the fake actor");
+            let _ = agent
+                .cancel(acp::CancelNotification::new(sid.clone()))
+                .await;
+        };
+        let _ = futures::join!(prompt_fut, cancel_fut);
+        assert_eq!(
+            order.borrow().as_slice(),
+            ["prompt", "cancel"],
+            "cancel must land on the actor mailbox after the prompt it targets"
         );
     });
 }
@@ -3065,7 +3309,7 @@ async fn drive_disconnect(agent: &MvpAgent, sid: &acp::SessionId) {
 async fn drive_disconnect_many(agent: &MvpAgent, sids: &[&acp::SessionId]) {
     use acp::Agent as _;
     let ids: Vec<&str> = sids.iter().map(|s| s.0.as_ref()).collect();
-    let params = serde_json::json!({ "sessionIds" : ids });
+    let params = serde_json::json!({ "sessionIds": ids });
     let raw = serde_json::value::to_raw_value(&params).unwrap();
     agent
         .ext_notification(acp::ExtNotification::new(
@@ -3080,7 +3324,7 @@ async fn drive_disconnect_many(agent: &MvpAgent, sids: &[&acp::SessionId]) {
 /// exercising the exact production path that finalizes the replica.
 async fn drive_close(agent: &MvpAgent, session_id: &str) -> Result<acp::ExtResponse, acp::Error> {
     use acp::Agent as _;
-    let params = serde_json::json!({ "sessionId" : session_id });
+    let params = serde_json::json!({ "sessionId": session_id });
     let raw = serde_json::value::to_raw_value(&params).unwrap();
     agent
         .ext_method(acp::ExtRequest::new(
@@ -3595,11 +3839,147 @@ fn repo_with_project_mcp_server() -> tempfile::TempDir {
     .unwrap();
     tmp
 }
+fn write_project_subagent_definitions(cwd: &std::path::Path) {
+    let roles = cwd.join(".grok/roles");
+    let personas = cwd.join(".grok/personas");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::create_dir_all(&personas).unwrap();
+    std::fs::write(roles.join("probe.toml"), "description = \"Project role\"").unwrap();
+    std::fs::write(
+        personas.join("probe.toml"),
+        "instructions = \"Project persona\"",
+    )
+    .unwrap();
+}
 fn folder_trust_on() -> crate::util::config::RemoteSettings {
     crate::util::config::RemoteSettings {
         folder_trust_enabled: Some(true),
         ..Default::default()
     }
+}
+#[test]
+#[serial_test::serial]
+fn subagent_spawn_context_reloads_project_definitions_after_trust_changes() {
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    write_project_subagent_definitions(repo.path());
+    run_local_for_bridge_test(|| async {
+        let (agent, _rx) = build_agent_with_gateway_rx();
+        let sid = acp::SessionId::new("roles-personas-trust-transition");
+        let (mut handle, _tx, _cmd_rx) = make_live_session_handle(&sid, None);
+        handle.info.cwd = repo.path().display().to_string();
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        {
+            let mut cfg = agent.cfg.borrow_mut();
+            cfg.subagent_roles.insert(
+                "refreshed".into(),
+                xai_grok_subagent_resolution::config::SubagentRole {
+                    description: "Refreshed user role".into(),
+                    source_dir: Some(repo.path().join("user-roles")),
+                    ..Default::default()
+                },
+            );
+            cfg.subagent_model_overrides
+                .insert("probe".into(), "refreshed-model".into());
+            cfg.subagent_toggle.insert("probe".into(), false);
+        }
+        crate::agent::folder_trust::record_for_test(repo.path(), false);
+        let untrusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(!untrusted.subagent_roles.contains_key("probe"));
+        assert!(!untrusted.subagent_personas.contains_key("probe"));
+        assert_eq!(
+            untrusted
+                .subagent_roles
+                .get("refreshed")
+                .map(|role| role.description.as_str()),
+            Some("Refreshed user role")
+        );
+        assert_eq!(
+            untrusted
+                .subagent_model_overrides
+                .get("probe")
+                .map(String::as_str),
+            Some("refreshed-model")
+        );
+        assert_eq!(untrusted.subagent_toggle.get("probe"), Some(&false));
+        crate::agent::folder_trust::record_for_test(repo.path(), true);
+        let trusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert_eq!(
+            trusted
+                .subagent_roles
+                .get("probe")
+                .map(|role| role.description.as_str()),
+            Some("Project role")
+        );
+        assert!(trusted.subagent_personas.contains_key("probe"));
+        crate::agent::folder_trust::record_for_test(repo.path(), false);
+        let revoked = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(!revoked.subagent_roles.contains_key("probe"));
+        assert!(!revoked.subagent_personas.contains_key("probe"));
+    });
+}
+/// End-to-end gate wiring: project `.grok/roles` / `personas` alone must drive
+/// real `resolve_and_record` untrusted (not a forced `record_for_test` verdict),
+/// keep project defs out of Task spawn context, then re-admit them after grant.
+#[test]
+#[serial_test::serial]
+fn project_roles_personas_gated_via_resolve_and_record_chain() {
+    use xai_grok_test_support::EnvGuard;
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set("GROK_HOME", home.path());
+    let _sim = EnvGuard::set(xai_grok_version::TEST_VERSION_ENV, "0.0-sim");
+    let _flag = EnvGuard::unset("GROK_FOLDER_TRUST");
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    write_project_subagent_definitions(repo.path());
+    run_local_for_bridge_test(|| async {
+        let (agent, _rx) = build_agent_with_gateway_rx();
+        let sid = acp::SessionId::new("roles-personas-resolve-chain");
+        let (mut handle, _tx, _cmd_rx) = make_live_session_handle(&sid, None);
+        handle.info.cwd = repo.path().display().to_string();
+        agent.sessions.borrow_mut().insert(sid.clone(), handle);
+        let allowed = crate::agent::folder_trust::resolve_and_record(
+            repo.path(),
+            Some(&folder_trust_on()),
+            false,
+        );
+        assert!(
+            !allowed,
+            "roles/personas markers alone must resolve untrusted without a grant"
+        );
+        assert!(
+            !crate::agent::folder_trust::project_scope_allowed(repo.path()),
+            "cached verdict after resolve_and_record must stay untrusted"
+        );
+        let untrusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert!(
+            !untrusted.subagent_roles.contains_key("probe"),
+            "untrusted: project role must stay out of spawn context"
+        );
+        assert!(
+            !untrusted.subagent_personas.contains_key("probe"),
+            "untrusted: project persona must stay out of spawn context"
+        );
+        crate::agent::folder_trust::grant_folder_trust(repo.path());
+        let allowed = crate::agent::folder_trust::resolve_and_record(
+            repo.path(),
+            Some(&folder_trust_on()),
+            false,
+        );
+        assert!(allowed, "store-granted folder must resolve trusted");
+        let trusted = agent.build_subagent_spawn_context(sid.0.as_ref());
+        assert_eq!(
+            trusted
+                .subagent_roles
+                .get("probe")
+                .map(|role| role.description.as_str()),
+            Some("Project role")
+        );
+        assert!(
+            trusted.subagent_personas.contains_key("probe"),
+            "trusted: project persona must enter spawn context after grant"
+        );
+    });
 }
 /// Pull the next `x.ai/folder_trust/request` reverse-request off the gateway and
 /// answer it with `outcome`. Returns the request's decoded params.
@@ -3617,7 +3997,7 @@ async fn answer_folder_trust_request(
     assert_eq!(args.request.method.as_ref(), "x.ai/folder_trust/request");
     let params: serde_json::Value = serde_json::from_str(args.request.params.get()).unwrap();
     let resp: acp::ExtResponse = acp::ExtResponse::new(std::sync::Arc::from(
-        serde_json::value::to_raw_value(&serde_json::json!({ "outcome" : outcome })).unwrap(),
+        serde_json::value::to_raw_value(&serde_json::json!({ "outcome": outcome })).unwrap(),
     ));
     let _ = args.response_tx.send(Ok(resp));
     params
@@ -4397,23 +4777,26 @@ mod direct_hub_cloud_removed {
     }
     #[test]
     fn cloud_server_id_meta_is_hard_error() {
-        let meta = serde_json::json!({ "x.ai/cloud_server_id" : "srv-123" });
+        let meta = serde_json::json!({ "x.ai/cloud_server_id": "srv-123" });
         let err = reject_direct_hub_cloud_meta(meta.as_object()).expect_err("must reject");
         assert_direct_hub_error(err);
     }
     #[test]
     fn cloud_server_id_null_still_present_is_hard_error() {
-        let meta = serde_json::json!({ "x.ai/cloud_server_id" : null });
+        let meta = serde_json::json!({ "x.ai/cloud_server_id": null });
         let err = reject_direct_hub_cloud_meta(meta.as_object()).expect_err("must reject");
         assert_direct_hub_error(err);
     }
     #[test]
     fn cloud_server_id_with_gateway_meta_still_hard_error() {
-        let meta = serde_json::json!(
-            { "x.ai/cloud_server_id" : "srv-legacy", "envId" : "env-1",
-            "x.ai/cloud_existing_workspace" : { "server_id" : "ws-1", "cwd" :
-            "/workspace" } }
-        );
+        let meta = serde_json::json!({
+            "x.ai/cloud_server_id": "srv-legacy",
+            "envId": "env-1",
+            "x.ai/cloud_existing_workspace": {
+                "server_id": "ws-1",
+                "cwd": "/workspace"
+            }
+        });
         let err = reject_direct_hub_cloud_meta(meta.as_object()).expect_err("Direct stamp wins");
         assert_direct_hub_error(err);
     }
@@ -4422,14 +4805,22 @@ mod direct_hub_cloud_removed {
         assert!(reject_direct_hub_cloud_meta(None).is_ok());
         assert!(reject_direct_hub_cloud_meta(serde_json::json!({}).as_object()).is_ok());
         assert!(
-            reject_direct_hub_cloud_meta(serde_json::json!({ "envId" : "env-1" }).as_object())
-                .is_ok()
+            reject_direct_hub_cloud_meta(
+                serde_json::json!({
+                    "envId": "env-1"
+                })
+                .as_object()
+            )
+            .is_ok()
         );
         assert!(
             reject_direct_hub_cloud_meta(
                 serde_json::json!({
-            "x.ai/cloud_existing_workspace" : { "server_id" : "ws-1", "cwd" :
-            "/workspace" } })
+                    "x.ai/cloud_existing_workspace": {
+                        "server_id": "ws-1",
+                        "cwd": "/workspace"
+                    }
+                })
                 .as_object()
             )
             .is_ok()
@@ -4460,10 +4851,11 @@ mod direct_hub_cloud_removed {
             vec!["url"],
             "HubConfig must only serialize url (no proxy-mode fields)"
         );
-        let from_legacy: HubConfig = serde_json::from_value(serde_json::json!(
-            { "url" : "wss://hub.example/ws", "workspace_mode" : "remote",
-            "send_turn_hooks" : false, }
-        ))
+        let from_legacy: HubConfig = serde_json::from_value(serde_json::json!({
+            "url": "wss://hub.example/ws",
+            "workspace_mode": "remote",
+            "send_turn_hooks": false,
+        }))
         .expect("ignore unknown fields");
         assert_eq!(from_legacy.url.as_deref(), Some("wss://hub.example/ws"));
     }
@@ -4487,6 +4879,11 @@ mod soft_default_settings_emit {
                 let cfg = AgentConfig {
                     remote_settings: Some(crate::util::config::RemoteSettings {
                         permission_mode: Some("always-approve".into()),
+                        slash_command_tags: Some(
+                            [("workflows".to_string(), "new".to_string())]
+                                .into_iter()
+                                .collect(),
+                        ),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -4507,8 +4904,18 @@ mod soft_default_settings_emit {
                     Some("always-approve"),
                     "post-auth emit must carry remote permission_mode for first session"
                 );
+                assert_eq!(
+                    params
+                        .get("slash_command_tags")
+                        .and_then(|v| v.get("workflows"))
+                        .and_then(|v| v.as_str()),
+                    Some("new"),
+                    "post-auth emit must carry remote slash_command_tags"
+                );
                 let _ = args.response_tx.send(Ok(()));
             })
             .await;
     }
 }
+#[cfg(feature = "dhat-heap")]
+mod dhat_soak;

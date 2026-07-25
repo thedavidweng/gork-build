@@ -39,7 +39,7 @@ fn turn_result_completed() {
         snapshot: Box::new(None),
         tools_called: vec![],
         structured_output: None,
-        refusal: false,
+        refusal: None,
     });
     assert_eq!(
         turn_result_to_hook_outcome(&result),
@@ -55,6 +55,16 @@ fn turn_result_cancelled() {
     assert_eq!(
         turn_result_to_hook_outcome(&result),
         TurnHookOutcome::Cancelled
+    );
+}
+#[test]
+fn turn_result_stationarity_ended_is_completed() {
+    let result: Result<TurnOutcome, acp::Error> = Ok(TurnOutcome::StationarityEnded {
+        snapshot: Box::new(None),
+    });
+    assert_eq!(
+        turn_result_to_hook_outcome(&result),
+        TurnHookOutcome::Completed
     );
 }
 #[test]

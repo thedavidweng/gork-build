@@ -249,7 +249,8 @@ pub struct PagerLocalSnapshot {
     pub available_models: Vec<(String, acp::ModelId)>,
     /// Whether the user has opted OUT of coding data sharing.
     /// Lives in auth metadata (no `UiConfig` field). Inverted mapping:
-    /// `opt_out == false` → canonical "opt-in".
+    /// `opt_out == false` → canonical "opt-in". Snapshot default is
+    /// `true` (opted out) to match the safer consumer default.
     pub coding_data_sharing_opt_out: bool,
     /// Whether plan mode is active. Uses effective state
     /// (`pending.unwrap_or(active)`) so rapid toggles don't double-send.
@@ -486,6 +487,14 @@ pub fn current_value_for(
         "compact_mode" => Some(SettingValue::Bool(ui.compact_mode)),
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
+        // Cache is the send-path source of truth (same pattern as group_tool_verbs).
+        "page_flip_on_send" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_page_flip_on_send(),
+        )),
+        // Cache is the drain-path source of truth (same pattern as page_flip_on_send).
+        "combine_queued_prompts" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_combine_queued_prompts(),
+        )),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
@@ -505,6 +514,9 @@ pub fn current_value_for(
         )),
         "contextual_hints.word_select" => Some(SettingValue::Bool(
             ui.contextual_hints.word_select.unwrap_or(true),
+        )),
+        "contextual_hints.ssh_wrap" => Some(SettingValue::Bool(
+            ui.contextual_hints.ssh_wrap.unwrap_or(true),
         )),
         "keep_text_selection" => Some(SettingValue::Enum(
             crate::appearance::cache::load_keep_text_selection().as_canonical(),
@@ -556,6 +568,10 @@ pub fn current_value_for(
         "screen_mode" => Some(SettingValue::Enum(canonical_screen_mode(
             ui.screen_mode.as_deref(),
         ))),
+        // SHELL — whether the Ctrl+Space / F8 chord is active; None → true.
+        "voice_keybind_enabled" => {
+            Some(SettingValue::Bool(ui.voice_keybind_enabled.unwrap_or(true)))
+        }
         // SHELL — canonicalized from `[ui].voice_capture_mode`; None → "hold".
         "voice_capture_mode" => Some(SettingValue::Enum(canonical_voice_capture_mode(
             ui.voice_capture_mode.as_deref(),
@@ -756,6 +772,13 @@ mod tests {
                         "contextual_hints.word_select default drifts from UiConfig::default()"
                     );
                 }
+                ("contextual_hints.ssh_wrap", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.contextual_hints.ssh_wrap.unwrap_or(true),
+                        "contextual_hints.ssh_wrap default drifts from UiConfig::default()"
+                    );
+                }
                 ("show_timestamps", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
@@ -770,6 +793,20 @@ mod tests {
                         *default,
                         ui.show_timeline_enabled(),
                         "show_timeline default drifts from UiConfig::default()"
+                    );
+                }
+                ("page_flip_on_send", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.page_flip_on_send_enabled(),
+                        "page_flip_on_send default drifts from UiConfig::default()"
+                    );
+                }
+                ("combine_queued_prompts", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.combine_queued_prompts.unwrap_or(false),
+                        "combine_queued_prompts default drifts from UiConfig::default()"
                     );
                 }
                 ("simple_mode", SettingKind::Bool { default }) => {
@@ -943,6 +980,14 @@ mod tests {
                         "flash"
                     };
                     assert_eq!(*default, expected);
+                }
+                // voice_keybind_enabled: Option<bool>; None → true.
+                ("voice_keybind_enabled", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.voice_keybind_enabled.unwrap_or(true),
+                        "voice_keybind_enabled default drifts from UiConfig::default()",
+                    );
                 }
                 // voice_capture_mode: Option<String>; None → "hold".
                 ("voice_capture_mode", SettingKind::Enum { default, .. }) => {
@@ -1505,6 +1550,7 @@ mod tests {
                 "contextual_hints.send_now",
                 "contextual_hints.small_screen",
                 "contextual_hints.word_select",
+                "contextual_hints.ssh_wrap",
             ],
         );
         for &key in *children {

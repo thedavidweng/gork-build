@@ -1,7 +1,8 @@
-//! Channel types for subagent communication (TaskTool ↔ MvpAgent coordinator).
+//! Data and channel types for subagent coordination.
 //!
-//! These types define the request/response protocol between the `TaskTool`
-//! (in `xai-grok-tools`) and the subagent coordinator (in `xai-grok-shell`).
+//! Request data is deliberately separate from command reply envelopes. The
+//! shared coordinator actor owns every reply sender and every lifecycle
+//! transition; child runners receive only plain request data.
 //!
 //! ## Resource types
 //!
@@ -20,15 +21,43 @@ use std::sync::Arc;
 
 use educe::Educe;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use xai_tool_types::{SubagentCapabilityMode, SubagentIsolationMode, WaitMode};
 
 use crate::register_resource;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SubagentOwner {
+    #[default]
+    Task,
+    Workflow {
+        run_id: String,
+    },
+}
+
+impl SubagentOwner {
+    pub fn workflow(run_id: impl Into<String>) -> Self {
+        Self::Workflow {
+            run_id: run_id.into(),
+        }
+    }
+
+    pub fn workflow_run_id(&self) -> Option<&str> {
+        match self {
+            Self::Task => None,
+            Self::Workflow { run_id } => Some(run_id),
+        }
+    }
+
+    pub fn is_workflow(&self) -> bool {
+        matches!(self, Self::Workflow { .. })
+    }
+}
+
 // Request / Response
 
-/// Request emitted by TaskTool, received by MvpAgent coordinator.
-#[derive(Educe)]
-#[educe(Debug)]
+/// Plain spawn request emitted by `TaskTool`.
+#[derive(Debug, Clone)]
 pub struct SubagentRequest {
     /// Subagent ID (UUID v7). Same as `TaskToolInput.task_id`; becomes the child session ID.
     pub id: String,
@@ -46,26 +75,59 @@ pub struct SubagentRequest {
     /// freshly rendered.
     pub resume_from: Option<String>,
     /// Explicit working directory for the child session.
-    /// Validated at spawn time in `handle_subagent_request()`.
+    /// Validated at spawn time by the injected child runner.
     pub cwd: Option<String>,
     /// Runtime overrides for the child agent.
     pub runtime_overrides: SubagentRuntimeOverrides,
     /// Whether this subagent was launched with `run_in_background: true`.
     ///
-    /// Background subagents survive parent-turn cancellation — they are
-    /// excluded from `cancel_by_parent_prompt_id` so the user can poll
-    /// results later via `get_task_output`.
+    /// Controls immediate handle delivery and completion surfacing. A
+    /// background child still auto-surfaces its completion to the model
+    /// (buffered reminder / auto-wake) when `surface_completion` is set —
+    /// background does not mean fire-and-forget. Prompt cancellation still
+    /// cancels every child owned by that prompt.
     pub run_in_background: bool,
     /// When false, the subagent's completion is NOT buffered for the
     /// between-turn "idle completion" reminder — used by harness-internal
     /// subagents like the goal planner/classifier that the model must never see.
     pub surface_completion: bool,
+    pub await_to_completion: bool,
     /// Harness-only: seed child with normalized parent conversation, then append
     /// `prompt`. Not on TaskToolInput. Successful `resume_from` takes precedence.
     pub fork_context: bool,
-    /// Oneshot channel for the coordinator to send back the result.
+    pub owner: SubagentOwner,
+    pub cancel_token: CancellationToken,
+}
+
+/// Spawn command envelope owned by the coordinator mailbox.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentSpawnRequest {
+    pub request: Box<SubagentRequest>,
     #[educe(Debug(ignore))]
     pub result_tx: oneshot::Sender<SubagentResult>,
+}
+
+impl std::ops::Deref for SubagentSpawnRequest {
+    type Target = SubagentRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl SubagentSpawnRequest {
+    /// Build and send a reply while the plain request remains borrowable.
+    ///
+    /// Primarily useful for channel adapters and deterministic test harnesses;
+    /// production lifecycle replies are owned by `SubagentCoordinator`.
+    pub fn respond_with(
+        self,
+        build: impl FnOnce(&SubagentRequest) -> SubagentResult,
+    ) -> Result<(), SubagentResult> {
+        let result = build(&self.request);
+        self.result_tx.send(result)
+    }
 }
 
 /// Per-spawn dynamic runtime overrides for a subagent.
@@ -105,6 +167,11 @@ pub struct SubagentRuntimeOverrides {
     /// (implementer vs explorer). `None` for every non-goal spawn ⇒ the parent
     /// agent decides the flavor (unchanged behavior).
     pub harness_agent_type: Option<String>,
+    pub completion_output_cap: Option<usize>,
+    pub spawn_depth: Option<u32>,
+    pub output_token_budget: Option<u64>,
+    pub output_schema: Option<serde_json::Value>,
+    pub loop_task_id: Option<String>,
 }
 
 /// Re-export of [`xai_tool_types::is_not_sentinel`] for existing call sites.
@@ -323,8 +390,10 @@ pub struct SubagentResult {
     pub tool_calls: u32,
     pub turns: u32,
     pub duration_ms: u64,
-    /// Total tokens consumed by the subagent's context window.
     pub tokens_used: u64,
+    pub output_tokens_used: u64,
+    pub total_tokens_used: u64,
+    pub output_usage_incomplete: bool,
     /// Path to the isolated worktree if one was created.
     pub worktree_path: Option<String>,
     /// Set when a blocking subagent exceeded its await budget and was
@@ -347,6 +416,9 @@ impl Default for SubagentResult {
             turns: 0,
             duration_ms: 0,
             tokens_used: 0,
+            output_tokens_used: 0,
+            total_tokens_used: 0,
+            output_usage_incomplete: false,
             worktree_path: None,
             backgrounded: false,
         }
@@ -368,12 +440,14 @@ impl SubagentResult {
 
 // Query protocol
 
-/// Query sent by TaskOutputTool, received by MvpAgent coordinator.
+/// Query sent by `TaskOutputTool` to the shared coordinator actor.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentQueryRequest {
     /// The subagent ID to look up.
     pub subagent_id: String,
+    /// Restrict the lookup to children owned by this parent session.
+    pub parent_session_id: Option<String>,
     /// If true, coordinator waits for completion (up to timeout) before responding.
     pub block: bool,
     /// Max wait time in ms when blocking. Default 30s.
@@ -381,6 +455,14 @@ pub struct SubagentQueryRequest {
     /// Oneshot for the coordinator to send back the snapshot.
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<Option<SubagentSnapshot>>,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentLoopUnitActiveRequest {
+    pub task_id: String,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<bool>,
 }
 
 /// Point-in-time snapshot of a subagent's state.
@@ -397,6 +479,27 @@ pub struct SubagentSnapshot {
     pub duration_ms: u64,
     /// Persona used by this subagent, if any.
     pub persona: Option<String>,
+}
+
+/// Lifecycle metadata returned to shell presentation and extension callers.
+#[derive(Debug, Clone)]
+pub struct SubagentInspection {
+    pub snapshot: SubagentSnapshot,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub fork_parent_prompt_id: Option<String>,
+    pub resumed_from: Option<String>,
+}
+
+impl SubagentSnapshot {
+    /// Whether the child is still in flight (initializing or running) — the
+    /// shared liveness rule every driver's blocking query loops on.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status,
+            SubagentSnapshotStatus::Running { .. } | SubagentSnapshotStatus::Initializing
+        )
+    }
 }
 
 /// Status of a subagent snapshot.
@@ -453,13 +556,14 @@ impl SubagentSnapshotStatus {
 pub enum SubagentCancelTarget {
     SubagentId(String),
     ParentPromptId(String),
+    WorkflowRunId(String),
 }
 
-/// Cancel request sent by KillTaskTool or session cancellation paths,
-/// received by MvpAgent coordinator.
+/// Cancel request sent by `KillTaskTool` or session cancellation paths.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentCancelRequest {
+    pub parent_session_id: Option<String>,
     pub target: SubagentCancelTarget,
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<SubagentCancelOutcome>,
@@ -473,6 +577,8 @@ pub enum SubagentCancelOutcome {
 }
 
 /// Summary of a completed subagent, used for between-turn delivery.
+/// Session ownership lives on the coordinator's `BufferedCompletion` wrapper;
+/// drains are scoped there, so delivered summaries carry no owner field.
 #[derive(Debug, Clone)]
 pub struct SubagentCompletionSummary {
     pub subagent_id: String,
@@ -508,6 +614,7 @@ pub struct SubagentMultiWaitRequest {
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentCompletionsRequest {
+    pub parent_session_id: Option<String>,
     pub suppress_ids: Vec<String>,
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<Vec<SubagentCompletionSummary>>,
@@ -527,6 +634,7 @@ pub struct SubagentOutstandingReply {
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentOutstandingRequest {
+    pub parent_session_id: String,
     pub prompt_id: String,
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<SubagentOutstandingReply>,
@@ -535,6 +643,7 @@ pub struct SubagentOutstandingRequest {
 /// Clear sticky incomplete after freeze/cancel has snapshotted the bill.
 #[derive(Debug)]
 pub struct SubagentClearUsageNotAppliedRequest {
+    pub parent_session_id: String,
     pub prompt_id: String,
 }
 
@@ -542,9 +651,92 @@ pub struct SubagentClearUsageNotAppliedRequest {
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentMarkUsageNotAppliedRequest {
+    pub parent_session_id: String,
     pub prompt_id: String,
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<()>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentRegistryCounts {
+    pub pending: usize,
+    pub active: usize,
+    pub completed: usize,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentRegistryCountsRequest {
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<SubagentRegistryCounts>,
+}
+
+/// Request for full metadata plus a resolved progress snapshot.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentInspectRequest {
+    pub subagent_id: String,
+    pub parent_session_id: Option<String>,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<Option<SubagentInspection>>,
+}
+
+/// Request for all running children owned by one parent session.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentListRunningRequest {
+    pub parent_session_id: String,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<Vec<SubagentInspection>>,
+}
+
+/// Fork/resume provenance retained by the shared coordinator.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentProvenance {
+    pub fork_parent_prompt_id: Option<String>,
+    pub resumed_from: Option<String>,
+}
+
+/// Reference to a child spawned during one parent prompt.
+#[derive(Debug, Clone)]
+pub struct SpawnedSubagentRef {
+    pub subagent_id: String,
+    pub child_session_id: String,
+    pub subagent_type: String,
+    pub description: String,
+    pub persona: Option<String>,
+    pub resumed_from: Option<String>,
+}
+
+/// Request for prompt-scoped spawned-child references.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct SubagentSpawnedRefsRequest {
+    pub parent_session_id: String,
+    pub prompt_id: String,
+    #[educe(Debug(ignore))]
+    pub respond_to: oneshot::Sender<Vec<SpawnedSubagentRef>>,
+}
+
+/// In-memory source data used by a runtime adapter to resume a child.
+#[derive(Debug, Clone)]
+pub struct SubagentResumeSource {
+    pub subagent_id: String,
+    pub child_session_id: String,
+    pub child_cwd: String,
+    pub worktree_path: Option<String>,
+    pub snapshot_ref: Option<String>,
+    pub subagent_type: String,
+    pub persona: Option<String>,
+    pub model_id: Option<String>,
+}
+
+/// Result of a resume-source lookup.
+#[derive(Debug, Clone)]
+pub enum SubagentResumeLookup {
+    Active,
+    Completed(SubagentResumeSource),
+    Missing,
 }
 
 // Validate-type protocol
@@ -647,20 +839,28 @@ pub struct SubagentDescribeRequest {
     pub respond_to: oneshot::Sender<SubagentDescribeOutcome>,
 }
 
-/// Coordinator message enum. Intentionally NOT `#[non_exhaustive]` —
-/// the cross-crate drain loop in `xai-grok-shell` relies on
-/// compile-time exhaustiveness.
+/// Coordinator message enum. Kept exhaustive so every actor command is handled.
 pub enum SubagentEvent {
-    Spawn(Box<SubagentRequest>),
+    Spawn(SubagentSpawnRequest),
     Query(SubagentQueryRequest),
     Cancel(SubagentCancelRequest),
     ListActive(SubagentListActiveRequest),
+    ListRunning(SubagentListRunningRequest),
     Completions(SubagentCompletionsRequest),
+    /// Fire-and-forget: drop buffered completions owned by a removed session
+    /// so unloaded sessions cannot leak entries into the shared buffer.
+    DiscardSessionCompletions {
+        parent_session_id: String,
+    },
     Outstanding(SubagentOutstandingRequest),
     ClearUsageNotApplied(SubagentClearUsageNotAppliedRequest),
     MarkUsageNotApplied(SubagentMarkUsageNotAppliedRequest),
+    RegistryCounts(SubagentRegistryCountsRequest),
+    Inspect(SubagentInspectRequest),
+    SpawnedRefs(SubagentSpawnedRefsRequest),
     ValidateType(SubagentValidateTypeRequest),
     DescribeType(SubagentDescribeRequest),
+    LoopUnitActive(SubagentLoopUnitActiveRequest),
 }
 
 // Resource types
@@ -726,10 +926,8 @@ pub fn drain_owned(
 
 /// Lightweight summary of a running subagent.
 ///
-/// This is the single shared definition of this type. The coordinator in
-/// xai-grok-shell produces it, the channel protocol carries it, and the
-/// compaction pipeline in xai-chat-state (via `RunningSubagentSummary`)
-/// consumes it. Do not duplicate this type in other crates.
+/// The shared coordinator produces this through the channel protocol, and the
+/// compaction pipeline consumes it through `RunningSubagentSummary`.
 #[derive(Debug, Clone)]
 pub struct ActiveSubagentSummary {
     /// The subagent's unique ID (same ID used by `get_task_output` / `kill_task`).
@@ -745,8 +943,7 @@ pub struct ActiveSubagentSummary {
 /// Request to list currently-running subagents for a specific parent session.
 ///
 /// Sent by the compaction pipeline in `SessionActor::run_compact_inner()`.
-/// Handled by `MvpAgent::start_subagent_coordinator()` which borrows the
-/// coordinator and calls `active_summaries_for()`.
+/// Handled by the shared coordinator actor.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct SubagentListActiveRequest {
@@ -798,6 +995,39 @@ register_resource!("grok_build", "TaskModelValidator", TaskModelValidator);
 pub struct SessionIdResource(pub String);
 
 register_resource!("grok_build", "SessionIdResource", SessionIdResource);
+
+/// Host-owned RAII token for an interruptible foreground wait.
+pub trait ForegroundWaitGuard: Send {}
+
+impl<T: Send> ForegroundWaitGuard for T {}
+
+type ForegroundWaitFactory = dyn Fn() -> Box<dyn ForegroundWaitGuard> + Send + Sync;
+
+/// Factory injected by hosts that expose a send-now wait window.
+#[derive(Clone)]
+pub struct SubagentForegroundWait(Arc<ForegroundWaitFactory>);
+
+impl SubagentForegroundWait {
+    pub fn new(factory: impl Fn() -> Box<dyn ForegroundWaitGuard> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(factory))
+    }
+
+    pub fn enter(&self) -> Box<dyn ForegroundWaitGuard> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for SubagentForegroundWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentForegroundWait").finish()
+    }
+}
+
+register_resource!(
+    "grok_build",
+    "SubagentForegroundWait",
+    SubagentForegroundWait
+);
 
 /// Carries the current parent prompt/turn ID for TaskTool subagent scoping.
 ///
@@ -1228,12 +1458,14 @@ mod tests {
         let (respond_to, mut response_rx) = oneshot::channel();
 
         tx.send(super::SubagentCompletionsRequest {
+            parent_session_id: Some("parent".into()),
             suppress_ids: vec!["id-1".into(), "id-2".into()],
             respond_to,
         })
         .unwrap();
 
         let req = rx.try_recv().unwrap();
+        assert_eq!(req.parent_session_id.as_deref(), Some("parent"));
         assert_eq!(req.suppress_ids, vec!["id-1", "id-2"]);
 
         let summaries = vec![super::SubagentCompletionSummary {
@@ -1316,6 +1548,7 @@ mod tests {
             .0
             .send(super::SubagentEvent::Completions(
                 super::SubagentCompletionsRequest {
+                    parent_session_id: None,
                     suppress_ids: vec![],
                     respond_to,
                 },
@@ -1347,6 +1580,7 @@ mod tests {
             .0
             .send(super::SubagentEvent::Completions(
                 super::SubagentCompletionsRequest {
+                    parent_session_id: None,
                     suppress_ids: vec![],
                     respond_to,
                 },

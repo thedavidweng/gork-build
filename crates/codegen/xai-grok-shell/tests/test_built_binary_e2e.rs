@@ -22,12 +22,10 @@
 //! ```
 
 use std::future::Future;
-use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
-use xai_grok_test_support::env::test_env_cmd_tokio;
 use xai_grok_test_support::*;
 
 /// Run an async test body inside a `LocalSet` (required by ACP's `!Send` futures).
@@ -40,6 +38,8 @@ where
 {
     tokio::task::LocalSet::new().run_until(f()).await;
 }
+
+const CHAT_COMPLETIONS_MODEL: &str = "chat-completions-model";
 
 /// Start a mock server with one model named `model` on the given API backend.
 async fn single_model_server(model: &str, backend: &str) -> MockInferenceServer {
@@ -105,25 +105,6 @@ fn inference_tool_names(server: &MockInferenceServer) -> Vec<String> {
         .collect()
 }
 
-async fn run_headless_with_env(
-    server: &MockInferenceServer,
-    args: &[&str],
-    cwd: &Path,
-    env: &[(&str, &str)],
-) -> HeadlessResult {
-    let home = tempfile::TempDir::new().expect("create temp home");
-    let mut cmd = tokio::process::Command::new(grok_binary());
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .envs(env.iter().copied());
-    test_env_cmd_tokio(&mut cmd, &server.url(), home.path());
-    run_headless_with_cmd(cmd).await
-}
-
 // ============================================================================
 // Smoke tests
 // ============================================================================
@@ -181,7 +162,7 @@ async fn test_headless_session_in_git_repo() {
         .await
         .expect("start mock server");
     let workdir = git_workdir();
-    let result = run_headless(&server, &["-p", "say hello", "--yolo"], workdir.path()).await;
+    let result = run_headless(&server, &["-p", "say hello", "--yolo"], workdir.workspace()).await;
 
     assert_headless_success(&result, "grok -p in git repo", Some(&server));
     assert_no_crashes(&result.stderr);
@@ -230,7 +211,7 @@ async fn test_headless_tools_allowlist_keeps_enabled_web_tools() {
             "--tools",
             "read_file,grep,list_dir,web_search,web_fetch",
         ],
-        workdir.path(),
+        workdir.workspace(),
         &[("GROK_WEB_FETCH", "1")],
     )
     .await;
@@ -291,7 +272,7 @@ async fn test_headless_tools_allowlist_does_not_fail_open_for_disabled_web_fetch
             "--tools",
             "read_file,web_fetch",
         ],
-        workdir.path(),
+        workdir.workspace(),
         &[("GROK_WEB_FETCH", "0")],
     )
     .await;
@@ -321,7 +302,7 @@ async fn test_headless_terminal_only_allowlist_is_foreground_only() {
     let result = run_headless(
         &server,
         &["-p", "say hello", "--yolo", "--tools", "run_terminal_cmd"],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -376,7 +357,7 @@ async fn test_headless_free_usage_exhausted_prints_paywall_message() {
     }
     let workdir = git_workdir();
 
-    let result = run_headless(&server, &["-p", "say hello", "--yolo"], workdir.path()).await;
+    let result = run_headless(&server, &["-p", "say hello", "--yolo"], workdir.workspace()).await;
 
     assert!(
         !result.timed_out && !result.status.success(),
@@ -415,7 +396,7 @@ async fn test_headless_streaming_json_output() {
             "--output-format",
             "streaming-json",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -468,19 +449,19 @@ async fn test_headless_streaming_json_output() {
 async fn test_headless_json_reports_server_cost() {
     use xai_grok_test_support::scripted::SseEvent;
 
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     let chunk = |body: serde_json::Value| SseEvent::data(body.to_string());
     server.enqueue_response(
         "/v1/chat/completions",
         xai_grok_test_support::scripted::ScriptedResponse::sse(vec![
             chunk(serde_json::json!({
                 "id": "chatcmpl-cost", "object": "chat.completion.chunk", "created": 0,
-                "model": "grok-4.5",
+                "model": CHAT_COMPLETIONS_MODEL,
                 "choices": [{ "index": 0, "delta": { "content": "4" }, "finish_reason": "stop" }]
             })),
             chunk(serde_json::json!({
                 "id": "chatcmpl-cost", "object": "chat.completion.chunk", "created": 0,
-                "model": "grok-4.5", "choices": [],
+                "model": CHAT_COMPLETIONS_MODEL, "choices": [],
                 "usage": {
                     "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
                     "cost_in_usd_ticks": 1_234_500_000_i64
@@ -498,13 +479,13 @@ async fn test_headless_json_reports_server_cost() {
             "what is 2+2",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--max-turns",
             "1",
             "--output-format",
             "json",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -528,7 +509,7 @@ async fn test_headless_json_reports_server_cost() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_json_reports_usage_on_max_turns() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.enqueue_response(
         "/v1/chat/completions",
         xai_grok_test_support::scripted::ScriptedResponse::sse(
@@ -537,7 +518,7 @@ async fn test_headless_json_reports_usage_on_max_turns() {
                 "call-1",
                 "read_file",
                 r#"{"path":"README.md"}"#,
-                "grok-4.5",
+                CHAT_COMPLETIONS_MODEL,
             ),
         ),
     );
@@ -550,13 +531,13 @@ async fn test_headless_json_reports_usage_on_max_turns() {
             "read the readme",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--max-turns",
             "1",
             "--output-format",
             "json",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -569,7 +550,7 @@ async fn test_headless_json_reports_usage_on_max_turns() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_streaming_json_usage() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     let workdir = git_workdir();
     let result = run_headless(
         &server,
@@ -578,11 +559,11 @@ async fn test_headless_streaming_json_usage() {
             "say hello",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--output-format",
             "streaming-json",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -604,7 +585,7 @@ async fn test_headless_streaming_json_usage() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn headless_json_schema_chat_completions_uses_response_format() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.set_response(r#"{"name":"Alice","age":30}"#);
 
     let workdir = git_workdir();
@@ -615,13 +596,13 @@ async fn headless_json_schema_chat_completions_uses_response_format() {
             "extract name and age",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--json-schema",
             r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}"#,
             "--max-turns",
             "1",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -680,7 +661,7 @@ async fn headless_json_schema_responses_uses_text_format() {
             "--max-turns",
             "1",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -736,7 +717,7 @@ async fn headless_json_schema_messages_backend_uses_structured_output_tool() {
             "--max-turns",
             "2",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -818,7 +799,7 @@ async fn headless_json_schema_messages_validates_text_when_tool_not_called() {
             "--max-turns",
             "1",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -865,7 +846,7 @@ async fn headless_json_schema_messages_retries_on_schema_violation() {
             "--max-turns",
             "3",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -887,7 +868,7 @@ async fn headless_json_schema_messages_retries_on_schema_violation() {
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
 async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
-    let server = single_model_server("grok-4.5", "chat_completions").await;
+    let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.set_response(r#"{"name":"Alice","age":30}"#);
 
     let workdir = git_workdir();
@@ -898,7 +879,7 @@ async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
             "extract name and age",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             // Valid JSON object, but `pattern` is an invalid regex → schema
             // compilation (`jsonschema::validator_for`) fails.
             "--json-schema",
@@ -906,7 +887,7 @@ async fn invalid_json_schema_disables_structured_output_and_surfaces_error() {
             "--max-turns",
             "1",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -965,7 +946,7 @@ async fn test_stdio_full_session_lifecycle() {
     with_local_set(|| async {
         let server = MockInferenceServer::start().await.expect("start mock server");
         let workdir = git_workdir();
-        let client = GrokStdioClient::spawn(&server, workdir.path()).await;
+        let client = GrokStdioClient::spawn(&server, workdir.workspace()).await;
 
         // Initialize and authenticate
         let init_resp = client.initialize_with_timeout().await;
@@ -975,7 +956,7 @@ async fn test_stdio_full_session_lifecycle() {
         );
 
         // Create session (triggers libgit2 init)
-        let session_id = client.create_session_with_timeout(workdir.path()).await;
+        let session_id = client.create_session_with_timeout(workdir.workspace()).await;
         assert!(!session_id.0.is_empty(), "session ID should be non-empty");
 
         // Send prompt — triggers inference to mock server
@@ -1012,10 +993,12 @@ async fn test_stdio_session_close() {
             .await
             .expect("start mock server");
         let workdir = git_workdir();
-        let client = GrokStdioClient::spawn(&server, workdir.path()).await;
+        let client = GrokStdioClient::spawn(&server, workdir.workspace()).await;
 
         client.initialize_with_timeout().await;
-        let session_id = client.create_session_with_timeout(workdir.path()).await;
+        let session_id = client
+            .create_session_with_timeout(workdir.workspace())
+            .await;
 
         // Session should be alive — session/info returns data with sessionId
         let info_resp = client
@@ -1074,7 +1057,7 @@ async fn test_stdio_prompt_then_immediate_load_session() {
     with_local_set(|| async {
         let server = MockInferenceServer::start().await.expect("start mock server");
         let workdir = git_workdir();
-        let mut writer = GrokStdioClient::spawn(&server, workdir.path()).await;
+        let mut writer = GrokStdioClient::spawn(&server, workdir.workspace()).await;
 
         let init_resp = writer.initialize_with_timeout().await;
         assert!(
@@ -1082,7 +1065,7 @@ async fn test_stdio_prompt_then_immediate_load_session() {
             "agent should return at least one auth method"
         );
 
-        let session_id = writer.create_session_with_timeout(workdir.path()).await;
+        let session_id = writer.create_session_with_timeout(workdir.workspace()).await;
         let result = writer.prompt_with_timeout(&session_id, "say hello").await;
         assert!(
             result.is_ok(),
@@ -1092,13 +1075,18 @@ async fn test_stdio_prompt_then_immediate_load_session() {
             stderr_tail(&writer.stderr(), 1200)
         );
 
-        let shared_home = writer.take_home();
+        let shared_sandbox = writer.take_sandbox();
         drop(writer);
 
-        let reader = GrokStdioClient::spawn_with_home(&server, workdir.path(), shared_home).await;
+        let reader = GrokStdioClient::spawn_with_sandbox(
+            &server,
+            workdir.workspace(),
+            shared_sandbox,
+        )
+        .await;
         reader.initialize_with_timeout().await;
         let _ = reader
-            .load_session_with_timeout(&session_id, workdir.path())
+            .load_session_with_timeout(&session_id, workdir.workspace())
             .await;
         assert!(
             reader.notification_count() > 0,
@@ -1152,7 +1140,7 @@ async fn test_stdio_xcode_escaped_slash_methods_get_responses() {
         .await
         .expect("start mock server");
     let workdir = git_workdir();
-    let mut agent = RawStdioClient::spawn(&server, workdir.path()).await;
+    let mut agent = RawStdioClient::spawn(&server, workdir.workspace()).await;
 
     // initialize/authenticate carry no slash (they work from Xcode too), but
     // ride string UUID ids and minimal capabilities like Xcode's client.
@@ -1192,7 +1180,7 @@ async fn test_stdio_xcode_escaped_slash_methods_get_responses() {
             "jsonrpc": "2.0",
             "id": new_id,
             "method": "session/new",
-            "params": { "cwd": workdir.path(), "mcpServers": [] },
+            "params": { "cwd": workdir.workspace(), "mcpServers": [] },
         }),
         "session/new",
     );
@@ -1254,63 +1242,40 @@ async fn test_stdio_xcode_escaped_slash_methods_get_responses() {
 /// Isolated headless run with a custom `~/.grok/`. Clean env (no leaked
 /// host credentials). Write config files into `grok_dir()` before `run()`.
 struct ConfigTestHarness {
-    home: tempfile::TempDir,
-    workdir: tempfile::TempDir,
-    env: Vec<(String, String)>,
+    sandbox: TestSandbox,
 }
 
 impl ConfigTestHarness {
     fn new(server: &MockInferenceServer) -> Self {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join(".grok")).unwrap();
         Self {
-            home,
-            workdir: git_workdir(),
-            env: vec![
-                ("GROK_CLI_CHAT_PROXY_BASE_URL".into(), server.url()),
-                ("GROK_TELEMETRY_ENABLED".into(), "false".into()),
-                ("GROK_FEEDBACK_ENABLED".into(), "false".into()),
-                ("GROK_TRACE_UPLOAD".into(), "false".into()),
-                ("GROK_INSTRUMENTATION".into(), "disabled".into()),
-                ("GROK_DISABLE_AUTOUPDATER".into(), "1".into()),
-            ],
+            sandbox: TestSandbox::builder().mock_url(server.url()).git().build(),
         }
     }
 
     fn grok_dir(&self) -> std::path::PathBuf {
-        self.home.path().join(".grok")
+        self.sandbox.grok_home().to_path_buf()
     }
 
     fn env(&mut self, key: &str, value: &str) -> &mut Self {
-        self.env.push((key.into(), value.into()));
+        self.sandbox.set_env(key, value);
         self
     }
 
-    async fn run(&self) -> HeadlessResult {
+    async fn run(self) -> HeadlessResult {
         let mut cmd = tokio::process::Command::new(grok_binary());
         cmd.args(["-p", "say hello", "--yolo"])
-            .current_dir(self.workdir.path())
+            .current_dir(self.sandbox.workspace())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .env_clear()
-            .env("HOME", self.home.path())
-            // Windows resolves `~` via USERPROFILE, not HOME — pin the grok
-            // home explicitly so the sandbox holds on all platforms (see
-            // `test_env_cmd_tokio`).
-            .env("GROK_HOME", self.grok_dir())
-            .env("PATH", std::env::var("PATH").unwrap_or_default());
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        run_headless_with_cmd(cmd).await
+            .kill_on_drop(true);
+        run_headless_in_sandbox(cmd, self.sandbox).await
     }
 }
 
 // ── Enterprise managed config tests ────────────────────────────────────────
 
-/// Enterprise BYOK: managed_config.toml overrides grok-build with a custom
+/// Enterprise BYOK: managed_config.toml overrides the default model with a custom
 /// endpoint + env_key. Mock rejects unauthenticated requests with 401.
 /// Regression guard for the 0.1.220 authentication regression.
 #[tokio::test]
@@ -1332,7 +1297,7 @@ async fn test_headless_managed_config_byok_sends_authorized_requests() {
 deployment_key = "test-deployment-key"
 xai_api_base_url = "{url}"
 
-[model.grok-build]
+[model."grok-4.5"]
 api_backend = "responses"
 base_url = "{url}"
 context_window = 500000
@@ -1369,7 +1334,7 @@ default = "grok-4.5"
 #[ignore] // requires pre-built binary; run with --ignored
 async fn headless_reasoning_efforts_payload_parses_and_legacy_effort_rides_wire() {
     let server = MockInferenceServer::start_with_models(vec![
-        MockModelEntry::new("grok-4.5")
+        MockModelEntry::new(CHAT_COMPLETIONS_MODEL)
             .with_api_backend("chat_completions")
             .with_supports_reasoning_effort(true)
             .with_reasoning_effort("xhigh")
@@ -1390,11 +1355,11 @@ async fn headless_reasoning_efforts_payload_parses_and_legacy_effort_rides_wire(
             "hi",
             "--yolo",
             "--model",
-            "grok-4.5",
+            CHAT_COMPLETIONS_MODEL,
             "--max-turns",
             "1",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -1512,7 +1477,7 @@ async fn test_headless_timeout_exit_kills_pending_background_task() {
         .await
         .expect("start mock server");
     let workdir = git_workdir();
-    let pid_file = workdir.path().join("task_pid.txt");
+    let pid_file = workdir.workspace().join("task_pid.txt");
     enqueue_background_task_turn(&server, &pid_file);
 
     let result = run_headless(
@@ -1524,7 +1489,7 @@ async fn test_headless_timeout_exit_kills_pending_background_task() {
             "--background-wait-timeout",
             "1",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -1553,7 +1518,7 @@ async fn test_headless_no_wait_exit_kills_background_task() {
         .await
         .expect("start mock server");
     let workdir = git_workdir();
-    let pid_file = workdir.path().join("task_pid.txt");
+    let pid_file = workdir.workspace().join("task_pid.txt");
     enqueue_background_task_turn(&server, &pid_file);
 
     let result = run_headless(
@@ -1564,7 +1529,7 @@ async fn test_headless_no_wait_exit_kills_background_task() {
             "--yolo",
             "--no-wait-for-background",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 
@@ -1590,7 +1555,7 @@ async fn test_headless_waits_for_short_background_task_and_exits_clean() {
         .await
         .expect("start mock server");
     let workdir = git_workdir();
-    let marker = workdir.path().join("finished.txt");
+    let marker = workdir.workspace().join("finished.txt");
     let command = format!("/bin/sleep 1 && echo ok > {}", marker.display());
     let args = serde_json::json!({
         "command": command,
@@ -1629,7 +1594,7 @@ async fn test_headless_waits_for_short_background_task_and_exits_clean() {
             "--background-wait-timeout",
             "30",
         ],
-        workdir.path(),
+        workdir.workspace(),
     )
     .await;
 

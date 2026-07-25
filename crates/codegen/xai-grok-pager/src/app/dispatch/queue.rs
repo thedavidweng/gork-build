@@ -10,9 +10,18 @@ use crate::app::actions::Effect;
 use crate::app::agent::{AgentCommand, AgentId};
 use crate::app::agent_view::{AgentView, PromptMode};
 use crate::app::app_view::{ActiveView, AppView};
+use crate::scrollback::EntryId;
 use crate::scrollback::block::RenderBlock;
 use agent_client_protocol as acp;
 use std::time::Instant;
+
+fn page_flip_on_send() -> bool {
+    crate::appearance::cache::load_page_flip_on_send()
+}
+
+fn combine_queued_prompts_enabled() -> bool {
+    crate::appearance::cache::load_combine_queued_prompts()
+}
 
 /// Whether a prompt/command submitted right now should take the
 /// server-authoritative immediate-send path: the **server is busy**
@@ -172,7 +181,21 @@ fn format_cron_prompt(prompt: &str, task_id: &str, human_schedule: &str) -> Stri
 /// - **Command**: starts command, returns the appropriate `Effect` (e.g., `Effect::Compact`)
 /// - **BashCommand**: starts turn (no user block), returns `Effect::SendBashCommand`
 /// - **Cron**: pushes cron prompt block to scrollback, starts turn, returns `Effect::SendPrompt`
-pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
+pub(super) struct QueueDrain {
+    pub(super) effects: Vec<Effect>,
+    pub(super) page_flip_entry: Option<EntryId>,
+}
+
+impl QueueDrain {
+    fn blocked() -> Self {
+        Self {
+            effects: Vec::new(),
+            page_flip_entry: None,
+        }
+    }
+}
+
+pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
     use crate::app::agent::QueueEntryKind;
     use crate::unified_log as ulog;
 
@@ -191,17 +214,17 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
 
     if !agent.session.state.is_idle() {
         log_blocked("turn_running", sid);
-        return vec![];
+        return QueueDrain::blocked();
     }
     // Hold the drain during an in-flight model switch. See the
     // `model_switch_pending` field doc for why a reconnect must clear it.
     if agent.session.model_switch_pending {
         log_blocked("model_switch_pending", sid);
-        return vec![];
+        return QueueDrain::blocked();
     }
     if agent.session.loading_replay {
         log_blocked("loading_replay", sid);
-        return vec![];
+        return QueueDrain::blocked();
     }
     // Server-owned next turn: a non-running server row (including this
     // client's own in-flight send-now echo) drains shell-side — the
@@ -217,11 +240,11 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
         .any(|e| Some(e.id.as_str()) != running)
     {
         log_blocked("server_queue_owns_next_turn", sid);
-        return vec![];
+        return QueueDrain::blocked();
     }
     let Some(session_id) = agent.session.session_id.clone() else {
         log_blocked("no_session_id", None);
-        return vec![];
+        return QueueDrain::blocked();
     };
 
     // Block drain if the user is editing the front prompt.
@@ -236,12 +259,23 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
         // from under the user. The turn status line will show a
         // "waiting on your edit" indicator.
         log_blocked("user_editing_front", Some(&session_id.0));
-        return vec![];
+        return QueueDrain::blocked();
     }
 
-    let queued = match agent.session.dequeue_prompt() {
+    // Row the user is actively editing (if any). The front-row case is already
+    // handled above; pass it so a combined drain also stops before an edited
+    // *follower* instead of merging it away.
+    let editing_id = match &agent.prompt_mode {
+        PromptMode::EditingQueued { id, .. } => Some(*id),
+        _ => None,
+    };
+    let queued = match if combine_queued_prompts_enabled() {
+        agent.session.dequeue_combined_prompt(editing_id)
+    } else {
+        agent.session.dequeue_prompt()
+    } {
         Some(q) => q,
-        None => return vec![],
+        None => return QueueDrain::blocked(),
     };
 
     // A new turn is starting: follow-up chips belong to the previous
@@ -306,40 +340,50 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
         QueueEntryKind::Prompt => {
             agent.start_turn_boundary(Some(&prompt_id));
             agent.session.current_prompt_id = Some(prompt_id.clone());
-            // Scrollback always shows the display text (e.g. "/commit fix bug"),
-            // never the raw skill XML. Skill prompts use a distinct accent color;
-            // plain prompts with composer-recognized tokens style just those.
+            // Scrollback shows display text (never raw skill XML). Combined
+            // drains paint one bubble per original follow-up.
             let is_skill = queued.display_as_skill;
-            let block = if is_skill {
-                RenderBlock::skill_prompt(&queued.text)
-            } else if !queued.skill_token_ranges.is_empty() {
-                RenderBlock::user_prompt_with_skill_tokens(
-                    &queued.text,
-                    queued.skill_token_ranges.clone(),
-                )
+            let multi = xai_prompt_queue::is_combined(&queued.combined_texts);
+            let (prompt_idx, prompt_entry_id, combined_entries) = if multi {
+                let (first_idx, _, last_id, all_ids) =
+                    paint_or_reuse_combined_user_bubbles(agent, &queued.combined_texts);
+                (first_idx, last_id, all_ids)
             } else {
-                RenderBlock::user_prompt(&queued.text)
+                let block = if is_skill {
+                    RenderBlock::skill_prompt(&queued.text)
+                } else if !queued.skill_token_ranges.is_empty() {
+                    RenderBlock::user_prompt_with_skill_tokens(
+                        &queued.text,
+                        queued.skill_token_ranges.clone(),
+                    )
+                } else {
+                    RenderBlock::user_prompt(&queued.text)
+                };
+                let id = agent.scrollback.push_block(block);
+                (agent.scrollback.len().saturating_sub(1), id, vec![id])
             };
-            let prompt_entry_id = agent.scrollback.push_block(block);
             // Stash for cancel-with-restore. Only plain (non-skill) prompts
             // can be reversed back into the input box.
             if queued.wire_blocks.is_none() {
+                let earlier = combined_entries
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != prompt_entry_id)
+                    .collect();
                 agent.session.in_flight_prompt = Some(crate::app::agent::InFlightPrompt {
                     text: queued.text.clone(),
                     images: queued.images.clone(),
                     scrollback_entry: prompt_entry_id,
+                    combined_scrollback_entries: earlier,
                     chip_elements: queued.chip_elements.clone(),
                 });
             }
             agent.turn_started_at = Some(Instant::now());
+            let flip = page_flip_on_send();
+            agent.scrollback.follow_new_turn(Some(prompt_idx), flip);
 
-            // Scroll to the new prompt and engage follow mode.
-            let prompt_idx = agent.scrollback.len().saturating_sub(1);
-            agent.scrollback.set_selected(Some(prompt_idx));
-            agent.scrollback.scroll_to_entry_top(prompt_idx);
-            agent.scrollback.enable_follow_with_preserve();
-
-            if let Some(mut blocks) = queued.wire_blocks {
+            let combined_segs = queued.combined_texts.clone();
+            let effects = if let Some(mut blocks) = queued.wire_blocks {
                 // Skill injection: send structured blocks.
                 // Annotate the first text block's meta with the display text
                 // so the pager can reconstruct the clean prompt on session
@@ -357,6 +401,7 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
                             serde_json::Value::Bool(true),
                         );
                     }
+                    xai_prompt_queue::stamp_combined_display_texts(map, &combined_segs);
                 } else {
                     tracing::debug!(
                         "wire_blocks[0] is not TextContent — displayText annotation skipped"
@@ -375,15 +420,32 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
                 // can be recovered from disk via the shared helper.
                 // Token ranges are NOT stamped here: the builder rewrites the
                 // text (placeholder stripping), which would shift byte offsets.
-                let blocks = crate::prompt_images::build_content_blocks_with_workspace(
+                let mut blocks = crate::prompt_images::build_content_blocks_with_workspace(
                     queued.text,
                     queued.images,
                     Some(std::path::Path::new(&agent.session.cwd)),
                 );
+                if let Some(acp::ContentBlock::Text(tb)) = blocks.first_mut() {
+                    let map = tb.meta.get_or_insert_with(acp::Meta::new);
+                    xai_prompt_queue::stamp_combined_display_texts(map, &combined_segs);
+                }
                 vec![Effect::SendPromptBlocks {
                     agent_id,
                     session_id,
                     blocks,
+                    prompt_id,
+                }]
+            } else if multi {
+                // Stamp combinedDisplayTexts so reload paints multi-bubble. No
+                // skillTokenRanges: dequeue_combined_prompt clears them on every
+                // combined drain (multi paints plain per-segment bubbles).
+                let mut tb = acp::TextContent::new(queued.text);
+                let map = tb.meta.get_or_insert_with(acp::Meta::new);
+                xai_prompt_queue::stamp_combined_display_texts(map, &combined_segs);
+                vec![Effect::SendPromptBlocks {
+                    agent_id,
+                    session_id,
+                    blocks: vec![acp::ContentBlock::Text(tb)],
                     prompt_id,
                 }]
             } else {
@@ -395,20 +457,24 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
                     prompt_id,
                     skill_token_ranges: queued.skill_token_ranges,
                 }]
+            };
+            QueueDrain {
+                effects,
+                page_flip_entry: flip.then_some(prompt_entry_id),
             }
         }
         QueueEntryKind::Command => {
             // Currently only `/compact` — future slash commands will branch here.
-            // `start_command` occupies the turn slot without `start_turn`, so
-            // it closes the between-turns status window itself.
-            agent.end_work_announced = false;
             agent.session.start_command(AgentCommand::Compact);
             agent.turn_started_at = Some(Instant::now());
 
-            vec![Effect::Compact {
-                agent_id,
-                session_id,
-            }]
+            QueueDrain {
+                effects: vec![Effect::Compact {
+                    agent_id,
+                    session_id,
+                }],
+                page_flip_entry: None,
+            }
         }
         QueueEntryKind::BashCommand => {
             // Start turn but do NOT push a user prompt block.
@@ -417,30 +483,31 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
             agent.session.current_prompt_id = Some(prompt_id.clone());
             agent.turn_started_at = Some(Instant::now());
 
-            // Engage follow mode so streaming output scrolls into view.
-            agent.scrollback.enable_follow_with_preserve();
+            agent.scrollback.follow_new_turn(None, page_flip_on_send());
 
-            vec![Effect::SendBashCommand {
-                agent_id,
-                session_id,
-                command: queued.text,
-                prompt_id,
-            }]
+            QueueDrain {
+                effects: vec![Effect::SendBashCommand {
+                    agent_id,
+                    session_id,
+                    command: queued.text,
+                    prompt_id,
+                }],
+                page_flip_entry: None,
+            }
         }
         QueueEntryKind::Cron => {
             let prompt_id = format!("scheduler-fired-{prompt_id}");
             agent.note_self_originated_prompt(&prompt_id);
             agent.start_turn_boundary(Some(&prompt_id));
             agent.session.current_prompt_id = Some(prompt_id.clone());
-            agent
+            let prompt_entry_id = agent
                 .scrollback
                 .push_block(RenderBlock::cron_prompt(&queued.text));
             agent.turn_started_at = Some(Instant::now());
 
             let prompt_idx = agent.scrollback.len().saturating_sub(1);
-            agent.scrollback.set_selected(Some(prompt_idx));
-            agent.scrollback.scroll_to_entry_top(prompt_idx);
-            agent.scrollback.enable_follow_with_preserve();
+            let flip = page_flip_on_send();
+            agent.scrollback.follow_new_turn(Some(prompt_idx), flip);
 
             let framed_text = format_cron_prompt(
                 &queued.text,
@@ -461,12 +528,15 @@ pub(crate) fn maybe_drain_queue(agent: &mut AgentView) -> Vec<Effect> {
                 acp::TextContent::new(framed_text).meta(Some(meta_map)),
             )];
 
-            vec![Effect::SendPromptBlocks {
-                agent_id,
-                session_id,
-                blocks,
-                prompt_id,
-            }]
+            QueueDrain {
+                effects: vec![Effect::SendPromptBlocks {
+                    agent_id,
+                    session_id,
+                    blocks,
+                    prompt_id,
+                }],
+                page_flip_entry: flip.then_some(prompt_entry_id),
+            }
         }
     }
 }
@@ -501,6 +571,85 @@ fn trailing_user_prompt_matching(
         }
     }
     None
+}
+
+/// Last `n` non-interjection user prompts (oldest → newest), scanning back past
+/// turn chrome. Used to reuse multi-bubble paints when the echo already rendered.
+fn trailing_user_prompts(
+    agent: &AgentView,
+    n: usize,
+) -> Option<Vec<(usize, crate::scrollback::EntryId, String)>> {
+    if n == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for idx in (0..agent.scrollback.len()).rev() {
+        let entry = agent.scrollback.entry(idx)?;
+        match &entry.block {
+            RenderBlock::UserPrompt(ub) if !ub.is_interjection => {
+                out.push((idx, entry.id, ub.text.clone()));
+                if out.len() == n {
+                    out.reverse();
+                    return Some(out);
+                }
+            }
+            RenderBlock::SessionEvent(_) | RenderBlock::System(_) => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Paint one user bubble per combined segment, or reuse matching trailing
+/// bubbles. Drops a single joined-body bubble if the echo raced ahead.
+///
+/// Returns `(first_idx, first_id, last_id, all_segment_ids oldest→newest)`.
+fn paint_or_reuse_combined_user_bubbles(
+    agent: &mut AgentView,
+    segments: &[String],
+) -> (
+    usize,
+    crate::scrollback::EntryId,
+    crate::scrollback::EntryId,
+    Vec<crate::scrollback::EntryId>,
+) {
+    if let Some(existing) = trailing_user_prompts(agent, segments.len()).filter(|rows| {
+        rows.iter()
+            .map(|(_, _, t)| t.as_str())
+            .eq(segments.iter().map(String::as_str))
+    }) {
+        let (first_idx, first_id, _) = existing[0];
+        let (_, last_id, _) = existing[existing.len() - 1];
+        let ids = existing.iter().map(|(_, id, _)| *id).collect();
+        return (first_idx, first_id, last_id, ids);
+    }
+
+    let joined = xai_prompt_queue::join_texts(segments.iter().map(String::as_str));
+    if let Some((_, id)) = trailing_user_prompt_matching(agent, &joined) {
+        agent.scrollback.remove_entry(id);
+    }
+
+    let mut first_idx = None;
+    let mut first_id = None;
+    let mut last_id = None;
+    let mut all_ids = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let id = agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt(seg.clone()));
+        all_ids.push(id);
+        if first_idx.is_none() {
+            first_idx = Some(agent.scrollback.len().saturating_sub(1));
+            first_id = Some(id);
+        }
+        last_id = Some(id);
+    }
+    (
+        first_idx.expect("segments non-empty"),
+        first_id.expect("segments non-empty"),
+        last_id.expect("segments non-empty"),
+        all_ids,
+    )
 }
 
 /// Paint the user block for a send-now'd prompt at dispatch: arming hides the
@@ -595,7 +744,8 @@ pub(crate) fn apply_turn_start_shim(
     prompt_id: String,
     text: Option<String>,
     kind: &str,
-) {
+    combined_texts: Option<Vec<String>>,
+) -> Option<EntryId> {
     // Re-derive the per-turn viewer flag (see the ACP gate). This shim adopts a
     // turn the leader drained into the running slot: if THIS client originated
     // it (its own queued/immediate prompt), it drives it; otherwise it is
@@ -644,26 +794,55 @@ pub(crate) fn apply_turn_start_shim(
     // them now that the turn is current.
     agent.flush_pending_follow_ups(&prompt_id);
 
-    // The display block to render (if any), and whether to stash an
-    // `in_flight_prompt` (only plain prompts are Ctrl+C-rewindable).
+    // Combined turn: one user bubble per original follow-up (painted below).
+    let multi_segments: Option<Vec<String>> = combined_texts.filter(|v| v.len() >= 2);
+
+    // Display block (if any) + whether Ctrl+C can restore into the composer.
     let (display_block, rewindable): (Option<RenderBlock>, bool) = match kind {
         "bash" => {
-            // The shell's execute block is the visual entry; no user block.
             agent.bash_turn = true;
             (None, false)
         }
         "cron" => (text.as_deref().map(RenderBlock::cron_prompt), false),
-        // Plain prompt (default).
+        _ if multi_segments.is_some() => (None, true),
         _ => (text.as_deref().map(RenderBlock::user_prompt), true),
     };
 
-    debug_assert_eq!(
-        display_block.is_some(),
-        shim_renders_own_user_block(kind, text.as_deref()),
+    debug_assert!(
+        multi_segments.is_some()
+            || display_block.is_some() == shim_renders_own_user_block(kind, text.as_deref()),
         "shim_renders_own_user_block must mirror apply_turn_start_shim's display_block"
     );
 
-    if let Some(block) = display_block {
+    let page_flip_entry = if let Some(segments) = multi_segments {
+        let (prompt_idx, first_id, last_id, all_ids) =
+            paint_or_reuse_combined_user_bubbles(agent, &segments);
+        if rewindable {
+            let restore = text.clone().unwrap_or_else(|| {
+                xai_prompt_queue::join_texts(segments.iter().map(String::as_str))
+            });
+            let earlier = all_ids.into_iter().filter(|id| *id != last_id).collect();
+            // An adopted turn arrives with text only, never the original
+            // attachments, so a Ctrl+C rewind restores just the joined text.
+            // The local drain path, which owns the data, restores images/chips.
+            agent.session.in_flight_prompt = Some(crate::app::agent::InFlightPrompt {
+                text: restore,
+                images: Vec::new(),
+                scrollback_entry: last_id,
+                combined_scrollback_entries: earlier,
+                chip_elements: Vec::new(),
+            });
+        }
+        if skip_entry_top {
+            agent.scrollback.set_selected(Some(prompt_idx));
+            agent.scrollback.enable_follow_mode();
+            None
+        } else {
+            let flip = page_flip_on_send();
+            agent.scrollback.follow_new_turn(Some(prompt_idx), flip);
+            flip.then_some(first_id)
+        }
+    } else if let Some(block) = display_block {
         // The block may already be painted: consume the send-now paint's
         // id-keyed entry, else reuse a trailing echo block by text — never
         // double-push the user-prompt row.
@@ -720,15 +899,19 @@ pub(crate) fn apply_turn_start_shim(
                 text: restore_text,
                 images: Vec::new(),
                 scrollback_entry: prompt_entry_id,
+                combined_scrollback_entries: Vec::new(),
                 chip_elements: Vec::new(),
             });
         }
-        agent.scrollback.set_selected(Some(prompt_idx));
         if skip_entry_top {
+            // Send-now: follow at the tail; never entry-top jump.
+            agent.scrollback.set_selected(Some(prompt_idx));
             agent.scrollback.enable_follow_mode();
+            None
         } else {
-            agent.scrollback.scroll_to_entry_top(prompt_idx);
-            agent.scrollback.enable_follow_with_preserve();
+            let flip = page_flip_on_send();
+            agent.scrollback.follow_new_turn(Some(prompt_idx), flip);
+            flip.then_some(prompt_entry_id)
         }
     } else {
         // No local block to render — this is a synthetic/cron/bash adoption with
@@ -739,8 +922,9 @@ pub(crate) fn apply_turn_start_shim(
         // `displayText`). Clear the skip so `handle_user_message` renders it
         // instead of dropping it (the cause of viewers missing the cron header).
         agent.session.tracker.clear_user_echo_skip();
-        agent.scrollback.enable_follow_with_preserve();
-    }
+        agent.scrollback.follow_new_turn(None, page_flip_on_send());
+        None
+    };
 
     agent.turn_started_at = Some(Instant::now());
 
@@ -756,6 +940,34 @@ pub(crate) fn apply_turn_start_shim(
     if let Some(tools) = agent.session.tracker.take_pending_acp_tools() {
         agent.session.available_tools = Some(tools.into_iter().collect());
     }
+    page_flip_entry
+}
+
+pub(crate) fn note_peek_page_flip(
+    app: &mut AppView,
+    agent_id: AgentId,
+    page_flip_entry: Option<EntryId>,
+) {
+    let Some(entry_id) = page_flip_entry else {
+        return;
+    };
+    let Some(mut dash) = app.dashboard.take() else {
+        return;
+    };
+    dash.note_page_flip_for_lease(agent_id, entry_id, &app.agents);
+    app.dashboard = Some(dash);
+}
+
+/// Drain the next queued prompt and, when that page-flips under a lease, note it.
+pub(crate) fn maybe_drain_queue_and_note_peek(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    let drain = {
+        let Some(agent) = app.agents.get_mut(&agent_id) else {
+            return vec![];
+        };
+        maybe_drain_queue(agent)
+    };
+    note_peek_page_flip(app, agent_id, drain.page_flip_entry);
+    drain.effects
 }
 
 /// Try to drain the next queued prompt (triggered after editing completes).
@@ -766,10 +978,7 @@ pub(super) fn dispatch_drain_queue(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
-    let Some(agent) = app.agents.get_mut(&id) else {
-        return vec![];
-    };
-    maybe_drain_queue(agent)
+    maybe_drain_queue_and_note_peek(app, id)
 }
 
 /// `Action::QueueInterjectShared` arm: map the (possibly edited) queue
@@ -942,6 +1151,54 @@ mod tests {
     }
 
     #[test]
+    fn drain_scroll_honors_page_flip_setting() {
+        fn app_at_bottom() -> AppView {
+            let mut app = test_app_with_agent();
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            for i in 0..40 {
+                agent
+                    .scrollback
+                    .push_block(RenderBlock::agent_message(format!("filler {i}")));
+            }
+            agent.scrollback.prepare_layout(80, 8);
+            agent.scrollback.goto_bottom();
+            app
+        }
+
+        crate::appearance::cache::set_page_flip_on_send(false);
+        let mut app = app_at_bottom();
+        let bottom = app.agents[&AgentId(0)].scrollback.scroll_offset();
+        dispatch(Action::SendPrompt("go".into()), &mut app);
+        let sb = &app.agents[&AgentId(0)].scrollback;
+        assert!(sb.is_follow_mode());
+        assert!(!sb.is_follow_preserve_scroll());
+        assert_eq!(sb.scroll_offset(), bottom);
+        assert_eq!(sb.selected(), Some(sb.len() - 1));
+
+        let mut app = app_at_bottom();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.scrollback.scroll_up(10);
+        let reading = agent.scrollback.scroll_offset();
+        dispatch(Action::SendPrompt("go".into()), &mut app);
+        let sb = &app.agents[&AgentId(0)].scrollback;
+        assert!(!sb.is_follow_mode());
+        assert_eq!(sb.scroll_offset(), reading);
+        assert_eq!(sb.selected(), Some(sb.len() - 1));
+
+        crate::appearance::cache::set_page_flip_on_send(true);
+        let mut app = app_at_bottom();
+        dispatch(Action::SendPrompt("go".into()), &mut app);
+        let sb = &app.agents[&AgentId(0)].scrollback;
+        assert!(sb.is_follow_mode());
+        assert!(sb.is_follow_preserve_scroll());
+        assert_eq!(sb.selected(), Some(sb.len() - 1));
+
+        crate::appearance::cache::set_page_flip_on_send(
+            xai_grok_shell::agent::config::UiConfig::PAGE_FLIP_ON_SEND_DEFAULT,
+        );
+    }
+
+    #[test]
     fn drain_queue_when_empty_does_nothing() {
         let mut app = test_app_with_agent();
         let effects = dispatch(Action::DrainQueue, &mut app);
@@ -1098,14 +1355,40 @@ mod tests {
         let agent = app.agents.get_mut(&id).unwrap();
         let before = agent.scrollback.len();
 
-        apply_turn_start_shim(agent, "p1".to_string(), Some("ls -la".to_string()), "bash");
+        let page_flip_entry = apply_turn_start_shim(
+            agent,
+            "p1".to_string(),
+            Some("ls -la".to_string()),
+            "bash",
+            None,
+        );
 
+        assert!(page_flip_entry.is_none());
         assert!(agent.bash_turn, "bash adoption must set bash_turn");
         assert!(agent.session.state.is_turn_running());
         assert_eq!(agent.session.current_prompt_id.as_deref(), Some("p1"));
         // No user/display block is pushed (the shell's execute block IS the entry).
         assert_eq!(agent.scrollback.len(), before);
         assert!(agent.session.in_flight_prompt.is_none());
+    }
+
+    #[test]
+    fn drain_reports_page_flip_only_when_prompt_starts() {
+        crate::appearance::cache::set_page_flip_on_send(true);
+        let mut app = test_app_with_agent();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.session.enqueue_prompt("first".into());
+        let started = maybe_drain_queue(agent);
+        let entry_id = started.page_flip_entry.expect("prompt starts a page flip");
+        assert_eq!(
+            agent.scrollback.index_of_id(entry_id),
+            agent.scrollback.selected()
+        );
+
+        agent.session.enqueue_prompt("queued".into());
+        let blocked = maybe_drain_queue(agent);
+        assert!(blocked.effects.is_empty());
+        assert!(blocked.page_flip_entry.is_none());
     }
 
     /// Turn-start path: the leader/viewer adoption shim
@@ -1115,7 +1398,13 @@ mod tests {
         let mut app = test_app_with_agent();
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         agent.apply_follow_ups("resp-1".into(), vec!["a".into()]);
-        apply_turn_start_shim(agent, "p9".to_string(), Some("hi".to_string()), "prompt");
+        apply_turn_start_shim(
+            agent,
+            "p9".to_string(),
+            Some("hi".to_string()),
+            "prompt",
+            None,
+        );
         assert!(agent.follow_ups.is_none(), "turn adoption must clear chips");
     }
 
@@ -1134,7 +1423,13 @@ mod tests {
         // The shim adopts turn p9 (viewer: "p9" is not self-originated): it
         // clears the shown chips but KEEPS the seen ring and sets
         // current_prompt_id = "p9".
-        apply_turn_start_shim(agent, "p9".to_string(), Some("hi".to_string()), "prompt");
+        apply_turn_start_shim(
+            agent,
+            "p9".to_string(),
+            Some("hi".to_string()),
+            "prompt",
+            None,
+        );
         assert!(agent.attached_as_viewer, "p9 is a viewer-adopted turn");
         assert!(agent.follow_ups.is_none(), "turn adoption clears chips");
         assert!(
@@ -1181,6 +1476,7 @@ mod tests {
             "p-self".to_string(),
             Some("hi".to_string()),
             "prompt",
+            None,
         );
         assert!(
             !agent.attached_as_viewer,
@@ -1216,7 +1512,7 @@ mod tests {
         // No queue text → no local block → clear the skip (let broadcast render).
         let mut app = test_app_with_agent();
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        apply_turn_start_shim(agent, "cron-1".to_string(), None, "prompt");
+        apply_turn_start_shim(agent, "cron-1".to_string(), None, "prompt", None);
         assert!(
             !agent.session.tracker.expects_user_echo(),
             "no-block adoption must clear the echo skip so the cron broadcast renders"
@@ -1230,6 +1526,7 @@ mod tests {
             "p2".to_string(),
             Some("hello world".to_string()),
             "prompt",
+            None,
         );
         assert!(
             agent2.session.tracker.expects_user_echo(),
@@ -1239,6 +1536,9 @@ mod tests {
 
     #[test]
     fn send_now_shim_skips_scroll_to_entry_top() {
+        // This test exercises the send-now exception within the page-flip
+        // behavior, so pin the setting ON (the cache is thread-local).
+        crate::appearance::cache::set_page_flip_on_send(true);
         fn seed_tall_scrollback(agent: &mut crate::app::agent_view::AgentView) -> usize {
             for i in 0..40 {
                 agent
@@ -1261,6 +1561,7 @@ mod tests {
             "p-normal".into(),
             Some("normal next".into()),
             "prompt",
+            None,
         );
         let normal_offset = agent_n.scrollback.scroll_offset();
         assert!(agent_n.scrollback.is_follow_mode());
@@ -1282,6 +1583,7 @@ mod tests {
             "p-send-now".into(),
             Some("hurry up".into()),
             "prompt",
+            None,
         );
         assert!(agent_s.follow_without_jump_prompt_id.is_none());
         assert!(agent_s.scrollback.is_follow_mode());
@@ -1297,7 +1599,7 @@ mod tests {
         let bottom_m = seed_tall_scrollback(agent_m);
         agent_m.note_self_originated_prompt("p-b");
         agent_m.arm_send_now_expectation("p-a".into());
-        apply_turn_start_shim(agent_m, "p-b".into(), Some("other".into()), "prompt");
+        apply_turn_start_shim(agent_m, "p-b".into(), Some("other".into()), "prompt", None);
         assert!(agent_m.follow_without_jump_prompt_id.is_none());
         assert_ne!(
             agent_m.scrollback.scroll_offset(),
@@ -1318,7 +1620,13 @@ mod tests {
             .scrollback
             .push_block(RenderBlock::user_prompt("/deslop"));
         let before = agent.scrollback.len();
-        apply_turn_start_shim(agent, "p-dup".into(), Some("/deslop".into()), "prompt");
+        apply_turn_start_shim(
+            agent,
+            "p-dup".into(),
+            Some("/deslop".into()),
+            "prompt",
+            None,
+        );
         assert_eq!(
             agent.scrollback.len(),
             before,
@@ -1329,6 +1637,73 @@ mod tests {
             RenderBlock::UserPrompt(ub) => assert_eq!(ub.text, "/deslop"),
             other => panic!("expected user prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shim_paints_one_bubble_per_combined_segment() {
+        let mut app = test_app_with_agent();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.note_self_originated_prompt("p-combo");
+        let before = agent.scrollback.len();
+        apply_turn_start_shim(
+            agent,
+            "p-combo".into(),
+            Some("first\n\nsecond".into()),
+            "prompt",
+            Some(vec!["first".into(), "second".into()]),
+        );
+        assert_eq!(agent.scrollback.len(), before + 2);
+        assert_eq!(user_prompt_count(agent, "first"), 1);
+        assert_eq!(user_prompt_count(agent, "second"), 1);
+        assert_eq!(user_prompt_count(agent, "first\n\nsecond"), 0);
+        assert_eq!(
+            agent.session.in_flight_prompt.as_ref().unwrap().text,
+            "first\n\nsecond"
+        );
+    }
+
+    #[test]
+    fn shim_replaces_joined_echo_with_multi_bubbles() {
+        let mut app = test_app_with_agent();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.note_self_originated_prompt("p-combo");
+        agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("first\n\nsecond"));
+        apply_turn_start_shim(
+            agent,
+            "p-combo".into(),
+            Some("first\n\nsecond".into()),
+            "prompt",
+            Some(vec!["first".into(), "second".into()]),
+        );
+        assert_eq!(user_prompt_count(agent, "first"), 1);
+        assert_eq!(user_prompt_count(agent, "second"), 1);
+        assert_eq!(user_prompt_count(agent, "first\n\nsecond"), 0);
+    }
+
+    #[test]
+    fn shim_reuses_already_painted_combined_segments() {
+        let mut app = test_app_with_agent();
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.note_self_originated_prompt("p-combo");
+        agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("first"));
+        agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("second"));
+        let before = agent.scrollback.len();
+        apply_turn_start_shim(
+            agent,
+            "p-combo".into(),
+            Some("first\n\nsecond".into()),
+            "prompt",
+            Some(vec!["first".into(), "second".into()]),
+        );
+        assert_eq!(agent.scrollback.len(), before);
+        assert_eq!(user_prompt_count(agent, "first"), 1);
+        assert_eq!(user_prompt_count(agent, "second"), 1);
     }
 
     /// Number of `UserPrompt` blocks with exactly `text`.
@@ -1355,6 +1730,7 @@ mod tests {
                 kind: "prompt".into(),
                 text: "ty".into(),
                 position: 0,
+                combined_texts: None,
             }];
         }
         let effects = dispatch(
@@ -1377,7 +1753,7 @@ mod tests {
         );
         // The adoption shim reuses the painted block instead of double-pushing.
         agent.note_self_originated_prompt("p-ty");
-        apply_turn_start_shim(agent, "p-ty".into(), Some("ty".into()), "prompt");
+        apply_turn_start_shim(agent, "p-ty".into(), Some("ty".into()), "prompt", None);
         assert_eq!(
             user_prompt_count(agent, "ty"),
             1,
@@ -1399,6 +1775,7 @@ mod tests {
                 kind: "prompt".into(),
                 text: "idle row".into(),
                 position: 0,
+                combined_texts: None,
             }];
         // Idle (no running turn): expects_send_now_cancel is false — no arm, no paint.
         let _ = dispatch(
@@ -1423,6 +1800,7 @@ mod tests {
                 kind: "bash".into(),
                 text: "ls -la".into(),
                 position: 0,
+                combined_texts: None,
             }];
         }
         let _ = dispatch(
@@ -1468,8 +1846,8 @@ mod tests {
         ));
         agent
             .scrollback
-            .push_block(RenderBlock::system("1 command still running"));
-        apply_turn_start_shim(agent, "p-late".into(), Some("ty".into()), "prompt");
+            .push_block(RenderBlock::system("connection restored"));
+        apply_turn_start_shim(agent, "p-late".into(), Some("ty".into()), "prompt", None);
         assert_eq!(
             user_prompt_count(agent, "ty"),
             1,
@@ -1480,7 +1858,7 @@ mod tests {
             .scrollback
             .push_block(RenderBlock::agent_message("done"));
         agent.note_self_originated_prompt("p-again");
-        apply_turn_start_shim(agent, "p-again".into(), Some("ty".into()), "prompt");
+        apply_turn_start_shim(agent, "p-again".into(), Some("ty".into()), "prompt", None);
         assert_eq!(
             user_prompt_count(agent, "ty"),
             2,
@@ -1514,12 +1892,12 @@ mod tests {
         agent.note_self_originated_prompt("p-ty");
         push_send_now_user_block(agent, "p-thx", "prompt", "thx", false);
         push_send_now_user_block(agent, "p-ty", "prompt", "ty", false);
-        apply_turn_start_shim(agent, "p-thx".into(), Some("thx".into()), "prompt");
+        apply_turn_start_shim(agent, "p-thx".into(), Some("thx".into()), "prompt", None);
         assert_eq!(user_prompt_count(agent, "thx"), 1);
         agent
             .scrollback
             .push_block(RenderBlock::agent_message("You're welcome."));
-        apply_turn_start_shim(agent, "p-ty".into(), Some("ty".into()), "prompt");
+        apply_turn_start_shim(agent, "p-ty".into(), Some("ty".into()), "prompt", None);
         assert_eq!(user_prompt_count(agent, "ty"), 1);
     }
 
@@ -1538,9 +1916,9 @@ mod tests {
         // The sibling's block must survive the first adoption's dup sweep.
         agent.note_self_originated_prompt("p-1");
         agent.note_self_originated_prompt("p-2");
-        apply_turn_start_shim(agent, "p-1".into(), Some("go".into()), "prompt");
+        apply_turn_start_shim(agent, "p-1".into(), Some("go".into()), "prompt", None);
         assert_eq!(user_prompt_count(agent, "go"), 2);
-        apply_turn_start_shim(agent, "p-2".into(), Some("go".into()), "prompt");
+        apply_turn_start_shim(agent, "p-2".into(), Some("go".into()), "prompt", None);
         assert_eq!(user_prompt_count(agent, "go"), 2);
         assert!(agent.send_now_painted_blocks.is_empty());
     }
@@ -1563,7 +1941,13 @@ mod tests {
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         agent.note_self_originated_prompt("p-edit");
         push_send_now_user_block(agent, "p-edit", "prompt", "old text", false);
-        apply_turn_start_shim(agent, "p-edit".into(), Some("new text".into()), "prompt");
+        apply_turn_start_shim(
+            agent,
+            "p-edit".into(),
+            Some("new text".into()),
+            "prompt",
+            None,
+        );
         assert_eq!(user_prompt_count(agent, "old text"), 0);
         assert_eq!(user_prompt_count(agent, "new text"), 1);
     }
@@ -1584,6 +1968,7 @@ mod tests {
                 kind: "prompt".into(),
                 text: "original".into(),
                 position: 0,
+                combined_texts: None,
             }];
         }
         let _ = dispatch(
@@ -1602,7 +1987,13 @@ mod tests {
         );
         // Adoption captures the pre-edit mirror text; the edited paint wins.
         agent.note_self_originated_prompt("p-ed");
-        apply_turn_start_shim(agent, "p-ed".into(), Some("original".into()), "prompt");
+        apply_turn_start_shim(
+            agent,
+            "p-ed".into(),
+            Some("original".into()),
+            "prompt",
+            None,
+        );
         assert_eq!(user_prompt_count(agent, "edited body"), 1);
         assert_eq!(user_prompt_count(agent, "original"), 0);
         // The Ctrl+C rewind restore must match the on-screen (edited) text.
@@ -1625,7 +2016,7 @@ mod tests {
         push_send_now_user_block(agent, "p-echo", "prompt", "ty", false);
         // Echo slips in before the adoption (no promptId, skip not armed yet).
         agent.scrollback.push_block(RenderBlock::user_prompt("ty"));
-        apply_turn_start_shim(agent, "p-echo".into(), Some("ty".into()), "prompt");
+        apply_turn_start_shim(agent, "p-echo".into(), Some("ty".into()), "prompt", None);
         assert_eq!(user_prompt_count(agent, "ty"), 1);
     }
 
@@ -1644,6 +2035,7 @@ mod tests {
             kind: "prompt".into(),
             text: "held".into(),
             position: 0,
+            combined_texts: None,
         }];
         arm_send_now_and_paint(agent, "p-drop", None);
         assert!(agent.visible_queue_is_empty(), "armed row is hidden");
@@ -1669,7 +2061,7 @@ mod tests {
         push_send_now_user_block(agent, "p-owned", "prompt", "go", false);
         // p-other adopts with the same text but no map entry of its own.
         agent.note_self_originated_prompt("p-other");
-        apply_turn_start_shim(agent, "p-other".into(), Some("go".into()), "prompt");
+        apply_turn_start_shim(agent, "p-other".into(), Some("go".into()), "prompt", None);
         assert_eq!(
             user_prompt_count(agent, "go"),
             2,
@@ -1746,7 +2138,7 @@ mod tests {
         );
 
         // Drain while loading_replay is true → must be blocked.
-        let effects = maybe_drain_queue(app.agents.get_mut(&id).unwrap());
+        let effects = maybe_drain_queue(app.agents.get_mut(&id).unwrap()).effects;
         assert!(
             effects.is_empty(),
             "drain must be blocked during loading_replay"
@@ -1761,7 +2153,7 @@ mod tests {
         app.agents.get_mut(&id).unwrap().session.loading_replay = false;
 
         // Drain again → should succeed now.
-        let effects = maybe_drain_queue(app.agents.get_mut(&id).unwrap());
+        let effects = maybe_drain_queue(app.agents.get_mut(&id).unwrap()).effects;
         assert_eq!(effects.len(), 1);
         assert!(
             matches!(&effects[0], Effect::SendPromptBlocks { .. }),
@@ -1923,11 +2315,12 @@ mod tests {
         assert_eq!(count_parked(agent), 1, "one marker per park");
     }
 
-    /// A re-park re-pushes the marker when intervening content buried the
-    /// previous one — otherwise the second park renders as a dead session.
+    /// A re-park after new PARENT OUTPUT (streamed through the tracker, so
+    /// the agent-output epoch bumps) pushes a fresh marker for the new park
+    /// episode — otherwise the second park renders as a dead session.
     #[test]
-    fn parked_marker_repushes_on_repark_after_buried_marker() {
-        use crate::scrollback::block::RenderBlock;
+    fn parked_marker_repushes_on_repark_after_new_parent_output() {
+        use crate::acp::meta::NotificationMeta;
 
         let mut app = test_app_with_agent();
         let id = AgentId(0);
@@ -1938,24 +2331,32 @@ mod tests {
         agent.maybe_push_parked_marker();
         assert_eq!(count_parked(agent), 1);
         agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 1, "current tail must dedupe");
+        assert_eq!(count_parked(agent), 1, "same episode must dedupe");
 
         complete_task_output_wait_call(agent, "wait-1");
         assert!(!agent.renders_parked(), "no parked look between parks");
-        agent
-            .scrollback
-            .push_block(RenderBlock::agent_message("between-parks content"));
+        // Between-parks content streams through the tracker (the production
+        // path), bumping the agent-output epoch.
+        assert!(agent.session.tracker.handle_update(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new("between-parks content")
+            ),)),
+            &NotificationMeta::default(),
+            &mut agent.scrollback,
+        ));
 
         simulate_task_output_wait_call(agent, "wait-2", "bg-1", 600_000);
         agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 2, "buried marker re-pushes on re-park");
+        assert_eq!(count_parked(agent), 2, "new episode pushes a fresh marker");
         assert!(agent.renders_parked());
     }
 
-    /// Content landing during a park makes the tail stale — the marker
-    /// restates, then the restated tail dedupes again.
+    /// Rows landing during a park WITHOUT parent output (chips and other
+    /// direct scrollback pushes) stay in the same park episode — the marker
+    /// is never re-pushed under them; the "… still running" status row carries
+    /// the ongoing-work story instead.
     #[test]
-    fn parked_marker_restates_when_tail_goes_stale_mid_park() {
+    fn parked_marker_stays_single_when_rows_land_mid_park() {
         use crate::scrollback::block::RenderBlock;
 
         let mut app = test_app_with_agent();
@@ -1967,13 +2368,15 @@ mod tests {
         agent.maybe_push_parked_marker();
         assert_eq!(count_parked(agent), 1);
 
-        agent
-            .scrollback
-            .push_block(RenderBlock::agent_message("mid-park chip"));
+        agent.scrollback.push_block(RenderBlock::bg_task_completed(
+            "sleep 5",
+            "bg-2",
+            std::time::Duration::from_secs(5),
+        ));
         agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 2, "stale tail restates the marker");
+        assert_eq!(count_parked(agent), 1, "chips never re-push the marker");
         agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 2, "restated tail dedupes again");
+        assert_eq!(count_parked(agent), 1, "still the same park episode");
     }
 
     /// A re-park whose previous marker is still the transcript tail pushes
@@ -2057,10 +2460,11 @@ mod tests {
         assert_eq!(count_parked(agent), 0, "forgone stays silent all turn");
     }
 
-    /// A work-count change makes the tail's marker stale — it restates, and
-    /// the restatement dedupes an immediate re-park.
+    /// A work-count change never touches the marker — the counts live on the
+    /// status row's "… still running" cue, so the transcript stays quiet while
+    /// work finishes mid-park.
     #[test]
-    fn count_change_restates_marker_and_dedupes_repark() {
+    fn count_change_never_restates_marker() {
         let mut app = test_app_with_agent();
         let id = AgentId(0);
         dispatch(Action::SendPrompt("first".into()), &mut app);
@@ -2077,19 +2481,12 @@ mod tests {
         simulate_task_output_wait_call(agent, "wait-1", "bg-1", 30_000);
         agent.maybe_push_parked_marker();
         assert_eq!(count_parked(agent), 1);
+        assert_eq!(agent.watchers().commands, 2);
 
         agent.session.bg_tasks.remove("bg-2");
         agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 2, "count change restates the marker");
-
-        complete_task_output_wait_call(agent, "wait-1");
-        simulate_task_output_wait_call(agent, "wait-2", "bg-1", 30_000);
-        agent.maybe_push_parked_marker();
-        assert_eq!(
-            count_parked(agent),
-            2,
-            "the restated tail dedupes the immediate re-park"
-        );
+        assert_eq!(count_parked(agent), 1, "count changes never restate");
+        assert_eq!(agent.watchers().commands, 1, "the cue counts down instead");
     }
 
     #[test]
@@ -2114,6 +2511,7 @@ mod tests {
             kind: "prompt".into(),
             text: "send now payload".into(),
             position: 0,
+            combined_texts: None,
         }];
         assert!(agent.visible_queue_is_empty());
         assert!(agent.has_held_user_queue());
@@ -2314,6 +2712,7 @@ mod tests {
             kind: "bash".into(),
             text: "server bash".into(),
             position: 0,
+            combined_texts: None,
         }];
         agent.session.pending_prompts.clear();
         agent.session.enqueue_bash_command("still bash".into());
@@ -2346,6 +2745,7 @@ mod tests {
                 kind: "prompt".into(),
                 text: "send now payload".into(),
                 position: 0,
+                combined_texts: None,
             },
             crate::app::prompt_queue::QueueEntryWire {
                 id: "held-1".into(),
@@ -2355,6 +2755,7 @@ mod tests {
                 kind: "prompt".into(),
                 text: "genuine held".into(),
                 position: 1,
+                combined_texts: None,
             },
         ];
         agent.session.current_prompt_id = Some(running);
@@ -2394,6 +2795,7 @@ mod tests {
                 kind: "prompt".into(),
                 text: "second held".into(),
                 position: 2,
+                combined_texts: None,
             });
         assert_eq!(agent.held_queue_count(), 2);
         agent.sync_queue_pane();
@@ -2430,6 +2832,7 @@ mod tests {
             kind: "prompt".into(),
             text: "send now payload".into(),
             position: 0,
+            combined_texts: None,
         }];
         assert!(
             agent.has_held_user_queue(),
@@ -2645,11 +3048,12 @@ mod tests {
     }
 
     /// The parked push is the unified marker: a static `TurnCompleted` event
-    /// block flagged `parked`, stamped with the turn's pid and carrying a
-    /// snapshot of the wait's work counts. The real final marker later
+    /// block flagged `parked`, stamped with the turn's pid. It carries no
+    /// work counts — the persistent "… still running" status row above the
+    /// prompt tracks the still-running work. The real final marker later
     /// pushes separately (two static lines — main's park shape).
     #[test]
-    fn parked_marker_is_static_completed_snapshot_with_counts() {
+    fn parked_marker_is_static_completed_snapshot() {
         use crate::scrollback::block::RenderBlock;
         use crate::scrollback::blocks::SessionEvent;
 
@@ -2681,9 +3085,7 @@ mod tests {
             block.stop_hooks.is_empty(),
             "a parked marker carries no hooks"
         );
-        let work = block.end_work.expect("park snapshots the work counts");
-        assert_eq!(work.running_commands, 1);
-        assert_eq!(work.running_monitors, 0);
-        assert_eq!(work.running_subagents, 0);
+        // The running bg command shows in the watchers cue, not the marker.
+        assert_eq!(agent.watchers().commands, 1);
     }
 }

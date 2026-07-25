@@ -492,6 +492,16 @@ mod link_click_tests {
         banner_height: u16,
         cols: u16,
     ) -> Buffer {
+        draw_frame_privacy(agent, reg, announcements, banner_height, cols, false)
+    }
+    fn draw_frame_privacy(
+        agent: &mut AgentView,
+        reg: &ActionRegistry,
+        announcements: &[xai_grok_announcements::RemoteAnnouncement],
+        banner_height: u16,
+        cols: u16,
+        privacy_banner: bool,
+    ) -> Buffer {
         let area = Rect::new(0, 0, cols, 30);
         let bundle = crate::app::bundle::BundleState::default();
         let mut buf = Buffer::empty(area);
@@ -503,16 +513,18 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            banner_height,
-            announcements,
-            &std::collections::BTreeSet::new(),
-            None,
+            crate::app::agent_view::BannerSlotParams {
+                height: banner_height,
+                announcements,
+                hidden_ids: &std::collections::BTreeSet::new(),
+                privacy_banner,
+                mouse_pos: None,
+                tip: None,
+            },
             &bundle,
             false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         buf
     }
@@ -557,6 +569,77 @@ mod link_click_tests {
             !matches!(outcome, InputOutcome::Action(Action::AnnouncementsHide)),
             "click where [hide] used to be must not hide-and-persist under a dropdown"
         );
+    }
+    /// Privacy upsell banner: when the caller passes `privacy_banner: true`,
+    /// the render layer gives it the slot (even over an announcement — the
+    /// critical-outranks-privacy ranking lives in `AppView::draw`, which
+    /// never passes `true` while a critical announcement is live), arms its
+    /// three rects, and clicks dispatch the banner actions. Turning it off
+    /// clears the rects.
+    #[test]
+    fn privacy_banner_owns_slot_and_clicks_dispatch() {
+        let reg = ActionRegistry::defaults();
+        let mut agent = make_agent();
+        agent.last_terminal_size = (80, 30);
+        let critical = [xai_grok_announcements::RemoteAnnouncement {
+            severity: Some("critical".into()),
+            title: Some("ZZCRIT".into()),
+            message: Some("outage".into()),
+            ..Default::default()
+        }];
+        let buf = draw_frame_privacy(&mut agent, &reg, &critical, 2, 80, true);
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.contains("Help improve Grok"), "banner copy painted");
+        assert!(
+            !text.contains("ZZCRIT"),
+            "critical announcement yields the slot to the privacy banner"
+        );
+        assert!(
+            agent.hit_announcement_hide.rect.is_none(),
+            "announcement [hide] must not be clickable under the privacy banner"
+        );
+        let rect = agent
+            .privacy_banner
+            .hit_accept
+            .rect
+            .expect("accept rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::PrivacyBannerAccept)
+        ));
+        let rect = agent
+            .privacy_banner
+            .hit_customize
+            .rect
+            .expect("customize rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::PrivacyBannerCustomize)
+        ));
+        let rect = agent
+            .privacy_banner
+            .hit_legal
+            .rect
+            .expect("legal rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::OpenUrl(ref url))
+                if url == crate::views::privacy_banner::PRIVACY_BANNER_LEGAL_URL
+        ));
+        draw_frame_privacy(&mut agent, &reg, &critical, 2, 80, false);
+        assert!(agent.privacy_banner.hit_accept.rect.is_none());
+        assert!(agent.privacy_banner.hit_customize.rect.is_none());
+        assert!(agent.privacy_banner.hit_legal.rect.is_none());
+        assert!(agent.hit_announcement_hide.rect.is_some());
     }
     /// Promo twin of the [hide] suppression test: the [label] CTA rect must
     /// also drop under an open dropdown so a dropdown click cannot open a URL
@@ -650,6 +733,38 @@ mod link_click_tests {
             "click where stop used to be must not cancel the turn under a dropdown"
         );
     }
+    /// Clicking the still-running watcher cue toggles the tasks pane like
+    /// Ctrl+G; only the first click that reveals the pane shows the one-time
+    /// shortcut toast.
+    #[test]
+    fn watching_cue_click_opens_tasks_pane_with_one_time_shortcut_toast() {
+        let reg = ActionRegistry::defaults();
+        let mut agent = make_agent();
+        agent.last_terminal_size = (80, 30);
+        super::test_fixtures::add_running_bg_task(&mut agent);
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let rect = agent.hit_watching_cue.rect.expect("cue rect must be armed");
+        let click = Event::Mouse(mouse_down(rect.x + 1, rect.y));
+        let _ = agent.handle_input(&click, &reg);
+        assert!(agent.tasks.overlay.focused);
+        assert!(agent.toast.is_none(), "focus-only click must not toast");
+        agent.tasks.overlay.hide();
+        agent.tasks.on_state_change();
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let _ = agent.handle_input(&click, &reg);
+        assert!(agent.tasks.overlay.visible && agent.tasks.overlay.focused);
+        assert_eq!(agent.active_pane, AgentPane::Tasks);
+        let toast = agent.toast.clone().map(|(msg, _)| msg);
+        assert_eq!(toast.as_deref(), Some("Tip: Ctrl+G toggles the tasks pane"));
+        agent.toast = None;
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let _ = agent.handle_input(&click, &reg);
+        assert!(!agent.tasks.overlay.visible);
+        draw_banner_frame(&mut agent, &reg, &[], 0);
+        let _ = agent.handle_input(&click, &reg);
+        assert!(agent.tasks.overlay.visible);
+        assert!(agent.toast.is_none(), "toast fires only once per session");
+    }
     /// Bg twin: the `[↓]` demote button rides the same turn-status row, so its
     /// rect must drop under an open dropdown too — a dropdown click must never
     /// background the running execute tool.
@@ -697,6 +812,24 @@ mod link_click_tests {
         assert!(
             !matches!(outcome, InputOutcome::Action(Action::DemoteToBackground)),
             "click where the bg button used to be must not demote under a dropdown"
+        );
+    }
+    #[test]
+    fn subagent_view_suppresses_background_button() {
+        let reg = ActionRegistry::defaults();
+        let mut parent = make_agent();
+        let mut child = make_agent();
+        super::test_fixtures::add_running_execute(&mut child);
+        parent
+            .subagent_views
+            .insert("child-sid".into(), Box::new(child));
+        assert!(!parent.subagent_views["child-sid"].is_subagent_view);
+        parent.open_subagent_fullscreen("child-sid".into());
+        let child = parent.subagent_views.get_mut("child-sid").unwrap();
+        draw_banner_frame(child, &reg, &[], 0);
+        assert!(
+            child.hit_bg_button.rect.is_none(),
+            "read-only child view must not advertise a background button"
         );
     }
     /// Header twin: the top-header upgrade CTA rect must drop under an open
@@ -1553,8 +1686,16 @@ mod link_click_tests {
         let registry = ActionRegistry::defaults();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let outcome = agent.handle_scrollback_key(&enter, &registry);
-        assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
-        assert!(agent.inline_edit.is_some(), "Enter must start inline edit");
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED {
+            assert!(matches!(outcome, InputOutcome::Changed), "got {outcome:?}");
+            assert!(agent.inline_edit.is_some(), "Enter must start inline edit");
+        } else {
+            assert!(agent.inline_edit.is_none(), "feature gated off: no edit");
+            assert!(
+                matches!(outcome, InputOutcome::Action(Action::OpenBlockViewer)),
+                "gated off: Enter must fall through to OpenBlockViewer, got {outcome:?}"
+            );
+        }
     }
     /// Bash prompts are not inline-editable: Enter falls through to the
     /// registry (OpenBlockViewer) exactly as before.
@@ -1575,8 +1716,10 @@ mod link_click_tests {
             "expected fall-through to OpenBlockViewer, got {outcome:?}"
         );
     }
-    /// Double-click on a user prompt enters inline edit mode (replacing the
-    /// old fold-toggle for editable prompts).
+    /// Double-click on a user prompt: enters inline edit when the feature is
+    /// enabled; while gated off it does NOT edit (falls through to the fold
+    /// arm), leaving the prompt free for text selection. Written for both flag
+    /// states so it stays valid when INLINE_EDIT_ENABLED is flipped back on.
     #[test]
     fn double_click_on_user_prompt_enters_inline_edit() {
         let mut agent = make_agent();
@@ -1592,10 +1735,17 @@ mod link_click_tests {
         let now = std::time::Instant::now();
         (agent.last_click, _) = agent.handle_scrollback_click(now, 0, false);
         let _ = agent.handle_scrollback_click(now + std::time::Duration::from_millis(10), 0, false);
-        assert!(
-            agent.inline_edit.is_some(),
-            "double-click must start inline edit"
-        );
+        if crate::app::inline_edit::INLINE_EDIT_ENABLED {
+            assert!(
+                agent.inline_edit.is_some(),
+                "double-click must start inline edit"
+            );
+        } else {
+            assert!(
+                agent.inline_edit.is_none(),
+                "feature gated off: double-click must not edit"
+            );
+        }
     }
     #[test]
     fn enter_on_subagent_group_header_falls_through_to_group_toggle() {
@@ -2087,16 +2237,11 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            0,
-            &[],
-            &std::collections::BTreeSet::new(),
-            None,
+            crate::app::agent_view::BannerSlotParams::none(),
             &bundle,
             false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         buf
     }
@@ -2190,16 +2335,14 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            0,
-            &[],
-            &std::collections::BTreeSet::new(),
-            Some("ZZSESSIONTIPZZ never shown in agent view"),
+            crate::app::agent_view::BannerSlotParams {
+                tip: Some("ZZSESSIONTIPZZ never shown in agent view"),
+                ..crate::app::agent_view::BannerSlotParams::none()
+            },
             &bundle,
             false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         let tip_y = (0..tall.height)
             .find(|&y| buffer_row(&buf, tall.width, y).contains("Queued"))
@@ -2266,16 +2409,18 @@ mod link_click_tests {
             &mut scratch,
             None,
             false,
-            2,
-            &critical,
-            &std::collections::BTreeSet::new(),
-            Some(long_tip.as_str()),
+            crate::app::agent_view::BannerSlotParams {
+                height: 2,
+                announcements: &critical,
+                hidden_ids: &std::collections::BTreeSet::new(),
+                privacy_banner: false,
+                mouse_pos: None,
+                tip: Some(long_tip.as_str()),
+            },
             &bundle,
             false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
         let frame: String = (0..tall.height)
             .map(|y| buffer_row(&buf, tall.width, y))

@@ -52,14 +52,16 @@ impl AuthSnapshot for AuthManager {
 /// Capability to run the operator's external auth binary. Split out of
 /// [`AuthSnapshot`] so OIDC refreshers (read-only) physically cannot reach it
 /// (interface segregation); only [`ExternalBinaryRefresher`] depends on it.
+#[async_trait::async_trait]
 pub(crate) trait ExternalCommandRunner: Send + Sync {
     /// Run the external auth binary and return the parsed output.
-    fn run_external_command(&self, command: &str) -> Option<GrokAuth>;
+    async fn run_external_command(&self, command: &str) -> Option<GrokAuth>;
 }
 
+#[async_trait::async_trait]
 impl ExternalCommandRunner for AuthManager {
-    fn run_external_command(&self, command: &str) -> Option<GrokAuth> {
-        self.run_external_refresh_command(command)
+    async fn run_external_command(&self, command: &str) -> Option<GrokAuth> {
+        self.run_external_refresh_command(command).await
     }
 }
 
@@ -92,8 +94,9 @@ pub(crate) enum RefreshOutcome {
     Success(Box<GrokAuth>),
     /// Terminal failure (e.g. invalid_grant), or a transient escalated to
     /// `Other` after repeated blips. Caller records a verdict scoped to the
-    /// rejected credential and retains it (`RefreshTokenRejected` is sticky,
-    /// the rest age out past the TTL).
+    /// rejected credential. `refresh_chain` discards AT+RT only for
+    /// `RefreshTokenRejected` (sticky until login); `ClientRejected` / `Other`
+    /// retain credentials and age out past the TTL.
     PermanentFailure {
         error: crate::auth::error::RefreshTokenFailedError,
         /// Key of the credential the refresher actually sent to the IdP, so

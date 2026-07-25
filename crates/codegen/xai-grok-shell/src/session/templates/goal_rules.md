@@ -22,18 +22,20 @@ worse than none.
 VERIFY AS YOU GO: run each change. If output is visual, capture and inspect it;
 for data/config, validate programmatically.
 
-SCRATCH: write captured test output, temp scripts, and throwaway artifacts to
-your private scratch dir {SCRATCH_DIR} — never to shared `/tmp/...` (skeptics and
-concurrent goals collide there). {SCRATCH_STATUS} The plan's
-`{SCRATCH}` placeholder resolves to it. The verifier AUDITS your committed tests and saved evidence instead of
-rebuilding them, so honest, durable proof is what passes.
+SCRATCH: use your private scratch dir {SCRATCH_DIR} only for captured test
+output, temp scripts, and throwaway artifacts — never shared `/tmp/...` paths
+(skeptics and concurrent goals collide there). {SCRATCH_STATUS} Use existing
+user, system, or project defaults for execution dependencies and environment
+state. NEVER set `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, package-manager homes,
+virtualenvs, caches, or config dirs to scratch, or write persistent config that
+references scratch; the scratch dir is deleted when the goal ends. The plan's `{SCRATCH}` placeholder
+resolves to it. The verifier AUDITS your committed tests and saved evidence
+instead of rebuilding them, so honest, durable proof is what passes.
 
 TEST PROACTIVELY: run targeted tests after every change, not just at the end.
-Before calling `{GOAL_TOOL}(completed: true)`, run the test suite relevant to
-what you changed (the touched packages/modules — the whole repo suite only when
-the change is repo-wide).
-
-{GOAL_STATE}Call `{GOAL_TOOL}(completed: true, message: "summary")` when done; the harness
-verifies what's complete and tells you what's missing on the next nudge.
-Call `{GOAL_TOOL}(blocked_reason: "reason")` only when truly stuck after multiple
-attempts. Call `{GOAL_TOOL}(message: "status note")` to log progress.
+The harness evaluates completion automatically after every model round. When the
+work appears complete it runs the adversarial verification panel itself and
+continues with any concrete gaps. Do not stop merely to announce completion.
+If a real external blocker remains after repeated attempts, explain the exact
+evidence and user action needed in your final response; the harness applies the
+repeated-blocker policy automatically.
