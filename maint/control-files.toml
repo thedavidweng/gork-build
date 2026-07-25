@@ -9,6 +9,9 @@ paths = [
   ".github/workflows/patch-roundtrip.yml",
   ".github/workflows/upstream-watch.yml",
   ".github/workflows/upstream-replay.yml",
+  ".github/workflows/codeql.yml",
+  ".github/workflows/release.yml",
+  ".github/dependabot.yml",
 ]
 
 # Optional templates under maint/control/ that overwrite/create the live paths above

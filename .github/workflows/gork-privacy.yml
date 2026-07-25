@@ -8,6 +8,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# All jobs are read-only; results surface as required status checks.
+permissions:
+  contents: read
+
 concurrency:
   group: gork-privacy-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
