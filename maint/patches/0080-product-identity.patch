@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:03:26 -0700
+Subject: [PATCH] product-identity: CLI binary name and entry surface
+
+Gork-Patch-Id: product-identity
+Gork-Invariant: product-cli-gork
+Gork-Risk: medium
+---
+ crates/codegen/xai-grok-pager-bin/Cargo.toml  | 18 ++++++-----
+ crates/codegen/xai-grok-pager-bin/src/main.rs | 20 ++++++------
+ .../xai-grok-pager/src/completions_cmd.rs     | 31 +++++++++++++------
+ 3 files changed, 44 insertions(+), 25 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
+index 5cb2c00930c8c0ea31eae949cd028d0ccbdcff8a..f2d1fdbbfd84fe9d3f6f33fe5c02fb8d08244c17 100644
+--- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
++++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
+@@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
+ version = "0.2.111"
+ edition.workspace = true
+ license = "Apache-2.0"
+-authors = ["xAI"]
+-default-run = "xai-grok-pager"
++authors = ["Gork Build contributors"]
++default-run = "gork"
++
++# Composition-root binary for the Gork Build TUI (privacy fork of Grok Build).
++# Primary artifact: `gork`. Alias `xai-grok-pager` kept for path/compat.
++# This package links the pager library and optional `xai-grok-pager-minimal`
++# render mode (minimal depends on pager, so pager cannot depend back — cargo
++# cycle). The binary installs the minimal-mode IoC hooks at startup.
++[[bin]]
++name = "gork"
++path = "src/main.rs"
+ 
+-# Composition-root binary for the Grok Build TUI. The artifact is still named
+-# `xai-grok-pager`. This package exists so the binary can link both the pager
+-# library and the optional `xai-grok-pager-minimal` render mode: `minimal`
+-# depends on `xai-grok-pager`, so the pager library cannot depend back on it
+-# (cargo cycle). The binary installs the minimal-mode IoC hooks at startup.
+ [[bin]]
+ name = "xai-grok-pager"
+ path = "src/main.rs"
+diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
+index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadfb3fa7e93 100644
+--- a/crates/codegen/xai-grok-pager-bin/src/main.rs
++++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
+@@ -3,7 +3,8 @@
+     unused_variables,
+     unused_mut,
+     unreachable_code,
+-    dead_code
++    dead_code,
++    clippy::possible_missing_else
+ )]
+ #[cfg(all(feature = "jemalloc", unix))]
+ #[global_allocator]
+@@ -154,7 +155,7 @@ async fn run_setup_command(json: bool) {
+     if !managed_config::has_principal() {
+         eprintln!("No deployment key or team sign-in found.");
+         eprintln!();
+-        eprintln!("To install managed configuration, sign in with a team using `grok login`,");
++        eprintln!("To install managed configuration, sign in with a team using `gork login`,");
+         eprintln!("or set a deployment key:");
+         eprintln!();
+         if cfg!(unix) {
+@@ -162,7 +163,7 @@ async fn run_setup_command(json: bool) {
+         } else {
+             eprintln!("  $env:GROK_DEPLOYMENT_KEY=\"<your-key>\"");
+         }
+-        eprintln!("  grok setup");
++        eprintln!("  gork setup");
+         eprintln!();
+         eprintln!("Or add the key to ~/.grok/config.toml:");
+         eprintln!();
+@@ -202,7 +203,7 @@ async fn run_setup_command(json: bool) {
+         }
+         SetupOutcome::Skipped => {
+             eprintln!(
+-                "Managed configuration was not applied this run (another process held the apply lock, or the credential changed during the fetch). Run `grok setup` again."
++                "Managed configuration was not applied this run (another process held the apply lock, or the credential changed during the fetch). Run `gork setup` again."
+             );
+         }
+         SetupOutcome::Failed(e) => {
+@@ -426,14 +427,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
+         WorkspaceGate::Enabled => {}
+         WorkspaceGate::Disabled => {
+             anyhow::bail!(
+-                "`grok workspace` is not enabled for this account \
++                "`gork workspace` is not enabled for this account \
+              (gated by a server-side feature flag that is currently off)."
+             )
+         }
+         WorkspaceGate::Unknown => {
+             anyhow::bail!(
+-                "Could not load your settings for `grok workspace`. Check your \
+-             network connection (run `grok login` if you are signed out), then \
++                "Could not load your settings for `gork workspace`. Check your \
++             network connection (run `gork login` if you are signed out), then \
+              try again."
+             )
+         }
+@@ -1621,7 +1622,8 @@ fn install_heap_profile_hooks() {
+ }
+ fn version_text(channel_label: &str) -> String {
+     format!(
+-        "grok {}\n",
++        "{} {}\n",
++        xai_grok_version::PRODUCT_CLI,
+         xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
+     )
+ }
+@@ -2331,7 +2333,7 @@ mod tests {
+             let mut output = Vec::new();
+             write_version(&mut output, label).unwrap();
+             let output = String::from_utf8(output).unwrap();
+-            assert!(output.starts_with("grok "));
++            assert!(output.starts_with(&format!("{} ", xai_grok_version::PRODUCT_CLI)));
+             assert!(output.contains(env!("VERSION_WITH_COMMIT")));
+             assert!(output.ends_with(expected_suffix), "{output:?}");
+         }
+diff --git a/crates/codegen/xai-grok-pager/src/completions_cmd.rs b/crates/codegen/xai-grok-pager/src/completions_cmd.rs
+index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab4eba9241 100644
+--- a/crates/codegen/xai-grok-pager/src/completions_cmd.rs
++++ b/crates/codegen/xai-grok-pager/src/completions_cmd.rs
+@@ -58,18 +58,25 @@ fn fix_zsh_root_prompt_positional(script: &str) -> String {
+             out.push_str(line);
+             out.push('\n');
+         });
++    // The curcontext pattern embeds the command name clap generated the
++    // script under — Gork Build ships as PRODUCT_CLI ("gork"), so the
++    // pattern must be built from it, not hard-coded to "grok".
++    let cli = xai_grok_version::PRODUCT_CLI;
+     for (from, to) in [
+         (
+-            r#"words=($line[2] "${words[@]}")"#,
+-            r#"words=($line[1] "${words[@]}")"#,
++            format!(r#"words=($line[2] "${{words[@]}}")"#),
++            format!(r#"words=($line[1] "${{words[@]}}")"#),
+         ),
+         (
+-            r#"curcontext="${curcontext%:*:*}:grok-command-$line[2]:""#,
+-            r#"curcontext="${curcontext%:*:*}:grok-command-$line[1]:""#,
++            format!(r#"curcontext="${{curcontext%:*:*}}:{cli}-command-$line[2]:""#),
++            format!(r#"curcontext="${{curcontext%:*:*}}:{cli}-command-$line[1]:""#),
++        ),
++        (
++            "case $line[2] in".to_string(),
++            "case $line[1] in".to_string(),
+         ),
+-        (r#"case $line[2] in"#, r#"case $line[1] in"#),
+     ] {
+-        out = out.replacen(from, to, 1);
++        out = out.replacen(&from, &to, 1);
+     }
+     out
+ }
+@@ -103,6 +110,7 @@ mod tests {
+         );
+ 
+         let fixed = fix_zsh_root_prompt_positional(&raw);
++        let cli = xai_grok_version::PRODUCT_CLI;
+         assert!(
+             !fixed.contains("::prompt"),
+             "prompt positional must not appear in the emitted zsh script"
+@@ -112,15 +120,20 @@ mod tests {
+             "root dispatch must be shifted to $line[1]"
+         );
+         assert!(
+-            fixed.contains(r#"curcontext="${curcontext%:*:*}:grok-command-$line[1]:""#),
++            fixed.contains(&format!(
++                r#"curcontext="${{curcontext%:*:*}}:{cli}-command-$line[1]:""#
++            )),
+             "root dispatch context must use $line[1]"
+         );
+         // Subcommand dispatch blocks (already on $line[1]) must survive.
+         assert!(
+-            fixed.contains("grok-worktree-command-$line[1]"),
++            fixed.contains(&format!("{cli}-worktree-command-$line[1]")),
+             "nested subcommand dispatch must be untouched"
+         );
+         // The subcommand list itself must still be offered at the root.
+-        assert!(fixed.contains("_grok_commands"), "root command list intact");
++        assert!(
++            fixed.contains(&format!("_{cli}_commands")),
++            "root command list intact"
++        );
+     }
+ }
+
+base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
+prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
+prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
+prerequisite-patch-id: a52276cc5d5a3f41e35f0a9442966519c69eef05
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
+prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
+-- 
+2.50.1 (Apple Git-155)
+
