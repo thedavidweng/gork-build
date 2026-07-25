@@ -30,7 +30,7 @@ index 04b543c2d1fc62866d3dfe733d2f2862c72b4fd4..6d0fa1e856b45eb31fb04014f1b0e0b1
  [features]
  default = []
 diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
-index c2cd3a72f3080afbe36ebaa1b1f3c54ab8b85e7c..880958e316e088ec445537d7b599bcea7e08bff7 100644
+index 65101dae6105f415f306d09d8ba700cf8bdf166e..e7ab6b074bbf2a206442245eabb7bf992811848c 100644
 --- a/crates/codegen/xai-grok-telemetry/src/client.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/client.rs
 @@ -75,14 +75,10 @@ impl TelemetryClient {
@@ -53,7 +53,7 @@ index c2cd3a72f3080afbe36ebaa1b1f3c54ab8b85e7c..880958e316e088ec445537d7b599bcea
              .filter(|s| !s.is_empty())
              .map(|k| deployment_id_from_key(&k));
 diff --git a/crates/codegen/xai-grok-telemetry/src/config.rs b/crates/codegen/xai-grok-telemetry/src/config.rs
-index b99c7c80c45c5332b4e14e7bf881cacd610c3ec4..e9d5abc8c77a3f7371c5baec6a017494cbe11e96 100644
+index 6594fb2fc88f47f4b62efc6bedc57244a8409d75..bddd060baf2a32a94fbc129e916ceaa353f5a2c5 100644
 --- a/crates/codegen/xai-grok-telemetry/src/config.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/config.rs
 @@ -127,23 +127,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
@@ -236,8 +236,8 @@ index 94a1a836706b674827af4fcde1c61bfab17505d1..437e3634849f2e8ec7b473111b2e36c5
      }
  }
 
-base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
-prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
+base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
+prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
 -- 
 2.50.1 (Apple Git-155)
 

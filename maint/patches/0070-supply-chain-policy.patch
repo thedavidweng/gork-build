@@ -49,12 +49,12 @@ index 0000000000000000000000000000000000000000..66bfd5ef4a7150978405ef619df18ef0
 +    "RUSTSEC-2026-0195",
 +]
 
-base-commit: 8adf9013a0929e5c7f1d4e849492d2387837a28d
-prerequisite-patch-id: b0232bb86a33d8cd46859e6ee3c48ce71192a7e5
+base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
+prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: e9f437719202ee6c29c0e20ba04de59849de4855
-prerequisite-patch-id: 5e0d8916332ea3d460fbb3ebef777f1e573cd4ca
-prerequisite-patch-id: 3143e6bf4cce3e3a6e18704377628cb32daa9645
+prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
+prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
+prerequisite-patch-id: a52276cc5d5a3f41e35f0a9442966519c69eef05
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 -- 
