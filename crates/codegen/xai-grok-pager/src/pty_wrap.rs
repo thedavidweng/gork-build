@@ -1,4 +1,4 @@
-//! Local PTY wrapper: the engine behind `gork wrap` (see [`crate::wrap_cmd`]).
+//! Local PTY wrapper: the engine behind `grok wrap` (see [`crate::wrap_cmd`]).
 //!
 //! Spawns a command inside a local pseudo-terminal and pipes its output
 //! through `crate::wrap_filter::Osc52Filter`, which intercepts OSC 52
@@ -22,7 +22,7 @@ use crate::wrap_restore::ModeTracker;
 
 /// Run an arbitrary command inside a local PTY with OSC 52 output filtering.
 ///
-/// This is the engine behind `gork wrap`: it spawns
+/// This is the engine behind `grok wrap`: it spawns
 /// `program` (with `args`) attached to a local pseudo-terminal, forwards the
 /// outer terminal's size changes to it, and filters its output through
 /// `Osc52Filter`, which intercepts OSC 52 clipboard sequences and writes
@@ -76,7 +76,7 @@ pub(crate) fn run_wrapped_command(program: &str, args: &[String]) -> Result<i32>
     // channel. Cross-thread use of portable-pty's `Write` impl observed EIO
     // (errno 5) on macOS even for small inject payloads; confining `write_all`
     // to a single owner thread avoids that. Handles are intentionally
-    // detached — `gork wrap` is short-lived and exits with the child.
+    // detached — `grok wrap` is short-lived and exits with the child.
     let mut pty_reader = pair.master.try_clone_reader()?;
 
     // NOTE: we intentionally do NOT block SIGWINCH here. The resize handler

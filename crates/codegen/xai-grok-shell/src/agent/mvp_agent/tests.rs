@@ -2710,16 +2710,11 @@ async fn auth_info_returns_profile_when_token_expired() {
     assert_eq!(info["firstName"], "Test");
 }
 #[tokio::test]
-async fn data_collection_disabled_for_normal_user_in_privacy_build() {
-    // Gork Build: research data collection is hard-off for every account.
+async fn data_collection_enabled_for_normal_user() {
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
     assert!(
-        agent.is_data_collection_disabled(),
-        "Gork Build must disable research data collection for all users"
-    );
-    assert!(
-        agent.trace_upload_config_snapshot().is_none(),
-        "trace uploads must be disabled in the privacy build"
+        !agent.is_data_collection_disabled(),
+        "normal user must have data collection enabled"
     );
 }
 #[tokio::test]
@@ -2776,7 +2771,7 @@ async fn data_collection_disabled_for_zdr_plus_opt_out() {
     );
 }
 #[tokio::test]
-async fn data_collection_disabled_even_for_non_zdr_team_blocks_in_privacy_build() {
+async fn data_collection_enabled_for_non_zdr_team_with_unrelated_blocks() {
     let agent = build_agent_with_auth(crate::auth::GrokAuth {
         team_blocked_reasons: vec![
             "BLOCKED_REASON_BILLING".into(),
@@ -2785,8 +2780,8 @@ async fn data_collection_disabled_even_for_non_zdr_team_blocks_in_privacy_build(
         ..crate::auth::GrokAuth::test_default()
     });
     assert!(
-        agent.is_data_collection_disabled(),
-        "Gork Build disables collection regardless of team block reasons"
+        !agent.is_data_collection_disabled(),
+        "non-ZDR blocked reasons must not disable data collection"
     );
 }
 fn enable_product_telemetry(agent: &MvpAgent) {
@@ -2873,7 +2868,7 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
     );
 }
 #[tokio::test]
-async fn diagnostic_upload_blocked_for_normal_user_in_privacy_build() {
+async fn diagnostic_upload_sent_for_normal_user() {
     let (stub_url, count) = spawn_counting_storage_stub().await;
     let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
     enable_trace_upload_config(&agent);

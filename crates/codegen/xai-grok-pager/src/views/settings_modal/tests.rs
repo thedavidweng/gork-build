@@ -3060,7 +3060,7 @@ fn picker_visual_smoke_debug() {
         category: SettingCategory::Privacy,
         owner: SettingOwner::Shared,
         label: "Coding data sharing",
-        description: "Controls whether the account may retain coding data for training.",
+        description: "Controls whether SpaceXAI may retain and train on coding data.",
         keywords: &["test"],
         kind: SettingKind::Enum {
             default: "opt-out",
@@ -3068,7 +3068,7 @@ fn picker_visual_smoke_debug() {
                 EnumChoice {
                     canonical: "opt-in",
                     display: "Opt in",
-                    description: "Allow account retention of coding session data for training and product improvement.",
+                    description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
                 },
                 EnumChoice {
                     canonical: "opt-out",
@@ -3117,7 +3117,7 @@ fn picker_long_description_wraps_to_multiple_lines() {
         category: SettingCategory::Privacy,
         owner: SettingOwner::Shared,
         label: "Coding data sharing",
-        description: "Controls whether the account may retain coding data for training.",
+        description: "Controls whether SpaceXAI may retain and train on coding data.",
         keywords: &["test"],
         kind: SettingKind::Enum {
             default: "opt-out",
@@ -3125,7 +3125,7 @@ fn picker_long_description_wraps_to_multiple_lines() {
                 EnumChoice {
                     canonical: "opt-in",
                     display: "Opt in",
-                    description: "Allow account retention of coding session data for training and product improvement.",
+                    description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
                 },
                 EnumChoice {
                     canonical: "opt-out",
@@ -3182,7 +3182,7 @@ fn picker_long_description_wraps_to_multiple_lines() {
         "choice 0 line 1 must contain the `·` separator, got: {r3:?}"
     );
     assert!(
-        r3.contains("Allow account retention"),
+        r3.contains("Allow SpaceXAI"),
         "choice 0 line 1 must start the description, got: {r3:?}"
     );
 
@@ -3224,8 +3224,8 @@ fn picker_long_description_wraps_to_multiple_lines() {
     );
     for word in [
         "Allow",
-        "account",
-        "retention",
+        "SpaceXAI",
+        "retain",
         "session",
         "training",
         "improvement",
@@ -3387,7 +3387,7 @@ fn picker_multi_line_choice_hit_rect_spans_all_lines() {
         category: SettingCategory::Privacy,
         owner: SettingOwner::Shared,
         label: "Coding data sharing",
-        description: "Controls whether the account may retain coding data.",
+        description: "Controls whether SpaceXAI may retain coding data.",
         keywords: &["test"],
         kind: SettingKind::Enum {
             default: "opt-in",
@@ -3395,7 +3395,7 @@ fn picker_multi_line_choice_hit_rect_spans_all_lines() {
                 EnumChoice {
                     canonical: "opt-in",
                     display: "Opt in",
-                    description: "Allow account retention of coding session data for training and product improvement.",
+                    description: "Allow SpaceXAI to retain and use coding session data for training and product improvement.",
                 },
                 EnumChoice {
                     canonical: "opt-out",
@@ -4706,7 +4706,7 @@ fn two_line_row_with_expansion_renders_three_segments() {
     // The row label is on line 1.
     let label_line = buf_row_text(&buf, rect.y, area.x, area.width);
     assert!(
-        label_line.contains("Coding data retention"),
+        label_line.contains("Coding data sharing"),
         "line 1 must contain the row label: {label_line:?}"
     );
     // The value (display: "Opt out" or similar) is on line 2.
