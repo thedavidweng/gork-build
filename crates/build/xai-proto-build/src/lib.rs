@@ -112,12 +112,20 @@ impl XaiProtoBuilder {
             );
         }
 
+        // protoc outputs go to real temp files: `/dev/stdout` / `/dev/null`
+        // do not exist on Windows, so native win32 builds fail with them.
+        let tmp = tempfile::TempDir::new().context("create protoc temp dir")?;
+        let dep_file = tmp.path().join("protoc-deps.d");
+        let descriptor_file = tmp.path().join("protoc-descriptor.bin");
+        let dep_file_str = dep_file.to_str().context("temp path not UTF-8")?;
+        let descriptor_file_str = descriptor_file.to_str().context("temp path not UTF-8")?;
+
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!("--dependency_out={dep_file_str}"))
+                .arg(format!("--descriptor_set_out={descriptor_file_str}"));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -144,21 +152,26 @@ impl XaiProtoBuilder {
             }
 
             let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
+                fs::read_to_string(&dep_file).context("protoc dependency_out not readable")?;
 
             let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
+            let first_line = lines.next().context("protoc dependency_out is empty")?;
+            // Format: "<descriptor_set_out>: dep1 \" — match on the marker
+            // filename rather than splitting on ':' (Windows drive letters).
+            let marker = "protoc-descriptor.bin:";
+            let idx = first_line.find(marker).with_context(|| {
+                format!("dependency_out must start with the descriptor path: {output:?}")
             })?;
+            let rem = &first_line[idx + marker.len()..];
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
                 let line = line.strip_suffix("\\").unwrap_or(line);
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                if line.contains("/include/google/protobuf/")
+                    || line.contains("\\include\\google\\protobuf\\")
+                {
                     continue;
                 }
 
