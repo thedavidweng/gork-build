@@ -54,6 +54,15 @@ file = "0070-supply-chain-policy.patch"
 critical = true
 contracts = ["cargo-audit"]
 
+[[patch]]
+id = "win-build-portability"
+file = "0075-win-build-portability.patch"
+# Critical: the release matrix's native win32 builds depend on it; a conflict
+# means upstream touched the protoc invocation and needs a fresh port (or
+# upstream fixed it — then drop this patch deliberately).
+critical = true
+contracts = []
+
 # Trailing non-critical: may be skipped on upstream conflict (draft PR still opens).
 [[patch]]
 id = "product-identity"

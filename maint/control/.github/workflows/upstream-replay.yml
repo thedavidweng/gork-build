@@ -443,22 +443,45 @@ jobs:
               core.info(`Closed superseded sync PR #${pr.number}`);
             }
 
-      # Start the branch-protection contexts on the merge branch, then arm
-      # auto-merge. GitHub performs the merge once all required checks pass;
-      # any red check leaves the PR open (fail-closed).
-      - name: Dispatch required checks and enable auto-merge
+      # Bot-created PRs DO get pull_request workflow runs, but GitHub holds
+      # them for approval (actor github-actions[bot] counts as a first-time
+      # contributor). The PR's status rollup only counts PR-associated check
+      # suites — a workflow_dispatch run on the same SHA does not satisfy
+      # branch protection — so approve the held runs, then arm auto-merge.
+      # GitHub merges once all required checks pass; any red check leaves the
+      # PR open (fail-closed). If approval is ever rejected for the bot
+      # token, the PR simply waits for a human — still fail-closed.
+      - name: Approve held PR checks and enable auto-merge
         if: >-
           needs.replay-and-test.outputs.conflict != 'true' &&
           steps.syncmerge.outputs.noop != 'true' &&
           steps.syncpr.outputs.auto_merge == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_BRANCH: ${{ steps.syncmerge.outputs.merge_branch }}
+          HEAD_SHA: ${{ steps.syncmerge.outputs.merge_sha }}
           PR_NUMBER: ${{ steps.syncpr.outputs.pr_number }}
         run: |
           set -euo pipefail
-          gh workflow run gork-privacy.yml --ref "${MERGE_BRANCH}"
-          gh workflow run patch-roundtrip.yml --ref "${MERGE_BRANCH}"
+          approved=0
+          for attempt in 1 2 3 4 5 6; do
+            RUNS=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?event=pull_request&status=action_required&per_page=50" \
+              --jq ".workflow_runs[] | select(.head_sha==\"${HEAD_SHA}\") | .id")
+            for run_id in $RUNS; do
+              if gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve" >/dev/null; then
+                echo "approved run ${run_id}"
+                approved=$((approved + 1))
+              else
+                echo "WARNING: could not approve run ${run_id} (insufficient token scope?)" >&2
+              fi
+            done
+            # Both required workflows (gork-privacy, patch-roundtrip) held?
+            if [[ "$approved" -ge 2 ]]; then break; fi
+            sleep 10
+          done
+          if [[ "$approved" -eq 0 ]]; then
+            echo "WARNING: no held runs approved — PR waits for a human" >&2
+          fi
           gh pr merge "${PR_NUMBER}" --auto --merge
 
       - name: Open conflict issue (dedupe)
