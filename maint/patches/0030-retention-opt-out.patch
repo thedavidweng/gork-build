@@ -20,11 +20,11 @@ Gork-Risk: critical
  10 files changed, 148 insertions(+), 230 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-index 370130ff165cf0984d261f82eb5725f114232a48..4bb07007aa4508c330a847b5449ea4071a3e67ea 100644
+index aca4db05a20279502bdf824ff1ac96ae1f794410..1d1264d1c95bc7e7ca22da98b58f29c9c7a894ba 100644
 --- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-@@ -1230,7 +1230,14 @@ impl AppView {
-                 .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
+@@ -1241,7 +1241,14 @@ impl AppView {
+         }
      }
      /// Welcome privacy banner visibility gates.
 +    ///
@@ -265,10 +265,10 @@ index b561dafb5a32c731c8fcaf5740db6d7cd0f1ba4c..e7663803afbd85014e709a968b30fe6c
              hidden_in_minimal: false,
          },
 diff --git a/crates/codegen/xai-grok-pager/src/settings/registry.rs b/crates/codegen/xai-grok-pager/src/settings/registry.rs
-index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8ce02fd66 100644
+index 6db1e1a16e9e169fd2ef427a0634b6ddb48f5ff3..67aa7d2dfd32ca5c8a45d03275a4cd15ecd580f6 100644
 --- a/crates/codegen/xai-grok-pager/src/settings/registry.rs
 +++ b/crates/codegen/xai-grok-pager/src/settings/registry.rs
-@@ -258,7 +258,8 @@ pub struct PagerLocalSnapshot {
+@@ -277,7 +277,8 @@ pub struct PagerLocalSnapshot {
      pub plan_mode_active: bool,
      /// `[cli].show_tips` mirror. `None` = no TOML override → default `true`.
      pub show_tips: Option<bool>,
@@ -278,15 +278,15 @@ index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8
      pub auto_update: Option<bool>,
      /// Process-wide vim-mode scrollback flag. Mirrors
      /// `appearance::cache::load_vim_mode()` at snapshot time.
-@@ -290,6 +291,7 @@ impl Default for PagerLocalSnapshot {
+@@ -309,6 +310,7 @@ impl Default for PagerLocalSnapshot {
              auto_mode: false,
              current_model_name: None,
              available_models: Vec::new(),
 +            // Gork Build: privacy by default.
              coding_data_sharing_opt_out: true,
+             coding_data_sharing_lock: None,
              plan_mode_active: false,
-             show_tips: None,
-@@ -668,7 +670,7 @@ pub fn current_value_for(
+@@ -688,7 +690,7 @@ pub fn current_value_for(
          )),
          // CLI batch: snapshot mirrors; `None` → effective default `true`.
          "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
@@ -295,7 +295,7 @@ index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8
          // fork_secondary_model: baseline value folds to empty string.
          "fork_secondary_model" => Some(SettingValue::String({
              let baseline = xai_grok_shell::models::default_model();
-@@ -891,16 +893,12 @@ mod tests {
+@@ -911,16 +913,12 @@ mod tests {
                          "max_thoughts_width default drifts from UiConfig::default()",
                      );
                  }
@@ -314,7 +314,7 @@ index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8
                      );
                  }
                  // CLI batch: fields live on CliConfig, not UiConfig.
-@@ -910,9 +908,9 @@ mod tests {
+@@ -930,9 +928,9 @@ mod tests {
                  }
                  ("auto_update", SettingKind::Bool { default }) => {
                      assert!(
@@ -784,10 +784,10 @@ index 9161dc76ce6d63b395a12dedac080ce065fc6815..b332a5729ef2e5bdcc70ab177a758762
      }))
  }
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: 47348d13ec4508dcfe440e34c6d511bb02998fb2
+prerequisite-patch-id: a6882a7c36c2de8f7c413d630c49d38e98e66b8f
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 
