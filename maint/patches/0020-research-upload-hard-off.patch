@@ -12,7 +12,7 @@ Gork-Risk: critical
  1 file changed, 134 insertions(+), 10 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f31cb4854 100644
+index ff33fda1f60c0e70e29ff70ed9586b60be49f145..fee9e9bad84d78e9dd232fa695a2524ccf625f71 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
 @@ -326,7 +326,7 @@ impl EndpointsConfig {
@@ -61,7 +61,7 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
              include_inline_fallback: false,
              max_inline_bytes: 0,
              dedup_untracked: true,
-@@ -2301,7 +2304,13 @@ impl Config {
+@@ -2310,7 +2313,13 @@ impl Config {
      pub fn is_two_pass_compaction_enabled(&self) -> bool {
          self.resolve_two_pass_compaction().value
      }
@@ -76,7 +76,7 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
          if let Some(mode) = self.requirements.telemetry.pinned() {
              return Resolved::new(mode, ConfigSource::Requirement);
          }
-@@ -2323,7 +2332,12 @@ impl Config {
+@@ -2332,7 +2341,12 @@ impl Config {
          }
          Resolved::new(TelemetryMode::Disabled, ConfigSource::Default)
      }
@@ -90,7 +90,7 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
          let mode = self.resolve_telemetry_mode();
          let ff = if mode.value.is_disabled() {
              None
-@@ -3353,7 +3367,7 @@ pub(crate) fn external_otel_master_switch_from(
+@@ -3362,7 +3376,7 @@ pub(crate) fn external_otel_master_switch_from(
  /// Layering follows `resolve_telemetry_mode`: **requirement > env > config >
  /// remote > default**, where the `[telemetry]` `otel_*` keys from the
  /// effective config (which already includes managed-config layers distributed
@@ -99,7 +99,7 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
  /// top, and the remote layer is restrictive-only + asynchronous
  /// ([`apply_external_otel_remote_policy`]).
  pub fn resolve_external_otel_config(
-@@ -9174,6 +9188,19 @@ reasoning_effort = "low"
+@@ -9247,6 +9261,19 @@ reasoning_effort = "low"
      #[test]
      #[serial]
      fn resolve_trace_upload_explicit_config_wins_over_telemetry_off() {
@@ -119,7 +119,7 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
          unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
          unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
          let mut cfg = Config::default();
-@@ -9204,19 +9231,46 @@ reasoning_effort = "low"
+@@ -9277,19 +9304,46 @@ reasoning_effort = "low"
          });
          let d = cfg.trace_upload_decision_debug();
          assert_eq!(d["trace_upload"], serde_json::json!(false));
@@ -169,7 +169,7 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
          unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
          unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
          let mut cfg = Config::default();
-@@ -9229,6 +9283,76 @@ reasoning_effort = "low"
+@@ -9302,6 +9356,76 @@ reasoning_effort = "low"
          let r = cfg.resolve_trace_upload();
          assert!(r.value, "defaults on when telemetry fully enabled");
      }
@@ -247,9 +247,9 @@ index ed20d9f550d6865e16a2d9a10169d02eade02e3a..4e9bbe5227b08b5da262ac3e390c463f
      #[serial]
      fn resolve_goal_defaults_to_true_when_unset() {
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: b41c75a578f98bddbd326ab02cd53618451d97ee
+prerequisite-patch-id: a6882a7c36c2de8f7c413d630c49d38e98e66b8f
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 
