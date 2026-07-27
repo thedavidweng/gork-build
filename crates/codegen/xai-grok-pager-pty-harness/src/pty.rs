@@ -21,6 +21,7 @@ pub mod keys {
     pub const Q: &[u8] = b"q";
     pub const DOWN: &[u8] = b"\x1b[B";
     pub const UP: &[u8] = b"\x1b[A";
+    pub const RIGHT: &[u8] = b"\x1b[C";
     pub const PGDN: &[u8] = b"\x1b[6~";
     pub const PGUP: &[u8] = b"\x1b[5~";
     pub const ENTER: &[u8] = b"\r";
@@ -28,6 +29,8 @@ pub mod keys {
     /// Ctrl+R (0x12) — prompt history search / scrollback mouse-reporting toggle.
     pub const CTRL_R: &[u8] = b"\x12";
     pub const ESC: &[u8] = b"\x1b";
+    /// F2 (SS3 `ESC O Q`, the xterm encoding crossterm parses) — opens the settings modal.
+    pub const F2: &[u8] = b"\x1bOQ";
 }
 
 /// One explicit environment mutation applied after the TestSandbox baseline.
@@ -571,6 +574,7 @@ const HOST_TERMINAL_ENV_VARS: &[&str] = &[
     "CMUX_SOCKET_PATH",
     "CMUX_PANEL_ID",
     "CMUX_BUNDLE_ID",
+    "HERDR_ENV",
     // Embedded editor markers (embedded_editor_from_env).
     "NVIM",
     "NVIM_LISTEN_ADDRESS",

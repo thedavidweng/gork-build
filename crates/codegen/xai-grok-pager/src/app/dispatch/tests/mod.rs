@@ -155,8 +155,7 @@ fn test_app() -> AppView {
         team_name: None,
         is_zdr: false,
         team_role: None,
-        // Gork Build: privacy default is opted out.
-        coding_data_retention_opt_out: true,
+        coding_data_retention_opt_out: false,
         privacy_notice_rollout: false,
         privacy_banner_reshow_days: None,
         privacy_banner_acked: None,

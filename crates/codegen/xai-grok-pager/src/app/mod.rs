@@ -458,6 +458,23 @@ fn resolve_hunk_tracker_mode(
         .find(|s| !s.is_empty())
         .map(str::to_owned)
 }
+/// Run a connect future bounded by cancellation and `timeout`, so a hung leader
+/// or embedded spawn cannot strand the user on a blank screen.
+async fn bounded_connect(
+    cancel: &CancellationToken,
+    timeout: std::time::Duration,
+    target: &str,
+    connect: impl std::future::Future<Output = anyhow::Result<crate::acp::AcpConnection>>,
+) -> anyhow::Result<crate::acp::AcpConnection> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(anyhow::anyhow!("startup cancelled before {target} connected")),
+        r = connect => r,
+        () = tokio::time::sleep(timeout) => {
+            Err(anyhow::anyhow!("timed out after {}s connecting to {target}", timeout.as_secs()))
+        }
+    }
+}
 /// Main entry point: connect to agent, init terminal, run event loop, restore.
 ///
 /// If a session ID is provided via `--resume` / `--load` / `--continue`, the
@@ -487,9 +504,16 @@ pub async fn run(
             xai_grok_shell::auth::GrokComConfig::default()
         }
     };
-    let refreshed_auth = xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config).await;
-    let early_prefetch =
-        xai_grok_shell::agent::models::start_early_prefetch_with_auth(refreshed_auth);
+    let refreshed_auth = tokio::time::timeout(
+        xai_grok_shell::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+        xai_grok_shell::auth::try_ensure_fresh_auth(&grok_com_config),
+    )
+    .await
+    .unwrap_or(None);
+    let early_prefetch = match refreshed_auth {
+        Some(auth) => xai_grok_shell::agent::models::start_early_prefetch_with_auth(Some(auth)),
+        None => xai_grok_shell::agent::models::start_early_prefetch(Some(grok_com_config.clone())),
+    };
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
     tokio::task::spawn_blocking(|| {});
     if let Ok(cwd) = std::env::current_dir() {
@@ -641,21 +665,6 @@ pub async fn run(
         default_yolo_mode: launch_yolo.yolo,
         default_auto_mode: launch_auto && !launch_yolo.yolo,
     };
-    let connection = if use_leader {
-        let conn = crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await?;
-        tracing::info!(
-            elapsed_ms = startup_start.elapsed().as_millis() as u64,
-            "Connected via leader"
-        );
-        conn
-    } else {
-        let conn = crate::acp::connect(&cancel, connect_flags).await?;
-        tracing::info!(
-            elapsed_ms = startup_start.elapsed().as_millis() as u64,
-            "Connected directly (non-leader)"
-        );
-        conn
-    };
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;
     let term_ctx = crate::terminal::terminal_context();
@@ -726,6 +735,53 @@ pub async fn run(
     if let Some(ref t) = session_title {
         set_terminal_title(t);
     }
+    const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let fallback_flags = use_leader.then(|| connect_flags.clone());
+    let primary_target = if use_leader {
+        "the grok leader"
+    } else {
+        "the embedded agent"
+    };
+    let connect_result = bounded_connect(&cancel, CONNECT_UI_TIMEOUT, primary_target, async {
+        if use_leader {
+            crate::acp::connect_via_leader(&cancel, connect_flags, &raw_config).await
+        } else {
+            crate::acp::connect(&cancel, connect_flags).await
+        }
+    })
+    .await;
+    let (connect_result, embedded_fallback) = match connect_result {
+        Err(e) if use_leader && !cancel.is_cancelled() => {
+            tracing::warn!(error = %e, "leader connect failed; falling back to embedded agent");
+            let flags = fallback_flags.expect("set on the use_leader path");
+            let fallback =
+                bounded_connect(&cancel, CONNECT_UI_TIMEOUT, "the embedded agent", async {
+                    crate::acp::connect(&cancel, flags).await
+                })
+                .await;
+            (fallback, true)
+        }
+        other => (other, false),
+    };
+    let mut connection = match connect_result {
+        Ok(conn) => {
+            tracing::info!(
+                elapsed_ms = startup_start.elapsed().as_millis() as u64,
+                use_leader = use_leader && !embedded_fallback,
+                embedded_fallback,
+                "Connected"
+            );
+            conn
+        }
+        Err(e) => {
+            crate::unified_log::flush_blocking().await;
+            let _ = restore_terminal(terminal, writer_thread, screen_mode);
+            cancel.cancel();
+            return Err(e);
+        }
+    };
+    let agent_guard =
+        crate::acp::spawn::AgentShutdownGuard::new(cancel.clone(), connection.agent_thread.take());
     let effective_args = PagerArgs {
         resume_session: None,
         load_session: None,
@@ -756,7 +812,7 @@ pub async fn run(
     .await;
     crate::unified_log::flush_blocking().await;
     let restore_result = restore_terminal(terminal, writer_thread, screen_mode);
-    cancel.cancel();
+    drop(agent_guard);
     xai_tty_utils::global_process_scope().kill_all();
     if let Err(cleanup_error) = restore_result {
         match &result {
@@ -1407,18 +1463,12 @@ pub(crate) fn set_terminal_title(title: &str) {
 /// terminate the OSC early and let the remainder inject arbitrary escape
 /// sequences into the terminal.
 fn terminal_title_string(title: &str) -> String {
-    let cli = xai_grok_version::PRODUCT_CLI;
     let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
     if sanitized.is_empty() {
-        cli.into()
+        "grok".into()
     } else {
-        // Reserve room for " - {cli}" suffix (space-dash-space + cli name).
-        let suffix_len = 3 + cli.len();
-        let truncated: String = sanitized
-            .chars()
-            .take(80_usize.saturating_sub(suffix_len))
-            .collect();
-        format!("{truncated} - {cli}")
+        let truncated: String = sanitized.chars().take(80 - 6).collect();
+        format!("{} - grok", truncated)
     }
 }
 fn set_panic_hook(mode: ScreenMode) {
@@ -1490,16 +1540,40 @@ mod tests {
         let toml_str = format!("[cli]\nuse_leader = {enabled}");
         toml::from_str(&toml_str).unwrap()
     }
+    #[tokio::test]
+    async fn bounded_connect_times_out_when_the_target_stalls() {
+        let cancel = CancellationToken::new();
+        let r = bounded_connect(
+            &cancel,
+            std::time::Duration::from_millis(20),
+            "the test target",
+            std::future::pending::<anyhow::Result<crate::acp::AcpConnection>>(),
+        )
+        .await;
+        assert!(r.is_err_and(|e| e.to_string().contains("timed out")));
+    }
+    #[tokio::test]
+    async fn bounded_connect_returns_err_on_cancel() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = bounded_connect(
+            &cancel,
+            std::time::Duration::from_secs(60),
+            "the test target",
+            std::future::pending::<anyhow::Result<crate::acp::AcpConnection>>(),
+        )
+        .await;
+        assert!(r.is_err_and(|e| e.to_string().contains("cancelled")));
+    }
     #[test]
     fn terminal_title_strips_control_characters() {
-        let cli = xai_grok_version::PRODUCT_CLI;
         assert_eq!(
             terminal_title_string("evil\x07\x1b]52;c;payload\x07title"),
-            format!("evil]52;c;payloadtitle - {cli}")
+            "evil]52;c;payloadtitle - grok"
         );
-        assert_eq!(terminal_title_string("\x07\x1b\x00"), cli);
-        assert_eq!(terminal_title_string(""), cli);
-        assert_eq!(terminal_title_string("My chat"), format!("My chat - {cli}"));
+        assert_eq!(terminal_title_string("\x07\x1b\x00"), "grok");
+        assert_eq!(terminal_title_string(""), "grok");
+        assert_eq!(terminal_title_string("My chat"), "My chat - grok");
     }
     #[test]
     fn hunk_tracker_mode_nothing_set_is_none() {
@@ -1867,25 +1941,24 @@ mod tests {
         assert!(!args.no_alt_screen);
     }
     #[test]
-    fn cli_command_name_is_gork() {
+    fn cli_command_name_is_grok() {
         use clap::CommandFactory;
-        assert_eq!(
-            PagerArgs::command().get_name(),
-            xai_grok_version::PRODUCT_CLI
-        );
+        assert_eq!(PagerArgs::command().get_name(), "grok");
     }
     #[test]
     fn cli_help_output_header() {
         use clap::CommandFactory;
         let help = PagerArgs::command().render_long_help().to_string();
         let first_5: Vec<&str> = help.lines().take(5).collect();
-        let usage = format!(
-            "Usage: {} [OPTIONS] [PROMPT] [COMMAND]",
-            xai_grok_version::PRODUCT_CLI
-        );
         assert_eq!(
             first_5,
-            vec!["Gork Build TUI", "", usage.as_str(), "", "Arguments:",]
+            vec![
+                "Grok Build TUI",
+                "",
+                "Usage: grok [OPTIONS] [PROMPT] [COMMAND]",
+                "",
+                "Arguments:",
+            ]
         );
         assert!(help.find("Arguments:\n").unwrap() < help.find("Options:\n").unwrap());
         assert!(help.find("Options:\n").unwrap() < help.find("Commands:\n").unwrap());

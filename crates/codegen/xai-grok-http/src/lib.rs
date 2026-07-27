@@ -5,11 +5,11 @@
 //! provides four clients for non-sampling traffic (the first three
 //! public and cached, the last crate-internal and built on demand):
 //!
-//! - `shared_client` -- a `OnceLock`-cached async client for general
+//! - `shared_client`: a `OnceLock`-cached async client for general
 //!   use (telemetry, feedback, settings, etc.).
-//! - `shared_upload_client` -- a `OnceLock`-cached client for GCS
+//! - `shared_upload_client`: a `OnceLock`-cached client for GCS
 //!   uploads with aggressive connection pool eviction.
-//! - `shared_blocking_client` -- a blocking client for the early
+//! - `shared_startup_blocking_client`: a blocking client for the early
 //!   model prefetch (runs before the async runtime is available).
 //! - `fresh_http1_client` -- a crate-internal, on-demand, pool-less
 //!   HTTP/1.1 client used by `send_with_retry_escaping_pool` for the
@@ -29,6 +29,42 @@
 use std::sync::OnceLock;
 
 use xai_grok_workspace::permission::ClientType;
+
+/// Per-attempt ceiling for a startup `/settings` or `/v1/models` fetch; raising
+/// it delays how soon the background refresh gives up and retries.
+pub const STARTUP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap on non-interactive boot auth (token refresh or cold-start mint); a mint
+/// that exceeds it leaves the leader session-less and is retried off the
+/// readiness path.
+pub const STARTUP_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Ceiling on a single startup token-refresh round trip, kept separate from
+/// `STARTUP_FETCH_TIMEOUT` so the two tune independently; on timeout the caller
+/// proceeds with cached or no credentials and re-auths later.
+pub const STARTUP_AUTH_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Outer bound on a single settings-reapply task, which drives up to
+/// `SETTINGS_FETCH_MAX_ATTEMPTS` fetches.
+pub const SETTINGS_REAPPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Attempt budget for the background settings fetch; bounds proxy load while
+/// still covering a brief blip.
+pub const SETTINGS_FETCH_MAX_ATTEMPTS: u32 = 3;
+// A `401` self-heal may add one more bounded fetch beyond this cap; that fetch
+// is cut off fail-closed and retried later, so the cap only needs to cover the
+// common path.
+const _: () = assert!(
+    SETTINGS_REAPPLY_TIMEOUT.as_millis()
+        > STARTUP_FETCH_TIMEOUT.as_millis() * (1 + SETTINGS_FETCH_MAX_ATTEMPTS as u128),
+    "SETTINGS_REAPPLY_TIMEOUT must exceed STARTUP_FETCH_TIMEOUT * (1 + MAX_ATTEMPTS)"
+);
+
+/// Lower bound for a client's leader-connect timeout: a slow-but-valid boot
+/// (bounded startup auth plus the rest of leader startup and the connect
+/// handshake) must never be aborted. The pager bounds its connect by this value,
+/// reached via the shell's `http` re-export.
+pub const MIN_CLIENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const _: () = assert!(
+    MIN_CLIENT_CONNECT_TIMEOUT.as_millis() >= 2 * STARTUP_AUTH_TIMEOUT.as_millis(),
+    "MIN_CLIENT_CONNECT_TIMEOUT must stay >= 2x STARTUP_AUTH_TIMEOUT"
+);
 
 /// Startup span timer, local to this crate.
 ///
@@ -347,13 +383,15 @@ pub fn shared_upload_client() -> reqwest::Client {
 /// `pool_max_idle_per_host(0)` + `http1_only()` so each request opens a new connection, and no
 /// connect timeout (callers bound each request with their own total timeout). The retry escape
 /// policy that reaches for this client to dodge a poisoned pool lives on `send_with_retry_escaping_pool`.
-pub(crate) fn fresh_http1_client() -> reqwest::Client {
+///
+/// Fallible: build can fail under fd/TLS pressure; the caller must not
+/// panic on error (fallback policy lives at the call site).
+pub(crate) fn fresh_http1_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .http1_only()
         .pool_max_idle_per_host(0)
         .user_agent(process_user_agent_string())
         .build()
-        .expect("failed to build fresh HTTP/1.1 client")
 }
 
 /// Joins an error's `source()` chain into one string. A `reqwest::Error`'s `Display`
@@ -456,7 +494,18 @@ where
         // Only the final attempt of a multi-attempt run escapes onto a fresh pool-less connection; a
         // single-attempt caller keeps the pooled client (there is no prior failure to escape).
         let client = if attempt > 0 && attempt + 1 == max_attempts {
-            fresh.get_or_insert_with(fresh_http1_client).clone()
+            match &fresh {
+                Some(c) => c.clone(),
+                None => match fresh_http1_client() {
+                    Ok(c) => fresh.insert(c).clone(),
+                    // Can't escape the pool (e.g. fd exhaustion); a pooled
+                    // final attempt still beats aborting the process.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to build pool-escape client; final attempt stays on pooled client");
+                        pooled.clone()
+                    }
+                },
+            }
         } else {
             pooled.clone()
         };
@@ -474,7 +523,8 @@ where
     Err(last_err.expect("send_with_retry_escaping_pool ran at least one attempt"))
 }
 
-/// Returns a shared [`reqwest::blocking::Client`], creating it on first call.
+/// Shared blocking client for startup fetches. Carries `STARTUP_FETCH_TIMEOUT`
+/// as the connect+read ceiling; do not reuse for long-lived requests.
 ///
 /// This avoids redundant TLS certificate loading for blocking HTTP calls
 /// (e.g., model prefetching during startup). The blocking client is separate
@@ -488,14 +538,14 @@ where
 /// (~60-100s; 30s is a conservative default) closes it. The HTTP/2 keepalive-ping
 /// setters that `shared_client()` uses are NOT exposed on reqwest's blocking
 /// `ClientBuilder` (0.12), so only the idle/TCP-eviction half applies here.
-pub fn shared_blocking_client() -> reqwest::blocking::Client {
+pub fn shared_startup_blocking_client() -> reqwest::blocking::Client {
     static BLOCKING_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     BLOCKING_CLIENT
         .get_or_init(|| {
             let _timer = startup_timer!("startup.http_blocking_client_build");
             reqwest::blocking::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(STARTUP_FETCH_TIMEOUT)
+                .timeout(STARTUP_FETCH_TIMEOUT)
                 .user_agent(process_user_agent_string())
                 .pool_idle_timeout(std::time::Duration::from_secs(30))
                 .tcp_keepalive(std::time::Duration::from_secs(30))

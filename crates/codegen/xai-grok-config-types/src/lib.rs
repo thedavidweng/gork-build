@@ -697,8 +697,9 @@ pub struct RemoteSettings {
     pub managed_mcps_enabled: Option<bool>,
     #[serde(default)]
     pub managed_mcp_gateway_tools_enabled: Option<bool>,
-    /// Fleet kill switch for the **external OTEL** stream (customer
-    /// collectors). Restrictive-only by construction: there is deliberately
+    /// Remote-policy disable lever for the **external OTEL** stream (customer
+    /// collectors); feeds `ExternalOtelRemotePolicy.force_disable`.
+    /// Restrictive-only by construction: there is deliberately
     /// no `external_otel_enabled` remote field — remote settings are fetched
     /// per-run and never persisted, so a remote "enable" could never reach
     /// init; org-wide enable ships via managed config instead. Applied
@@ -711,6 +712,9 @@ pub struct RemoteSettings {
     /// Tighten-only, like `external_otel_disabled`.
     #[serde(default)]
     pub external_otel_content_gates_locked: Option<bool>,
+    /// `Some(false)` disarms managed-config signature verification (remote kill-switch).
+    #[serde(default)]
+    pub managed_config_signature_verification: Option<bool>,
     #[serde(default)]
     pub telemetry_enabled: Option<bool>,
     /// Telemetry mode override (string): `"session-metrics"`, `"full"`, `"off"`.
