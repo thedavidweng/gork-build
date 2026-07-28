@@ -1,8 +1,8 @@
 {
-  "branch": "sync/upstream-0.2.111-6e38642",
-  "upstream": "6e386420825bd44ae648c63e7c8cba12fcec9401",
-  "version": "0.2.111",
-  "source_rev": "9b8d35b46d959c042ea9aa31cbbebbd1f0c5c527",
+  "branch": "sync/upstream-0.2.112-02d9359",
+  "upstream": "02d9359435d0e9c20a20945679389cdce441e431",
+  "version": "0.2.112",
+  "source_rev": "1adcd1f477870e4a97bacbd6be78c8a3bfbac46d",
   "applied": [
     "0001-privacy-core.patch",
     "0010-telemetry-hard-off.patch",
@@ -12,11 +12,13 @@
     "0050-privacy-contract-tests.patch",
     "0060-egress-guard.patch",
     "0070-supply-chain-policy.patch",
+    "0075-win-build-portability.patch",
     "0080-product-identity.patch",
-    "0081-package-publishing.patch",
+    "0081-package-publishing.patch"
+  ],
+  "skipped": [
     "0082-branding-docs.patch"
   ],
-  "skipped": [],
   "conflicted": null,
-  "branding_required": false
+  "branding_required": true
 }
