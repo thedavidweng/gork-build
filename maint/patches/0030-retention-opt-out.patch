@@ -20,11 +20,11 @@ Gork-Risk: critical
  10 files changed, 148 insertions(+), 230 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-index 370130ff165cf0984d261f82eb5725f114232a48..4bb07007aa4508c330a847b5449ea4071a3e67ea 100644
+index 73576dd50ec15761d6f370d2decbdbaefc874080..0a83f6ca3e482741587ae213e45a40278bee656e 100644
 --- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-@@ -1230,7 +1230,14 @@ impl AppView {
-                 .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
+@@ -1248,7 +1248,14 @@ impl AppView {
+         }
      }
      /// Welcome privacy banner visibility gates.
 +    ///
@@ -265,10 +265,10 @@ index b561dafb5a32c731c8fcaf5740db6d7cd0f1ba4c..e7663803afbd85014e709a968b30fe6c
              hidden_in_minimal: false,
          },
 diff --git a/crates/codegen/xai-grok-pager/src/settings/registry.rs b/crates/codegen/xai-grok-pager/src/settings/registry.rs
-index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8ce02fd66 100644
+index 66907242c169c0ced4f51505fb756193028f34e8..208497c0c989d74de12f947e74677971c39dc1a5 100644
 --- a/crates/codegen/xai-grok-pager/src/settings/registry.rs
 +++ b/crates/codegen/xai-grok-pager/src/settings/registry.rs
-@@ -258,7 +258,8 @@ pub struct PagerLocalSnapshot {
+@@ -277,7 +277,8 @@ pub struct PagerLocalSnapshot {
      pub plan_mode_active: bool,
      /// `[cli].show_tips` mirror. `None` = no TOML override → default `true`.
      pub show_tips: Option<bool>,
@@ -278,15 +278,15 @@ index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8
      pub auto_update: Option<bool>,
      /// Process-wide vim-mode scrollback flag. Mirrors
      /// `appearance::cache::load_vim_mode()` at snapshot time.
-@@ -290,6 +291,7 @@ impl Default for PagerLocalSnapshot {
+@@ -314,6 +315,7 @@ impl Default for PagerLocalSnapshot {
              auto_mode: false,
              current_model_name: None,
              available_models: Vec::new(),
 +            // Gork Build: privacy by default.
              coding_data_sharing_opt_out: true,
+             coding_data_sharing_lock: None,
              plan_mode_active: false,
-             show_tips: None,
-@@ -668,7 +670,7 @@ pub fn current_value_for(
+@@ -695,7 +697,7 @@ pub fn current_value_for(
          )),
          // CLI batch: snapshot mirrors; `None` → effective default `true`.
          "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
@@ -295,7 +295,7 @@ index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8
          // fork_secondary_model: baseline value folds to empty string.
          "fork_secondary_model" => Some(SettingValue::String({
              let baseline = xai_grok_shell::models::default_model();
-@@ -891,16 +893,12 @@ mod tests {
+@@ -918,16 +920,12 @@ mod tests {
                          "max_thoughts_width default drifts from UiConfig::default()",
                      );
                  }
@@ -314,7 +314,7 @@ index 3c0fd169cbcd5050ec2f3dd780a8170f29be6f2e..c1a74297a03c04d768b9f25ec09cd3e8
                      );
                  }
                  // CLI batch: fields live on CliConfig, not UiConfig.
-@@ -910,9 +908,9 @@ mod tests {
+@@ -937,9 +935,9 @@ mod tests {
                  }
                  ("auto_update", SettingKind::Bool { default }) => {
                      assert!(
@@ -485,10 +485,10 @@ index 53f042441d2bfc63fa529d517d250e6c7ed5ee6d..32ff89dd72f39f4c1844e33cfa5918c9
      }
  }
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager.rs b/crates/codegen/xai-grok-shell/src/auth/manager.rs
-index ca6e4bbb7c79562c92bcbf9c092c4bdd8318d6c2..d619faa479d5714a23256123acb0add48ed19289 100644
+index cd6d782bd3da21c109489da46dda7c004f039de1..5aef66abbae7343a28d077fb83de27d15363ec3e 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager.rs
-@@ -742,10 +742,16 @@ impl AuthManager {
+@@ -750,10 +750,16 @@ impl AuthManager {
      /// [`Self::current_or_expired`] because neither flag changes on token
      /// expiry and `current()` returns `None` during the refresh window.
      ///
@@ -508,7 +508,7 @@ index ca6e4bbb7c79562c92bcbf9c092c4bdd8318d6c2..d619faa479d5714a23256123acb0add4
          self.current_or_expired()
              .is_some_and(|a| a.is_data_collection_disabled())
      }
-@@ -755,7 +761,12 @@ impl AuthManager {
+@@ -763,7 +769,12 @@ impl AuthManager {
      /// cleared auth (e.g. after a mid-session `/logout`) counts as
      /// disabled — nothing may leave the machine while the privacy state is
      /// unknown.
@@ -521,7 +521,7 @@ index ca6e4bbb7c79562c92bcbf9c092c4bdd8318d6c2..d619faa479d5714a23256123acb0add4
          self.current_or_expired()
              .is_some_and(|a| !a.is_data_collection_disabled())
      }
-@@ -1347,7 +1358,7 @@ impl AuthManager {
+@@ -1355,7 +1366,7 @@ impl AuthManager {
              }
              TokenType::LegacySession => {
                  // Deliberate side effect: re-read auth.json under the
@@ -531,7 +531,7 @@ index ca6e4bbb7c79562c92bcbf9c092c4bdd8318d6c2..d619faa479d5714a23256123acb0add4
                  // the on-disk credentials. `pick_up_sibling_token` only
                  // mutates inner when the disk holds a *different valid*
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
-index 489d3da18755710bc4d8658855d58ee937902fad..c6116dabe64cbaac1b826cdbd7d1679f8e2548e6 100644
+index 840b429556436a6abc5985e8df63a15b2183b1d2..84a3162ff0a6f536431eaccaaa6030ea6df77c6d 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
 @@ -443,68 +443,54 @@ fn clear_does_not_remove_legacy_scope() {
@@ -643,7 +643,7 @@ index 489d3da18755710bc4d8658855d58ee937902fad..c6116dabe64cbaac1b826cdbd7d1679f
  }
  
  // -- token_suffix ----------------------------------------------------------------
-@@ -1102,7 +1083,7 @@ async fn auth_returns_expired_api_key_consistently_with_current() {
+@@ -1108,7 +1089,7 @@ async fn auth_returns_expired_api_key_consistently_with_current() {
  
      // Async path: must NOT clone the stale key for downstream
      // consumers. Surface `TokenExpiredNoRefresh` so callers can
@@ -652,7 +652,7 @@ index 489d3da18755710bc4d8658855d58ee937902fad..c6116dabe64cbaac1b826cdbd7d1679f
      let err = mgr.auth().await.unwrap_err();
      assert!(
          matches!(err, AuthError::TokenExpiredNoRefresh),
-@@ -1712,11 +1693,11 @@ async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_i
+@@ -1718,11 +1699,11 @@ async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_i
      );
      assert!(mgr.permanent_failure().is_some());
  
@@ -666,7 +666,7 @@ index 489d3da18755710bc4d8658855d58ee937902fad..c6116dabe64cbaac1b826cdbd7d1679f
      let err = mgr.auth().await.unwrap_err();
      assert!(
          matches!(err, AuthError::NotLoggedIn),
-@@ -3141,9 +3122,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
+@@ -3147,9 +3128,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
      assert_eq!(auth.principal_type.as_deref(), Some("Team"));
      assert_eq!(auth.principal_id.as_deref(), Some("team-1"));
      assert!(auth.is_zdr_team());
@@ -784,10 +784,10 @@ index 9161dc76ce6d63b395a12dedac080ce065fc6815..b332a5729ef2e5bdcc70ab177a758762
      }))
  }
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: 02d9359435d0e9c20a20945679389cdce441e431
+prerequisite-patch-id: a6882a7c36c2de8f7c413d630c49d38e98e66b8f
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 

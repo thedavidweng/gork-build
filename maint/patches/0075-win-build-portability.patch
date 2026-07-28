@@ -26,10 +26,10 @@ Gork-Risk: low
  1 file changed, 21 insertions(+), 8 deletions(-)
 
 diff --git a/crates/build/xai-proto-build/src/lib.rs b/crates/build/xai-proto-build/src/lib.rs
-index 417c4b28f9cdbd5b09c5303176d21eb242aac764..5dee3432e689d7b144526b7f1f09aed6097eeec7 100644
+index 66613d040959cb83661872f4af395aada3646566..7046725113400013c8d678d59c81eee9e1b9a33f 100644
 --- a/crates/build/xai-proto-build/src/lib.rs
 +++ b/crates/build/xai-proto-build/src/lib.rs
-@@ -112,12 +112,20 @@ impl XaiProtoBuilder {
+@@ -116,12 +116,20 @@ impl XaiProtoBuilder {
              );
          }
  
@@ -52,7 +52,7 @@ index 417c4b28f9cdbd5b09c5303176d21eb242aac764..5dee3432e689d7b144526b7f1f09aed6
  
              // Add protoc's well-known types include directory first (if found).
              // This is needed for Bazel sandboxed builds where protoc and its
-@@ -144,21 +152,26 @@ impl XaiProtoBuilder {
+@@ -148,21 +156,26 @@ impl XaiProtoBuilder {
              }
  
              let output =
@@ -86,15 +86,15 @@ index 417c4b28f9cdbd5b09c5303176d21eb242aac764..5dee3432e689d7b144526b7f1f09aed6
                  }
  
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: 02d9359435d0e9c20a20945679389cdce441e431
+prerequisite-patch-id: a6882a7c36c2de8f7c413d630c49d38e98e66b8f
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
-prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
+prerequisite-patch-id: 3daed330cac2602bef12fa50e24f205f03c606d2
 prerequisite-patch-id: a52276cc5d5a3f41e35f0a9442966519c69eef05
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 
