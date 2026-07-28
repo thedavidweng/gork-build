@@ -323,7 +323,7 @@ fn voice_off_target_surface_does_not_enable_or_record() {
     assert!(!app.voice_state.pending_cold_start());
     assert!(rx.try_recv().is_err(), "no PttPress without a target");
 }
-/// `gork dashboard` before login: the startup hook consumes the
+/// `grok dashboard` before login: the startup hook consumes the
 /// `GROK_OPEN_DASHBOARD_AT_STARTUP` env var and stashes
 /// `deferred_startup.open_dashboard`; `AuthComplete` must then open the
 /// dashboard view. Regression test for the silent drop where the
@@ -349,7 +349,7 @@ fn auth_complete_opens_deferred_dashboard() {
     assert!(matches!(app.auth_state, AuthState::Done));
     assert!(
         matches!(app.active_view, ActiveView::AgentDashboard),
-        "deferred `gork dashboard` must open the dashboard after login",
+        "deferred `grok dashboard` must open the dashboard after login",
     );
     assert!(
         !app.deferred_startup.open_dashboard,
@@ -1338,7 +1338,7 @@ fn dashboard_peek_cycle_does_not_retire_the_nudge() {
 /// leader mode. The dashboard renders local sessions regardless; leader
 /// mode only adds the roster poll. Every entry point funnels through
 /// `Action::OpenDashboard`, so this covers `/dashboard`, `Ctrl+\`,
-/// `gork dashboard`, and the startup hook.
+/// `grok dashboard`, and the startup hook.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]
 fn dashboard_open_works_without_leader() {
@@ -2071,6 +2071,7 @@ fn dashboard_deferred_plan_mode_applied_on_session_created() {
             agent_id: id,
             session_id: session_id.clone(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -5234,6 +5235,7 @@ fn dashboard_attach_roster_focuses_existing_local_agent() {
             agent_id: id,
             session_id: "local-owned".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );

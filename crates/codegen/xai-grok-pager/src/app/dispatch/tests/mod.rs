@@ -155,8 +155,7 @@ fn test_app() -> AppView {
         team_name: None,
         is_zdr: false,
         team_role: None,
-        // Gork Build: privacy default is opted out.
-        coding_data_retention_opt_out: true,
+        coding_data_retention_opt_out: false,
         privacy_notice_rollout: false,
         privacy_banner_reshow_days: None,
         privacy_banner_acked: None,
@@ -261,6 +260,7 @@ fn test_app() -> AppView {
         optimistic_prompt_echoes: std::collections::HashMap::new(),
         pending_running_adoptions: std::collections::HashMap::new(),
         session_picker_grouped: false,
+        scheduler_background_loops_seed: true,
         cancel_rewind_enabled: true,
         session_recap_available: false,
         tutorial: None,

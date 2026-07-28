@@ -381,8 +381,7 @@ pub(crate) async fn run_shell_child(
         .spawn_depth
         .unwrap_or(ctx.parent_depth + 1);
     let tools_before_policy = definition.tool_config.tools.len();
-    let allow_nested_subagents =
-        child_depth < xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH;
+    let allow_nested_subagents = child_depth < ctx.subagents_max_depth;
     xai_grok_subagent_resolution::apply_child_tool_policy(
         &mut definition,
         effective_runtime.capability_mode,
@@ -835,7 +834,11 @@ pub(crate) async fn run_shell_child(
             let hooks_val = hooks_config.as_value();
             let (specs, errors) = xai_grok_hooks::config::parse_hooks_from_value_with_dir(
                 &hooks_val,
-                &format!("agent:{}", definition.name),
+                &format!(
+                    "{}{}",
+                    xai_grok_hooks::config::AGENT_HOOK_PREFIX,
+                    definition.name
+                ),
                 &ctx.parent_cwd,
             );
             for e in &errors {
@@ -1093,6 +1096,7 @@ pub(crate) async fn run_shell_child(
         ctx.goal_enabled,
         ctx.background_workflows_enabled,
         true,
+        ctx.subagents_max_depth,
         ctx.ask_user_question_enabled,
         ctx.client_hooks.clone(),
         None,

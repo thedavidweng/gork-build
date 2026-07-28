@@ -36,7 +36,7 @@ pub(super) fn consume_chat_kind(app: &mut AppView) -> bool {
 /// The prompt is always pushed to the queue first. If the agent is idle
 /// (and has a session), `maybe_drain_queue` pops the front prompt and
 /// sends it in the same dispatch call — no deferred ticks.
-/// Start (if needed) and submit the initial prompt from `gork "<prompt>"`.
+/// Start (if needed) and submit the initial prompt from `grok "<prompt>"`.
 ///
 /// Shared by the TUI startup path (already authenticated) and the post-login
 /// `AuthComplete` path (deferred via `deferred_startup.prompt`). It does nothing
@@ -467,6 +467,7 @@ pub(super) fn dispatch_send_prompt_inner(
     };
     // Capture app-level fields before the mut-borrow on `agent`.
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
+    let coding_data_sharing_lock_from_app = app.coding_data_sharing_lock();
     let show_tips_from_app = app.show_tips;
     let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
@@ -476,6 +477,7 @@ pub(super) fn dispatch_send_prompt_inner(
     // shown after the agent borrow ends so we can re-enter via the tip helper.
     let mut tip_send_now_after_queue = false;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -563,6 +565,7 @@ pub(super) fn dispatch_send_prompt_inner(
                         .map(|(id, info)| (info.name.clone(), id.clone()))
                         .collect(),
                     coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
+                    coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                     // Prefer optimistic pending over confirmed active.
                     plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
                     show_tips: show_tips_from_app,
@@ -573,6 +576,11 @@ pub(super) fn dispatch_send_prompt_inner(
                     auto_mode_gate: auto_mode_gate_from_app,
                     ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                     voice_stt_language: voice_stt_language_from_app,
+                    // This session's own value (what its fires will actually
+                    // do), seed only until the session response lands.
+                    scheduler_background_loops: agent
+                        .scheduler_background_loops
+                        .unwrap_or(scheduler_background_loops_seed),
                 },
             };
 
@@ -845,7 +853,6 @@ pub(super) fn dispatch_send_prompt_inner(
 
             if parked_sendable_wait && !hold_behind_existing_queue {
                 agent.arm_send_now_expectation(prompt_id.clone());
-                agent.suppress_parked_marker_on_interject();
             }
 
             if consume_input {

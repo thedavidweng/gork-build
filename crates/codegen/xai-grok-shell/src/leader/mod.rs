@@ -111,7 +111,7 @@ fn should_evict(leader_version: Option<&str>, client_version: &str) -> bool {
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum delay between reconnection attempts (caps exponential backoff).
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
-/// Maximum reconnection attempts for bounded mode (headless/`gork -p`).
+/// Maximum reconnection attempts for bounded mode (headless/`grok -p`).
 /// TUI mode uses unlimited retries controlled by a cancellation token.
 const RECONNECT_MAX_ATTEMPTS_BOUNDED: u32 = 5;
 /// Environment URLs to pass to the leader subprocess.
@@ -787,6 +787,14 @@ pub enum ConnectionError {
     Timeout,
     #[error("Reconnection cancelled")]
     Cancelled,
+    #[error(
+        "leader mode is unavailable under sandbox profile '{0}': the leader is a \
+         separate, shared process this client cannot prove is confined by that \
+         profile, so tools are not guaranteed to stay inside it. Disable the \
+         profile at the source that selected it (CLI, env, config, or a managed \
+         requirement)"
+    )]
+    SandboxConfinement(&'static str),
 }
 /// Handle for a connection to the leader process.
 ///
@@ -890,7 +898,7 @@ pub enum ReconnectPolicy {
     /// Suitable for interactive TUI sessions where the user expects persistence.
     Unbounded,
     /// Retry up to a fixed number of attempts, then fail.
-    /// Suitable for headless/`gork -p` where hanging forever is unacceptable.
+    /// Suitable for headless/`grok -p` where hanging forever is unacceptable.
     Bounded { max_attempts: u32 },
 }
 impl ReconnectPolicy {
@@ -1051,6 +1059,13 @@ impl LeaderReconnector {
                 Ok(conn) => {
                     info!(attempt, "Reconnected to leader");
                     return Ok(conn.into_channels_with_disconnect());
+                }
+                Err(e) if is_terminal_refusal(&e) => {
+                    warn!(attempt, error = %e, "Reconnection refused (terminal)");
+                    let _ = self.status_tx.send(ConnectionStatus::Failed {
+                        error: e.to_string(),
+                    });
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(attempt, error = %e, "Reconnection attempt failed");
@@ -1364,6 +1379,10 @@ fn is_connect_level_failure(error: &ConnectionError) -> bool {
         ConnectionError::Timeout | ConnectionError::Client(ClientError::Connect(_, _))
     )
 }
+/// Policy refusals that can never succeed on reconnect retry (not zombie-evictable).
+fn is_terminal_refusal(error: &ConnectionError) -> bool {
+    matches!(error, ConnectionError::SandboxConfinement(_))
+}
 /// Evict a suspected zombie leader (holds the flock but is not connectable).
 /// SIGTERM, wait, then escalate to SIGKILL if it overran the grace window.
 async fn evict_zombie_leader(pid: u32, sock_path: &Path, waited: Duration) {
@@ -1425,6 +1444,9 @@ pub async fn connect_or_spawn(
     env_urls: &LeaderEnvUrls,
     capabilities: ClientCapabilities,
 ) -> Result<LeaderConnection, ConnectionError> {
+    if let Some(profile) = xai_grok_sandbox::requested_confinement_profile() {
+        return Err(ConnectionError::SandboxConfinement(profile));
+    }
     let start = std::time::Instant::now();
     let mut lock = LeaderLock::new(&env_urls.grok_ws_url);
     let sock_path = lock.socket_path().clone();
@@ -1608,7 +1630,7 @@ pub async fn connect_or_spawn(
 ///
 /// For a **managed install** — the running binary lives under `grok_home`
 /// (e.g. `~/.grok/...`) — prefer the managed `~/.grok/bin/grok` symlink. After an
-/// auto-update or `gork update` atomically swaps that symlink, `current_exe()`
+/// auto-update or `grok update` atomically swaps that symlink, `current_exe()`
 /// still resolves (via `/proc/self/exe` on Linux) to the *old* versioned target,
 /// so spawning it would relaunch the stale binary. The symlink always points to
 /// the freshly-installed version. This mirrors
@@ -1895,6 +1917,20 @@ mod tests {
         assert!(!is_connect_level_failure(&ConnectionError::Client(
             ClientError::ConnectionClosed
         )));
+        assert!(!is_connect_level_failure(
+            &ConnectionError::SandboxConfinement("strict")
+        ));
+    }
+    #[test]
+    fn terminal_refusal_classification() {
+        assert!(is_terminal_refusal(&ConnectionError::SandboxConfinement(
+            "strict"
+        )));
+        assert!(!is_terminal_refusal(&ConnectionError::Timeout));
+        assert!(!is_terminal_refusal(&ConnectionError::SpawnFailed(
+            "boom".into()
+        )));
+        assert!(!is_terminal_refusal(&ConnectionError::Cancelled));
     }
     /// Per-PID eviction budget: allows `max` attempts, then denies; a PID change
     /// resets the counter so a fresh zombie gets its own budget.

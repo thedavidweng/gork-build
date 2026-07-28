@@ -1,4 +1,4 @@
-//! Headless single-turn mode (`gork -p "prompt"`).
+//! Headless single-turn mode (`grok -p "prompt"`).
 //!
 //! Runs the agent in-process via
 //! `spawn_grok_shell`, sends the ACP lifecycle (init → auth → session → prompt),
@@ -26,7 +26,7 @@ use xai_grok_shell::sampling::types::{
 use xai_grok_shell::util::config as cli_config;
 
 use crate::acp::model_state::{EffortTokenError, ModelState};
-use crate::acp::spawn::spawn_grok_shell;
+use crate::acp::spawn::{AgentShutdownGuard, spawn_grok_shell};
 use crate::client_identity::{HEADLESS_CLIENT_TYPE, PAGER_CLIENT_VERSION};
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -508,14 +508,14 @@ fn auto_respond_to_permissions(
 /// "Not signed in" error message, tailored to the session type.
 fn auth_required_message(interactive: bool) -> String {
     if interactive {
-        "Not signed in. Run `gork login` to authenticate \
-         (or `gork login --device-code` if no browser is available)."
+        "Not signed in. Run `grok login` to authenticate \
+         (or `grok login --device-code` if no browser is available)."
             .to_string()
     } else {
         "Not signed in. To authenticate without a browser, run:\n  \
          grok login --device-code\n\n\
          Alternatively, set the XAI_API_KEY environment variable \
-         or run `gork login` on a machine with a browser."
+         or run `grok login` on a machine with a browser."
             .to_string()
     }
 }
@@ -890,7 +890,7 @@ pub async fn run_single_turn(
     );
 
     // No agent-level hub client URL (gateway-only cloud; workspace provider
-    // hub_url lives on `gork workspace` / WorkspaceStartArgs only).
+    // hub_url lives on `grok workspace` / WorkspaceStartArgs only).
 
     apply_agent_flag(&options.agent, &mut agent_config);
 
@@ -928,6 +928,8 @@ pub async fn run_single_turn(
             anyhow::bail!("{msg}");
         }
     };
+    // Cancel + join on every return path (success or bail).
+    let _agent_guard = AgentShutdownGuard::new(cancel.clone(), Some(spawned.thread_handle));
     let (acp_tx, mut acp_rx) = (spawned.channel.tx, spawned.channel.rx);
     crate::unified_log::init(acp_tx.clone());
     crate::unified_log::info(
@@ -947,7 +949,6 @@ pub async fn run_single_turn(
         Err(e) => {
             let msg = format!("Couldn't initialize: {e}");
             emitter.on_error(&msg);
-            cancel.cancel();
             anyhow::bail!("{msg}");
         }
     };
@@ -969,7 +970,6 @@ pub async fn run_single_turn(
         Ok(is_api_key) => is_api_key,
         Err(e) => {
             emitter.on_error(&e.to_string());
-            cancel.cancel();
             return Err(e);
         }
     };
@@ -1041,7 +1041,6 @@ pub async fn run_single_turn(
         Err(e) => {
             let msg = format!("Couldn't create session: {e}");
             emitter.on_error(&msg);
-            cancel.cancel();
             anyhow::bail!("{msg}");
         }
     };
@@ -1075,7 +1074,6 @@ pub async fn run_single_turn(
     {
         let msg = e.to_string();
         emitter.on_error(&msg);
-        cancel.cancel();
         anyhow::bail!("{msg}");
     }
 
@@ -1177,7 +1175,6 @@ pub async fn run_single_turn(
             msg = acp_rx.recv() => {
                 let Some(msg) = msg else {
                     emitter.on_error("Connection closed unexpectedly");
-                    cancel.cancel();
                     anyhow::bail!("Connection closed unexpectedly");
                 };
                 handle_headless_acp_message(
@@ -1253,7 +1250,7 @@ pub async fn run_single_turn(
         // Non-blocking flock so a slow/network ~/.grok can't hang exit.
         let _ = xai_grok_shell::active_sessions::try_unregister(&session_id);
     }
-    cancel.cancel();
+    // Agent cancel + join (SessionEnd flush) runs in AgentShutdownGuard::drop.
     match prompt_result {
         Some(Ok(resp)) => {
             let stop_reason = format!("{:?}", resp.stop_reason);

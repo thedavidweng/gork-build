@@ -13,11 +13,11 @@ Gork-Risk: medium
  3 files changed, 44 insertions(+), 25 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
-index 5cb2c00930c8c0ea31eae949cd028d0ccbdcff8a..f2d1fdbbfd84fe9d3f6f33fe5c02fb8d08244c17 100644
+index 39f2d8692ddd2feb6e0468a3f2d415345f05ad49..7dc5010f795f4f4463f68ba2cfbb4b6f3ab5ec0c 100644
 --- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
 @@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
- version = "0.2.111"
+ version = "0.2.112"
  edition.workspace = true
  license = "Apache-2.0"
 -authors = ["xAI"]
@@ -43,7 +43,7 @@ index 5cb2c00930c8c0ea31eae949cd028d0ccbdcff8a..f2d1fdbbfd84fe9d3f6f33fe5c02fb8d
  name = "xai-grok-pager"
  path = "src/main.rs"
 diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
-index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadfb3fa7e93 100644
+index e4937c98329e5729a5c076d536c728bc51ab7bc7..ca45f5fb33b417bc25ca8640e59f68d011833cac 100644
 --- a/crates/codegen/xai-grok-pager-bin/src/main.rs
 +++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
 @@ -3,7 +3,8 @@
@@ -56,7 +56,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
  )]
  #[cfg(all(feature = "jemalloc", unix))]
  #[global_allocator]
-@@ -154,7 +155,7 @@ async fn run_setup_command(json: bool) {
+@@ -155,7 +156,7 @@ async fn run_setup_command(json: bool) {
      if !managed_config::has_principal() {
          eprintln!("No deployment key or team sign-in found.");
          eprintln!();
@@ -65,7 +65,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
          eprintln!("or set a deployment key:");
          eprintln!();
          if cfg!(unix) {
-@@ -162,7 +163,7 @@ async fn run_setup_command(json: bool) {
+@@ -163,7 +164,7 @@ async fn run_setup_command(json: bool) {
          } else {
              eprintln!("  $env:GROK_DEPLOYMENT_KEY=\"<your-key>\"");
          }
@@ -74,7 +74,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
          eprintln!();
          eprintln!("Or add the key to ~/.grok/config.toml:");
          eprintln!();
-@@ -202,7 +203,7 @@ async fn run_setup_command(json: bool) {
+@@ -203,7 +204,7 @@ async fn run_setup_command(json: bool) {
          }
          SetupOutcome::Skipped => {
              eprintln!(
@@ -83,7 +83,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
              );
          }
          SetupOutcome::Failed(e) => {
-@@ -426,14 +427,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
+@@ -441,14 +442,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
          WorkspaceGate::Enabled => {}
          WorkspaceGate::Disabled => {
              anyhow::bail!(
@@ -101,7 +101,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
               try again."
              )
          }
-@@ -1621,7 +1622,8 @@ fn install_heap_profile_hooks() {
+@@ -1657,7 +1658,8 @@ fn install_heap_profile_hooks() {
  }
  fn version_text(channel_label: &str) -> String {
      format!(
@@ -111,7 +111,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
          xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
      )
  }
-@@ -2331,7 +2333,7 @@ mod tests {
+@@ -2367,7 +2369,7 @@ mod tests {
              let mut output = Vec::new();
              write_version(&mut output, label).unwrap();
              let output = String::from_utf8(output).unwrap();
@@ -189,16 +189,16 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
      }
  }
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: 02d9359435d0e9c20a20945679389cdce441e431
+prerequisite-patch-id: a6882a7c36c2de8f7c413d630c49d38e98e66b8f
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
-prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
+prerequisite-patch-id: 3daed330cac2602bef12fa50e24f205f03c606d2
 prerequisite-patch-id: a52276cc5d5a3f41e35f0a9442966519c69eef05
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
 prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 
