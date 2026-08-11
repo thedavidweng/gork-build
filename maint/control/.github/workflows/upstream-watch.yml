@@ -1,0 +1,92 @@
+# Daily: detect new upstream (SHA + version + SOURCE_REV) and dispatch replay.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "17 15 * * *"
+  workflow_dispatch:
+    inputs:
+      force_replay:
+        description: "Dispatch replay even if lock matches"
+        type: boolean
+        default: false
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect upstream drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      drift: ${{ steps.detect.outputs.drift }}
+      remote_sha: ${{ steps.detect.outputs.remote_sha }}
+      remote_version: ${{ steps.detect.outputs.remote_version }}
+      remote_source_rev: ${{ steps.detect.outputs.remote_source_rev }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect
+        id: detect
+        run: |
+          set -euo pipefail
+          set +e
+          OUT=$(python3 maint/scripts/patchctl.py detect 2>&1)
+          RC=$?
+          set -e
+          echo "$OUT"
+          REMOTE_SHA=$(echo "$OUT" | sed -n 's/^remote.main     = //p' | tail -1)
+          REMOTE_VER=$(echo "$OUT" | sed -n 's/^remote.version  = //p' | tail -1)
+          REMOTE_SR=$(echo "$OUT" | sed -n 's/^remote.source_rev = //p' | tail -1)
+          if [[ "$REMOTE_SR" == "(empty)" ]]; then REMOTE_SR=""; fi
+          echo "remote_sha=${REMOTE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "remote_version=${REMOTE_VER}" >> "$GITHUB_OUTPUT"
+          echo "remote_source_rev=${REMOTE_SR}" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            if [[ "${{ inputs.force_replay || false }}" == "true" ]]; then
+              echo "drift=true" >> "$GITHUB_OUTPUT"
+              echo "forced replay"
+            fi
+          elif [[ "$RC" -eq 2 ]]; then
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "detect failed rc=$RC" >&2
+            exit "$RC"
+          fi
+
+  dispatch-replay:
+    name: Dispatch upstream replay
+    needs: detect
+    if: needs.detect.outputs.drift == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Trigger upstream-replay
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const sha = '${{ needs.detect.outputs.remote_sha }}';
+            const version = '${{ needs.detect.outputs.remote_version }}';
+            const sourceRev = '${{ needs.detect.outputs.remote_source_rev }}';
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'upstream-replay.yml',
+              ref: context.ref.replace(/^refs\/heads\//, '') || 'main',
+              inputs: {
+                upstream_sha: sha,
+                upstream_version: version,
+                source_rev: sourceRev,
+              },
+            });
