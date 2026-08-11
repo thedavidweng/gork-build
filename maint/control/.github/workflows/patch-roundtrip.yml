@@ -1,0 +1,62 @@
+# Fail closed if the privacy patch series no longer rebuilds the locked tip.
+name: Patch roundtrip
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: patch-roundtrip-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-roundtrip:
+    name: Lint + roundtrip
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git identity (required for git am in roundtrip)
+        run: |
+          git config --global user.email "gork-ci@users.noreply.github.com"
+          git config --global user.name "Gork CI"
+
+      - name: Ensure locked base is present
+        run: |
+          set -euo pipefail
+          BASE=$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          print(tomllib.loads(Path("maint/upstream.lock.toml").read_text())["commit"])
+          PY
+          )
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            git fetch --no-tags https://github.com/xai-org/grok-build.git "$BASE"
+          fi
+          # Best-effort: fetch recorded tips if they exist on origin
+          python3 - <<'PY'
+          import subprocess, tomllib
+          from pathlib import Path
+          lock = tomllib.loads(Path("maint/upstream.lock.toml").read_text())
+          for key in ("patch_tip", "product_tip"):
+              rev = (lock.get(key) or "").strip()
+              if not rev:
+                  continue
+              r = subprocess.run(["git", "cat-file", "-e", f"{rev}^{{commit}}"])
+              if r.returncode != 0:
+                  subprocess.run(
+                      ["git", "fetch", "--no-tags", "origin", rev],
+                      check=False,
+                  )
+          PY
+
+      - name: patchctl lint (roundtrip vs HEAD + product_tip when available)
+        run: python3 maint/scripts/patchctl.py lint

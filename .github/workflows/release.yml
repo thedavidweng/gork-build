@@ -1,0 +1,264 @@
+# Community release builder for Gork Build.
+#
+# Mirrors upstream's prebuilt-binary matrix: xai-org/grok-build ships
+# per-platform npm packages for darwin-{arm64,x64}, linux-{arm64,x64} and
+# win32-{arm64,x64} (crates/codegen/xai-grok-pager/npm/) — Gork Build
+# publishes the same six targets as GitHub release assets. Upstream has no
+# GitHub releases of its own; this repo's Releases page is the community
+# distribution channel (vendor auto-update is hard-off).
+#
+# Autonomy: runs daily and releases exactly once per product version — after
+# the upstream-sync flywheel merges a new version into main, the next run
+# tags it `v<version>-gork.1` and builds. Auto-merge pushes by GITHUB_TOKEN
+# cannot trigger push workflows, hence schedule instead of `on: push`.
+name: Release
+
+on:
+  schedule:
+    - cron: "23 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.94.0"
+
+jobs:
+  plan:
+    name: Plan release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.plan.outputs.proceed }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      main_sha: ${{ steps.plan.outputs.main_sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Decide whether this version needs a release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codegen/xai-grok-version/Cargo.toml | head -1)
+          if [[ -z "$VER" ]]; then
+            echo "could not read product version" >&2
+            exit 1
+          fi
+          TAG="v${VER}-gork.1"
+          MAIN_SHA=$(git rev-parse HEAD)
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists — nothing to do"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "will release ${TAG} from ${MAIN_SHA}"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: plan
+    if: needs.plan.outputs.proceed == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    # win32-arm64 mirrors upstream's matrix but rides a newer runner class;
+    # don't hold the whole release hostage to it.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-latest
+          - platform: darwin-x64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          - platform: win32-x64
+            runner: windows-latest
+          - platform: win32-arm64
+            runner: windows-11-arm
+            experimental: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.main_sha }}
+          persist-credentials: false
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev cmake libclang-dev build-essential
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y nasm
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Pinned protoc matching upstream's dotslash wrapper (bin/protoc → v29.3).
+      # Discovery in xai-proto-build honors $PROTOC first, so set it explicitly
+      # instead of relying on package managers (choco's protoc broke win32).
+      - name: Install protoc 29.3 (pinned, all platforms)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=29.3
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)      SUFFIX="linux-x86_64" ;;
+            Linux-ARM64)    SUFFIX="linux-aarch_64" ;;
+            macOS-ARM64)    SUFFIX="osx-aarch_64" ;;
+            macOS-X64)      SUFFIX="osx-x86_64" ;;
+            Windows-X64)    SUFFIX="win64" ;;
+            Windows-ARM64)  SUFFIX="win64" ;;  # x64 protoc runs under ARM emulation
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+          esac
+          DEST="${RUNNER_TEMP}/protoc"
+          mkdir -p "$DEST"
+          curl -fsSL --retry 5 -o "${RUNNER_TEMP}/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${VER}/protoc-${VER}-${SUFFIX}.zip"
+          unzip -q -o "${RUNNER_TEMP}/protoc.zip" -d "$DEST"
+          BIN="${DEST}/bin/protoc"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          "$BIN" --version
+          echo "PROTOC=${BIN}" >> "$GITHUB_ENV"
+          echo "${DEST}/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: release-${{ matrix.platform }}
+          cache-targets: "true"
+
+      - name: Build gork (release)
+        shell: bash
+        env:
+          # MSVC: this binary's symbol count exceeds PDB limits
+          # (LNK4319/LNK1318 on both win32 targets). Release artifacts ship
+          # without debug info anyway — disable PDB generation outright.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C link-arg=/DEBUG:NONE' || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.target }}" ]]; then
+            cargo build -p xai-grok-pager-bin --release --target "${{ matrix.target }}"
+          else
+            cargo build -p xai-grok-pager-bin --release
+          fi
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          OUTDIR="target/release"
+          if [[ -n "${{ matrix.target }}" ]]; then
+            OUTDIR="target/${{ matrix.target }}/release"
+          fi
+          STAGE=$(mktemp -d)
+          if [[ "$PLATFORM" == win32-* ]]; then
+            cp "${OUTDIR}/gork.exe" "${STAGE}/gork.exe"
+            ASSET="gork-${TAG}-${PLATFORM}.zip"
+            (cd "$STAGE" && 7z a -tzip "${GITHUB_WORKSPACE}/${ASSET}" gork.exe >/dev/null)
+          else
+            cp "${OUTDIR}/gork" "${STAGE}/gork"
+            "${STAGE}/gork" --version || true
+            ASSET="gork-${TAG}-${PLATFORM}.tar.gz"
+            tar -C "$STAGE" -czf "${ASSET}" gork
+          fi
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [plan, build]
+    # Publish when the non-experimental targets built; experimental targets
+    # (continue-on-error) count as success and simply ship if present.
+    if: needs.plan.outputs.proceed == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.main_sha }}
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: release-*
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          ls -la assets/
+          (cd assets && shasum -a 256 gork-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          MAIN_SHA: ${{ needs.plan.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          UPSTREAM=$(sed -n 's/^commit = "\(.*\)"/\1/p' maint/upstream.lock.toml | head -1)
+          SOURCE_REV=$(head -1 SOURCE_REV | tr -d '[:space:]')
+          cat > notes.md <<EOF
+          Community privacy build of Grok Build **${VERSION}**.
+
+          Based on upstream [\`xai-org/grok-build\`](https://github.com/xai-org/grok-build) commit \`${UPSTREAM}\` (SOURCE_REV \`${SOURCE_REV}\`) with the full Gork privacy patch queue applied:
+
+          - Product analytics (Mixpanel / events): **hard-off**
+          - Client research / trace / session uploads: **hard-off** (remote flags cannot re-enable)
+          - Coding-data retention: **locked to opt-out**
+          - Vendor auto-update (x.ai/cli): **hard-disabled** — update from this page or rebuild from source
+
+          Platform matrix mirrors upstream's prebuilt set (darwin/linux/win32 × arm64/x64). macOS binaries are unsigned: \`xattr -d com.apple.quarantine gork\` after extracting.
+
+          Verified in CI before this release: privacy contracts, patch-queue roundtrip, cargo audit, and a release-binary egress smoke.
+          EOF
+          gh release create "$TAG" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$MAIN_SHA" \
+            --title "Gork Build ${VERSION} (${TAG})" \
+            --notes-file notes.md
