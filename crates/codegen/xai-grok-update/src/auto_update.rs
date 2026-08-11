@@ -45,14 +45,22 @@ fn manual_install_cmd(_channel: &str) -> String {
         .to_string()
 }
 
-/// Build a reinstall hint for a known installer type.
+/// Env escape hatch for integration tests only (feature-gated).
+#[doc(hidden)]
+pub const TEST_ALLOW_UPDATE_ENV: &str = "GORK_TEST_ALLOW_UPDATE";
 
-/// Gork Build never auto-updates from vendor (x.ai) channels. Enabling that
-/// path would replace this privacy fork with official Grok Build.
-/// Callers must check it, and [`run_install_script`] enforces it as the
-/// last-line chokepoint.
+/// Gork Build never auto-updates from vendor (x.ai) channels.
+/// Callers must check it; [`run_install_script`] enforces it as the last-line chokepoint.
 #[inline]
 pub fn vendor_auto_update_forbidden() -> bool {
+    #[cfg(feature = "updater-integration-tests")]
+    {
+        // SAFETY: only honored when the integration-tests feature is compiled
+        // in; product builds never link this path.
+        if std::env::var(TEST_ALLOW_UPDATE_ENV).as_deref() == Ok("1") {
+            return false;
+        }
+    }
     // Compile-time privacy switch. Also consult research_data_collection so a
     // mis-built binary without PRIVACY_BUILD still fails closed if research is locked.
     xai_grok_version::PRIVACY_BUILD || xai_grok_version::research_data_collection_forbidden()
@@ -71,6 +79,7 @@ fn vendor_update_blocked_err() -> anyhow::Error {
     anyhow::anyhow!("{}", vendor_update_blocked_message())
 }
 
+/// Build a reinstall hint for a known installer type.
 fn reinstall_hint(installer: &str, channel: &str) -> String {
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @gork-build/gork".to_string(),
@@ -193,8 +202,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
     if vendor_auto_update_forbidden() && !json {
         println!(
             "Gork Build - v{} [{}]",
-            status.current_version,
-            status.channel
+            status.current_version, status.channel
         );
         println!("Auto-update: disabled (privacy build never installs from vendor channels).");
         println!("{}", vendor_update_blocked_message());
@@ -242,22 +250,23 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
 }
 
 pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
-    if vendor_auto_update_forbidden() {
-        return UpdateStatus {
-            current_version: get_installed_grok_version(),
-            latest_version: None,
-            update_available: false,
-            installer: None,
-            channel: update_config.channel.clone(),
-            auto_update: Some(false),
-            error: None,
-        };
-    }
     let installer = get_installer().await.map(|value| value.to_string());
     let current_version = get_installed_grok_version();
     let current_config = config::load_config().await;
     let auto_update = current_config.cli.auto_update;
     let channel = update_config.channel.clone();
+    // Privacy: never advertise vendor updates, but still report installer/current.
+    if vendor_auto_update_forbidden() {
+        return UpdateStatus {
+            current_version,
+            latest_version: None,
+            update_available: false,
+            installer,
+            channel,
+            auto_update: Some(false),
+            error: None,
+        };
+    }
 
     let Some(ref inst) = installer else {
         return UpdateStatus {
@@ -5470,38 +5479,74 @@ mod tests {
             "PRIVACY_BUILD must forbid vendor auto-update"
         );
         let msg = vendor_update_blocked_message();
-        assert!(msg.contains("Gork Build") || msg.contains("privacy") || msg.contains("vendor"));
-        assert!(!msg.contains("curl -fsSL https://x.ai/cli"));
+        assert!(
+            msg.contains("Gork Build") || msg.contains("vendor") || msg.contains("never"),
+            "{msg}"
+        );
+        assert!(!msg.contains("curl -fsSL https://x.ai/cli"), "{msg}");
     }
 
     #[tokio::test]
     async fn run_install_script_fail_closed_under_privacy() {
-        let cfg = crate::config::UpdateConfig::default();
+        let cfg = UpdateConfig {
+            proxy_base_url: "http://test.invalid/v1".to_string(),
+            auth_scope: "test".to_string(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".to_string(),
+            npm_registry: None,
+        };
         let err = run_install_script(
             "internal",
             Some("1.0.0"),
             &cfg,
-            crate::telemetry::CliUpdateTrigger::UserCommand,
+            CliUpdateTrigger::UserCommand,
         )
         .await
         .expect_err("run_install_script must refuse under privacy");
         let s = format!("{err:#}");
-        assert!(s.contains("vendor") || s.contains("Gork") || s.contains("privacy") || s.contains("never"), "{s}");
+        assert!(
+            s.contains("vendor")
+                || s.contains("Gork")
+                || s.contains("privacy")
+                || s.contains("never"),
+            "{s}"
+        );
     }
 
     #[tokio::test]
     async fn ensure_latest_on_disk_no_install_under_privacy() {
-        let cfg = crate::config::UpdateConfig::default();
+        let cfg = UpdateConfig {
+            proxy_base_url: "http://test.invalid/v1".to_string(),
+            auth_scope: "test".to_string(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".to_string(),
+            npm_registry: None,
+        };
         let out = ensure_latest_on_disk(&cfg)
             .await
             .expect("privacy path is Ok(no-op), not network error");
-        assert!(out.installed.is_none(), "leader hourly path must not install under privacy");
-        assert!(!out.relaunch_needed, "must not claim relaunch after a privacy no-op");
+        assert!(
+            out.installed.is_none(),
+            "leader hourly path must not install under privacy"
+        );
+        assert!(
+            !out.relaunch_needed,
+            "must not claim relaunch after a privacy no-op"
+        );
     }
 
     #[tokio::test]
     async fn auto_update_target_none_under_privacy() {
-        let cfg = crate::config::UpdateConfig::default();
+        let cfg = UpdateConfig {
+            proxy_base_url: "http://test.invalid/v1".to_string(),
+            auth_scope: "test".to_string(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".to_string(),
+            npm_registry: None,
+        };
         assert!(auto_update_target(&cfg).await.is_none());
     }
 
@@ -5517,5 +5562,4 @@ mod tests {
             "must not recommend vendor installers: {hint}"
         );
     }
-
 }

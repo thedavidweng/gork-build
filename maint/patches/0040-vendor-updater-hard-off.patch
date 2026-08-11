@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From ebf0da10daeeecfc4c45f700076ab9a6e20a8f2b Mon Sep 17 00:00:00 2001
 From: Gork <gork-ci@users.noreply.github.com>
-Date: Tue, 11 Aug 2026 16:17:56 -0700
+Date: Tue, 11 Aug 2026 16:54:02 -0700
 Subject: [PATCH] vendor-updater-hard-off: install chokepoint and
  leader/min-version gates
 
@@ -9,12 +9,13 @@ Gork-Invariant: vendor-install-unreachable
 Gork-Risk: critical
 ---
  crates/codegen/xai-grok-update/Cargo.toml     |   7 +
- .../xai-grok-update/src/auto_update.rs        | 193 ++++++++++++++----
+ .../xai-grok-update/src/auto_update.rs        | 235 ++++++++++++++----
  crates/codegen/xai-grok-update/src/version.rs |   4 +-
- 3 files changed, 157 insertions(+), 47 deletions(-)
+ .../xai-grok-update/tests/common/mod.rs       |   3 +
+ 4 files changed, 203 insertions(+), 46 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-update/Cargo.toml b/crates/codegen/xai-grok-update/Cargo.toml
-index 045ee6c2fd5a4cbfbf1e541577f659ddfb417a16..0a45287068d84bbfdf9fa024ea7b1f5ac3ada965 100644
+index 045ee6c..0a45287 100644
 --- a/crates/codegen/xai-grok-update/Cargo.toml
 +++ b/crates/codegen/xai-grok-update/Cargo.toml
 @@ -4,6 +4,13 @@ name = "xai-grok-update"
@@ -32,10 +33,10 @@ index 045ee6c2fd5a4cbfbf1e541577f659ddfb417a16..0a45287068d84bbfdf9fa024ea7b1f5a
  anyhow = { workspace = true }
  futures = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07fa5ed149 100644
+index 2ae404b..540d70f 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
-@@ -29,55 +29,53 @@ pub enum UpdateRunMode {
+@@ -29,55 +29,62 @@ pub enum UpdateRunMode {
  
  const PROMPT_UPDATE_NOW: &str = "Update now? [Y/n/d]";
  const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
@@ -81,23 +82,30 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
 -        format!("$env:GROK_CHANNEL='{channel}'; irm https://x.ai/cli/install.ps1 | iex")
 -    } else {
 -        format!("curl -fsSL https://x.ai/cli/install.sh | GROK_CHANNEL='{channel}' bash")
--    }
 +/// Manual reinstall hint for Gork Build (never points at x.ai installers —
 +/// those would replace this fork with official Grok Build).
 +/// `channel` is accepted for API compatibility with upstream call sites but ignored.
 +fn manual_install_cmd(_channel: &str) -> String {
 +    "git pull && cargo build -p xai-grok-pager-bin --release  # binary: target/release/gork"
 +        .to_string()
- }
- 
- /// Build a reinstall hint for a known installer type.
++}
 +
-+/// Gork Build never auto-updates from vendor (x.ai) channels. Enabling that
-+/// path would replace this privacy fork with official Grok Build.
-+/// Callers must check it, and [`run_install_script`] enforces it as the
-+/// last-line chokepoint.
++/// Env escape hatch for integration tests only (feature-gated).
++#[doc(hidden)]
++pub const TEST_ALLOW_UPDATE_ENV: &str = "GORK_TEST_ALLOW_UPDATE";
++
++/// Gork Build never auto-updates from vendor (x.ai) channels.
++/// Callers must check it; [`run_install_script`] enforces it as the last-line chokepoint.
 +#[inline]
 +pub fn vendor_auto_update_forbidden() -> bool {
++    #[cfg(feature = "updater-integration-tests")]
++    {
++        // SAFETY: only honored when the integration-tests feature is compiled
++        // in; product builds never link this path.
++        if std::env::var(TEST_ALLOW_UPDATE_ENV).as_deref() == Ok("1") {
++            return false;
++        }
+     }
 +    // Compile-time privacy switch. Also consult research_data_collection so a
 +    // mis-built binary without PRIVACY_BUILD still fails closed if research is locked.
 +    xai_grok_version::PRIVACY_BUILD || xai_grok_version::research_data_collection_forbidden()
@@ -114,8 +122,9 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
 +/// Err used by install/update chokepoints under [`vendor_auto_update_forbidden`].
 +fn vendor_update_blocked_err() -> anyhow::Error {
 +    anyhow::anyhow!("{}", vendor_update_blocked_message())
-+}
-+
+ }
+ 
+ /// Build a reinstall hint for a known installer type.
  fn reinstall_hint(installer: &str, channel: &str) -> String {
      match installer {
 -        "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
@@ -127,7 +136,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      }
  }
  
-@@ -191,6 +189,17 @@ pub struct UpdateStatus {
+@@ -191,6 +198,16 @@ pub struct UpdateStatus {
  
  /// Format and print an [`UpdateStatus`] to stdout.
  pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<()> {
@@ -135,8 +144,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
 +    if vendor_auto_update_forbidden() && !json {
 +        println!(
 +            "Gork Build - v{} [{}]",
-+            status.current_version,
-+            status.channel
++            status.current_version, status.channel
 +        );
 +        println!("Auto-update: disabled (privacy build never installs from vendor channels).");
 +        println!("{}", vendor_update_blocked_message());
@@ -145,7 +153,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      if json {
          let payload = serde_json::to_string(status)?;
          println!("{payload}");
-@@ -199,7 +208,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
+@@ -199,7 +216,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
  
      if let Some(error) = status.error.as_deref() {
          println!(
@@ -154,7 +162,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
              status.current_version, status.channel
          );
          println!("Update check failed: {error}");
-@@ -211,28 +220,39 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
+@@ -211,24 +228,24 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
      if status.update_available {
          if let Some(latest_version) = status.latest_version.as_deref() {
              println!(
@@ -183,22 +191,26 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      Ok(())
  }
  
- pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
+@@ -238,6 +255,18 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
+     let current_config = config::load_config().await;
+     let auto_update = current_config.cli.auto_update;
+     let channel = update_config.channel.clone();
++    // Privacy: never advertise vendor updates, but still report installer/current.
 +    if vendor_auto_update_forbidden() {
 +        return UpdateStatus {
-+            current_version: get_installed_grok_version(),
++            current_version,
 +            latest_version: None,
 +            update_available: false,
-+            installer: None,
-+            channel: update_config.channel.clone(),
++            installer,
++            channel,
 +            auto_update: Some(false),
 +            error: None,
 +        };
 +    }
-     let installer = get_installer().await.map(|value| value.to_string());
-     let current_version = get_installed_grok_version();
-     let current_config = config::load_config().await;
-@@ -362,6 +382,9 @@ async fn fetch_update_plan(
+ 
+     let Some(ref inst) = installer else {
+         return UpdateStatus {
+@@ -362,6 +391,9 @@ async fn fetch_update_plan(
  /// on the installer (via `installer_allows_downgrade`) so npm is never
  /// downgraded — the decision depends on the installer, never the caller.
  pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'static str, String)> {
@@ -208,7 +220,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      let installer = get_installer().await?;
      let current = get_installed_grok_version();
      let policy = config::VersionPolicy::resolve();
-@@ -410,6 +433,12 @@ pub struct EnsureLatestOutcome {
+@@ -410,6 +442,12 @@ pub struct EnsureLatestOutcome {
  /// re-download is NOT fixed there; only the symlink layout can prove the
  /// disk is current without exec'ing the binary.
  pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<EnsureLatestOutcome> {
@@ -221,7 +233,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      let mut outcome = EnsureLatestOutcome {
          installed: None,
          relaunch_needed: false,
-@@ -598,6 +627,9 @@ impl BackgroundUpdateCheck {
+@@ -598,6 +636,9 @@ impl BackgroundUpdateCheck {
  /// TUI, the leader's hourly checker) already put the target version on disk,
  /// no download is started — only the restart hint is surfaced.
  pub async fn check_update_background(update_config: &UpdateConfig) -> BackgroundUpdateCheck {
@@ -231,7 +243,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      let Some(installer) = get_installer().await else {
          return BackgroundUpdateCheck::none();
      };
-@@ -688,6 +720,9 @@ pub async fn run_update_if_available(
+@@ -688,6 +729,9 @@ pub async fn run_update_if_available(
      trigger: CliUpdateTrigger,
      update_config: &UpdateConfig,
  ) -> Result<bool> {
@@ -241,7 +253,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      let Some(inst) = get_installer().await else {
          // Skip update check if no known installer.
          return Ok(false);
-@@ -745,7 +780,7 @@ pub async fn run_update_if_available(
+@@ -745,7 +789,7 @@ pub async fn run_update_if_available(
      let channel_label = format!(" [{}]", update_config.channel);
      if auto_update {
          eprintln!(
@@ -250,7 +262,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
              current_version, latest_version, channel_label
          );
          if interactive {
-@@ -773,7 +808,7 @@ pub async fn run_update_if_available(
+@@ -773,7 +817,7 @@ pub async fn run_update_if_available(
              return Ok(false);
          }
          eprintln!(
@@ -259,7 +271,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
              current_version, latest_version, channel_label
          );
          if interactive {
-@@ -930,6 +965,11 @@ pub async fn run_install_script(
+@@ -930,6 +974,11 @@ pub async fn run_install_script(
      update_config: &UpdateConfig,
      trigger: CliUpdateTrigger,
  ) -> Result<()> {
@@ -271,7 +283,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      // What's on disk is being replaced, not this (possibly stale) process's
      // version; npm has no trustworthy disk version, so it falls back.
      let from_version =
-@@ -1372,6 +1412,10 @@ async fn download_cli_artifact_from_gcs(
+@@ -1372,6 +1421,10 @@ async fn download_cli_artifact_from_gcs(
  
  /// Returns the version that was actually activated.
  async fn install_internal(target: Option<&str>, update_config: &UpdateConfig) -> Result<String> {
@@ -282,7 +294,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      let bases = crate::version::cli_base_urls();
      let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
      install_internal_from_bases(target, update_config, &base_refs).await
-@@ -2644,6 +2688,9 @@ pub async fn run_update(
+@@ -2644,6 +2697,9 @@ pub async fn run_update(
      update_config: &mut UpdateConfig,
      trigger: CliUpdateTrigger,
  ) -> Result<Option<String>> {
@@ -292,7 +304,7 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
      apply_channel_switch(channel_switch, update_config).await;
      let installer = match get_installer().await {
          Some(i) => i,
-@@ -5415,4 +5462,60 @@ mod tests {
+@@ -5415,4 +5471,95 @@ mod tests {
              "other executables' leftovers must be untouched"
          );
      }
@@ -304,38 +316,74 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
 +            "PRIVACY_BUILD must forbid vendor auto-update"
 +        );
 +        let msg = vendor_update_blocked_message();
-+        assert!(msg.contains("Gork Build") || msg.contains("privacy") || msg.contains("vendor"));
-+        assert!(!msg.contains("curl -fsSL https://x.ai/cli"));
++        assert!(
++            msg.contains("Gork Build") || msg.contains("vendor") || msg.contains("never"),
++            "{msg}"
++        );
++        assert!(!msg.contains("curl -fsSL https://x.ai/cli"), "{msg}");
 +    }
 +
 +    #[tokio::test]
 +    async fn run_install_script_fail_closed_under_privacy() {
-+        let cfg = crate::config::UpdateConfig::default();
++        let cfg = UpdateConfig {
++            proxy_base_url: "http://test.invalid/v1".to_string(),
++            auth_scope: "test".to_string(),
++            deployment_key: None,
++            alpha_test_key: None,
++            channel: "stable".to_string(),
++            npm_registry: None,
++        };
 +        let err = run_install_script(
 +            "internal",
 +            Some("1.0.0"),
 +            &cfg,
-+            crate::telemetry::CliUpdateTrigger::UserCommand,
++            CliUpdateTrigger::UserCommand,
 +        )
 +        .await
 +        .expect_err("run_install_script must refuse under privacy");
 +        let s = format!("{err:#}");
-+        assert!(s.contains("vendor") || s.contains("Gork") || s.contains("privacy") || s.contains("never"), "{s}");
++        assert!(
++            s.contains("vendor")
++                || s.contains("Gork")
++                || s.contains("privacy")
++                || s.contains("never"),
++            "{s}"
++        );
 +    }
 +
 +    #[tokio::test]
 +    async fn ensure_latest_on_disk_no_install_under_privacy() {
-+        let cfg = crate::config::UpdateConfig::default();
++        let cfg = UpdateConfig {
++            proxy_base_url: "http://test.invalid/v1".to_string(),
++            auth_scope: "test".to_string(),
++            deployment_key: None,
++            alpha_test_key: None,
++            channel: "stable".to_string(),
++            npm_registry: None,
++        };
 +        let out = ensure_latest_on_disk(&cfg)
 +            .await
 +            .expect("privacy path is Ok(no-op), not network error");
-+        assert!(out.installed.is_none(), "leader hourly path must not install under privacy");
-+        assert!(!out.relaunch_needed, "must not claim relaunch after a privacy no-op");
++        assert!(
++            out.installed.is_none(),
++            "leader hourly path must not install under privacy"
++        );
++        assert!(
++            !out.relaunch_needed,
++            "must not claim relaunch after a privacy no-op"
++        );
 +    }
 +
 +    #[tokio::test]
 +    async fn auto_update_target_none_under_privacy() {
-+        let cfg = crate::config::UpdateConfig::default();
++        let cfg = UpdateConfig {
++            proxy_base_url: "http://test.invalid/v1".to_string(),
++            auth_scope: "test".to_string(),
++            deployment_key: None,
++            alpha_test_key: None,
++            channel: "stable".to_string(),
++            npm_registry: None,
++        };
 +        assert!(auto_update_target(&cfg).await.is_none());
 +    }
 +
@@ -351,10 +399,9 @@ index 2ae404b5ca2280654382e2b5afe34c379aa15649..f8f6f9774458bce48c9a89e026462e07
 +            "must not recommend vendor installers: {hint}"
 +        );
 +    }
-+
  }
 diff --git a/crates/codegen/xai-grok-update/src/version.rs b/crates/codegen/xai-grok-update/src/version.rs
-index 721d859bfac7b955665634e63b53c949935d2a85..de55f63382533d0e50018f3d9f24e0d7c07058a9 100644
+index 721d859..de55f63 100644
 --- a/crates/codegen/xai-grok-update/src/version.rs
 +++ b/crates/codegen/xai-grok-update/src/version.rs
 @@ -10,8 +10,8 @@ use xai_grok_shell::env::GrokBuildEnvironment;
@@ -368,12 +415,20 @@ index 721d859bfac7b955665634e63b53c949935d2a85..de55f63382533d0e50018f3d9f24e0d7
  
  /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
  /// for binaries and origin-respecting no-cache for channel pointers.
-
-base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
-prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
-prerequisite-patch-id: 34ca1becedc5edfe22fb9108fc3a4215e49bb0d1
+diff --git a/crates/codegen/xai-grok-update/tests/common/mod.rs b/crates/codegen/xai-grok-update/tests/common/mod.rs
+index 9845e49..1524e3d 100644
+--- a/crates/codegen/xai-grok-update/tests/common/mod.rs
++++ b/crates/codegen/xai-grok-update/tests/common/mod.rs
+@@ -56,6 +56,9 @@ pub fn test_home() -> &'static PathBuf {
+             std::env::remove_var("GROK_INSTALLER");
+             std::env::remove_var("GROK_MANAGED_BY_NPM");
+             std::env::remove_var("GROK_MANAGED_BY_INTERNAL");
++            // Installer-mechanics suites: only effective when the crate is
++            // built with `--features updater-integration-tests`.
++            std::env::set_var("GORK_TEST_ALLOW_UPDATE", "1");
+         }
+         path
+     })
 -- 
 2.50.1 (Apple Git-155)
 
