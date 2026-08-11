@@ -188,6 +188,42 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
 +        );
      }
  }
+diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
+--- a/crates/codegen/xai-grok-pager/src/app/cli.rs
++++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
+@@ -401,9 +401,9 @@
+ }
+ #[derive(Debug, Clone, Parser)]
+ #[command(
+-    name = "grok",
++    name = "gork",
+     version = env!("VERSION_WITH_COMMIT"),
+-    about = "Grok Build TUI",
++    about = "Gork Build TUI",
+     disable_version_flag = true,
+     next_display_order = None,
+     help_template = "\
+diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
+--- a/crates/codegen/xai-grok-pager-bin/src/main.rs
++++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
+@@ -1107,7 +1107,7 @@
+     let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
+     if !is_stdio && !is_leader {
+         eprintln!(
+-            "Grok Build (pager) - v{}",
++            "Gork Build (pager) - v{}",
+             xai_grok_version::display_version_with_commit(
+                 env!("VERSION_WITH_COMMIT"),
+                 xai_grok_update::channel_label(),
+diff --git a/crates/codegen/xai-grok-pager/src/lib.rs b/crates/codegen/xai-grok-pager/src/lib.rs
+--- a/crates/codegen/xai-grok-pager/src/lib.rs
++++ b/crates/codegen/xai-grok-pager/src/lib.rs
+@@ -1,4 +1,4 @@
+-//! xai-grok-pager — Grok Build TUI.
++//! xai-grok-pager — Gork Build TUI.
+ //!
+ //! A clean-room implementation built on the v3 pager rendering engine.
+ 
 
 base-commit: b13fa526f5112c0b20dad5f1f2300d3d3b127895
 prerequisite-patch-id: e91e5a7076a517f7a2ce2b292e6c4c2fd9c2b7af
