@@ -11,7 +11,7 @@ const DEFAULT_EARLY_INVALIDATION_SECS: u64 = 300; // 5 minutes
 /// Legacy auth.json scope key. Fallback for old devbox auth files.
 pub(super) const LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
 
-/// auth.json scope key for plain API key auth (desktop login, `grok login --api-key`).
+/// auth.json scope key for plain API key auth (desktop login, `gork login --api-key`).
 pub(super) const API_KEY_SCOPE: &str = "xai::api_key";
 
 const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
@@ -36,7 +36,7 @@ pub enum AuthMode {
     Oidc,
     /// External auth provider binary
     External,
-    /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
+    /// Plain API key (e.g. from grok-desktop login or `gork login --api-key`)
     ApiKey,
 }
 
@@ -186,6 +186,10 @@ impl GrokAuth {
     /// Product analytics (`telemetry_enabled`) and user-facing sync
     /// features should use `is_zdr_team()` directly.
     pub(crate) fn is_data_collection_disabled(&self) -> bool {
+        // Gork Build: research data never leaves the machine regardless of account flags.
+        if xai_grok_version::research_data_collection_forbidden() {
+            return true;
+        }
         self.is_zdr_team() || self.coding_data_retention_opt_out
     }
 
@@ -302,7 +306,7 @@ pub(crate) struct UserInfo {
 
 /// Look up auth from the store by scope key.
 ///
-/// Legacy `WebLogin` tokens (from the pre-OIDC `grok login --legacy`
+/// Legacy `WebLogin` tokens (from the pre-OIDC `gork login --legacy`
 /// flow) are skipped — they are validated via a per-request DB lookup
 /// server-side which fails at high volume.  Skipping them here forces
 /// affected users to re-authenticate via OIDC on next launch.
