@@ -409,9 +409,9 @@ pub struct LeaderArgs {
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "grok",
+    name = "gork",
     version = env!("VERSION_WITH_COMMIT"),
-    about = "Grok Build TUI",
+    about = "Gork Build TUI",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
@@ -830,14 +830,18 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
 impl PagerArgs {
     /// Parse CLI arguments without applying side effects.
     pub fn parse_cli() -> Self {
+        // Gork Build ships as PRODUCT_CLI ("gork"); keep "grok"/"agent" as
+        // recognized invocation names for path/compat aliases.
         let bin_name = std::env::args()
             .next()
             .as_deref()
             .map(std::path::Path::new)
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .filter(|n| *n == "grok" || *n == "agent")
-            .unwrap_or("grok")
+            .filter(|n| {
+                *n == xai_grok_version::PRODUCT_CLI || *n == "gork" || *n == "grok" || *n == "agent"
+            })
+            .unwrap_or(xai_grok_version::PRODUCT_CLI)
             .to_owned();
         Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
     }
