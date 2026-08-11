@@ -1,4 +1,4 @@
-From ebf0da10daeeecfc4c45f700076ab9a6e20a8f2b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Gork <gork-ci@users.noreply.github.com>
 Date: Tue, 11 Aug 2026 16:54:02 -0700
 Subject: [PATCH] vendor-updater-hard-off: install chokepoint and
@@ -15,7 +15,7 @@ Gork-Risk: critical
  4 files changed, 203 insertions(+), 46 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-update/Cargo.toml b/crates/codegen/xai-grok-update/Cargo.toml
-index 045ee6c..0a45287 100644
+index 045ee6c2fd5a4cbfbf1e541577f659ddfb417a16..0a45287068d84bbfdf9fa024ea7b1f5ac3ada965 100644
 --- a/crates/codegen/xai-grok-update/Cargo.toml
 +++ b/crates/codegen/xai-grok-update/Cargo.toml
 @@ -4,6 +4,13 @@ name = "xai-grok-update"
@@ -33,7 +33,7 @@ index 045ee6c..0a45287 100644
  anyhow = { workspace = true }
  futures = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 2ae404b..540d70f 100644
+index 2ae404b5ca2280654382e2b5afe34c379aa15649..540d70f9d405cb33df1b5dea2817b603a8afd0b6 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
 @@ -29,55 +29,62 @@ pub enum UpdateRunMode {
@@ -401,7 +401,7 @@ index 2ae404b..540d70f 100644
 +    }
  }
 diff --git a/crates/codegen/xai-grok-update/src/version.rs b/crates/codegen/xai-grok-update/src/version.rs
-index 721d859..de55f63 100644
+index 721d859bfac7b955665634e63b53c949935d2a85..de55f63382533d0e50018f3d9f24e0d7c07058a9 100644
 --- a/crates/codegen/xai-grok-update/src/version.rs
 +++ b/crates/codegen/xai-grok-update/src/version.rs
 @@ -10,8 +10,8 @@ use xai_grok_shell::env::GrokBuildEnvironment;
@@ -416,7 +416,7 @@ index 721d859..de55f63 100644
  /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
  /// for binaries and origin-respecting no-cache for channel pointers.
 diff --git a/crates/codegen/xai-grok-update/tests/common/mod.rs b/crates/codegen/xai-grok-update/tests/common/mod.rs
-index 9845e49..1524e3d 100644
+index 9845e49f8c839f88525d460d3e13b178c9f61ce8..1524e3dce464acc4406d37c58aa4d1c0fc169bf2 100644
 --- a/crates/codegen/xai-grok-update/tests/common/mod.rs
 +++ b/crates/codegen/xai-grok-update/tests/common/mod.rs
 @@ -56,6 +56,9 @@ pub fn test_home() -> &'static PathBuf {
@@ -429,6 +429,12 @@ index 9845e49..1524e3d 100644
          }
          path
      })
+
+base-commit: be713136d2a69080743a3f6b3c72077057e5948f
+prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
+prerequisite-patch-id: 34ca1becedc5edfe22fb9108fc3a4215e49bb0d1
 -- 
 2.50.1 (Apple Git-155)
 
