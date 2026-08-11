@@ -1,0 +1,11 @@
+# Locked upstream base for the Gork privacy patch queue.
+schema = 1
+
+repository = "https://github.com/xai-org/grok-build.git"
+commit = "be713136d2a69080743a3f6b3c72077057e5948f"
+source_rev = "5d08d7e4123092567ccd584cd9f99afa2972065c"
+version = "1.0.1"
+
+patchset_revision = 1
+patch_tip = "c5c25ab8eeca22f75e9ae1fc2bffe78c7b1afa11"
+product_tip = "9403bfce31c9534a765cf10391981a1e7a441ecf"

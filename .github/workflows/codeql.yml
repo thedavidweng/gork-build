@@ -1,0 +1,78 @@
+# CodeQL advanced setup for Gork Build.
+#
+# Replaces GitHub's default CodeQL setup so we can exclude upstream *test*
+# code from alerting: this repo tracks xai-org/grok-build nearly verbatim,
+# and alerts on upstream test fixtures (cleartext logging of fake data,
+# hard-coded test keys, …) are noise we cannot fix without diverging from
+# upstream. Product (non-test) code stays fully scanned.
+#
+# Alert policy for upstream *product* code findings: dismiss as "won't fix"
+# with an "upstream-inherited" comment unless the finding touches a privacy
+# egress path — those we patch (see maint/patchset.toml).
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "37 11 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config: |
+            paths-ignore:
+              # Upstream test code (see header). Product code is NOT excluded.
+              - "**/tests/**"
+              - "**/test/**"
+              - "**/*_tests.rs"
+              - "**/tests.rs"
+              - "**/*_test.rs"
+              - "**/test_helpers.rs"
+              - "**/test_helpers/**"
+              - "**/testdata/**"
+              - "**/fixtures/**"
+              - "**/benches/**"
+              - "**/examples/**"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          category: "/language:${{ matrix.language }}"
