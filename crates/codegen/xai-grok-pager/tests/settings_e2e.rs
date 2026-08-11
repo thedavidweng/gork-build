@@ -4903,11 +4903,11 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
 #[test]
 fn pr9_coding_data_sharing_choices_use_canonical_strings() {
     let reg = SettingsRegistry::defaults();
-    let meta = reg.get("coding_data_sharing").expect("coding_data_sharing in registry");
-    let SettingKind::Enum { choices, .. } = &meta.kind else {
-        panic!("coding_data_sharing must be Enum");
+    let meta = reg.find("coding_data_sharing").unwrap();
+    let canonicals: Vec<&str> = match &meta.kind {
+        SettingKind::Enum { choices, .. } => choices.iter().map(|c| c.canonical).collect(),
+        _ => panic!("coding_data_sharing must be Enum"),
     };
-    let canonicals: Vec<&str> = choices.iter().map(|c| c.canonical).collect();
     assert_eq!(
         canonicals,
         vec!["opt-out"],
