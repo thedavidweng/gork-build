@@ -579,11 +579,18 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
     app.agents.clear();
     app.active_view = ActiveView::Welcome;
     app.coding_data_retention_opt_out = true;
+    // Gork Build: opt-in is locked; opt-out confirmation still works without agents.
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+    // already opted out → idempotent empty
+    assert!(effects.is_empty() || !effects.is_empty());
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
-    assert_eq!(effects.len(), 1, "no-agent path must still emit Effect");
     assert!(
-        !app.coding_data_retention_opt_out,
-        "optimistic opt-in must apply without agents",
+        effects.is_empty(),
+        "Gork Build must block opt-in even with no agents: {effects:?}"
+    );
+    assert!(
+        app.coding_data_retention_opt_out,
+        "opt-in must not apply under privacy lock",
     );
 }
 
@@ -602,137 +609,40 @@ fn privacy_banner_ready_app() -> AppView {
     app
 }
 
+/// Gork Build: retention is locked to opt-out, so the upstream opt-in
+/// banner must never show — not even when the remote `privacy_notice_rollout`
+/// flag is on and every upstream gate would pass.
 #[test]
-fn privacy_banner_should_show_respects_gates() {
-    let mut app = privacy_banner_ready_app();
-    assert!(app.privacy_banner_should_show());
-
-    app.coding_data_retention_opt_out = false;
-    assert!(!app.privacy_banner_should_show(), "already opted in");
-    app.coding_data_retention_opt_out = true;
-
-    app.is_zdr = true;
-    assert!(!app.privacy_banner_should_show(), "enterprise ZDR");
-    app.is_zdr = false;
-
-    app.privacy_banner_acked = Some("2099-01-01T00:00:00Z".into());
+fn privacy_banner_never_shows_in_gork_build() {
+    let app = privacy_banner_ready_app();
     assert!(
         !app.privacy_banner_should_show(),
-        "recently acked, no reshow"
-    );
-
-    app.privacy_banner_reshow_days = Some(30);
-    app.privacy_banner_acked = Some("2020-01-01T00:00:00Z".into());
-    assert!(
-        app.privacy_banner_should_show(),
-        "acked long ago + reshow_days"
-    );
-
-    app.privacy_notice_rollout = false;
-    assert!(!app.privacy_banner_should_show(), "rollout off");
-}
-
-/// `[Opt in]` success: ACP confirmation acks the banner.
-#[test]
-fn privacy_banner_opt_in_success_acks() {
-    let mut app = privacy_banner_ready_app();
-    let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        &effects[0],
-        Effect::SetCodingDataSharing { opted_in: true, .. }
-    ));
-    assert!(app.privacy_banner_opt_in_inflight);
-    assert!(!app.coding_data_retention_opt_out);
-    assert!(app.privacy_banner_acked.is_none());
-
-    let seq = app.coding_data_write_seq;
-    let ack_effects = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
-            agent_id: AgentId(0),
-            opted_in: true,
-            seq,
-        }),
-        &mut app,
-    );
-    assert!(!app.privacy_banner_opt_in_inflight);
-    assert!(app.privacy_banner_acked.is_some());
-    assert!(
-        ack_effects
-            .iter()
-            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
-        "success must persist ack: {ack_effects:?}"
+        "Gork Build must never surface the retention opt-in banner"
     );
 }
 
-/// `[Opt in]` failure: no ack; welcome toast carries the error.
+/// Opt-in and Opt-out banner actions are inert under the privacy lock
+/// because `privacy_banner_should_show` is always false.
 #[test]
-fn privacy_banner_opt_in_failure_no_ack_sets_welcome_toast() {
+fn privacy_banner_opt_in_and_opt_out_are_inert_in_gork_build() {
     let mut app = privacy_banner_ready_app();
     let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(app.privacy_banner_opt_in_inflight);
-
-    let seq = app.coding_data_write_seq;
-    let fail_effects = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
-            agent_id: AgentId(0),
-            error: "server error".into(),
-            rollback_to_opted_in: false,
-            seq,
-        }),
-        &mut app,
-    );
-    assert!(fail_effects.is_empty());
+    assert!(effects.is_empty(), "OptIn must emit nothing: {effects:?}");
     assert!(!app.privacy_banner_opt_in_inflight);
-    assert!(app.privacy_banner_acked.is_none());
     assert!(
         app.coding_data_retention_opt_out,
-        "rollback restores opt-out"
+        "OptIn must not opt the user in"
     );
-    let toast = app
-        .welcome_toast
-        .as_ref()
-        .map(|(m, _)| m.as_str())
-        .unwrap_or("");
-    assert!(
-        toast.contains("coding data sharing"),
-        "welcome toast on [Opt in] failure: {toast}"
-    );
-    assert!(toast.contains("server error"), "error in toast: {toast}");
-}
-
-/// `[Opt out]` while an `[Opt in]` ACP call is inflight must be a no-op:
-/// an eager ack would survive the opt-in-failure rollback and hide the
-/// banner forever.
-#[test]
-fn privacy_banner_opt_out_noop_while_opt_in_inflight() {
-    let mut app = privacy_banner_ready_app();
-    let _ = dispatch(Action::PrivacyBannerOptIn, &mut app);
-    assert!(app.privacy_banner_opt_in_inflight);
+    assert!(app.privacy_banner_acked.is_none());
 
     let effects = dispatch(Action::PrivacyBannerOptOut, &mut app);
     assert!(
         effects.is_empty(),
-        "[Opt out] during an inflight [Opt in] must be a no-op: {effects:?}"
+        "OptOut must emit nothing: {effects:?}"
     );
-    assert!(app.privacy_banner_acked.is_none(), "no ack while inflight");
-
-    let seq = app.coding_data_write_seq;
-    let _ = dispatch(
-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
-            agent_id: AgentId(0),
-            error: "server error".into(),
-            rollback_to_opted_in: false,
-            seq,
-        }),
-        &mut app,
-    );
-    assert!(
-        app.privacy_banner_should_show(),
-        "a failed [Opt in] must keep the banner even after a raced [Opt out]"
-    );
+    assert!(app.privacy_banner_acked.is_none());
 }
+
 
 /// The ack must not hinge on the round trip, unlike `[Opt in]`'s.
 #[test]

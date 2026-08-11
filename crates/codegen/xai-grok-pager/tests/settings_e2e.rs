@@ -2010,7 +2010,7 @@ fn defaults_round_trip_through_registry() {
             "voice_stt_language" => SettingValue::Enum("en"),
             "plan_mode" => SettingValue::Enum("off"),
             "show_tips" => SettingValue::Bool(true),
-            "auto_update" => SettingValue::Bool(true),
+            "auto_update" => SettingValue::Bool(false),
             "fork_secondary_model" => SettingValue::String(String::new()),
             "show_thinking_blocks" => SettingValue::Bool(true),
             "prompt_suggestions" => SettingValue::Bool(true),
@@ -4903,25 +4903,15 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
 #[test]
 fn pr9_coding_data_sharing_choices_use_canonical_strings() {
     let reg = SettingsRegistry::defaults();
-    let meta = reg.find("coding_data_sharing").unwrap();
-    let canonicals: Vec<&str> = match &meta.kind {
-        SettingKind::Enum { choices, .. } => choices.iter().map(|c| c.canonical).collect(),
-        _ => panic!("coding_data_sharing must be Enum"),
+    let meta = reg.get("coding_data_sharing").expect("coding_data_sharing in registry");
+    let SettingKind::Enum { choices, .. } = &meta.kind else {
+        panic!("coding_data_sharing must be Enum");
     };
+    let canonicals: Vec<&str> = choices.iter().map(|c| c.canonical).collect();
     assert_eq!(
-        canonicals.len(),
-        2,
-        "coding_data_sharing catalog must be exactly {{opt-in, opt-out}} — adding a \
-         choice requires updating the action_for_enum_commit arm in \
-         views/settings_modal.rs AND the action_for_reset arm in dispatch.rs",
-    );
-    assert!(
-        canonicals.contains(&"opt-in"),
-        "coding_data_sharing must include 'opt-in' canonical"
-    );
-    assert!(
-        canonicals.contains(&"opt-out"),
-        "coding_data_sharing must include 'opt-out' canonical"
+        canonicals,
+        vec!["opt-out"],
+        "Gork Build locks coding_data_sharing to a single opt-out choice",
     );
 }
 
@@ -6436,7 +6426,7 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
     use xai_grok_pager::settings::current_value_for;
     let ui = UiConfig::default();
     let pager = PagerLocalSnapshot::default();
-    for (key, expected) in [("show_tips", true), ("auto_update", true)] {
+    for (key, expected) in [("show_tips", true), ("auto_update", false)] {
         let value = current_value_for(key, &ui, &pager)
             .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
         assert_eq!(
