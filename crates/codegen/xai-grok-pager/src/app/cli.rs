@@ -831,10 +831,7 @@ impl PagerArgs {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .filter(|n| {
-                *n == xai_grok_version::PRODUCT_CLI
-                    || *n == "gork"
-                    || *n == "grok"
-                    || *n == "agent"
+                *n == xai_grok_version::PRODUCT_CLI || *n == "gork" || *n == "grok" || *n == "agent"
             })
             .unwrap_or(xai_grok_version::PRODUCT_CLI)
             .to_owned();

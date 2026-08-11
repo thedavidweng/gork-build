@@ -1,6 +1,6 @@
-From 4313141e0e9aedf751540b1ca10683277dede79b Mon Sep 17 00:00:00 2001
+From ec3e6e845f2e0e3ac905ba0a27805652915d7b4c Mon Sep 17 00:00:00 2001
 From: Gork <gork-ci@users.noreply.github.com>
-Date: Tue, 11 Aug 2026 03:07:25 -0700
+Date: Tue, 11 Aug 2026 03:09:53 -0700
 Subject: [PATCH] product-identity: CLI binary name and entry surface
 
 Gork-Patch-Id: product-identity
@@ -9,10 +9,10 @@ Gork-Risk: medium
 ---
  crates/codegen/xai-grok-pager-bin/Cargo.toml  | 18 ++++++-----
  crates/codegen/xai-grok-pager-bin/src/main.rs | 22 +++++++------
- crates/codegen/xai-grok-pager/src/app/cli.rs  | 15 ++++++---
+ crates/codegen/xai-grok-pager/src/app/cli.rs  | 12 ++++---
  .../xai-grok-pager/src/completions_cmd.rs     | 31 +++++++++++++------
  crates/codegen/xai-grok-pager/src/lib.rs      |  2 +-
- 5 files changed, 57 insertions(+), 31 deletions(-)
+ 5 files changed, 54 insertions(+), 31 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
 index 39ccb43..4a5cc59 100644
@@ -132,7 +132,7 @@ index b97dd4e..a9f45c4 100644
              assert!(output.ends_with(expected_suffix), "{output:?}");
          }
 diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
-index 70f029f..d49f97c 100644
+index 70f029f..53453be 100644
 --- a/crates/codegen/xai-grok-pager/src/app/cli.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
 @@ -401,9 +401,9 @@ pub struct LeaderArgs {
@@ -147,7 +147,7 @@ index 70f029f..d49f97c 100644
      disable_version_flag = true,
      next_display_order = None,
      help_template = "\
-@@ -822,14 +822,21 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
+@@ -822,14 +822,18 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
  impl PagerArgs {
      /// Parse CLI arguments without applying side effects.
      pub fn parse_cli() -> Self {
@@ -162,10 +162,7 @@ index 70f029f..d49f97c 100644
 -            .filter(|n| *n == "grok" || *n == "agent")
 -            .unwrap_or("grok")
 +            .filter(|n| {
-+                *n == xai_grok_version::PRODUCT_CLI
-+                    || *n == "gork"
-+                    || *n == "grok"
-+                    || *n == "agent"
++                *n == xai_grok_version::PRODUCT_CLI || *n == "gork" || *n == "grok" || *n == "agent"
 +            })
 +            .unwrap_or(xai_grok_version::PRODUCT_CLI)
              .to_owned();
