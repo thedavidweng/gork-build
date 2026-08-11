@@ -5,7 +5,7 @@ use super::modal::remove_agent_and_cleanup;
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{Action, Effect, SwitchModelError};
-use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState};
+use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState, DeferredModelSwitch};
 use crate::app::agent_view::{ActivePane, AgentView, McpInitProgress};
 use crate::app::app_view::{ActiveView, AppView, TrustState};
 use crate::app::dispatch::ctx::{
@@ -30,18 +30,23 @@ use xai_grok_shell::sampling::types::ReasoningEffort;
 /// model override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeferredSwitchOutcome {
-    pub switch: Option<(acp::ModelId, Option<ReasoningEffort>)>,
+    pub switch: Option<DeferredModelSwitch>,
     pub effort_error: Option<EffortTokenError>,
 }
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
 /// catalog via [`ModelState::resolve_effort_for_model`] (same gate-first policy
 /// as `/effort` and headless).
 pub(crate) fn take_deferred_model_switch(
-    stashed: Option<(acp::ModelId, Option<ReasoningEffort>)>,
+    stashed: Option<DeferredModelSwitch>,
     models: &ModelState,
     cli_effort_token: Option<&str>,
 ) -> DeferredSwitchOutcome {
-    if let Some((model_id, mut effort)) = stashed {
+    if let Some(DeferredModelSwitch {
+        model_id,
+        mut effort,
+        prev_model_id,
+    }) = stashed
+    {
         let effort_error = match cli_effort_token {
             Some(token) if effort.is_none() => {
                 match models.resolve_effort_for_model(&model_id, token) {
@@ -55,7 +60,11 @@ pub(crate) fn take_deferred_model_switch(
             _ => None,
         };
         return DeferredSwitchOutcome {
-            switch: Some((model_id, effort)),
+            switch: Some(DeferredModelSwitch {
+                model_id,
+                effort,
+                prev_model_id,
+            }),
             effort_error,
         };
     }
@@ -77,7 +86,11 @@ pub(crate) fn take_deferred_model_switch(
             effort_error: None,
         },
         Ok(effort) => DeferredSwitchOutcome {
-            switch: Some((current, Some(effort))),
+            switch: Some(DeferredModelSwitch {
+                model_id: current,
+                effort: Some(effort),
+                prev_model_id: None,
+            }),
             effort_error: None,
         },
         Err(err) => DeferredSwitchOutcome {
@@ -88,19 +101,26 @@ pub(crate) fn take_deferred_model_switch(
 }
 /// Take the stashed deferred switch, resolve any CLI effort token against the
 /// session catalog, surface effort errors, and return the switch to apply.
+/// `prev_model_id` becomes the session's authoritative model when the
+/// create/load response replaced the catalog, else the stash-time display.
 pub(crate) fn apply_deferred_model_switch(
     agent: &mut AgentView,
     cli_effort_token: Option<&str>,
-) -> Option<(acp::ModelId, Option<ReasoningEffort>)> {
+) -> Option<DeferredModelSwitch> {
     let stashed = agent.session.deferred_model_switch.take();
     let outcome = take_deferred_model_switch(stashed, &agent.session.models, cli_effort_token);
-    apply_deferred_switch_outcome(agent, outcome)
+    apply_deferred_switch_outcome(agent, outcome).map(|mut switch| {
+        if agent.session.models.current.as_ref() != Some(&switch.model_id) {
+            switch.prev_model_id = agent.session.models.current.clone();
+        }
+        switch
+    })
 }
 /// Surface effort-token errors and return the model/effort switch (if any).
 pub(crate) fn apply_deferred_switch_outcome(
     agent: &mut AgentView,
     outcome: DeferredSwitchOutcome,
-) -> Option<(acp::ModelId, Option<ReasoningEffort>)> {
+) -> Option<DeferredModelSwitch> {
     if let Some(err) = outcome.effort_error {
         let msg = format!("--effort/--reasoning-effort: {}", err.message());
         tracing::warn!("{msg}");
@@ -126,6 +146,13 @@ pub(in crate::app::dispatch) fn dispatch_new_session(app: &mut AppView) -> Vec<E
     if !app.session_startup_allowed() {
         app.deferred_startup.new_session = true;
         return vec![];
+    }
+    #[cfg(feature = "local-workspace")]
+    if matches!(app.active_view, ActiveView::Welcome) {
+        let skip_apply = app.welcome_session_local_workspace.is_some();
+        if !skip_apply && let Err(effects) = apply_welcome_workspace_on_new_session(app) {
+            return effects;
+        }
     }
     let in_git_repo = get_active_agent(app)
         .map(|a| a.current_branch.is_some())
@@ -261,6 +288,53 @@ pub(in crate::app::dispatch) fn open_agent_type_mismatch_question(
 /// Core new-session logic: create a placeholder agent, push the
 /// `/dashboard` tip, and return the `CreateSession` effect.
 ///
+/// Apply welcome workspace selection before creating a session from Welcome.
+///
+/// Returns `Err(effects)` when session creation should abort (ACK pending or
+/// empty effects). `Ok(())` means continue into the normal new-session path.
+#[cfg(feature = "local-workspace")]
+fn apply_welcome_workspace_on_new_session(app: &mut AppView) -> Result<(), Vec<Effect>> {
+    use crate::views::welcome::workspace_mode::{
+        WelcomeWorkspaceMode, WelcomeWorkspacePrepare, prepare_welcome_workspace_for_new_session,
+    };
+    match prepare_welcome_workspace_for_new_session(
+        app.welcome_workspace_mode,
+        app.local_workspace_startup_locked,
+        app.chat_mode,
+        &app.cwd,
+        false,
+    ) {
+        Ok(WelcomeWorkspacePrepare::Continue {
+            session_override,
+            warning,
+        }) => {
+            if let Some(msg) = warning {
+                tracing::warn!("{msg}");
+                app.show_toast(&msg);
+            }
+            if let Some(override_cfg) = session_override {
+                app.welcome_session_local_workspace = Some(override_cfg);
+            }
+            Ok(())
+        }
+        Ok(WelcomeWorkspacePrepare::AwaitAck) => {
+            app.welcome_local_workspace_ack_pending = true;
+            app.session_picker_entries = None;
+            app.session_picker_loading = false;
+            app.session_picker_list_seq = app.session_picker_list_seq.saturating_add(1);
+            Err(vec![])
+        }
+        Err(err) => {
+            tracing::warn!("welcome workspace mode: {err}");
+            app.show_toast(&format!(
+                "Local workspace unavailable ({err}); using sandbox"
+            ));
+            app.welcome_session_local_workspace = Some(None);
+            app.welcome_workspace_mode = WelcomeWorkspaceMode::Sandbox;
+            Ok(())
+        }
+    }
+}
 /// Factored out of [`dispatch_new_session`] so the worktree-question
 /// "No" path can call it directly without re-opening the modal.
 pub(in crate::app::dispatch) fn dispatch_new_session_inner(
@@ -277,11 +351,15 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     app: &mut AppView,
     model_id: Option<acp::ModelId>,
 ) -> (AgentId, Vec<Effect>) {
-    let mut effects =
-        unregister_session_effect(get_active_agent(app).and_then(|a| a.session.session_id.clone()));
-    let (effective_cwd, inherit_worktree) = get_active_agent(app)
-        .map(|a| (a.session.cwd.clone(), a.session.is_worktree))
-        .unwrap_or_else(|| (app.cwd.clone(), false));
+    let (previous_session_id, effective_cwd, inherit_worktree) = match get_active_agent(app) {
+        Some(a) => (
+            a.session.session_id.clone(),
+            a.session.cwd.clone(),
+            a.session.is_worktree,
+        ),
+        None => (None, app.cwd.clone(), false),
+    };
+    let mut effects = unregister_session_effect(previous_session_id);
     reseed_tip_for_new_session(app);
     let agent_id = AgentId(app.next_agent_id);
     app.next_agent_id += 1;
@@ -340,6 +418,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
             app.usage_visible,
+            !app.has_external_auth_provider,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,
@@ -357,27 +436,46 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
     if app.screen_mode.is_minimal() {
         app.minimal_state.welcome_pending = true;
     }
-    if !app.needs_project_picker() {
-        let chat_kind = consume_chat_kind(app);
-        if let Some(agent) = app.agents.get_mut(&agent_id) {
-            agent.chat_kind = chat_kind;
-            agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
-            agent.mcp_init_progress = Some(McpInitProgress {
-                total: 0,
-                connected: 0,
-                started_at: Instant::now(),
-            });
-            agent.session.prompt_history_loading = true;
+    let chat_kind = consume_chat_kind(app);
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.chat_kind = chat_kind;
+        agent.conversation_entry = chat_kind;
+        #[cfg(feature = "local-workspace")]
+        {
+            let local_intent = match &app.welcome_session_local_workspace {
+                Some(Some(_)) => true,
+                Some(None) => false,
+                None => crate::app::session_startup::active_local_workspace()
+                    .ok()
+                    .flatten()
+                    .is_some(),
+            };
+            let (mode, locked) =
+                crate::views::welcome::workspace_mode::indicator_for_opening_session(
+                    agent.chat_kind,
+                    false,
+                    app.local_workspace_startup_locked,
+                    local_intent,
+                );
+            agent.workspace_mode = mode;
+            agent.workspace_mode_cli_locked = locked;
         }
-        let preferred_session_id = app.deferred_startup.preferred_session_id.take();
-        effects.push(Effect::CreateSession {
-            agent_id,
-            cwd: effective_cwd,
-            model_id,
-            preferred_session_id,
-            chat_kind,
+        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.mcp_init_progress = Some(McpInitProgress {
+            total: 0,
+            connected: 0,
+            started_at: Instant::now(),
         });
+        agent.session.prompt_history_loading = true;
     }
+    let preferred_session_id = app.deferred_startup.preferred_session_id.take();
+    effects.push(Effect::CreateSession {
+        agent_id,
+        cwd: effective_cwd,
+        model_id,
+        preferred_session_id,
+        chat_kind,
+    });
     (agent_id, effects)
 }
 /// Exit the current session and return to the welcome screen.
@@ -392,6 +490,133 @@ pub(in crate::app::dispatch) fn dispatch_exit_session(app: &mut AppView) -> Vec<
     app.session_picker_content_results = None;
     app.session_picker_content_loading = false;
     app.exit_session_pending = None;
+    effects
+}
+/// Aftermath for `/delete` on the active agent: dashboard overlay returns
+/// there; standalone agent sessions go home.
+fn after_delete_current_session(
+    app: &AppView,
+    id: AgentId,
+) -> crate::app::actions::AfterSessionDelete {
+    use crate::app::actions::AfterSessionDelete;
+    if app
+        .dashboard
+        .as_ref()
+        .is_some_and(|d| d.attached_agent == Some(id))
+    {
+        AfterSessionDelete::Dashboard
+    } else {
+        AfterSessionDelete::Welcome
+    }
+}
+/// Confirm deleting the parent session (not a subagent view).
+pub(in crate::app::dispatch) fn open_delete_current_session_question(
+    app: &mut AppView,
+) -> Vec<Effect> {
+    use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
+    use xai_grok_tools::implementations::grok_build::ask_user_question::{
+        Question, QuestionOption,
+    };
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let delete_description = if after_delete_current_session(app, id)
+        == crate::app::actions::AfterSessionDelete::Dashboard
+    {
+        "Remove history and return to the dashboard"
+    } else {
+        "Remove history and return home"
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    if agent.session.session_id.is_none() {
+        app.show_toast("No active session to delete");
+        return vec![];
+    }
+    if agent.question_view.is_some() {
+        app.show_toast("Finish answering the current question first");
+        return vec![];
+    }
+    let question = Question {
+        question: "Delete this session permanently?".into(),
+        id: None,
+        options: vec![
+            QuestionOption {
+                label: "Delete".into(),
+                description: delete_description.into(),
+                preview: None,
+                id: None,
+            },
+            QuestionOption {
+                label: "Cancel".into(),
+                description: "Keep the session".into(),
+                preview: None,
+                id: None,
+            },
+        ],
+        multi_select: Some(false),
+    };
+    let stashed = agent.prompt.stash();
+    agent.question_view = Some(
+        QuestionViewState::new(
+            format!("delete-session-{}", uuid::Uuid::new_v4()),
+            vec![question],
+            stashed,
+        )
+        .with_local_kind(LocalQuestionKind::DeleteCurrentSession)
+        .with_no_freeform(),
+    );
+    agent.prompt.set_text("");
+    vec![]
+}
+pub(in crate::app::dispatch) fn dispatch_delete_current_session_answered(
+    app: &mut AppView,
+    confirmed: bool,
+) -> Vec<Effect> {
+    if !confirmed {
+        return vec![];
+    }
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some((session_id, cwd, running_bg_tasks)) = app.agents.get(&id).and_then(|agent| {
+        let session_id = agent.session.session_id.clone()?;
+        let cwd = agent.session.cwd.display().to_string();
+        let running_bg_tasks: Vec<String> = agent
+            .session
+            .bg_tasks
+            .values()
+            .filter(|t| t.status == crate::app::agent::BgTaskStatus::Running)
+            .map(|t| t.task_id.clone())
+            .collect();
+        Some((session_id, cwd, running_bg_tasks))
+    }) else {
+        app.show_toast("No active session to delete");
+        return vec![];
+    };
+    let after = after_delete_current_session(app, id);
+    let mut effects = vec![Effect::CancelTurn {
+        session_id: session_id.clone(),
+        cancel_subagents: true,
+        trigger: None,
+        rewind_if_no_output: false,
+    }];
+    effects.extend(
+        running_bg_tasks
+            .into_iter()
+            .map(|task_id| Effect::KillBgTask {
+                session_id: session_id.clone(),
+                task_id,
+            }),
+    );
+    app.show_toast("Deleting session\u{2026}");
+    effects.push(Effect::DeleteSession {
+        source: "current".into(),
+        session_id: session_id.to_string(),
+        cwd,
+        after,
+    });
     effects
 }
 /// Handle the user accepting the folder-trust question: persist the grant for
@@ -426,7 +651,7 @@ pub(in crate::app::dispatch) fn clear_startup_actions(app: &mut AppView) {
     let _ = app.deferred_startup.take();
 }
 /// Replay the session-startup actions deferred until auth + trust both resolved
-/// (`--resume` / `--worktree` / initial-prompt / `gork dashboard`). Extracted
+/// (`--resume` / `--worktree` / initial-prompt / `grok dashboard`). Extracted
 /// from the `AuthComplete` handler so the folder-trust answer can run the SAME
 /// machinery; whichever gate resolves last drains it (each call site guards on
 /// the other gate being `Done`, so it runs exactly once).
@@ -446,6 +671,8 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
         prompt,
         open_dashboard,
         pending_chat,
+        #[cfg(feature = "local-workspace")]
+        history_load_as_build,
     } = app.deferred_startup.take();
     let mut effects = Vec::new();
     match deferred {
@@ -466,6 +693,10 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
             session_cwd,
             chat_kind,
         }) => {
+            #[cfg(feature = "local-workspace")]
+            {
+                app.welcome_history_load_as_build = history_load_as_build;
+            }
             if worktree {
                 if chat_kind || pending_chat {
                     app.deferred_startup.pending_chat = true;
@@ -569,6 +800,33 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
     git_ref: Option<String>,
     preferred_session_id: Option<String>,
 ) -> Vec<Effect> {
+    #[cfg(feature = "local-workspace")]
+    if load_session_id.is_none()
+        && matches!(app.active_view, crate::app::app_view::ActiveView::Welcome)
+    {
+        let skip_apply = app.welcome_session_local_workspace.is_some();
+        if !skip_apply && let Err(effects) = apply_welcome_workspace_on_new_session(app) {
+            app.deferred_startup.worktree = true;
+            if let Some(ref label) = label {
+                app.deferred_startup.worktree_label = Some(label.clone());
+            }
+            if let Some(ref git_ref) = git_ref {
+                app.deferred_startup.worktree_ref = Some(git_ref.clone());
+            }
+            if let Some(sid) = load_session_id.clone() {
+                app.deferred_startup.session =
+                    Some(crate::app::session_startup::DeferredSessionStartup::Load {
+                        session_id: sid,
+                        session_cwd: None,
+                        chat_kind: app.deferred_startup.pending_chat,
+                    });
+            }
+            if let Some(id) = preferred_session_id.clone() {
+                app.deferred_startup.preferred_session_id = Some(id);
+            }
+            return effects;
+        }
+    }
     let preferred_session_id =
         preferred_session_id.or_else(|| app.deferred_startup.preferred_session_id.take());
     if !app.session_startup_allowed() {
@@ -606,6 +864,11 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
                 message: msg,
                 action: None,
             });
+        }
+        #[cfg(feature = "local-workspace")]
+        {
+            app.welcome_session_local_workspace = None;
+            app.welcome_history_load_as_build = false;
         }
         return vec![];
     }
@@ -681,12 +944,34 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         agent.apply_app_scoped_gates(
             app.sharing_enabled,
             app.usage_visible,
+            !app.has_external_auth_provider,
             app.chat_mode,
             app.screen_mode,
             &app.active_announcements,
             &app.tier_restricted_commands,
         );
         agent.chat_kind = chat_kind;
+        agent.conversation_entry = chat_kind;
+        #[cfg(feature = "local-workspace")]
+        {
+            let local_intent = match &app.welcome_session_local_workspace {
+                Some(Some(_)) => true,
+                Some(None) => false,
+                None => crate::app::session_startup::active_local_workspace()
+                    .ok()
+                    .flatten()
+                    .is_some(),
+            };
+            let (mode, locked) =
+                crate::views::welcome::workspace_mode::indicator_for_opening_session(
+                    agent.chat_kind,
+                    app.welcome_history_load_as_build,
+                    app.local_workspace_startup_locked,
+                    local_intent,
+                );
+            agent.workspace_mode = mode;
+            agent.workspace_mode_cli_locked = locked;
+        }
         agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
         agent
             .prompt
@@ -721,17 +1006,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_with_id(
             Some(crate::app::session_startup::DeferredSessionStartup::NewWithId { session_id });
         return vec![];
     }
-    let (agent_id, mut effects) = dispatch_new_session_inner_with_id(app, None);
-    for e in &mut effects {
-        if let Effect::CreateSession {
-            preferred_session_id,
-            ..
-        } = e
-        {
-            *preferred_session_id = Some(session_id.clone());
-        }
-    }
-    let _ = agent_id;
+    let (_agent_id, effects) = dispatch_new_session_inner_with_id(app, None);
     effects
 }
 /// Tear down a placeholder agent that must not proceed under sticky `--chat`
@@ -760,47 +1035,12 @@ pub(in crate::app::dispatch) fn refuse_chat_mode_build_agent(app: &mut AppView, 
         }
     }
 }
-/// Dismiss the project picker and create a session in the current directory.
-pub(in crate::app::dispatch) fn skip_picker_and_create_session(
-    app: &mut AppView,
-    agent_id: AgentId,
-) -> Vec<Effect> {
-    if app
-        .agents
-        .get(&agent_id)
-        .is_some_and(|a| a.session.session_id.is_some() || a.mcp_init_progress.is_some())
-    {
-        return vec![];
-    }
-    app.mark_project_picker_done();
-    let chat_kind = consume_chat_kind(app);
-    if let Some(agent) = app.agents.get_mut(&agent_id) {
-        agent.chat_kind = chat_kind;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
-        agent.mcp_init_progress = Some(McpInitProgress {
-            total: 0,
-            connected: 0,
-            started_at: Instant::now(),
-        });
-        agent.session.prompt_history_loading = true;
-        if let Some(qv) = agent.question_view.take() {
-            agent.prompt.restore(qv.stashed_prompt);
-        }
-    }
-    let preferred_session_id = app.deferred_startup.preferred_session_id.take();
-    vec![Effect::CreateSession {
-        agent_id,
-        cwd: app.cwd.clone(),
-        model_id: None,
-        preferred_session_id,
-        chat_kind,
-    }]
-}
 pub(in crate::app::dispatch) fn handle_session_created(
     app: &mut AppView,
     agent_id: AgentId,
     session_id: acp::SessionId,
     new_models: Option<acp::SessionModelState>,
+    scheduler_background_loops: Option<bool>,
 ) -> Vec<Effect> {
     let agent_count = app.agents.len();
     let switch_hint =
@@ -822,6 +1062,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
             )));
         }
         agent.bind_session_id(session_id);
+        agent.scheduler_background_loops = scheduler_background_loops;
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -868,14 +1109,15 @@ pub(in crate::app::dispatch) fn handle_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
-        if let Some((model_id, effort)) = deferred {
+        if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: session_id_clone.clone(),
-                model_id,
-                effort,
-                prev_model_id: None,
+                model_id: switch.model_id,
+                effort: switch.effort,
+                prev_model_id: switch.prev_model_id,
             });
         }
         if let Some(mode) = deferred_mode {
@@ -910,14 +1152,20 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     worktree_path: std::path::PathBuf,
     session_cwd: std::path::PathBuf,
     new_models: Option<acp::SessionModelState>,
+    scheduler_background_loops: Option<bool>,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.finish_command();
         agent.mark_turn_finished();
         let session_id_clone = session_id.clone();
         agent.bind_session_id(session_id);
+        agent.scheduler_background_loops = scheduler_background_loops;
         agent.session.cwd = session_cwd.clone();
         agent.session.is_worktree = true;
+        agent.current_branch = None;
+        agent.main_repo = None;
+        agent.is_worktree = true;
+        crate::git_info::populate_from_cwd_async(session_cwd.clone());
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -969,14 +1217,15 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
+            nonce: 0,
         });
-        if let Some((model_id, effort)) = deferred {
+        if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: session_id_clone.clone(),
-                model_id,
-                effort,
-                prev_model_id: None,
+                model_id: switch.model_id,
+                effort: switch.effort,
+                prev_model_id: switch.prev_model_id,
             });
         }
         if let Some(mode) = deferred_mode {
@@ -1014,6 +1263,25 @@ fn push_session_create_failure_warning(app: &mut AppView, msg: &str) {
         });
     }
 }
+/// After an orphan create fails, New/Fork may already have moved overlay
+/// attach onto the removed placeholder. Re-point to the survivor so
+/// Left/Esc still exit to the dashboard; clear when recovery is Welcome.
+fn restore_dashboard_attach_after_orphan_remove(
+    app: &mut AppView,
+    removed: AgentId,
+    survivor: Option<AgentId>,
+) {
+    let Some(d) = app.dashboard.as_mut() else {
+        return;
+    };
+    if d.attached_agent != Some(removed) {
+        return;
+    }
+    match survivor {
+        Some(target) => d.repoint_attach_if_on(removed, target),
+        None => d.close_popup(),
+    }
+}
 /// Failed plain `CreateSession`: drop orphan placeholders, clear the
 /// starting-session spinner, and surface the error (toast when an agent
 /// remains; startup warning on the welcome screen, which has no toast).
@@ -1036,6 +1304,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
             if failed_was_active {
                 switch_to_agent(app, target, SwitchCause::Picker);
             }
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, Some(target));
             if matches!(app.active_view, ActiveView::Welcome) {
                 push_session_create_failure_warning(app, &msg);
             } else {
@@ -1049,6 +1318,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
             app.session_picker_state.selected = 0;
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, None);
             push_session_create_failure_warning(app, &msg);
         }
     } else if let Some(agent) = app.agents.get_mut(&agent_id) {
@@ -1085,6 +1355,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
         remove_agent_and_cleanup(app, agent_id);
         if let Some(target) = fallback {
             switch_to_agent(app, target, SwitchCause::Picker);
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, Some(target));
         } else {
             show_welcome(app);
             app.welcome_prompt_focused = true;
@@ -1093,6 +1364,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
             app.session_picker_state.selected = 0;
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
+            restore_dashboard_attach_after_orphan_remove(app, agent_id, None);
         }
         let msg = format!("Cannot create worktree: {error}");
         if !app.startup_warnings.iter().any(|w| w.message == msg) {
@@ -1199,7 +1471,11 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
         {
             agent.session.models.set_current(model_id.clone(), effort);
             if effort.is_some() {
-                agent.session.deferred_model_switch = Some((model_id, effort));
+                agent.session.deferred_model_switch = Some(DeferredModelSwitch {
+                    model_id,
+                    effort,
+                    prev_model_id: None,
+                });
             }
         }
         effects

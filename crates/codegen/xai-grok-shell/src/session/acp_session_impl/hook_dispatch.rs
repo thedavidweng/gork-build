@@ -98,6 +98,7 @@ impl SessionActor {
         xai_grok_hooks::runner::RunContext {
             session_id: &self.session_info.id.0,
             workspace_root: &self.hook_resolved_workspace_root,
+            process_scope: self.tool_context.process_scope.clone(),
         }
     }
 
@@ -379,6 +380,8 @@ mod notification_hook_filter_tests {
                 explicitly_killed: false,
                 owner_session_id: None,
                 description: None,
+                is_backgrounded: false,
+                output_total_bytes: 0,
             },
             will_wake: false,
         };

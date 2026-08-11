@@ -46,15 +46,14 @@ pub(super) fn open_url_or_show(app: &mut AppView, url: &str) {
         return;
     }
 
-    use crate::app::link_opener::{OpenUrlResult, browser_unavailable_message, try_open_url};
+    use crate::app::link_opener::{OpenUrlResult, browser_unavailable_line, try_open_url};
     use crate::terminal::hyperlinks::SchemeFilter;
 
     match try_open_url(url, SchemeFilter::Standard) {
         OpenUrlResult::Opened | OpenUrlResult::RejectedScheme => {}
         OpenUrlResult::BrowserUnavailable => {
-            let _ = crate::clipboard::SystemClipboard::try_set(url);
-            // No scrollback on the welcome screen — toast carries the URL.
-            app.show_toast(&browser_unavailable_message(url));
+            let copied = crate::clipboard::SystemClipboard::try_set(url).reported_success();
+            app.show_toast(&browser_unavailable_line(url, copied));
         }
     }
 }
@@ -137,6 +136,16 @@ pub(super) fn reseed_tip_for_new_session(app: &mut AppView) {
 pub(super) fn show_welcome(app: &mut AppView) {
     app.active_view = ActiveView::Welcome;
     app.welcome_announcement = WelcomeAnnouncementState::default();
+    // Drop stale welcome workspace one-shot / ACK so a later create/load
+    // cannot inherit an override from a deferred or abandoned NewSession.
+    #[cfg(feature = "local-workspace")]
+    {
+        app.welcome_session_local_workspace = None;
+        app.welcome_local_workspace_ack_pending = false;
+        // Abandoning a session/restore must not leak history bypass into the
+        // next welcome LoadSession / SessionFlags.chat_mode batch.
+        app.welcome_history_load_as_build = false;
+    }
 }
 
 /// Restore the view a mid-session auth flow launched from, falling back to the
@@ -204,9 +213,16 @@ pub(super) fn surface_screen_mode_switch_hint(app: &mut AppView, target: AgentId
 
 /// Switch the active agent — the primary funnel for assigning `ActiveView::Agent`
 /// (new, resume, picker, fork); also fires [`surface_yolo_launch_block_notice`].
+///
+/// For [`SwitchCause::New`] and [`SwitchCause::Fork`], also follows dashboard
+/// overlay attach when it named the prior top-level agent (Left / Esc / Ctrl+\
+/// back-out only works while attach matches the active agent). Load and Picker
+/// keep their own attach rules. Uses the top-level `ActiveView` id, never a
+/// subagent placeholder from [`get_active_agent`].
+///
 /// No-op if `target` is unknown or already active. Dashboard-first flows that
 /// assign `Agent` directly must call the notice themselves.
-pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, _cause: SwitchCause) {
+pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, cause: SwitchCause) {
     // Structural backstop for the auth + folder-trust session gate. This is the
     // single funnel every FRESH-agent creator routes through (New/Load/Fork —
     // `Picker` switches to an already-created, post-gate agent), so asserting the
@@ -215,13 +231,12 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, _cause: Switch
     // that forgets the deferring chokepoint gate trips this in debug/tests. The
     // deferring chokepoints (`dispatch_new_session`/`_worktree_session`/
     // `_load_session_inner`) stash+return BEFORE reaching here, so this never
-    // fires on the reachable gated paths. (`dispatch_project_selected` re-creates
-    // an already-active, post-gate agent without switching, so it is exempt.)
-    // `_cause` stays underscored so it isn't flagged unused once `debug_assert!`
-    // compiles out in release.
+    // fires on the reachable gated paths.
+    // `cause` is also used for New/Fork overlay follow (and remains live for
+    // the debug_assert even when that assert compiles out in release).
     debug_assert!(
-        matches!(_cause, SwitchCause::Picker) || app.session_startup_allowed(),
-        "session creation via {_cause:?} requires the startup gate open (auth + folder trust)"
+        matches!(cause, SwitchCause::Picker) || app.session_startup_allowed(),
+        "session creation via {cause:?} requires the startup gate open (auth + folder trust)"
     );
     if !app.agents.contains_key(&target) {
         return;
@@ -229,6 +244,11 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, _cause: Switch
     if matches!(app.active_view, ActiveView::Agent(current) if current == target) {
         return;
     }
+    // Capture before mutating active_view (subagent views are not top-level ids).
+    let previous_top_level = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        _ => None,
+    };
     app.active_view = ActiveView::Agent(target);
     // Re-anchor the global permission-mode mirror to the now-active agent so the
     // cycle's `sync_active_auto_flag` (which derives from the global) can't copy a
@@ -261,6 +281,13 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, _cause: Switch
     // registry.
     app.sync_permission_mode_slash_gate();
     surface_yolo_launch_block_notice(app, target);
+
+    if matches!(cause, SwitchCause::New | SwitchCause::Fork)
+        && let Some(previous) = previous_top_level
+        && let Some(d) = app.dashboard.as_mut()
+    {
+        d.repoint_attach_if_on(previous, target);
+    }
 }
 
 pub(super) fn find_agent_id_by_session_id(

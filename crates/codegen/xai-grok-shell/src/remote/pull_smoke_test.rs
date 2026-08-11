@@ -30,7 +30,7 @@ mod tests {
             ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
         };
 
-        let auth = load_prod_auth().expect("No auth.json — run `gork login`");
+        let auth = load_prod_auth().expect("No auth.json — run `grok login`");
         let am = Arc::new(crate::auth::AuthManager::new(
             &crate::util::grok_home::grok_home(),
             crate::auth::GrokComConfig::default(),
@@ -57,6 +57,7 @@ mod tests {
             subagent_role: None,
             fork_context_source: None,
             subagent_depth: None,
+            title_is_manual: None,
         };
 
         let sync = RemoteSync::new(

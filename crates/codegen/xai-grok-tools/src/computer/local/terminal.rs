@@ -18,11 +18,13 @@ use tokio_util::sync::CancellationToken;
 use crate::computer::local::cgroup::{
     CgroupGuard, CgroupMemoryConfig, MemoryMonitor, PROCESS_OOM_EXIT_CODE,
 };
+use crate::computer::task_log;
 use crate::computer::types::{
     BackgroundHandle, ComputerError, KillOutcome, TaskSnapshot, TerminalBackend,
     TerminalRunRequest, TerminalRunResult,
 };
 use crate::notification::types::{BashNotificationBase, BashOutputChunk, ToolNotificationHandle};
+use crate::util::truncate::FRONT_BACK_TRUNCATION_MARKER;
 
 use super::SearchShadowConfig;
 #[cfg(unix)]
@@ -77,6 +79,9 @@ fn output_file_cap_from_env() -> u64 {
 /// Max time to drain stdout/stderr after process exit. Prevents `cmd &`
 /// (inherited pipe, no redirect) from blocking the actor loop forever.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long completion waits on a kill before taking the output there is: a
+/// process that never dies must not hold its task open forever.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 /// Max bytes retained in the output file after process exit. Truncated
 /// so `to_task_snapshot` / `read_file` don't materialize huge strings.
 const MAX_RETAINED_OUTPUT_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
@@ -88,6 +93,10 @@ const MAX_COMPLETED_TASK_SNAPSHOTS: usize = 100;
 fn notification_interval() -> Duration {
     Duration::from_millis(DEFAULT_NOTIFICATION_INTERVAL_MS)
 }
+
+#[path = "lifecycle.rs"]
+mod lifecycle;
+use lifecycle::{Collection, Lifecycle};
 
 /// Exit status of a terminal process
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -243,8 +252,7 @@ struct ProcessState {
     truncated: bool,
     /// Total bytes written to file (before truncation)
     total_bytes: usize,
-    /// Exit status once process completes
-    exit_status: Option<ExitStatus>,
+    lifecycle: Lifecycle,
     /// Whether process was backgrounded and how
     bg_status: BackgroundStatus,
     /// Waiters for this process to complete (foreground only)
@@ -267,8 +275,6 @@ struct ProcessState {
     cwd: String,
     /// Wall-clock start time (for TaskSnapshot)
     start_wall_time: std::time::SystemTime,
-    /// When the process completed (for TTL-based eviction of background tasks)
-    completed_at: Option<Instant>,
     /// Wall-clock end time (for TaskSnapshot duration calculation)
     end_wall_time: Option<std::time::SystemTime>,
 
@@ -285,10 +291,6 @@ struct ProcessState {
     /// is a truncated tail that *shrinks* once `maybe_truncate` fires; a
     /// length-based gate would go (and stay) false after truncation.
     last_notified_total: usize,
-    /// Whether stdout/stderr have already been drained after exit.
-    /// Prevents repeated 2s drain timeouts on every poll tick when
-    /// orphaned children hold pipes open.
-    drained: bool,
     /// Set when a `block=true` waiter consumed this task's result.
     block_waited: bool,
     /// Set when the model explicitly killed this task via the kill tool,
@@ -308,28 +310,17 @@ struct ProcessState {
 
 impl ProcessState {
     fn to_result(&self) -> TerminalRunResult {
-        let combined_output = if let Some(ref front) = self.front_buffer {
-            let front_str = String::from_utf8_lossy(front);
-            let back_str = String::from_utf8_lossy(&self.output_buffer);
-            format!(
-                "{}\n\n... (output truncated) ...\n\n{}",
-                front_str.trim_end(),
-                back_str.trim_start()
-            )
-        } else {
-            String::from_utf8_lossy(&self.output_buffer).into_owned()
-        };
         TerminalRunResult {
-            combined_output,
-            exit_code: self.exit_status.as_ref().and_then(|s| s.exit_code),
+            combined_output: self.ring_output(),
+            exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
             truncated: self.truncated,
             signal: match self.bg_status {
                 BackgroundStatus::Backgrounded { reason } => Some(reason.as_signal().to_string()),
-                _ => self.exit_status.as_ref().and_then(|s| s.signal.clone()),
+                _ => self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
             },
             timed_out: self
-                .exit_status
-                .as_ref()
+                .lifecycle
+                .exit_status()
                 .map(|s| s.signal.as_deref() == Some("timeout"))
                 .unwrap_or(false),
             output_file: self.output_file.clone(),
@@ -396,25 +387,32 @@ impl ProcessState {
         self.start_time.elapsed() > self.timeout
     }
 
+    fn is_complete(&self) -> bool {
+        self.lifecycle.is_complete()
+    }
+
+    /// The output is not final until `finish_output`.
+    fn mark_exited(&mut self, status: ExitStatus) {
+        if !self.lifecycle.has_exited() {
+            self.lifecycle = Lifecycle::Exiting {
+                status,
+                since: Instant::now(),
+            };
+        }
+    }
+
+    fn finish_output(&mut self, collection: Collection) {
+        self.lifecycle.finish_output(collection);
+    }
+
     /// Build a snapshot of this process's current state.
     /// Uses async I/O to read output from disk for completed background tasks.
     async fn to_task_snapshot(&self, task_id: &str) -> TaskSnapshot {
-        // For completed background tasks, the in-memory buffer is cleared to free
-        // memory. Fall back to reading from the output file (non-blocking).
-        let output = if self.output_buffer.is_empty() && self.exit_status.is_some() {
-            tokio::fs::read_to_string(&self.output_file)
-                .await
-                .unwrap_or_default()
-        } else if let Some(ref front) = self.front_buffer {
-            let front_str = String::from_utf8_lossy(front);
-            let back_str = String::from_utf8_lossy(&self.output_buffer);
-            format!(
-                "{}\n\n... (output truncated) ...\n\n{}",
-                front_str.trim_end(),
-                back_str.trim_start()
-            )
+        let swept = matches!(self.lifecycle, Lifecycle::Swept { .. });
+        let (output, short_of_full_log) = if swept && !self.output_file.as_os_str().is_empty() {
+            task_log::read_prefix(&self.output_file, task_log::MAX_SNAPSHOT_BYTES).await
         } else {
-            String::from_utf8_lossy(&self.output_buffer).into_owned()
+            (self.ring_output(), false)
         };
 
         TaskSnapshot {
@@ -423,7 +421,7 @@ impl ProcessState {
             display_command: self.display_command.clone(),
             cwd: self.cwd.clone(),
             start_time: self.start_wall_time,
-            end_time: if self.exit_status.is_some() {
+            end_time: if self.lifecycle.has_exited() {
                 // Use the recorded wall-clock end time if available,
                 // otherwise fall back to now (process just completed this tick).
                 Some(
@@ -435,15 +433,30 @@ impl ProcessState {
             },
             output,
             output_file: self.output_file.clone(),
-            truncated: self.truncated,
-            exit_code: self.exit_status.as_ref().and_then(|s| s.exit_code),
-            signal: self.exit_status.as_ref().and_then(|s| s.signal.clone()),
-            completed: self.exit_status.is_some(),
+            truncated: self.truncated || short_of_full_log,
+            output_total_bytes: self.total_bytes,
+            exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
+            signal: self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
+            completed: self.is_complete(),
             block_waited: self.block_waited,
             explicitly_killed: self.explicitly_killed,
             kind: self.kind,
             owner_session_id: self.owner_session_id.clone(),
             description: self.description.clone(),
+            is_backgrounded: self.bg_status.is_backgrounded(),
+        }
+    }
+
+    /// Output held in memory: the latest part, after the earliest part once
+    /// the task has run past its live limit.
+    fn ring_output(&self) -> String {
+        match self.front_buffer.as_ref() {
+            Some(front) => format!(
+                "{}{FRONT_BACK_TRUNCATION_MARKER}{}",
+                String::from_utf8_lossy(front).trim_end(),
+                String::from_utf8_lossy(&self.output_buffer).trim_start()
+            ),
+            None => String::from_utf8_lossy(&self.output_buffer).into_owned(),
         }
     }
 }
@@ -474,6 +487,12 @@ struct LocalTerminalActor {
     /// outlive the process. Defaults to the process-global scope; tests inject
     /// their own to avoid latching the global.
     scope: crate::util::ProcessScope,
+
+    /// Additional owner: the scope of the session that started this backend, so
+    /// closing the session reaps its commands without waiting for process exit.
+    /// Enrolling in both means whichever reaper fires first wins and the other
+    /// finds a dead group.
+    session_scope: Option<crate::util::ProcessScope>,
 
     /// Active processes: task_id -> ProcessState
     processes: HashMap<String, ProcessState>,
@@ -548,12 +567,14 @@ impl LocalTerminalActor {
         foreground_block_budget: Duration,
         output_file_cap: u64,
         scope: crate::util::ProcessScope,
+        session_scope: Option<crate::util::ProcessScope>,
         shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
     ) -> Self {
         Self {
             cmd_rx,
             cancel_token,
             scope,
+            session_scope,
             shell_env_policy,
             processes: HashMap::new(),
             completion_waiters: HashMap::new(),
@@ -683,7 +704,7 @@ impl LocalTerminalActor {
             .map_err(|e| ComputerError::io(format!("fd mapping: {e}")))?;
 
         unsafe {
-            cmd.pre_exec(crate::util::detach_from_tty);
+            cmd.pre_exec(xai_tty_utils::detach_pre_exec_hook());
         }
 
         #[cfg(target_os = "linux")]
@@ -693,6 +714,7 @@ impl LocalTerminalActor {
             }
         }
 
+        #[allow(clippy::disallowed_methods)] // attached to a process group below
         let child = cmd.spawn().map_err(|e| {
             ComputerError::io_with_kind(format!("spawn shell in {}: {e}", cwd.display()), e.kind())
         })?;
@@ -803,7 +825,7 @@ impl LocalTerminalActor {
             .map_err(|e| ComputerError::io(format!("fd mapping: {e}")))?;
 
         unsafe {
-            cmd.pre_exec(crate::util::detach_from_tty);
+            cmd.pre_exec(xai_tty_utils::detach_pre_exec_hook());
         }
 
         #[cfg(target_os = "linux")]
@@ -813,6 +835,7 @@ impl LocalTerminalActor {
             }
         }
 
+        #[allow(clippy::disallowed_methods)] // attached to a process group below
         let child = cmd.spawn().map_err(|e| {
             ComputerError::io_with_kind(
                 format!("spawn shell in {}: {e}", prep.cwd.display()),
@@ -1009,6 +1032,11 @@ impl LocalTerminalActor {
     ) -> std::sync::Arc<crate::util::ProcessGroup> {
         let group = std::sync::Arc::new(group);
         self.scope.register(&group);
+        if let Some(session_scope) = &self.session_scope {
+            // A closed session scope kills the group here, which is the point:
+            // a command racing session teardown must not survive it.
+            session_scope.register(&group);
+        }
         group
     }
 
@@ -1063,7 +1091,7 @@ impl LocalTerminalActor {
             front_buffer: None,
             truncated: false,
             total_bytes: 0,
-            exit_status: None,
+            lifecycle: Lifecycle::Running,
             bg_status: BackgroundStatus::Foreground {
                 auto_bg_on_timeout: request.auto_background_on_timeout,
             },
@@ -1080,13 +1108,11 @@ impl LocalTerminalActor {
             display_command: request.display_command.clone(),
             cwd: request.working_directory.display().to_string(),
             start_wall_time: std::time::SystemTime::now(),
-            completed_at: None,
             end_wall_time: None,
             notification_handle: request.notification_handle.clone(),
             tool_call_id: request.tool_call_id.clone(),
             kind: request.kind,
             last_notified_total: 0,
-            drained: false,
             block_waited: false,
             explicitly_killed: false,
             state_dump_handle,
@@ -1117,7 +1143,7 @@ impl LocalTerminalActor {
             return KillOutcome::NotFound;
         };
 
-        if process.exit_status.is_some() {
+        if process.lifecycle.has_exited() {
             return KillOutcome::AlreadyExited;
         }
 
@@ -1195,7 +1221,7 @@ impl LocalTerminalActor {
             front_buffer: None,
             truncated: false,
             total_bytes: 0,
-            exit_status: None,
+            lifecycle: Lifecycle::Running,
             bg_status: BackgroundStatus::Backgrounded {
                 reason: BackgroundReason::Explicit,
             },
@@ -1213,13 +1239,11 @@ impl LocalTerminalActor {
             display_command: request.display_command.clone(),
             cwd: request.working_directory.display().to_string(),
             start_wall_time: std::time::SystemTime::now(),
-            completed_at: None,
             end_wall_time: None,
             notification_handle: request.notification_handle.clone(),
             tool_call_id: request.tool_call_id.clone(),
             kind: request.kind,
             last_notified_total: 0,
-            drained: false,
             block_waited: false,
             explicitly_killed: false,
             // Background commands don't update the canonical shell state —
@@ -1290,7 +1314,7 @@ impl LocalTerminalActor {
         let prev_block_waited = process.block_waited;
         process.block_waited = true;
 
-        if process.exit_status.is_some() {
+        if process.is_complete() {
             let snapshot = process.to_task_snapshot(&task_id).await;
             if reply.send(Some(snapshot)).is_err() {
                 // Receiver dropped (e.g. the awaiting turn was cancelled):
@@ -1303,13 +1327,13 @@ impl LocalTerminalActor {
 
         // Register as a completion waiter and return control to the actor loop.
         let timeout = timeout.unwrap_or(Duration::from_secs(30));
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         self.completion_waiters
             .entry(task_id)
             .or_default()
-            .push(CompletionWaiter {
-                reply,
-                deadline: Instant::now() + timeout,
-            });
+            .push(CompletionWaiter { reply, deadline });
 
         // Return immediately — actor loop resumes processing other commands.
     }
@@ -1330,7 +1354,7 @@ impl LocalTerminalActor {
             let newest_id = self
                 .processes
                 .iter()
-                .filter(|(_, p)| p.exit_status.is_none())
+                .filter(|(_, p)| !p.lifecycle.has_exited())
                 .max_by_key(|(_, p)| p.start_time)
                 .map(|(id, _)| id.clone());
 
@@ -1339,12 +1363,13 @@ impl LocalTerminalActor {
             {
                 send_sigkill_to_group(process);
                 drain_remaining_output(process).await;
-                process.exit_status = Some(ExitStatus {
+                process.mark_exited(ExitStatus {
                     exit_code: Some(PROCESS_OOM_EXIT_CODE),
                     signal: Some("oom".to_owned()),
                 });
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
+                process.finish_output(Collection::of(&process.child));
                 let result = Ok(process.to_result());
                 process.notify_waiters(result);
             }
@@ -1356,7 +1381,7 @@ impl LocalTerminalActor {
             .iter()
             .filter(|(_, p)| {
                 p.bg_status.is_backgrounded()
-                    && p.exit_status.is_none()
+                    && !p.lifecycle.has_exited()
                     && p.start_time.elapsed() > BACKGROUND_MAX_RUNTIME
             })
             .map(|(id, _)| id.clone())
@@ -1368,7 +1393,7 @@ impl LocalTerminalActor {
                 // Fire-and-forget SIGTERM — poll loop escalates to SIGKILL
                 // on the next tick if the process doesn't exit.
                 send_sigterm_to_group(process);
-                process.exit_status = Some(ExitStatus {
+                process.mark_exited(ExitStatus {
                     exit_code: None,
                     signal: Some("max_runtime".to_owned()),
                 });
@@ -1383,7 +1408,7 @@ impl LocalTerminalActor {
         let size_exceeded: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| p.exit_status.is_none() && p.total_bytes as u64 > output_cap)
+            .filter(|(_, p)| !p.lifecycle.has_exited() && p.total_bytes as u64 > output_cap)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1398,7 +1423,7 @@ impl LocalTerminalActor {
                 // Fire-and-forget SIGTERM — poll loop escalates to SIGKILL
                 // on the next tick if the process doesn't exit.
                 send_sigterm_to_group(process);
-                process.exit_status = Some(ExitStatus {
+                process.mark_exited(ExitStatus {
                     exit_code: None,
                     signal: Some("output_limit".to_owned()),
                 });
@@ -1446,7 +1471,7 @@ impl LocalTerminalActor {
                         continue;
                     };
                     // Only foreground processes update the canonical state.
-                    if process.exit_status.is_none() || process.bg_status.is_backgrounded() {
+                    if !process.lifecycle.has_exited() || process.bg_status.is_backgrounded() {
                         continue;
                     }
                     process.state_dump_handle.take()
@@ -1476,7 +1501,7 @@ impl LocalTerminalActor {
             let completed = self
                 .processes
                 .get(&task_id)
-                .map(|p| p.exit_status.is_some())
+                .map(ProcessState::is_complete)
                 .unwrap_or(true); // process gone = treat as completed
 
             if completed && let Some(waiters) = self.completion_waiters.remove(&task_id) {
@@ -1539,33 +1564,29 @@ impl LocalTerminalActor {
             }
         }
 
-        // 3. Set completed_at and clear output buffer for completed background tasks
+        // 3. Sweep finished background tasks: drop the in-memory copy
         // First pass: mark completed and clear buffers, collect IDs for notification
         let mut newly_completed: Vec<String> = Vec::new();
         for (task_id, process) in self.processes.iter_mut() {
-            if process.exit_status.is_some()
+            if process.is_complete()
                 && process.bg_status.is_backgrounded()
-                && process.completed_at.is_none()
+                && process.lifecycle.swept_at().is_none()
             {
-                process.completed_at = Some(Instant::now());
+                process.lifecycle.sweep();
                 if process.end_wall_time.is_none() {
                     process.end_wall_time = Some(std::time::SystemTime::now());
                 }
-                // Drop in-memory buffer — output file on disk has the full content
+                // The log file has everything, and a drained task adds no more.
                 process.output_buffer.clear();
+                process.front_buffer = None;
                 newly_completed.push(task_id.clone());
             }
         }
         // Second pass: send completion notifications (requires async file read).
         //
-        // The `block_waited` gate that suppresses the redundant auto-wake
-        // synthetic prompt for awaited tasks lives in
-        // `tools/notification_bridge.rs` (the `TaskCompleted` arm checks
-        // `task_snapshot.block_waited` before the auto-wake injection
-        // branch — see the comment there). This pass must still fire
-        // `send_task_complete` unconditionally for newly-completed
-        // background tasks so the pager UI, persistence, and
-        // `TaskCompletionReservations` bookkeeping all still get the snapshot.
+        // Fires unconditionally: the pager UI, persistence, and reservation
+        // bookkeeping all need the snapshot. The auto-wake suppression for
+        // awaited tasks lives in the bridge's `TaskCompleted` arm.
         for task_id in newly_completed {
             if let Some(process) = self.processes.get(&task_id) {
                 let snapshot = process.to_task_snapshot(&task_id).await;
@@ -1580,14 +1601,14 @@ impl LocalTerminalActor {
             .processes
             .iter()
             .filter(|(_, p)| {
-                if p.exit_status.is_none() {
+                if !p.lifecycle.has_exited() {
                     return false; // still running, keep
                 }
                 if !p.bg_status.is_backgrounded() {
                     return true; // foreground, already replied, evict
                 }
                 // Backgrounded + completed: evict after TTL
-                matches!(p.completed_at, Some(t) if t.elapsed() >= self.completed_task_ttl)
+                matches!(p.lifecycle.swept_at(), Some(t) if t.elapsed() >= self.completed_task_ttl)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1608,15 +1629,18 @@ impl LocalTerminalActor {
                     end_time: p.end_wall_time,
                     output: String::new(),
                     output_file: p.output_file.clone(),
-                    truncated: p.truncated,
-                    exit_code: p.exit_status.as_ref().and_then(|s| s.exit_code),
-                    signal: p.exit_status.as_ref().and_then(|s| s.signal.clone()),
+                    // The output is dropped here; the log file keeps it.
+                    truncated: p.truncated || p.total_bytes > 0,
+                    exit_code: p.lifecycle.exit_status().and_then(|s| s.exit_code),
+                    signal: p.lifecycle.exit_status().and_then(|s| s.signal.clone()),
                     completed: true,
                     kind: p.kind,
                     block_waited: p.block_waited,
                     explicitly_killed: p.explicitly_killed,
                     owner_session_id: p.owner_session_id.clone(),
                     description: p.description.clone(),
+                    is_backgrounded: true,
+                    output_total_bytes: p.total_bytes,
                 };
                 self.completed_task_snapshots.insert(id.clone(), snapshot);
             }
@@ -1642,29 +1666,39 @@ impl LocalTerminalActor {
             return;
         };
 
-        // If exit_status is already set (e.g., by timeout handler or external signal),
-        // the process may still be running. Escalate to SIGKILL if needed, and drain
-        // output once it exits.
-        if process.exit_status.is_some() {
-            if process.drained {
-                // Already drained — nothing left to do for this process.
+        // An exited task may still hold a live child. Escalate to SIGKILL if
+        // needed, drain the pipes once it dies, and keep trying to collect it.
+        if process.lifecycle.has_exited() {
+            if process.lifecycle.is_settled() {
                 return;
             }
+            let waiting_since = match &process.lifecycle {
+                Lifecycle::Exiting { since, .. } => Some(*since),
+                Lifecycle::Running | Lifecycle::Finished { .. } | Lifecycle::Swept { .. } => None,
+            };
             match process.child.try_wait() {
+                Ok(None) if process.is_complete() => {
+                    // Already given up on this one; keep the kill signal fresh
+                    // and keep trying to collect it.
+                    send_sigkill_to_group(process);
+                }
                 Ok(None) => {
                     // Process was told to die but is still running — escalate to SIGKILL
                     send_sigkill_to_group(process);
+                    let gave_up = waiting_since.is_some_and(|since| since.elapsed() >= REAP_GRACE);
+                    if gave_up {
+                        // It is not dying. Take the output there is so the task
+                        // can report completion instead of waiting forever.
+                        take_available_output(process).await;
+                        process.flush_and_truncate_output_file().await;
+                        process.finish_output(Collection::ABANDONED);
+                    }
                 }
-                Ok(Some(_)) => {
-                    // Process finally exited — drain any remaining output
+                Ok(Some(_)) | Err(_) => {
+                    // A second drain is harmless: the first one closes the pipes.
                     drain_remaining_output(process).await;
                     process.flush_and_truncate_output_file().await;
-                    process.drained = true;
-                }
-                Err(_) => {
-                    drain_remaining_output(process).await;
-                    process.flush_and_truncate_output_file().await;
-                    process.drained = true;
+                    process.finish_output(Collection::of(&process.child));
                 }
             }
             return;
@@ -1771,7 +1805,7 @@ impl LocalTerminalActor {
         // can override via BashParams.foreground_block_budget_ms (0 = disable
         // short budget so only `timeout` auto-bgs). The `timeout` check below
         // also auto-bgs when auto_bg is on, or kills when it is off.
-        if process.exit_status.is_none()
+        if !process.lifecycle.has_exited()
             && matches!(
                 process.bg_status,
                 BackgroundStatus::Foreground {
@@ -1785,7 +1819,7 @@ impl LocalTerminalActor {
         }
 
         // Check for timeout.
-        if process.is_timed_out() && process.exit_status.is_none() {
+        if process.is_timed_out() && !process.lifecycle.has_exited() {
             if matches!(
                 process.bg_status,
                 BackgroundStatus::Foreground {
@@ -1798,7 +1832,7 @@ impl LocalTerminalActor {
 
             // Default: kill the process on timeout.
             send_sigterm_to_group(process);
-            process.exit_status = Some(ExitStatus {
+            process.mark_exited(ExitStatus {
                 exit_code: None,
                 signal: Some("timeout".to_owned()),
             });
@@ -1819,9 +1853,10 @@ impl LocalTerminalActor {
                 // buffers are read, resulting in empty output.
                 drain_remaining_output(process).await;
 
-                process.exit_status = Some(extract_exit_status(status));
+                process.mark_exited(extract_exit_status(status));
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
+                process.finish_output(Collection::of(&process.child));
                 let result = Ok(process.to_result());
                 process.notify_waiters(result);
             }
@@ -1832,12 +1867,16 @@ impl LocalTerminalActor {
                 // Still running
             }
             Err(e) => {
-                process.exit_status = Some(ExitStatus {
+                drain_remaining_output(process).await;
+                process.mark_exited(ExitStatus {
                     exit_code: None,
                     signal: Some(format!("error: {}", e)),
                 });
                 process.end_wall_time = Some(std::time::SystemTime::now());
                 process.flush_and_truncate_output_file().await;
+                // An erroring `try_wait` is no proof the child was
+                // collected; keep polling.
+                process.finish_output(Collection::of(&process.child));
                 let result = Ok(process.to_result());
                 process.notify_waiters(result);
             }
@@ -1903,7 +1942,7 @@ impl LocalTerminalActor {
         let fg_ids: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| !p.bg_status.is_backgrounded() && p.exit_status.is_none())
+            .filter(|(_, p)| !p.bg_status.is_backgrounded() && !p.lifecycle.has_exited())
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1928,7 +1967,7 @@ impl LocalTerminalActor {
                     handle.abort();
                 }
 
-                process.exit_status = Some(ExitStatus {
+                process.mark_exited(ExitStatus {
                     exit_code: None,
                     signal: Some("cancelled".to_owned()),
                 });
@@ -1955,7 +1994,7 @@ impl LocalTerminalActor {
             .filter(|(_, p)| {
                 p.owner_session_id.as_deref() == Some(owner_session_id)
                     && !p.bg_status.is_backgrounded()
-                    && p.exit_status.is_none()
+                    && !p.lifecycle.has_exited()
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1969,7 +2008,7 @@ impl LocalTerminalActor {
                 if let Some(handle) = process.state_dump_handle.take() {
                     handle.abort();
                 }
-                process.exit_status = Some(ExitStatus {
+                process.mark_exited(ExitStatus {
                     exit_code: None,
                     signal: Some("cancelled".to_owned()),
                 });
@@ -1993,7 +2032,7 @@ impl LocalTerminalActor {
             .iter()
             .filter(|(_, p)| {
                 p.owner_session_id.as_deref() == Some(owner_session_id)
-                    && p.exit_status.is_none()
+                    && !p.lifecycle.has_exited()
                     && p.bg_status.is_backgrounded()
             })
             .map(|(id, _)| id.clone())
@@ -2027,7 +2066,7 @@ impl LocalTerminalActor {
         for (task_id, process) in self.processes.iter_mut() {
             if process.owner_session_id.as_deref() == Some(old_owner_session_id)
                 && process.bg_status.is_backgrounded()
-                && process.exit_status.is_none()
+                && !process.lifecycle.has_exited()
             {
                 // Only reparent backgrounded, still-running tasks. Foreground
                 // processes keep the child's owner_session_id so the subsequent
@@ -2142,6 +2181,7 @@ struct LocalTerminalConfig {
     login_shell_capture: bool,
     search_shadows: SearchShadowConfig,
     shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
+    process_scope: Option<crate::util::ProcessScope>,
 }
 
 impl Default for LocalTerminalConfig {
@@ -2153,6 +2193,7 @@ impl Default for LocalTerminalConfig {
             login_shell_capture: true,
             search_shadows: SearchShadowConfig::default(),
             shell_env_policy: None,
+            process_scope: None,
         }
     }
 }
@@ -2189,15 +2230,6 @@ impl LocalTerminalBackend {
         })
     }
 
-    /// Create a new LocalTerminalBackend with both memory limits and persistent shell.
-    pub fn with_memory_limit_and_persistent_shell(config: CgroupMemoryConfig) -> Self {
-        Self::new_inner(LocalTerminalConfig {
-            memory_config: Some(config),
-            persistent_shell: true,
-            ..Default::default()
-        })
-    }
-
     /// Create a new LocalTerminalBackend using spawn_local (for single-threaded runtimes).
     ///
     /// `search_shadows` is the host-resolved `find`→`bfs` / `grep`→`ugrep` enable
@@ -2214,12 +2246,14 @@ impl LocalTerminalBackend {
         search_shadows: SearchShadowConfig,
         login_shell_capture: bool,
         shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
+        process_scope: Option<crate::util::ProcessScope>,
     ) -> Self {
         Self::new_inner(LocalTerminalConfig {
             use_spawn_local: true,
             login_shell_capture,
             search_shadows,
             shell_env_policy,
+            process_scope,
             ..Default::default()
         })
     }
@@ -2231,21 +2265,14 @@ impl LocalTerminalBackend {
     pub fn new_local_with_persistent_shell(
         search_shadows: SearchShadowConfig,
         shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
+        process_scope: Option<crate::util::ProcessScope>,
     ) -> Self {
         Self::new_inner(LocalTerminalConfig {
             use_spawn_local: true,
             persistent_shell: true,
             search_shadows,
             shell_env_policy,
-            ..Default::default()
-        })
-    }
-
-    /// Create a new LocalTerminalBackend using spawn_local with memory limits.
-    pub fn new_local_with_memory_limit(config: CgroupMemoryConfig) -> Self {
-        Self::new_inner(LocalTerminalConfig {
-            memory_config: Some(config),
-            use_spawn_local: true,
+            process_scope,
             ..Default::default()
         })
     }
@@ -2257,6 +2284,7 @@ impl LocalTerminalBackend {
     pub(crate) fn new_local_with_scope(
         search_shadows: SearchShadowConfig,
         scope: crate::util::ProcessScope,
+        session_scope: Option<crate::util::ProcessScope>,
     ) -> Self {
         Self::new_with_ttl(
             None,
@@ -2268,6 +2296,7 @@ impl LocalTerminalBackend {
             FOREGROUND_BLOCK_BUDGET,
             MAX_OUTPUT_FILE_BYTES,
             scope,
+            session_scope,
             None,
         )
     }
@@ -2286,6 +2315,7 @@ impl LocalTerminalBackend {
             MAX_OUTPUT_FILE_BYTES,
             crate::util::global_process_scope().clone(),
             None,
+            None,
         )
     }
 
@@ -2302,6 +2332,7 @@ impl LocalTerminalBackend {
             budget,
             MAX_OUTPUT_FILE_BYTES,
             crate::util::global_process_scope().clone(),
+            None,
             None,
         )
     }
@@ -2320,6 +2351,7 @@ impl LocalTerminalBackend {
             output_file_cap,
             crate::util::global_process_scope().clone(),
             None,
+            None,
         )
     }
 
@@ -2331,6 +2363,7 @@ impl LocalTerminalBackend {
             login_shell_capture,
             search_shadows,
             shell_env_policy,
+            process_scope,
         } = config;
         Self::new_with_ttl(
             memory_config,
@@ -2342,6 +2375,7 @@ impl LocalTerminalBackend {
             foreground_block_budget_from_env(),
             output_file_cap_from_env(),
             crate::util::global_process_scope().clone(),
+            process_scope,
             shell_env_policy,
         )
     }
@@ -2356,6 +2390,7 @@ impl LocalTerminalBackend {
         foreground_block_budget: Duration,
         output_file_cap: u64,
         scope: crate::util::ProcessScope,
+        session_scope: Option<crate::util::ProcessScope>,
         shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
@@ -2383,6 +2418,7 @@ impl LocalTerminalBackend {
                 foreground_block_budget,
                 output_file_cap,
                 scope,
+                session_scope,
                 shell_env_policy,
             );
             actor.run().await;
@@ -2725,6 +2761,41 @@ async fn drain_remaining_output(process: &mut ProcessState) {
     process.maybe_truncate();
 }
 
+/// Take the output already sitting in the pipes, then drop the handles.
+/// Never waits: a live pipe would hold the single threaded actor for the
+/// full drain timeout, so this is safe on a process that is still running.
+async fn take_available_output(process: &mut ProcessState) {
+    let mut collected = Vec::new();
+    if let Some(stdout) = process.child.stdout.as_mut() {
+        read_available(stdout, &mut collected);
+    }
+    if let Some(stderr) = process.child.stderr.as_mut() {
+        read_available(stderr, &mut collected);
+    }
+    process.child.stdout.take();
+    process.child.stderr.take();
+
+    if collected.is_empty() {
+        return;
+    }
+    process.output_buffer.extend_from_slice(&collected);
+    process.total_bytes += collected.len();
+    if let Some(file) = process.file_handle.as_mut() {
+        let _ = file.write_all(&collected).await;
+    }
+    process.maybe_truncate();
+}
+
+fn read_available(reader: &mut (impl tokio::io::AsyncRead + Unpin), out: &mut Vec<u8>) {
+    let mut buf = [0u8; READ_BUFFER_SIZE];
+    loop {
+        match try_read_nonblocking(reader, &mut buf) {
+            Some(Ok(0)) | Some(Err(_)) | None => return,
+            Some(Ok(n)) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
 /// Two-phase kill that synchronously waits for the process to exit.
 /// Used ONLY by `kill_and_finalize` (the explicit kill_task API) where
 /// the caller expects the process to be dead when the call returns.
@@ -2773,7 +2844,7 @@ async fn graceful_kill_and_wait(process: &mut ProcessState) {
 )]
 async fn kill_and_finalize(process: &mut ProcessState) -> KillOutcome {
     // Already reaped between the caller's check and here (race with poll_process)
-    if process.exit_status.is_some() {
+    if process.lifecycle.has_exited() {
         return KillOutcome::AlreadyExited;
     }
 
@@ -2815,13 +2886,15 @@ async fn kill_and_finalize(process: &mut ProcessState) -> KillOutcome {
     KillOutcome::Killed
 }
 
-/// Set exit_status, flush the output file, and notify foreground waiters.
+/// Mark the task exited, flush the output file, and notify foreground
+/// waiters. Callers read the remaining output first. A process that could
+/// not be collected stays unsettled, so the poll loop keeps trying.
 async fn finalize_process(process: &mut ProcessState, status: Option<std::process::ExitStatus>) {
-    if process.exit_status.is_some() {
+    if process.lifecycle.has_exited() {
         return;
     }
 
-    process.exit_status = Some(match status {
+    process.mark_exited(match status {
         Some(s) => extract_exit_status(s),
         None => ExitStatus {
             exit_code: None,
@@ -2833,6 +2906,7 @@ async fn finalize_process(process: &mut ProcessState, status: Option<std::proces
     }
 
     process.flush_and_truncate_output_file().await;
+    process.finish_output(Collection::of(&process.child));
 
     let result = Ok(process.to_result());
     process.notify_waiters(result);
@@ -2931,6 +3005,7 @@ async fn capture_login_env() -> HashMap<String, String> {
             .kill_on_drop(true);
         crate::util::detach_command(&mut cmd);
         cmd.envs(crate::util::pager_env());
+        #[allow(clippy::disallowed_methods)] // probe killed on drop
         let mut child = cmd.spawn().ok()?;
 
         let mut stdout_buf = Vec::new();
@@ -3179,11 +3254,13 @@ fn spawn_shell_command(
     #[cfg(unix)]
     let mut group = crate::util::ProcessGroup::new()?;
     #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)] // attached to the process group built above
     let child = cmd.spawn().map_err(|e| {
         std::io::Error::new(e.kind(), format!("spawn shell in {}: {e}", cwd.display()))
     })?;
 
     #[cfg(not(unix))]
+    #[allow(clippy::disallowed_methods)] // attached to the process group built in this block
     let (child, mut group) = {
         let group = crate::util::ProcessGroup::new()?;
         let mut cmd = build_cmd(true);
@@ -4562,6 +4639,7 @@ mod tests {
             let backend = LocalTerminalBackend::new_local_with_scope(
                 SearchShadowConfig::default(),
                 scope.clone(),
+                None,
             );
 
             let mut bg_req = make_request("sleep 120");
@@ -4593,6 +4671,41 @@ mod tests {
         });
     }
 
+    /// A session-scoped command stays enrolled in the base scope too, so the TUI
+    /// exit paths (which `kill_all()` only the process-global scope, and reach
+    /// `process::exit` without running `Drop`) still reap it.
+    #[test]
+    fn session_scoped_child_is_still_reaped_via_base_scope() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let base = crate::util::ProcessScope::new();
+            let session = crate::util::ProcessScope::new();
+            let backend = LocalTerminalBackend::new_local_with_scope(
+                SearchShadowConfig::default(),
+                base.clone(),
+                Some(session),
+            );
+
+            let mut bg_req = make_request("sleep 120");
+            bg_req.tool_call_id = "bg-dual-scope".to_string();
+            let bg = backend
+                .run_background(bg_req)
+                .await
+                .expect("background spawn should succeed");
+
+            base.kill_all();
+
+            assert!(
+                poll_until_task_completed(&backend, &bg.task_id, Duration::from_secs(10)).await,
+                "base-scope kill_all did not reap a session-scoped child"
+            );
+        });
+    }
+
     /// Once a background child is reaped, the actor must drop its
     /// `Arc<ProcessGroup>` so the scope's `Weak` dies. The completed task lingers
     /// in `self.processes` for `COMPLETED_TASK_TTL`; if the actor kept the `Arc`
@@ -4610,6 +4723,7 @@ mod tests {
             let backend = LocalTerminalBackend::new_local_with_scope(
                 SearchShadowConfig::default(),
                 scope.clone(),
+                None,
             );
 
             // A brief sleep (not `true`): it must still be running when we read
@@ -4954,6 +5068,14 @@ mod tests {
         assert!(snap_after.completed);
         assert_eq!(snap_after.exit_code, Some(0));
         assert_eq!(snap_after.task_id, bg.task_id);
+        // The tombstone drops the output but still reports the size the task
+        // produced, so it has to say the output is incomplete.
+        assert!(snap_after.output.is_empty());
+        assert!(snap_after.output_total_bytes > 0);
+        assert!(
+            snap_after.truncated,
+            "a tombstone that reports bytes must not claim complete output"
+        );
 
         // 5. list_tasks should include the evicted task.
         let all = backend.list_tasks().await;

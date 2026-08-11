@@ -11,9 +11,31 @@ fn api_key_id_for(auth: Option<&crate::auth::GrokAuth>) -> Option<String> {
     auth.filter(|a| matches!(a.auth_mode, crate::auth::AuthMode::ApiKey))
         .map(|a| xai_grok_telemetry::config::deployment_id_from_key(&a.key))
 }
+/// Sampler [`BearerResolver`](xai_grok_sampler::BearerResolver) over a live
+/// [`AuthManager`]: wire-valid only — never stamps a hard-expired access
+/// token (the client auth contract). Shared by the session sampler and
+/// subagent configs so the contract can't drift between them.
+pub(crate) struct WireValidBearerResolver(pub(crate) Arc<AuthManager>);
+impl WireValidBearerResolver {
+    /// The one constructor both the session sampler and subagent configs use,
+    /// so the wire-valid contract cannot drift between the call sites.
+    pub(crate) fn shared(auth_manager: Arc<AuthManager>) -> xai_grok_sampler::SharedBearerResolver {
+        Arc::new(Self(auth_manager))
+    }
+}
+impl std::fmt::Debug for WireValidBearerResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireValidBearerResolver").finish()
+    }
+}
+impl xai_grok_sampler::BearerResolver for WireValidBearerResolver {
+    fn current_bearer(&self) -> Option<String> {
+        self.0.current_wire_valid().map(|a| a.key)
+    }
+}
 /// Production impl: wraps the live `AuthManager`. 401 recovery
 /// delegates to `AuthManager::unauthorized_recovery`.
-pub struct ShellAuthCredentialProvider {
+pub(crate) struct ShellAuthCredentialProvider {
     auth_manager: Arc<AuthManager>,
     static_credentials: GrokAuthCredentials,
 }
@@ -228,7 +250,7 @@ impl xai_file_utils::storage_client::Auth401AttributionCallback for StorageClien
 ///
 /// Before upgrade, the bootstrap manager provides disk-read-only
 /// behavior (equivalent to the pre-consolidation OTel path).
-pub struct OtelAuthCredentialProvider {
+pub(crate) struct OtelAuthCredentialProvider {
     /// Bootstrap manager used before the live one is available.
     bootstrap: Arc<AuthManager>,
     /// Swapped to the agent's live `AuthManager` via `set_live()`.
@@ -249,10 +271,10 @@ impl OtelAuthCredentialProvider {
     /// `snapshot()` reads from the live manager (proactive refresh
     /// keeps it hot) and `refresh_after_unauthorized()` drives the
     /// full recovery state machine.
-    pub fn set_live(&self, auth_manager: Arc<AuthManager>) {
+    pub(crate) fn set_live(&self, auth_manager: Arc<AuthManager>) {
         self.live.store(Arc::new(Some(auth_manager)));
     }
-    pub fn set_deployment_key(&self, key: String) {
+    pub(crate) fn set_deployment_key(&self, key: String) {
         self.deployment_key.store(Arc::new(Some(key)));
     }
     /// Single-load snapshot of the live/bootstrap state.
@@ -358,7 +380,7 @@ static OTEL_PROVIDER: std::sync::OnceLock<Arc<OtelAuthCredentialProvider>> =
 /// `AuthManager`. Call this once after the main `AuthManager` is
 /// constructed and has its refresher configured. No-ops if the OTel
 /// layer was never initialized (e.g. `InstrumentationMode::Disabled`).
-pub fn wire_otel_auth_manager(auth_manager: Arc<AuthManager>) {
+pub(crate) fn wire_otel_auth_manager(auth_manager: Arc<AuthManager>) {
     if let Some(provider) = OTEL_PROVIDER.get() {
         provider.set_live(auth_manager);
         tracing::debug!("otel: upgraded credential provider to live AuthManager");
@@ -370,7 +392,7 @@ pub fn wire_otel_auth_manager(auth_manager: Arc<AuthManager>) {
 /// stamps per-export, so both pipelines attribute identically. No-op when
 /// the OTel provider was never initialized or the external stream is
 /// dormant.
-pub fn sync_external_otel_identity() {
+pub(crate) fn sync_external_otel_identity() {
     if let Some(provider) = OTEL_PROVIDER.get() {
         let snapshot = provider.snapshot();
         xai_grok_telemetry::external::set_identity(
@@ -379,7 +401,7 @@ pub fn sync_external_otel_identity() {
     }
 }
 /// No-ops if the OTel layer was never initialized.
-pub fn wire_otel_deployment_key(key: String) {
+pub(crate) fn wire_otel_deployment_key(key: String) {
     if let Some(provider) = OTEL_PROVIDER.get() {
         provider.set_deployment_key(key);
         tracing::debug!("otel: set deployment key on credential provider");
@@ -475,6 +497,40 @@ mod tests {
             mgr.hot_swap(auth);
         }
         Arc::new(mgr)
+    }
+    /// The shell half of the subagent-401 contract (the sampler half is
+    /// pinned in xai-grok-sampler's resolver tests): over a real
+    /// `AuthManager`, the resolver returns `None` when hard-expired
+    /// (fail-closed), the token inside the early-invalidation buffer
+    /// (still proxy-accepted), and the fresh token after a rotation --
+    /// same resolver, no client rebuild.
+    #[test]
+    fn wire_valid_resolver_tracks_manager_across_expiry_and_refresh() {
+        use xai_grok_sampler::BearerResolver;
+        let _guard = EarlyInvalidationGuard::pin_to_default();
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = make_manager(
+            &dir,
+            Some(make_auth("hard-expired-token", ChronoDuration::hours(-1))),
+        );
+        let resolver = WireValidBearerResolver(mgr.clone());
+        assert_eq!(
+            resolver.current_bearer(),
+            None,
+            "a hard-expired token must never ride the wire"
+        );
+        mgr.hot_swap(make_auth("buffer-window-token", ChronoDuration::minutes(4)));
+        assert_eq!(
+            resolver.current_bearer().as_deref(),
+            Some("buffer-window-token"),
+            "inside the early-invalidation buffer the token is still wire-valid"
+        );
+        mgr.hot_swap(make_auth("fresh-token", ChronoDuration::hours(1)));
+        assert_eq!(
+            resolver.current_bearer().as_deref(),
+            Some("fresh-token"),
+            "the same resolver must serve the rotated token without a rebuild"
+        );
     }
     /// `apply()` and `snapshot()` agree (snapshot==wire invariant) when the
     /// in-memory token is fresh.

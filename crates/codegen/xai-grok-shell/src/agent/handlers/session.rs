@@ -29,7 +29,7 @@ fn backfill_session_summary(summary: &mut Summary) {
 }
 
 /// Router for x.ai/session/* and x.ai/session_summaries/* methods.
-pub async fn handle(
+pub(crate) async fn handle(
     agent: &MvpAgent,
     args: &acp::ExtRequest,
 ) -> Result<acp::ExtResponse, acp::Error> {
@@ -79,9 +79,8 @@ async fn handle_session_info(
 
     let session_id = req.session_id.or_else(|| {
         agent
-            .sessions
-            .borrow()
-            .keys()
+            .resident_ids()
+            .into_iter()
             .next()
             .map(|id| id.0.to_string())
     });
@@ -93,7 +92,7 @@ async fn handle_session_info(
     };
 
     let sid = acp::SessionId::new(session_id.clone());
-    let Some(session) = agent.sessions.borrow().get(&sid).cloned() else {
+    let Some(session) = agent.resident_handle(&sid) else {
         return ExtMethodResult::success(serde_json::json!({}))
             .to_ext_response()
             .map_err(|e| acp::Error::internal_error().data(e.to_string()));
@@ -157,23 +156,22 @@ async fn handle_session_close(
     let req: CloseRequest = serde_json::from_str(args.params.get())
         .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
 
-    let sid = acp::SessionId::new(req.session_id.clone());
-    let existed = agent.sessions.borrow().contains_key(&sid);
-    if existed {
-        // Explicit terminal close: shut the actor down and finalize the cloud
-        // replica (genuine session end). Distinct from a mere client disconnect,
-        // which detaches but keeps the session resumable and never finalizes
-        // (see `MvpAgent::handle_evict_sessions` / `close_session_explicit`).
-        agent.request_session_shutdown(&sid);
-        agent.close_session_explicit(&sid);
-        tracing::info!(session_id = %req.session_id, "session closed via x.ai/session/close");
-    } else {
-        tracing::debug!(session_id = %req.session_id, "session/close: session not found (already closed)");
-    }
+    let sid = acp::SessionId::new(req.session_id);
+    let outcome = agent.close_active_session(&sid).await;
+    tracing::info!(
+        session_id = %sid.0,
+        ?outcome,
+        "x.ai/session/close"
+    );
 
-    ExtMethodResult::success(serde_json::json!({ "success": true }))
-        .to_ext_response()
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+    // `success` stays for existing callers; `outcome` says what the close
+    // actually did (`closed` / `notResident` / `superseded`).
+    ExtMethodResult::success(serde_json::json!({
+        "success": true,
+        "outcome": outcome.wire_str(),
+    }))
+    .to_ext_response()
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
 async fn handle_session_summaries(
@@ -267,8 +265,8 @@ async fn handle_session_list(
 ) -> Result<acp::ExtResponse, acp::Error> {
     use crate::session::unified_list;
 
-    // Under chat mode `parse_list_req` REPLACES any client-sent `kind` facet
-    // (never union) so every list surface is conversations-only.
+    // Under chat mode `parse_list_req` force-rewrites `kind` to conversations
+    // unless `local-workspace` is compiled in and the client sent chat/build.
     let req = unified_list::parse_list_req(args.params.get())
         .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?;
     tracing::debug!(
@@ -288,4 +286,60 @@ async fn handle_session_list(
     ExtMethodResult::success(unified_list::ext_list_response(result))
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
+/// Build sessions in exactly the requested directory. A page walk cannot reach
+/// past `over_fetch(limit)` rows per cwd: the local lane re-scans that window
+/// each page instead of seeking to the cursor.
+pub(crate) async fn handle_list_sessions(
+    agent: &MvpAgent,
+    args: acp::ListSessionsRequest,
+) -> Result<acp::ListSessionsResponse, acp::Error> {
+    use crate::session::unified_list;
+
+    // Kept in step with the capability, withheld under chat mode.
+    if crate::agent::chat_modes::process_chat_mode_enabled() {
+        return Err(acp::Error::method_not_found());
+    }
+
+    let additional_directories = args.additional_directories.len();
+    let cwd = args.cwd.map(|p| p.to_string_lossy().into_owned());
+    let mut req = unified_list::ListReq {
+        cwd: cwd.clone(),
+        cursor: args.cursor,
+        meta: args.meta.map(serde_json::Value::Object),
+        cwd_scope: unified_list::CwdScope::Only,
+        ..Default::default()
+    };
+    unified_list::force_kind(&mut req, unified_list::SessionKind::Build);
+
+    let registry_client = agent.session_registry_client();
+    let conversations_client = agent.conversations_client();
+    let result = unified_list::build_unified_list(
+        registry_client.as_ref(),
+        conversations_client.as_ref(),
+        req,
+    )
+    .await;
+
+    let meta = unified_list::acp_response_meta(&result);
+    // `CwdScope::Only` already dropped rows the schema cannot represent, so this
+    // conversion discards nothing and the page keeps the size it was given.
+    let sessions: Vec<acp::SessionInfo> = result
+        .rows
+        .into_iter()
+        .filter_map(|row| row.into_session_info().try_into().ok())
+        .collect();
+
+    tracing::debug!(
+        cwd = cwd.as_deref().unwrap_or("<all>"),
+        paged = result.next_cursor.is_some(),
+        returned = sessions.len(),
+        additional_directories,
+        "session/list"
+    );
+
+    Ok(acp::ListSessionsResponse::new(sessions)
+        .next_cursor(result.next_cursor)
+        .meta(meta))
 }

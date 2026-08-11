@@ -124,7 +124,7 @@ impl xai_tool_runtime::Tool for GrepTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "grep",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -185,6 +185,7 @@ impl xai_tool_runtime::Tool for GrepTool {
         cmd.stdin(Stdio::null());
 
         // Spawn.
+        #[allow(clippy::disallowed_methods)] // search helper, waited on below
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -279,7 +280,7 @@ impl xai_tool_runtime::Tool for GrepTool {
         }
 
         // Sort by mtime (most recent first).
-        matches.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+        matches.sort_by_key(|b| std::cmp::Reverse(b.mtime_ms));
 
         let total_matches = matches.len();
         let truncated = total_matches > RESULT_LIMIT;

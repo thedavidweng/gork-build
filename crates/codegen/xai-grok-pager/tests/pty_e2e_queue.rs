@@ -11,6 +11,10 @@ mod common;
 
 #[path = "pty_e2e/auto_wake_cancel_preserves_queued_user_prompt.rs"]
 mod auto_wake_cancel_preserves_queued_user_prompt;
+#[path = "pty_e2e/auto_wake_cancel_via_esc_preserves_queued_user_prompt.rs"]
+mod auto_wake_cancel_via_esc_preserves_queued_user_prompt;
+#[path = "pty_e2e/auto_wake_cancel_via_stop_click_preserves_queued_user_prompt.rs"]
+mod auto_wake_cancel_via_stop_click_preserves_queued_user_prompt;
 #[path = "pty_e2e/bash_queued_mid_turn_drains_as_bash.rs"]
 mod bash_queued_mid_turn_drains_as_bash;
 #[path = "pty_e2e/cancel_discards_buffered_interjection.rs"]
@@ -49,6 +53,10 @@ mod mid_turn_slash_dropdown_esc_dismisses_not_cancel;
 mod minimal_ctrl_o_send_now_queued_apple_terminal;
 #[path = "pty_e2e/queue_and_interjection_lifecycle.rs"]
 mod queue_and_interjection_lifecycle;
+#[path = "pty_e2e/queue_reorder_local_row_above_server_row.rs"]
+mod queue_reorder_local_row_above_server_row;
+#[path = "pty_e2e/queue_reorder_moves_row_up.rs"]
+mod queue_reorder_moves_row_up;
 #[path = "pty_e2e/queued_bash_promotion_renders_output_pty.rs"]
 mod queued_bash_promotion_renders_output_pty;
 #[path = "pty_e2e/queued_message_renders_once_not_twice.rs"]

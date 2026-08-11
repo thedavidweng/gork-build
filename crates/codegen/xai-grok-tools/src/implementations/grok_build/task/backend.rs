@@ -163,6 +163,78 @@ impl ChannelBackend {
         response_rx.await.unwrap_or(SubagentCancelOutcome::NotFound)
     }
 
+    /// User Stop: cancel all non-workflow children for this parent session.
+    ///
+    /// Requires [`Self::for_session`]; unbound backends return `NotFound` and
+    /// do not broadcast a wildcard cancel.
+    pub async fn cancel_parent_session(&self) -> SubagentCancelOutcome {
+        let (respond_to, response_rx) = oneshot::channel();
+        if !self.request_cancel_parent_session(respond_to) {
+            return SubagentCancelOutcome::NotFound;
+        }
+        response_rx.await.unwrap_or(SubagentCancelOutcome::NotFound)
+    }
+
+    /// Fire-and-forget ParentSession cancel used by the shell Stop path.
+    /// Returns false when the backend is unbound or the channel is closed.
+    pub fn request_cancel_parent_session(
+        &self,
+        respond_to: oneshot::Sender<SubagentCancelOutcome>,
+    ) -> bool {
+        let Some(parent_session_id) = self.parent_session_id() else {
+            return false;
+        };
+        self.tx
+            .send(SubagentEvent::Cancel(SubagentCancelRequest {
+                parent_session_id: Some(parent_session_id),
+                target: SubagentCancelTarget::ParentSession,
+                respond_to,
+            }))
+            .is_ok()
+    }
+
+    /// Re-open Task spawns after a prior ParentSession stop (start of next turn).
+    pub fn open_spawn_admission(&self) -> bool {
+        let Some(parent_session_id) = self.parent_session_id() else {
+            return false;
+        };
+        self.tx
+            .send(SubagentEvent::OpenSpawnAdmission { parent_session_id })
+            .is_ok()
+    }
+
+    /// Delete-path teardown: cancel `parent_session_id`'s children and wait, up
+    /// to `budget`, for the coordinator to drain them. Owns the event shape and
+    /// the wait policy so the host does not rebuild them. Best-effort: on a
+    /// closed channel or an elapsed budget it logs and returns (the coordinator
+    /// keeps admission closed until its own backstop deadline).
+    pub async fn teardown_session_and_drain(
+        &self,
+        parent_session_id: &str,
+        budget: std::time::Duration,
+    ) {
+        let (respond_to, response_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(SubagentEvent::TeardownSession {
+                parent_session_id: parent_session_id.to_owned(),
+                respond_to: Some(respond_to),
+            })
+            .is_err()
+        {
+            return;
+        }
+        // Err = budget elapsed with children still finishing; Ok = drained or
+        // the responder was dropped.
+        if tokio::time::timeout(budget, response_rx).await.is_err() {
+            tracing::warn!(
+                parent_session_id,
+                budget_ms = budget.as_millis() as u64,
+                "subagents still running after session-delete drain budget"
+            );
+        }
+    }
+
     pub async fn inspect(&self, id: &str) -> Option<SubagentInspection> {
         let (respond_to, response_rx) = oneshot::channel();
         self.tx
@@ -429,15 +501,15 @@ pub const VALIDATE_TYPE_TIMEOUT_ENV_VAR: &str = "XAI_VALIDATE_TYPE_TIMEOUT_MS";
 
 /// Validation timeout, honoring the env-var override.
 pub fn validate_type_timeout() -> std::time::Duration {
-    let raw = std::env::var(VALIDATE_TYPE_TIMEOUT_ENV_VAR).ok();
-    parse_timeout_ms(raw.as_deref())
+    let value = std::env::var(VALIDATE_TYPE_TIMEOUT_ENV_VAR).ok();
+    parse_timeout_ms(value.as_deref())
         .map(std::time::Duration::from_millis)
         .unwrap_or(VALIDATE_TYPE_TIMEOUT)
 }
 
 /// Parse a positive `u64` millisecond value; `None` for unset, invalid, or zero.
 pub(crate) fn parse_timeout_ms(value: Option<&str>) -> Option<u64> {
-    value?.parse::<u64>().ok().filter(|&ms| ms > 0)
+    value.and_then(crate::util::env::parse_positive)
 }
 
 /// Resolve a `Duration` from a positive-millisecond env override, falling back

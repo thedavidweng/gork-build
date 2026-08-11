@@ -61,7 +61,9 @@ pub fn requires_hook_write_deny(profile: &ProfileName, workspace: &Path) -> bool
 }
 #[cfg(all(feature = "enforce", unix))]
 use nono::Sandbox;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 static SANDBOX: OnceLock<GlobalSandboxState> = OnceLock::new();
@@ -103,6 +105,19 @@ pub fn set_configured_profile(name: impl Into<String>) {
 /// Resolved sandbox profile from startup, or `None` if `set_configured_profile` was never called.
 pub fn configured_profile_name() -> Option<&'static str> {
     CONFIGURED_PROFILE.get().map(|s| s.as_str())
+}
+/// The non-`off` sandbox profile this process was **requested** with, if any.
+///
+/// This is the configured request, not a report that enforcement succeeded —
+/// `is_active()` can be false while the process is still confined (e.g. some
+/// Linux bwrap paths), and a requested-but-unapplied profile already warns the
+/// user. Keying on the request is the fail-closed choice.
+pub fn requested_confinement_profile() -> Option<&'static str> {
+    configured_profile_name().filter(|name| profile_confines(name))
+}
+fn profile_confines(name: &str) -> bool {
+    name.parse::<ProfileName>()
+        .is_ok_and(|profile| profile != ProfileName::Off)
 }
 /// Whether the sandbox was successfully applied to this process.
 pub fn is_active() -> bool {
@@ -293,7 +308,13 @@ pub(crate) fn bwrap_reexec_command_ex(
     if is_inside_bwrap() {
         return None;
     }
-    let self_exe = std::env::current_exe().ok()?;
+    let self_exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("error: could not resolve the current executable for the bwrap re-exec: {e}");
+            return None;
+        }
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cmd = std::process::Command::new("bwrap");
     cmd.arg("--cap-drop").arg("ALL");
@@ -426,6 +447,15 @@ pub fn requires_read_deny(profile: &ProfileName, workspace: &Path) -> bool {
 pub fn requires_read_deny(_profile: &ProfileName, _workspace: &Path) -> bool {
     false
 }
+/// Whether a `resolve_profile` failure must refuse startup: any profile that
+/// enforces hook write-deny or its own deny list cannot proceed with an empty
+/// plan. The read-deny arm covers deny-carrying `extends = "devbox"` profiles,
+/// which the hook arm does not; devbox resolution is infallible today, so that
+/// arm is defense in depth against a future fallible resolve step.
+#[cfg(all(feature = "enforce", target_os = "linux"))]
+fn resolve_failure_must_refuse(profile: &ProfileName, workspace: &Path) -> bool {
+    requires_hook_write_deny(profile, workspace) || requires_read_deny(profile, workspace)
+}
 /// A profile's resolved bwrap deny plan.
 #[cfg(target_os = "linux")]
 struct BwrapDenyPlan {
@@ -448,7 +478,7 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
         match profile.resolve_profile(workspace, &config) {
             Ok(r) => Some(r),
             Err(e) => {
-                if requires_hook_write_deny(profile, workspace) {
+                if resolve_failure_must_refuse(profile, workspace) {
                     eprintln!("error: sandbox profile resolve failed: {e}");
                     return None;
                 }
@@ -474,6 +504,7 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
         None
     };
     if needs_hooks && hook_plan.is_none() {
+        eprintln!("error: hook write-deny is required but no plan was prepared");
         return None;
     }
     let (exact, globs) = deny::partition_deny_entries(&entries);
@@ -485,13 +516,14 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
             "sandbox deny globs are enforced best-effort on Linux (expanded at launch); \
              files matching them that are created later are NOT covered"
         );
-        deny_read.extend(deny::expand_deny_globs(
-            workspace,
-            &globs,
-            deny::DENY_GLOB_MAX_DEPTH,
-            deny::DENY_GLOB_MAX_MATCHES,
-            deny::DENY_GLOB_MAX_ENTRIES,
-        )?);
+        match deny::expand_deny_globs(workspace, &globs, deny::DENY_GLOB_CAPS) {
+            Ok(paths) => deny_read.extend(paths),
+            Err(reason) => {
+                tracing::error!(%reason, "sandbox deny-glob expansion failed; refusing to start");
+                eprintln!("error: sandbox deny glob could not be enforced on Linux: {reason}");
+                return None;
+            }
+        }
     }
     Some(BwrapDenyPlan {
         deny_write_optional,
@@ -500,6 +532,8 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
         has_globs,
     })
 }
+/// Without kernel enforcement there is no read-deny; the devbox `/data`
+/// write-deny and the hook write-deny plan still apply.
 #[cfg(all(not(feature = "enforce"), target_os = "linux"))]
 fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyPlan> {
     let config = profiles::load_sandbox_config(workspace);
@@ -527,11 +561,17 @@ fn bwrap_deny_plan(profile: &ProfileName, workspace: &Path) -> Option<BwrapDenyP
         has_globs: false,
     })
 }
+/// Build the bwrap re-exec command a profile needs on Linux. Returns `None`
+/// when no re-exec is needed (already inside bwrap, nothing to deny) or the
+/// deny plan could not be built; plan failures print their cause.
 #[cfg(target_os = "linux")]
 pub fn bwrap_reexec_for_profile(
     profile: &ProfileName,
     workspace: &Path,
 ) -> Option<std::process::Command> {
+    if is_inside_bwrap() {
+        return None;
+    }
     let BwrapDenyPlan {
         deny_write_optional,
         hook_plan,
@@ -772,6 +812,15 @@ mod tests {
         assert_eq!(configured_profile_name(), Some("read-only"));
     }
     #[test]
+    fn profile_confines_only_for_non_off_profiles() {
+        assert!(!super::profile_confines("off"));
+        assert!(!super::profile_confines("none"));
+        assert!(super::profile_confines("strict"));
+        assert!(super::profile_confines("read-only"));
+        assert!(super::profile_confines("readonly"));
+        assert!(super::profile_confines("my-custom-profile"));
+    }
+    #[test]
     fn known_launch_guard_is_linux_only() {
         assert_eq!(
             restrict_network_at_known_linux_launches(true, true),
@@ -897,5 +946,32 @@ mod tests {
             "non-devbox custom must re-exec for direct-hook write-deny"
         );
         let _ = std::fs::remove_dir_all(&ws_ws);
+    }
+    #[test]
+    #[cfg(all(feature = "enforce", target_os = "linux"))]
+    fn resolve_failure_refuses_for_deny_carrying_devbox_extends() {
+        let workspace = temp_workspace_with_sandbox_toml(
+            "resolve-refuse",
+            "[profiles.devdeny]\nextends = \"devbox\"\ndeny = [\"secret.pem\"]\n",
+        );
+        let profile = ProfileName::Custom("devdeny".to_string());
+        assert!(!requires_hook_write_deny(&profile, &workspace));
+        assert!(resolve_failure_must_refuse(&profile, &workspace));
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    #[cfg(all(feature = "enforce", target_os = "linux"))]
+    fn bwrap_reexec_for_profile_skips_plan_inside_bwrap() {
+        let _g = EnvGuard::set(BWRAP_ENV_VAR, "1");
+        let workspace = temp_workspace_with_sandbox_toml(
+            "inside-bwrap-skip",
+            "[profiles.devskip]\nextends = \"devbox\"\ndeny = [\"secret.pem\"]\n",
+        );
+        assert!(
+            bwrap_reexec_for_profile(&ProfileName::Custom("devskip".to_string()), &workspace)
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

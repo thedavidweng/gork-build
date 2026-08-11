@@ -81,7 +81,7 @@ pub enum ConfigUpdate {
 /// Runs on `tokio::spawn` (`Send`). Receives raw [`ConfigChangeEvent`]s from
 /// the file watcher, diffs against last-known state, and sends [`ConfigUpdate`]
 /// messages to the agent via an `mpsc` channel.
-pub struct ConfigReloader {
+pub(crate) struct ConfigReloader {
     last_auth_key_hash: u64,
     last_global_config: toml::Value,
     /// Per-cwd content hash of the project MCP config files, used to
@@ -99,7 +99,7 @@ pub struct ConfigReloader {
 }
 
 impl ConfigReloader {
-    pub fn new(
+    pub(crate) fn new(
         grok_home: PathBuf,
         initial_auth_key_hash: u64,
         initial_config: toml::Value,
@@ -123,7 +123,7 @@ impl ConfigReloader {
     }
 
     /// Main loop. Batches all events from each debounce tick before processing.
-    pub async fn run(
+    pub(crate) async fn run(
         mut self,
         mut events: mpsc::UnboundedReceiver<ConfigChangeEvent>,
         cancel: CancellationToken,
@@ -273,7 +273,7 @@ impl ConfigReloader {
         }
     }
 
-    fn reload_auth(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn reload_auth(&mut self) -> anyhow::Result<()> {
         let auth_path = self.grok_home.join("auth.json");
         let store = read_auth_json(&auth_path)?;
 
@@ -494,7 +494,7 @@ pub(crate) fn hash_auth_key(key: &str) -> u64 {
 /// Extract the `[skills]` table from an effective config.
 ///
 /// Consumers: the reload dispatch above (change detection →
-/// `ConfigUpdate::Skills`) and `gork inspect` (via the `crate::config`
+/// `ConfigUpdate::Skills`) and `grok inspect` (via the `crate::config`
 /// re-export), so both honor the same paths/ignore/disabled as a live
 /// session. Session spawn parses the same table separately through the typed
 /// `Config.skills` (agent/config.rs) — keep these in sync rather than adding

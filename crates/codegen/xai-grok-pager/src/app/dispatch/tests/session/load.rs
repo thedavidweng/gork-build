@@ -1,26 +1,6 @@
 //! Tests for session loading, restore, pickers, and deep search.
 use super::*;
 use xai_grok_shell::session::unified_list::ListScope;
-#[test]
-fn follow_up_chip_bypasses_project_picker() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.cwd = PathBuf::from("/tmp");
-    app.project_picker_shown = false;
-    assert!(
-        app.needs_project_picker(),
-        "precondition: the picker would fire for a typed prompt here"
-    );
-    let effects = dispatch(Action::SubmitFollowUp("Summarize this".into()), &mut app);
-    assert!(
-        app.agents[&id].question_view.is_none(),
-        "a literal chip must not open the project question"
-    );
-    assert!(
-        matches!(&effects[..], [Effect::SendPrompt { text, .. }] if text == "Summarize this"),
-        "chip text must be sent literally, not swallowed, got {effects:?}"
-    );
-}
 /// Opening the cancel-turn picker while scrollback is focused must
 /// hand keyboard focus to the picker — otherwise up/down keys go
 /// to scrollback and the modal is only navigable via mouse.
@@ -64,13 +44,14 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
             ),
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::HydrateSessionTitleFromDisk { .. }))
+            .any(|e| matches!(e, Effect::HydrateSessionMetaFromDisk { .. }))
     );
     assert!(
         effects
@@ -106,9 +87,11 @@ fn session_title_hydration_auto_leaves_display_name_none() {
     );
     let id = AgentId(0);
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("Auto Title".into(), false)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
@@ -131,9 +114,11 @@ fn session_title_hydration_manual_restores_display_name_cold_cache_only() {
     );
     let id = AgentId(0);
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("Disk Title".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
@@ -144,9 +129,11 @@ fn session_title_hydration_manual_restores_display_name_cold_cache_only() {
     }
     app.agents.get_mut(&id).unwrap().display_name = Some("Fresh Rename".into());
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("Stale Disk Title".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
@@ -154,6 +141,42 @@ fn session_title_hydration_manual_restores_display_name_cold_cache_only() {
         app.agents[&id].display_name.as_deref(),
         Some("Fresh Rename"),
         "hydration is a cold-cache fallback, never an overwrite"
+    );
+    assert_eq!(
+        app.agents[&id].generated_session_title.as_deref(),
+        Some("Disk Title"),
+        "generated_session_title is also cold-cache; a live title must not be clobbered"
+    );
+}
+/// A live auto title (SessionSummaryGenerated) that wins the race with the
+/// disk read must not be replaced — ghost-prefill falls back to this field.
+#[test]
+fn session_title_hydration_does_not_clobber_live_generated_title() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().generated_session_title = Some("Live Auto".into());
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: Some(("Stale Disk Title".into(), false)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert_eq!(
+        agent.generated_session_title.as_deref(),
+        Some("Live Auto"),
+        "late disk hydrate must not replace a live generated title"
+    );
+    assert!(
+        agent.display_name.is_none(),
+        "auto disk titles must not restore display_name"
     );
 }
 /// Whitespace-only titles from disk are ignored entirely, manual or not.
@@ -166,15 +189,151 @@ fn session_title_hydration_ignores_blank_title() {
     );
     let id = AgentId(0);
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("   ".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
     let agent = &app.agents[&id];
     assert!(agent.display_name.is_none());
     assert!(agent.generated_session_title.is_none());
+}
+/// Pure C0/whitespace titles strip to blank — skip rather than restoring
+/// the unsanitized string into `display_name`.
+#[test]
+fn session_title_hydration_skips_control_only_title() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: Some(("\u{1b}\u{07}\n\t".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert!(
+        agent.display_name.is_none(),
+        "control-only title must not land in display_name, got {:?}",
+        agent.display_name
+    );
+    assert!(
+        agent.generated_session_title.is_none(),
+        "control-only title must not land in generated_session_title, got {:?}",
+        agent.generated_session_title
+    );
+}
+/// Dirty-but-nonempty on-disk titles are stripped then capped before restore.
+#[test]
+fn session_title_hydration_sanitizes_and_caps_dirty_title() {
+    use xai_grok_shell::session::persistence::MAX_TITLE_SCALARS;
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    let dirty = format!(
+        "ok\u{1b}]0;PWNED\u{07}{}",
+        "é".repeat(MAX_TITLE_SCALARS + 5)
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: Some((dirty, true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    const PREFIX: &str = "ok]0;PWNED";
+    let expected = format!(
+        "{PREFIX}{}",
+        "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+    );
+    let agent = &app.agents[&id];
+    assert_eq!(agent.display_name.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        agent.generated_session_title.as_deref(),
+        Some(expected.as_str())
+    );
+}
+/// The persisted last-turn summary hydrates cold-cache only: a value already
+/// set by a live `LastTurnSummary` delivery (always newer than any disk read)
+/// must not be overwritten by the slower disk result.
+#[test]
+fn last_turn_summary_hydration_is_cold_cache_only() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: None,
+            last_turn_summary: Some("From disk".into()),
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].last_turn_summary.as_deref(),
+        Some("From disk")
+    );
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .set_last_turn_summary(Some("Live delivery".into()));
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: None,
+            last_turn_summary: Some("Stale disk read".into()),
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].last_turn_summary.as_deref(),
+        Some("Live delivery"),
+        "hydration is a cold-cache fallback, never an overwrite"
+    );
+}
+/// A rewind that clears `last_turn_summary` while disk hydration is in flight
+/// must not be undone by the late pre-rewind `summary.json` value.
+#[test]
+fn last_turn_summary_hydration_does_not_restore_after_rewind_clear() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().set_last_turn_summary(None);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: None,
+            last_turn_summary: Some("Pre-rewind disk summary".into()),
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].last_turn_summary, None,
+        "stale disk hydrate must not re-apply a summary rewind already cleared"
+    );
 }
 /// A resumed session whose replay left entries marked running (bg tasks,
 /// scheduler runs, tools cut off when the previous process died) must
@@ -206,6 +365,7 @@ fn session_loaded_without_adoption_finishes_replayed_running_entries() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -214,6 +374,58 @@ fn session_loaded_without_adoption_finishes_replayed_running_entries() {
         !agent.scrollback.has_running_entries(),
         "replayed running entries must be finished when no turn is adopted"
     );
+}
+/// Resume into a cwd with `.git/grok-worktree-source` sets `session.is_worktree`.
+#[test]
+fn load_session_marks_standalone_worktree_cwd() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    dispatch(
+        Action::LoadSession("sess-wt".into(), Some(clone.path.clone()), false),
+        &mut app,
+    );
+    assert!(
+        app.agents[&AgentId(0)].session.is_worktree,
+        "resume into a standalone grok worktree must set session.is_worktree"
+    );
+    assert_eq!(app.agents[&AgentId(0)].session.cwd, clone.path);
+}
+#[test]
+fn load_session_plain_repo_is_not_worktree() {
+    let mut app = test_app();
+    let repo = crate::test_util::TempGitRepo::init("main");
+    dispatch(
+        Action::LoadSession("sess-plain-git".into(), Some(repo.path.clone()), false),
+        &mut app,
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_worktree);
+}
+#[test]
+fn remote_restore_marks_standalone_worktree_cwd() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    app.cwd = clone.path.clone();
+    let _ = dispatch_load_session_with_restore(
+        &mut app,
+        "remote-wt".into(),
+        clone.path.display().to_string(),
+    );
+    assert!(app.agents[&AgentId(0)].session.is_worktree);
+    assert_eq!(app.agents[&AgentId(0)].session.cwd, clone.path);
+}
+#[test]
+fn remote_restore_plain_repo_is_not_worktree() {
+    let mut app = test_app();
+    let repo = crate::test_util::TempGitRepo::init("main");
+    app.cwd = repo.path.clone();
+    let _ = dispatch_load_session_with_restore(
+        &mut app,
+        "remote-plain".into(),
+        repo.path.display().to_string(),
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_worktree);
 }
 /// Cross-cwd resume anchors the agent cwd to the resolved origin cwd.
 #[test]
@@ -273,6 +485,7 @@ fn session_loaded_purges_replay_transient() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -297,6 +510,7 @@ fn session_loaded_during_open_reload_window_defers_to_window() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -406,6 +620,7 @@ fn session_loaded_with_restore_failure_shows_warning_banner() {
             ),
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -447,13 +662,14 @@ fn session_loaded_without_restore_no_summary() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::HydrateSessionTitleFromDisk { .. }))
+            .any(|e| matches!(e, Effect::HydrateSessionMetaFromDisk { .. }))
     );
     assert!(
         effects
@@ -489,6 +705,7 @@ fn session_loaded_without_restore_resets_restore_degree() {
             restore_summary: Some("checked out abc".into()),
             restore_degree: Some(xai_grok_workspace::session::git::RestoreDegree::Full),
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -505,6 +722,7 @@ fn session_loaded_without_restore_resets_restore_degree() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -533,6 +751,7 @@ fn session_loaded_with_flag_emits_five_fetches_and_clears_flag() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -658,10 +877,11 @@ fn session_restored_refuses_local_build_under_chat_mode() {
         "placeholder agent must be removed on refuse"
     );
 }
-/// `SessionRestored` never carries a conversation-entry bit: the follow-up
-/// LoadSession stays `chat_kind: false`; the agent UI bit is sticky `--chat`.
+/// `SessionRestored` follow-up LoadSession stays `chat_kind: false` (not a
+/// picker conversation entry). Sticky `--chat` with no local disk still
+/// opens as chat, so `conversation_entry` / rename kind are Chat.
 #[test]
-fn session_restored_load_never_sets_conversation_entry_bit() {
+fn session_restored_sticky_chat_sets_conversation_entry() {
     let mut app = test_app_with_agent();
     let id = *app.agents.keys().next().unwrap();
     app.chat_mode = true;
@@ -682,6 +902,14 @@ fn session_restored_load_never_sets_conversation_entry_bit() {
     ));
     let agent = app.agents.get(&id).expect("agent kept");
     assert!(agent.chat_kind, "agent UI bit comes from sticky --chat");
+    assert!(
+        agent.conversation_entry,
+        "sticky --chat restore with no local disk opens as chat (rename kind)"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Chat
+    );
 }
 /// Completing a mid-session login restores the agent view instead of
 /// running the startup load-session flow.
@@ -725,6 +953,7 @@ fn session_loaded_drains_pending_first_prompt_to_front() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -754,6 +983,7 @@ fn session_loaded_with_no_pending_first_prompt_does_not_enqueue() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -859,6 +1089,7 @@ fn session_loaded_clears_stale_running_entries() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -898,6 +1129,7 @@ fn resume_focuses_existing_agent_for_open_session() {
             agent_id: agent_0,
             session_id: "wt-sess-1".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -915,6 +1147,7 @@ fn resume_focuses_existing_agent_for_open_session() {
             agent_id: agent_1,
             session_id: "new-sess-2".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -945,6 +1178,7 @@ fn resume_unknown_session_still_creates_new_agent() {
             agent_id: AgentId(0),
             session_id: "sess-aaa".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -975,6 +1209,7 @@ fn resume_open_session_does_not_rearm_stale_overlay() {
             agent_id: agent_0,
             session_id: "sess-a".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -985,6 +1220,7 @@ fn resume_open_session_does_not_rearm_stale_overlay() {
             agent_id: agent_1,
             session_id: "sess-b".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1010,6 +1246,7 @@ fn resume_conversation_does_not_focus_build_id_collision() {
             agent_id: agent_0,
             session_id: "shared-id".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1041,6 +1278,7 @@ fn duplicate_load_unbind_invalidates_old_minimal_btw_response() {
             agent_id: old_owner,
             session_id: "shared-id".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1084,6 +1322,7 @@ fn resume_under_chat_mode_focuses_despite_entry_false() {
             agent_id: agent_0,
             session_id: "chat-mode-sess".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1095,6 +1334,7 @@ fn resume_under_chat_mode_focuses_despite_entry_false() {
             agent_id: agent_1,
             session_id: "other".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1120,6 +1360,7 @@ fn resume_stale_attached_target_focuses_dashboard_row() {
             agent_id: agent_0,
             session_id: "sess-a".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1130,6 +1371,7 @@ fn resume_stale_attached_target_focuses_dashboard_row() {
             agent_id: agent_1,
             session_id: "sess-b".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1203,6 +1445,7 @@ fn session_restored_clears_stale_session_id() {
             agent_id: AgentId(0),
             session_id: "remote-sess".into(),
             models: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );
@@ -1218,243 +1461,6 @@ fn session_restored_clears_stale_session_id() {
     assert_eq!(
         app.agents[&AgentId(1)].session.session_id,
         Some(acp::SessionId::new("remote-sess"))
-    );
-}
-#[test]
-fn project_picker_skip_falls_back_to_original_cwd() {
-    use crate::views::prompt_widget::StashedPrompt;
-    use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
-    let qv = QuestionViewState::new("test".into(), vec![], StashedPrompt::default());
-    let kind = LocalQuestionKind::ProjectSelect {
-        resolved_paths: vec![PathBuf::from("/projects/a")],
-        original_cwd: PathBuf::from("/home/user"),
-        stashed_prompt: "hello".into(),
-        dont_ask_index: 1,
-    };
-    let outcome = crate::app::agent_view::translate_local_submit_for_test(&qv, kind, true);
-    match outcome {
-        crate::app::app_view::InputOutcome::Action(Action::ProjectSelected {
-            path,
-            stashed_prompt,
-            disable_picker,
-        }) => {
-            assert_eq!(path, PathBuf::from("/home/user"));
-            assert_eq!(stashed_prompt, "hello");
-            assert!(!disable_picker);
-        }
-        other => panic!("expected ProjectSelected, got {other:?}"),
-    }
-}
-#[test]
-fn project_picker_freeform_path_used_when_no_option_selected() {
-    use crate::views::prompt_widget::StashedPrompt;
-    use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
-    use xai_grok_tools::implementations::grok_build::ask_user_question::{
-        Question, QuestionOption,
-    };
-    let q = Question {
-        question: "Pick".into(),
-        id: None,
-        options: vec![QuestionOption {
-            label: "A".into(),
-            description: String::new(),
-            preview: None,
-            id: None,
-        }],
-        multi_select: Some(false),
-    };
-    let mut qv = QuestionViewState::new("test".into(), vec![q], StashedPrompt::default());
-    qv.per_question_freeform[0] = "~/my-project".into();
-    qv.per_question_freeform_selected[0] = true;
-    let kind = LocalQuestionKind::ProjectSelect {
-        resolved_paths: vec![PathBuf::from("/fallback")],
-        original_cwd: PathBuf::from("/home/user"),
-        stashed_prompt: "hello".into(),
-        dont_ask_index: 1,
-    };
-    let outcome = crate::app::agent_view::translate_local_submit_for_test(&qv, kind, false);
-    match outcome {
-        crate::app::app_view::InputOutcome::Action(Action::ProjectSelected {
-            path,
-            disable_picker,
-            ..
-        }) => {
-            let expanded = shellexpand::tilde("~/my-project");
-            assert_eq!(path, PathBuf::from(expanded.as_ref()));
-            assert!(!disable_picker, "freeform selection must not opt out");
-        }
-        other => panic!("expected ProjectSelected, got {other:?}"),
-    }
-}
-#[test]
-fn project_picker_freeform_overrides_dont_ask() {
-    use crate::views::prompt_widget::StashedPrompt;
-    use crate::views::question_view::{LocalQuestionKind, QuestionSelection, QuestionViewState};
-    use xai_grok_tools::implementations::grok_build::ask_user_question::{
-        Question, QuestionOption,
-    };
-    let opt = |label: &str| QuestionOption {
-        label: label.into(),
-        description: String::new(),
-        preview: None,
-        id: None,
-    };
-    let q = Question {
-        question: "Pick".into(),
-        id: None,
-        options: vec![opt("a (current)"), opt("Don't ask me again")],
-        multi_select: Some(false),
-    };
-    let mut qv = QuestionViewState::new("test".into(), vec![q], StashedPrompt::default());
-    qv.selections[0] = QuestionSelection::Single(Some(1));
-    qv.per_question_freeform[0] = "~/my-project".into();
-    qv.per_question_freeform_selected[0] = true;
-    let kind = LocalQuestionKind::ProjectSelect {
-        resolved_paths: vec![PathBuf::from("/home/user")],
-        original_cwd: PathBuf::from("/home/user"),
-        stashed_prompt: "hello".into(),
-        dont_ask_index: 1,
-    };
-    let outcome = crate::app::agent_view::translate_local_submit_for_test(&qv, kind, false);
-    match outcome {
-        crate::app::app_view::InputOutcome::Action(Action::ProjectSelected {
-            path,
-            disable_picker,
-            ..
-        }) => {
-            let expanded = shellexpand::tilde("~/my-project");
-            assert_eq!(path, PathBuf::from(expanded.as_ref()));
-            assert!(
-                !disable_picker,
-                "freeform must take precedence over dont-ask"
-            );
-        }
-        other => panic!("expected ProjectSelected, got {other:?}"),
-    }
-}
-#[test]
-fn needs_project_picker_false_when_disabled() {
-    let mut app = project_picker_app();
-    assert!(
-        app.needs_project_picker(),
-        "baseline: non-project dir, not yet shown"
-    );
-    app.project_picker_disabled = true;
-    assert!(
-        !app.needs_project_picker(),
-        "opt-out must suppress the picker before the cwd check"
-    );
-}
-#[test]
-fn project_picker_dont_ask_again_sets_disable_flag() {
-    use crate::views::prompt_widget::StashedPrompt;
-    use crate::views::question_view::{LocalQuestionKind, QuestionSelection, QuestionViewState};
-    use xai_grok_tools::implementations::grok_build::ask_user_question::{
-        Question, QuestionOption,
-    };
-    let opt = |label: &str| QuestionOption {
-        label: label.into(),
-        description: String::new(),
-        preview: None,
-        id: None,
-    };
-    let q = Question {
-        question: "Pick".into(),
-        id: None,
-        options: vec![opt("a (current)"), opt("Don't ask me again")],
-        multi_select: Some(false),
-    };
-    let mut qv = QuestionViewState::new("test".into(), vec![q], StashedPrompt::default());
-    qv.selections[0] = QuestionSelection::Single(Some(1));
-    let kind = LocalQuestionKind::ProjectSelect {
-        resolved_paths: vec![PathBuf::from("/home/user")],
-        original_cwd: PathBuf::from("/home/user"),
-        stashed_prompt: "hello".into(),
-        dont_ask_index: 1,
-    };
-    let outcome = crate::app::agent_view::translate_local_submit_for_test(&qv, kind, false);
-    match outcome {
-        crate::app::app_view::InputOutcome::Action(Action::ProjectSelected {
-            path,
-            disable_picker,
-            ..
-        }) => {
-            assert_eq!(path, PathBuf::from("/home/user"));
-            assert!(disable_picker, "don't-ask option must set disable_picker");
-        }
-        other => panic!("expected ProjectSelected, got {other:?}"),
-    }
-}
-#[test]
-fn project_picker_recent_project_selection_uses_that_path() {
-    use crate::views::prompt_widget::StashedPrompt;
-    use crate::views::question_view::{LocalQuestionKind, QuestionSelection, QuestionViewState};
-    use xai_grok_tools::implementations::grok_build::ask_user_question::{
-        Question, QuestionOption,
-    };
-    let opt = |label: &str| QuestionOption {
-        label: label.into(),
-        description: String::new(),
-        preview: None,
-        id: None,
-    };
-    let q = Question {
-        question: "Pick".into(),
-        id: None,
-        options: vec![
-            opt("home (current)"),
-            opt("alpha"),
-            opt("Don't ask me again"),
-        ],
-        multi_select: Some(false),
-    };
-    let mut qv = QuestionViewState::new("test".into(), vec![q], StashedPrompt::default());
-    qv.selections[0] = QuestionSelection::Single(Some(1));
-    let kind = LocalQuestionKind::ProjectSelect {
-        resolved_paths: vec![
-            PathBuf::from("/home/user"),
-            PathBuf::from("/projects/alpha"),
-        ],
-        original_cwd: PathBuf::from("/home/user"),
-        stashed_prompt: "hello".into(),
-        dont_ask_index: 2,
-    };
-    let outcome = crate::app::agent_view::translate_local_submit_for_test(&qv, kind, false);
-    match outcome {
-        crate::app::app_view::InputOutcome::Action(Action::ProjectSelected {
-            path,
-            disable_picker,
-            ..
-        }) => {
-            assert_eq!(path, PathBuf::from("/projects/alpha"));
-            assert!(
-                !disable_picker,
-                "picking a recent project must not disable the picker"
-            );
-        }
-        other => panic!("expected ProjectSelected, got {other:?}"),
-    }
-}
-#[tokio::test]
-async fn dispatch_project_selected_disable_picker_persists() {
-    let mut app = project_picker_app();
-    dispatch(Action::NewSession, &mut app);
-    let dir = std::env::temp_dir();
-    let selected = dunce::canonicalize(&dir).unwrap_or(dir);
-    let effects = dispatch(
-        Action::ProjectSelected {
-            path: selected,
-            stashed_prompt: "hello".into(),
-            disable_picker: true,
-        },
-        &mut app,
-    );
-    assert!(app.project_picker_disabled, "in-memory flag must be set");
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::PersistProjectPickerDisabled { disabled: true })),
-        "must emit a persist effect for the opt-out",
     );
 }
 #[test]
@@ -1623,7 +1629,7 @@ fn chat_mode_debounce_expiry_fetches_current_and_drops_stale() {
     assert!(
         matches!(
             &effects[..],
-            [Effect::FetchSessionList { query: Some(q), seq: 1 }] if q == "abc"
+            [Effect::FetchSessionList { query: Some(q), seq: 1, .. }] if q == "abc"
         ),
         "current debounce expiry must fetch with the query, got {effects:?}"
     );
@@ -1855,7 +1861,7 @@ fn chat_mode_force_search_fetches_immediately_and_empty_query_unfilters() {
     assert!(
         matches!(
             &effects[..],
-            [Effect::FetchSessionList { query: Some(q), seq: 1 }] if q == "abc"
+            [Effect::FetchSessionList { query: Some(q), seq: 1, .. }] if q == "abc"
         ),
         "forced search must fetch without debouncing, got {effects:?}"
     );
@@ -1870,7 +1876,8 @@ fn chat_mode_force_search_fetches_immediately_and_empty_query_unfilters() {
             &effects[..],
             [Effect::FetchSessionList {
                 query: None,
-                seq: 2
+                seq: 2,
+                ..
             }]
         ),
         "cleared query must refetch the unfiltered list immediately (no debounce), got {effects:?}"
@@ -2551,7 +2558,8 @@ fn build_mode_rapid_plain_fetches_keep_last_write_wins() {
                 &effects[..],
                 [Effect::FetchSessionList {
                     query: None,
-                    seq: 0
+                    seq: 0,
+                    ..
                 }]
             ),
             "Build-mode plain fetch must not bump the seq, got {effects:?}"
@@ -2610,7 +2618,8 @@ fn plain_picker_fetch_carries_no_query_and_bumps_seq() {
             &effects[..],
             [Effect::FetchSessionList {
                 query: None,
-                seq: 2
+                seq: 2,
+                ..
             }]
         ),
         "picker fetch must be unfiltered and supersede the search, got {effects:?}"

@@ -18,6 +18,7 @@ use crate::types::resources::{
     Cwd, DisplayCwd, FileSystem, GitignoreFilter, PathNotFoundHints, RespectGitignore,
     SharedResources, TruncationCfg, display_cwd_or_cwd, resolve_model_path,
 };
+use crate::types::skill_discovery_tracker::SkillManager;
 use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::{ToolKind, ToolNamespace};
 use std::sync::LazyLock;
@@ -105,7 +106,7 @@ pub(crate) const DESCRIPTION_FULL: &str = r#"Read a file.
 Usage:
 - The ${{ params.read.target_file }} parameter can be a relative path in the workspace or an absolute path
 - By default, it reads up to {max_lines_read} lines starting from the beginning of the file
-- Results are returned with line numbers starting at 1. The format is: LINE_NUMBER→LINE_CONTENT
+- Line numbers (1-based) appear as anchors in the format LINE_NUMBER→LINE_CONTENT on the first returned line and on every 10th line of the file; the lines in between show content only. Count from the nearest anchor when referring to a specific line
 - This tool can read PDF files (.pdf), PowerPoint files (.pptx), Jupyter notebooks (.ipynb files), and image files (e.g. PNG, JPG, etc).
 - When reading an image file the contents are presented visually as this tool uses multimodal LLMs."#;
 /// Schema-only advertised default (runtime still treats omit as line 1 via unwrap_or).
@@ -390,14 +391,30 @@ pub(crate) async fn run_read_file(
             let display_path = display_dcwd.join(&input.path);
             return Ok(match e.io_error_kind() {
                 Some(std::io::ErrorKind::NotFound) => {
-                    let msg = crate::util::format_not_found_error(
+                    let skill_suggestion = {
+                        let res = resources.lock().await;
+                        res.get::<SkillManager>()
+                            .and_then(|manager| manager.suggest_skill_path(&path))
+                    };
+                    let verified_skill_suggestion = if let Some(suggestion) = skill_suggestion
+                        && fs.file_exists(&suggestion.path).await.unwrap_or(false)
+                    {
+                        Some(suggestion)
+                    } else {
+                        None
+                    };
+                    let mut msg = crate::util::format_not_found_error(
                         &display_path,
                         &path,
                         &cwd,
                         &display_dcwd,
-                        hints_enabled,
+                        hints_enabled && verified_skill_suggestion.is_none(),
                     )
                     .await;
+                    if let Some(suggestion) = verified_skill_suggestion {
+                        msg.push_str("\nThe skill you are looking for is registered at:\n");
+                        msg.push_str(&suggestion.display_path.to_string_lossy());
+                    }
                     ReadFileOutput::FileNotFound(msg)
                 }
                 Some(std::io::ErrorKind::IsADirectory) => ReadFileOutput::IsADirectory(format!(
@@ -608,7 +625,7 @@ impl xai_tool_runtime::Tool for ReadFileTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "read_file",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
@@ -723,8 +740,8 @@ mod tests {
     use crate::computer::local::LocalFs;
     use crate::implementations::read_file::MAX_PDF_BYTES;
     use crate::implementations::read_file::compress_image_for_conversation;
+    use crate::implementations::skills::types::SkillInfo;
     use crate::notification::types::ToolNotificationHandle;
-    #[allow(unused_imports)]
     use crate::types::resources::{NotificationHandle, Resources};
     use crate::types::tool_metadata::test_ctx;
     use std::sync::Arc;
@@ -817,6 +834,138 @@ mod tests {
             }
             other => panic!("Expected FileNotFound, got {:?}", other),
         }
+    }
+    fn seeded_manager(skills: Vec<SkillInfo>) -> SkillManager {
+        let mut manager = SkillManager::new();
+        manager.seed(None, None, skills, None, None, None);
+        manager
+    }
+    async fn not_found_msg(resources: Resources, path: &str) -> String {
+        let input = ReadFileInput {
+            path: path.to_owned(),
+            offset: None,
+            limit: None,
+            pages: None,
+            format: None,
+        };
+        let result =
+            xai_tool_runtime::Tool::run(&ReadFileTool, test_ctx(resources.into_shared()), input)
+                .await
+                .unwrap();
+        match result {
+            ReadFileOutput::FileNotFound(msg) => msg,
+            other => panic!("Expected FileNotFound, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn missing_skill_read_suggests_registered_path() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".grok/skills/code-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_path, "# Code review\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(PathNotFoundHints(true));
+        resources.insert(seeded_manager(vec![SkillInfo {
+            name: "code-review".to_owned(),
+            path: skill_path.to_string_lossy().into_owned(),
+            disable_model_invocation: true,
+            ..SkillInfo::default()
+        }]));
+        let msg = not_found_msg(resources, "/wrong/root/skills/code-review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            format!(
+                "Error: /wrong/root/skills/code-review/SKILL.md does not exist.\n\
+                 The skill you are looking for is registered at:\n{}",
+                skill_path.display()
+            )
+        );
+    }
+    #[tokio::test]
+    async fn missing_skill_read_uses_display_path() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".grok/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_path, "# Review\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(DisplayCwd(std::path::PathBuf::from("/display/project")));
+        let mut manager = SkillManager::new();
+        manager.seed(
+            Some(tmp.path().to_path_buf()),
+            None,
+            vec![SkillInfo {
+                name: "review".to_owned(),
+                path: skill_path.to_string_lossy().into_owned(),
+                ..SkillInfo::default()
+            }],
+            Some("/display/project".to_owned()),
+            None,
+            None,
+        );
+        resources.insert(manager);
+        let msg = not_found_msg(resources, "/wrong/root/review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            "Error: /wrong/root/review/SKILL.md does not exist.\n\
+             The skill you are looking for is registered at:\n\
+             /display/project/.grok/skills/review/SKILL.md"
+        );
+    }
+    #[tokio::test]
+    async fn missing_skill_read_omits_ambiguous_suggestion() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("first/review/SKILL.md");
+        let second = tmp.path().join("second/review/SKILL.md");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, "# First\n").unwrap();
+        std::fs::write(&second, "# Second\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(PathNotFoundHints(true));
+        resources.insert(seeded_manager(vec![
+            SkillInfo {
+                name: "review".to_owned(),
+                path: first.to_string_lossy().into_owned(),
+                ..SkillInfo::default()
+            },
+            SkillInfo {
+                name: "review".to_owned(),
+                path: second.to_string_lossy().into_owned(),
+                ..SkillInfo::default()
+            },
+        ]));
+        let msg = not_found_msg(resources, "/wrong/root/review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            format!(
+                "Error: /wrong/root/review/SKILL.md does not exist.\n\
+                 Note: your current working directory is {}",
+                tmp.path().display()
+            )
+        );
+    }
+    #[tokio::test]
+    async fn missing_skill_read_omits_stale_registered_path() {
+        let tmp = TempDir::new().unwrap();
+        let stale_path = tmp.path().join(".grok/skills/review/SKILL.md");
+        let mut resources = test_resources(tmp.path());
+        resources.insert(PathNotFoundHints(true));
+        resources.insert(seeded_manager(vec![SkillInfo {
+            name: "review".to_owned(),
+            path: stale_path.to_string_lossy().into_owned(),
+            ..SkillInfo::default()
+        }]));
+        let msg = not_found_msg(resources, "/wrong/root/review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            format!(
+                "Error: /wrong/root/review/SKILL.md does not exist.\n\
+                 Note: your current working directory is {}",
+                tmp.path().display()
+            )
+        );
     }
     #[tokio::test]
     async fn legacy_read_file_directory_returns_exact_historical_message() {

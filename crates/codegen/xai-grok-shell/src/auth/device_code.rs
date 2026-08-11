@@ -21,21 +21,18 @@ const DEFAULT_DEVICE_POLL_INTERVAL_SECS: i32 = 5;
 const DEVICE_SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 const MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS: i64 = 10 * 60;
 
+/// Only the 404 "no device endpoint" case is typed, because the login flow
+/// matches on it to fall back to loopback. Every other device-code failure
+/// stays a plain `anyhow` error: wrapping one in a `#[error(transparent)]`
+/// variant hides the `reqwest::Error` the login funnel classifies, because
+/// transparent forwards `source()` past the error it wraps.
 #[derive(Debug, Error)]
-pub enum DeviceCodeError {
+pub(crate) enum DeviceCodeError {
     #[error(
         "Device-code login is not available for this deployment. \
-         Try `gork login` or set XAI_API_KEY instead."
+         Try `grok login` or set XAI_API_KEY instead."
     )]
     NotEnabled,
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
-impl From<reqwest::Error> for DeviceCodeError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Other(e.into())
-    }
 }
 
 // --- Public types ---
@@ -47,7 +44,7 @@ impl From<reqwest::Error> for DeviceCodeError {
 /// consent page — the traffic that otherwise pollutes the device-flow
 /// conversion denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientSurface {
+pub(crate) enum ClientSurface {
     /// An interactive front-end (TUI / IDE) renders the URL + code to a human.
     Ui,
     /// CLI attached to an interactive terminal (stderr is a TTY).
@@ -82,7 +79,7 @@ fn detect_cli_surface() -> ClientSurface {
 /// Callers display `verification_uri` + `user_code` to the user,
 /// then pass this struct to `complete_device_code_login`.
 #[derive(Debug, Clone)]
-pub struct DeviceCode {
+pub(crate) struct DeviceCode {
     pub verification_uri: String,
     pub verification_uri_complete: Option<String>,
     pub user_code: String,
@@ -132,12 +129,12 @@ struct IdTokenClaims {
 /// This is a single HTTP POST. The caller is responsible for displaying
 /// `DeviceCode::verification_uri` and `DeviceCode::user_code` to the user
 /// before calling `complete_device_code_login`.
-pub async fn request_device_code(
+pub(crate) async fn request_device_code(
     issuer: &str,
     client_id: &str,
     scopes: &[String],
     surface: ClientSurface,
-) -> Result<DeviceCode, DeviceCodeError> {
+) -> anyhow::Result<DeviceCode> {
     let client = crate::http::shared_client();
     let url = format!("{}/oauth2/device/code", issuer.trim_end_matches('/'));
     let scope_str = scopes.join(" ");
@@ -164,9 +161,9 @@ pub async fn request_device_code(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status.as_u16() == 404 {
-            return Err(DeviceCodeError::NotEnabled);
+            anyhow::bail!(DeviceCodeError::NotEnabled);
         }
-        return Err(anyhow::anyhow!("Device code request failed (HTTP {status}): {body}").into());
+        anyhow::bail!("Device code request failed (HTTP {status}): {body}");
     }
 
     let server_resp: DeviceCodeResponse = resp.json().await?;
@@ -177,10 +174,7 @@ pub async fn request_device_code(
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
-        return Err(anyhow::anyhow!(
-            "Server returned invalid user_code format (expected [A-Z0-9-])"
-        )
-        .into());
+        anyhow::bail!("Server returned invalid user_code format (expected [A-Z0-9-])");
     }
 
     validate_verification_uri(&server_resp.verification_uri)?;
@@ -209,7 +203,7 @@ pub async fn request_device_code(
 ///
 /// Callers should have already displayed `device_code.verification_uri`
 /// and `device_code.user_code` to the user before calling this.
-pub async fn complete_device_code_login(
+pub(crate) async fn complete_device_code_login(
     issuer: &str,
     client_id: &str,
     device_code: DeviceCode,
@@ -232,7 +226,7 @@ pub async fn complete_device_code_login(
         tokio::time::sleep(poll_interval).await;
 
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Device code expired. Run `gork login --device-auth` again.");
+            anyhow::bail!("Device code expired. Run `grok login --device-auth` again.");
         }
 
         let resp = with_alpha_test_key(
@@ -273,7 +267,7 @@ pub async fn complete_device_code_login(
             }
             "expired_token" => {
                 tracing::warn!(description = detail, "device auth token expired");
-                anyhow::bail!("Device code expired. Run `gork login --device-auth` again.");
+                anyhow::bail!("Device code expired. Run `grok login --device-auth` again.");
             }
             other => {
                 tracing::warn!(
@@ -296,7 +290,7 @@ pub async fn complete_device_code_login(
 ///
 /// Takes `channels` by `&mut`, consuming it only after the device code is
 /// obtained, so callers can reuse it for a loopback fallback on `NotEnabled`.
-pub async fn run_device_code_login_channels(
+pub(crate) async fn run_device_code_login_channels(
     issuer: &str,
     client_id: &str,
     scopes: &[String],

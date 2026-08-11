@@ -35,6 +35,7 @@ xai-grok-env = { workspace = true }
 xai-grok-secrets = { workspace = true }
 xai-mixpanel = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-token-estimation = { workspace = true }
 dirs = { workspace = true }
@@ -60,7 +61,7 @@ whoami = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 obfstr = { workspace = true, optional = true }
 mid = "4.0.0"
-tokio = { workspace = true, features = ["macros", "sync", "rt"] }
+tokio = { workspace = true, features = ["macros", "sync", "rt", "time"] }
 parking_lot = { workspace = true }
 xai-grok-auth = { workspace = true }
 opentelemetry = { workspace = true }
@@ -69,8 +70,20 @@ opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_periodicreader_with_async_runtime",
     "rt-tokio-current-thread",
 ] }
-opentelemetry-otlp = { workspace = true }
+# `tls-aws-lc` compiles opentelemetry-otlp's TLS support for the gRPC
+# transport. The workspace default is only `tls-roots`, which since otlp 0.32
+# no longer implies a TLS provider feature — without one, every `https://`
+# gRPC collector endpoint is rejected at exporter build time (GB-4580).
+# aws-lc matches the TLS backend the workspace `tonic` already uses.
+opentelemetry-otlp = { workspace = true, features = ["tls-aws-lc"] }
 opentelemetry-http = { workspace = true }
+# Embedded Mozilla trust anchors for the gRPC TLS fallback: keeps `https://`
+# collectors working on hosts with no readable system CA store (parity with
+# the HTTP transport's embedded-roots reqwest client in `otlp_http.rs`).
+webpki-roots = { workspace = true }
+# Re-encodes the validated GROK_EXTRA_CA_BUNDLE DERs as PEM for tonic's
+# `Certificate::from_pem` (the gRPC transport's extra-CA parity with HTTP).
+base64 = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
@@ -79,7 +92,15 @@ tokio-stream = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
+# Pre-main unified-log redirect for this crate's own test binary.
+ctor = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
+# Self-signed CA + server cert for the TLS collector fixture
+# (tests/external_otlp_grpc_tls.rs). `rustls` pins the process-default crypto
+# provider there: the test binary links both ring and aws-lc-rs, so rustls
+# can't auto-select one for the server-side acceptor.
+rcgen = { workspace = true }
+rustls = { workspace = true }
 # In-memory log/metric exporters for the external-stream wire-shape tests.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # In-process OTLP collector fixture (tests/external_otlp.rs).

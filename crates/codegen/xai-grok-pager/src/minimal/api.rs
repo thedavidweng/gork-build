@@ -562,10 +562,7 @@ pub fn resolve_turn_activity(v: &AgentView) -> Option<TurnActivity> {
     v.resolve_turn_activity()
 }
 
-/// [`AgentView::renders_parked`] — while the parked-wait marker's turn is
-/// parked, minimal renders the "… still running" cue (watchers running) or the
-/// idle hint (none), mirroring the full TUI. The marker itself is pushed by
-/// the shared ACP notification path, so minimal's scrollback carries it too.
+/// [`AgentView::renders_parked`].
 pub fn renders_parked(v: &AgentView) -> bool {
     v.renders_parked()
 }
@@ -590,6 +587,13 @@ pub fn held_queue_top_sendable(v: &AgentView) -> bool {
 /// [`AgentView::sync_pending_user_input_marks`].
 pub fn sync_pending_user_input_marks(v: &mut AgentView) {
     v.sync_pending_user_input_marks();
+}
+
+/// Scrollback entry id of the tool row for `tool_call_id`, while the tracker
+/// still has that tool pending. `None` once it has been reaped, or if it never
+/// reached scrollback.
+pub fn pending_tool_entry_id(v: &AgentView, tool_call_id: &str) -> Option<EntryId> {
+    v.session.tracker.pending_tool_entry_id(tool_call_id)
 }
 
 /// [`AgentView::draw_active_modal`] — minimal reuses the full-TUI modal renderer.

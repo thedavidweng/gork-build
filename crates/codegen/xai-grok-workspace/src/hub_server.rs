@@ -7,7 +7,7 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::handle::WorkspaceHandle;
 use crate::hub_ids::WORKSPACE_RPC_TOOL_ID;
 use crate::rpc_envelope::{RpcEnvelope, envelope_err};
-use crate::workspace_ops::WorkspaceOp;
+use crate::workspace_ops::{RpcActivityClass, WorkspaceOp, WorkspaceRpc};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
@@ -60,7 +60,9 @@ static WORKSPACE_RPC_REQUESTS_TOTAL: std::sync::LazyLock<IntCounterVec> =
     std::sync::LazyLock::new(|| {
         register_int_counter_vec!(
             "grok_workspace_rpc_requests_total",
-            "Workspace RPC dispatches, by method and result",
+            "Workspace RPC dispatches, by method and result. Donated per-sandbox \
+             series inflate absolute volume — SLOs must use ratios \
+             (error/total), not increase() counts.",
             &["method", "result"]
         )
         .unwrap()
@@ -71,7 +73,9 @@ static WORKSPACE_RPC_ERRORS_TOTAL: std::sync::LazyLock<IntCounterVec> =
     std::sync::LazyLock::new(|| {
         register_int_counter_vec!(
             "grok_workspace_rpc_errors_total",
-            "Failed workspace RPC dispatches, by method and error kind",
+            "Failed workspace RPC dispatches, by method and error kind. \
+             Donated per-sandbox series inflate absolute volume — compare \
+             error_kind shares or error/total ratios, not raw counts.",
             &["method", "error_kind"]
         )
         .unwrap()
@@ -90,17 +94,13 @@ static WORKSPACE_RPC_DURATION_SECONDS: std::sync::LazyLock<HistogramVec> =
         .unwrap()
     });
 const UNKNOWN_METHOD_LABEL: &str = "unknown";
-/// Prefix of the [`WorkspaceError::HubError`] for an unrecognized method. Shared
-/// by the dispatch default arm and the metric classifier so the "collapse to
-/// `unknown`" decision cannot drift from the error it keys on.
-const UNKNOWN_METHOD_ERR_PREFIX: &str = "unknown workspace method:";
 /// Zero-init this module's metric families. See [`crate::init_metrics`].
 pub(crate) fn init_metrics() {
     WORKSPACE_RPC_REQUESTS_TOTAL
         .with_label_values(&[UNKNOWN_METHOD_LABEL, "error"])
         .inc_by(0);
     WORKSPACE_RPC_ERRORS_TOTAL
-        .with_label_values(&[UNKNOWN_METHOD_LABEL, "hub_error"])
+        .with_label_values(&[UNKNOWN_METHOD_LABEL, "unknown_method"])
         .inc_by(0);
     let _ = WORKSPACE_RPC_DURATION_SECONDS.with_label_values(&[UNKNOWN_METHOD_LABEL]);
 }
@@ -192,12 +192,20 @@ fn ensure_client_fs_queries_enabled() -> WorkspaceResult<()> {
         ))
     }
 }
+/// Stamp client-RPC activity for mutation-classed methods. Called before
+/// param validation so a malformed call from a live client still counts.
+fn note_mutation<Op: WorkspaceRpc>(ws: &WorkspaceHandle) {
+    if Op::ACTIVITY == RpcActivityClass::Mutation {
+        ws.activity_tracker().note_client_rpc_activity();
+    }
+}
 /// Generic dispatch helper: deserialize params, execute, serialize result.
 async fn dispatch_op<Op: WorkspaceOp>(
     params: Value,
     ws: &WorkspaceHandle,
     session_id: Option<&str>,
 ) -> WorkspaceResult<Value> {
+    note_mutation::<Op>(ws);
     let req: Op = serde_json::from_value(params)
         .map_err(|e| WorkspaceError::HubError(format!("invalid params for {}: {e}", Op::METHOD)))?;
     let result = req.execute(ws, session_id).await?;
@@ -247,8 +255,7 @@ async fn list_outstanding_background_tasks(
         })
         .collect()
 }
-/// Point-in-time snapshot of the session's outstanding background terminal
-/// tasks and live scheduled tasks.
+/// Incomplete backgrounded terminal tasks + live scheduled tasks (client tray rebuild).
 async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
     let (terminal, scheduler) = {
         let res = toolset.resources.lock().await;
@@ -262,7 +269,7 @@ async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
             .list_tasks()
             .await
             .into_iter()
-            .filter(|t| !t.completed)
+            .filter(|t| t.is_outstanding_background())
             .map(|t| {
                 let command = t
                     .display_command
@@ -370,7 +377,7 @@ impl WorkspaceRpcHandler {
             ConfigureMcpReq, DropSessionReq, InstallPluginReq, ListBackgroundTasksReq,
             ListBackgroundTasksResponse, ListTodosReq, ListTodosResponse, LoadEnvrcReq,
             LoadPermissionsReq, LoadProjectConfigReq, RefreshPluginsReq, ResolveFileReferencesReq,
-            TasksSnapshotReq, ToolDefinitionsReq, UpdateToolConfigReq,
+            TasksSnapshotReq, ToolDefinitionsReq, UpdateToolConfigReq, WorkspaceInfo,
         };
         use xai_grok_workspace_types::rpc::worktree::WorktreeCreateSyncReq;
         tracing::debug!(method, "workspace rpc dispatch");
@@ -382,8 +389,6 @@ impl WorkspaceRpcHandler {
         match method {
             <WorkspaceInfoReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
-                let cwd_str = cwd.to_string_lossy().to_string();
-                let os = std::env::consts::OS;
                 let shell = std::env::var("SHELL")
                     .ok()
                     .and_then(|s| {
@@ -392,11 +397,13 @@ impl WorkspaceRpcHandler {
                             .map(|n| n.to_string_lossy().to_string())
                     })
                     .unwrap_or_else(|| "sh".to_string());
-                Ok(serde_json::json!({
-                    "os": os,
-                    "shell": shell,
-                    "cwd": cwd_str,
-                }))
+                let info = WorkspaceInfo {
+                    os: std::env::consts::OS.to_owned(),
+                    shell,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    version: Some(xai_grok_version::VERSION.to_owned()),
+                };
+                serde_json::to_value(info).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <GitStatusReq as WorkspaceRpc>::METHOD => {
                 static DEPRECATION_WARNING: std::sync::Once = std::sync::Once::new();
@@ -474,6 +481,7 @@ impl WorkspaceRpcHandler {
                     .map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <UpdateToolConfigReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<UpdateToolConfigReq>(&self.workspace);
                 let caller = resolve_mutation_caller(
                     "update_tool_config",
                     bound_session,
@@ -526,10 +534,27 @@ impl WorkspaceRpcHandler {
                 let cwd = self.workspace.root_cwd()?;
                 let mut results = Vec::new();
                 for ref_path in &refs {
-                    let full_path = if std::path::Path::new(ref_path).is_absolute() {
+                    let requested_path = if std::path::Path::new(ref_path).is_absolute() {
                         std::path::PathBuf::from(ref_path)
                     } else {
                         cwd.join(ref_path)
+                    };
+                    let full_path = match self
+                        .workspace
+                        .confine_to_workspace_root(&requested_path)
+                        .await
+                    {
+                        Ok((confined, _)) => confined,
+                        Err(e) => {
+                            results.push(serde_json::json!({
+                                "path": requested_path.to_string_lossy(),
+                                "ref": ref_path,
+                                "exists": false,
+                                "content": Value::Null,
+                                "error": e.to_string(),
+                            }));
+                            continue;
+                        }
                     };
                     let exists = full_path.exists();
                     let content = if exists {
@@ -601,6 +626,9 @@ impl WorkspaceRpcHandler {
                 );
                 Ok(Value::Array(plugins))
             }
+            <ExportGithubReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<ExportGithubReq>(params, &self.workspace, None).await
+            }
             <HookRegistryReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<HookRegistryReq>(params, &self.workspace, None).await
             }
@@ -614,10 +642,11 @@ impl WorkspaceRpcHandler {
             }
             <LoadEnvrcReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
-                let env = crate::envrc::load_envrc_or_empty(&cwd);
+                let env = crate::envrc::spawn_envrc_load(cwd, true).join().await;
                 serde_json::to_value(env).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <InstallPluginReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<InstallPluginReq>(&self.workspace);
                 let _ = params;
                 Ok(Value::Null)
             }
@@ -632,6 +661,7 @@ impl WorkspaceRpcHandler {
                 Ok(Value::Array(plugins))
             }
             <ConfigureMcpReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<ConfigureMcpReq>(&self.workspace);
                 let session_id = bound_session.ok_or_else(|| {
                     WorkspaceError::HubError("configure_mcp requires a bound session".into())
                 })?;
@@ -705,12 +735,16 @@ impl WorkspaceRpcHandler {
                 dispatch_op::<PrepareWorktreeFromWorktreeReq>(params, &self.workspace, None).await
             }
             <WorktreeCreateSyncReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<WorktreeCreateSyncReq>(&self.workspace);
                 let req: crate::worktree::CreateWorktreeRequest = serde_json::from_value(params)
                     .map_err(|e| {
                         WorkspaceError::HubError(format!("invalid create_sync params: {e}"))
                     })?;
                 let result = crate::worktree::create_worktree_streaming(&req, &NoOpNotifier).await;
                 serde_json::to_value(result).map_err(|e| WorkspaceError::HubError(e.to_string()))
+            }
+            <ReposListReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<ReposListReq>(params, &self.workspace, None).await
             }
             <GitStatusExtReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitStatusExtReq>(params, &self.workspace, None).await
@@ -735,6 +769,9 @@ impl WorkspaceRpcHandler {
             }
             <GitCommitReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitCommitReq>(params, &self.workspace, None).await
+            }
+            <GitSyncBaseReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<GitSyncBaseReq>(params, &self.workspace, None).await
             }
             <GitCheckoutReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitCheckoutReq>(params, &self.workspace, None).await
@@ -894,6 +931,7 @@ impl WorkspaceRpcHandler {
                 serde_json::to_value(points).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <RewindToReq as WorkspaceRpc>::METHOD => {
+                note_mutation::<RewindToReq>(&self.workspace);
                 let req: RewindToReq = serde_json::from_value(params).map_err(|e| {
                     WorkspaceError::HubError(format!("invalid params for rewind_to: {e}"))
                 })?;
@@ -908,9 +946,7 @@ impl WorkspaceRpcHandler {
             }
             _ => {
                 tracing::warn!(method, "unknown workspace rpc method");
-                Err(WorkspaceError::HubError(format!(
-                    "{UNKNOWN_METHOD_ERR_PREFIX} {method}"
-                )))
+                Err(WorkspaceError::UnknownMethod(method.to_owned()))
             }
         }
     }
@@ -959,18 +995,11 @@ impl ToolServerHandler for WorkspaceRpcHandler {
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
         let bound_session = ctx.extensions.get::<xai_tool_runtime::SessionContext>();
+        let session_id = bound_session.as_deref().map(|s| s.0.as_str());
         let start = std::time::Instant::now();
-        let result = self
-            .dispatch(
-                method,
-                params,
-                bound_session.as_deref().map(|s| s.0.as_str()),
-            )
-            .await;
-        let is_unknown_method = matches!(
-            &result,
-            Err(WorkspaceError::HubError(msg)) if msg.starts_with(UNKNOWN_METHOD_ERR_PREFIX)
-        );
+        let result = self.dispatch(method, params, session_id).await;
+        let error_kind = result.as_ref().err().map(WorkspaceError::metric_kind);
+        let is_unknown_method = matches!(&result, Err(WorkspaceError::UnknownMethod(_)));
         let method_label = if is_unknown_method {
             UNKNOWN_METHOD_LABEL
         } else {
@@ -979,9 +1008,9 @@ impl ToolServerHandler for WorkspaceRpcHandler {
         WORKSPACE_RPC_REQUESTS_TOTAL
             .with_label_values(&[method_label, if result.is_ok() { "ok" } else { "error" }])
             .inc();
-        if let Err(e) = &result {
+        if let Some(error_kind) = error_kind {
             WORKSPACE_RPC_ERRORS_TOTAL
-                .with_label_values(&[method_label, e.metric_kind()])
+                .with_label_values(&[method_label, error_kind])
                 .inc();
         }
         WORKSPACE_RPC_DURATION_SECONDS
@@ -1118,6 +1147,7 @@ impl ToolServerHandler for WorkspaceRpcHandler {
             if let Some(session) = sessions.remove(sid) {
                 session.abort_system_notify_forwarder();
                 session.shutdown_terminal_backend();
+                session.shutdown_browser_service();
                 session.cancel_hunk_tracker();
             }
             let empty = sessions.is_empty();
@@ -1169,7 +1199,9 @@ impl ToolServerHandler for WorkspaceRpcHandler {
 mod tests {
     use super::*;
     use crate::capability::CapabilityMode;
-    use crate::handle::tests::{background_capable_cfg, make_handle, start_background_sleep};
+    use crate::handle::tests::{
+        background_capable_cfg, make_confining_handle, make_handle, start_background_sleep,
+    };
     use xai_grok_tools::implementations::grok_build::scheduler::types::{
         ScheduledTask, SchedulerState,
     };
@@ -1249,15 +1281,33 @@ mod tests {
         assert_eq!(reply, turn_hook::HookReply::default());
     }
     #[tokio::test]
-    async fn dispatch_unknown_method_returns_hub_error() {
+    async fn dispatch_workspace_info_reports_server_version() {
+        use xai_grok_workspace_types::rpc::workspace::{WorkspaceInfo, WorkspaceInfoReq};
+        let handler = WorkspaceRpcHandler::new(make_handle());
+        let value = handler
+            .dispatch(
+                <WorkspaceInfoReq as WorkspaceRpc>::METHOD,
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .expect("workspace.info dispatch");
+        let info: WorkspaceInfo = serde_json::from_value(value).expect("typed WorkspaceInfo");
+        assert_eq!(Some(xai_grok_version::VERSION.to_owned()), info.version);
+    }
+    #[tokio::test]
+    async fn dispatch_unknown_method_returns_unknown_method_error() {
         let handle = make_handle();
         let handler = WorkspaceRpcHandler::new(handle);
         let result = handler
             .dispatch("workspace.nonexistent", Value::Null, None)
             .await;
-        assert!(
-            matches!(result, Err(WorkspaceError::HubError(msg)) if msg.contains("unknown workspace method"))
-        );
+        match result {
+            Err(WorkspaceError::UnknownMethod(method)) => {
+                assert_eq!(method, "workspace.nonexistent");
+            }
+            other => panic!("expected UnknownMethod, got {other:?}"),
+        }
     }
     /// A hub evict runs the two-phase drain then settles into terminal
     /// ShuttingDown (not a lingering Draining) for an evicted workspace.
@@ -1501,6 +1551,149 @@ mod tests {
             "next_fire_at must be RFC3339: {}",
             loop_task.next_fire_at
         );
+    }
+    /// FG in-flight out of snapshot; after backgrounding in; completed BG out.
+    /// Preconditions ensure a bare `!completed` filter would fail.
+    #[tokio::test]
+    async fn tasks_snapshot_excludes_foreground_and_completed_processes() {
+        use crate::handle::tests::terminal_run_request;
+        use std::time::{Duration, Instant};
+        let handle = make_handle();
+        let cfg = background_capable_cfg();
+        let session = handle
+            .create_session_with_config(
+                "snap-fg-rpc",
+                None,
+                Some(cfg.clone()),
+                CapabilityMode::All,
+                None,
+                false,
+            )
+            .expect("create background-capable session");
+        session.set_bind_tool_config_fingerprint(serde_json::to_value(&cfg).ok());
+        let out_dir = tempfile::tempdir().expect("temp dir");
+        let handler = WorkspaceRpcHandler::new(handle.clone());
+        async fn snapshot(handler: &WorkspaceRpcHandler) -> TasksSnapshotResponse {
+            let value = handler
+                .dispatch(
+                    "workspace.tasks_snapshot",
+                    serde_json::json!({"session_id": "snap-fg-rpc"}),
+                    Some("snap-fg-rpc"),
+                )
+                .await
+                .expect("tasks_snapshot rpc");
+            serde_json::from_value(value).expect("decode response")
+        }
+        let backend = session.terminal_backend().clone();
+        let fg_req = terminal_run_request("sleep 30", out_dir.path(), "snap-fg-task");
+        let fg_join = tokio::spawn(async move { backend.run(fg_req).await });
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let listed = session.terminal_backend().list_tasks().await;
+            if listed.iter().any(|t| !t.completed && !t.is_backgrounded) {
+                break;
+            }
+            assert!(
+                Instant::now() < poll_deadline,
+                "timeout waiting for incomplete FG in list_tasks: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks.is_empty(),
+            "in-flight FG must not appear in tasks_snapshot: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            session
+                .terminal_backend()
+                .background_foreground_command("snap-fg-task")
+                .await,
+            "expected FG process snap-fg-task to background"
+        );
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == "snap-fg-task"),
+            "backgrounded former FG must appear: {:?}",
+            snap.background_tasks
+        );
+        assert_eq!(
+            snap.background_tasks.len(),
+            1,
+            "only the transitioned FG so far: {:?}",
+            snap.background_tasks
+        );
+        let bg = start_background_sleep(&session, out_dir.path(), "snap-bg-task").await;
+        let snap = snapshot(&handler).await;
+        assert_eq!(
+            snap.background_tasks.len(),
+            2,
+            "transitioned FG + incomplete BG must appear: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == bg.task_id),
+            "run_background task missing: {:?}",
+            snap.background_tasks
+        );
+        let short = session
+            .terminal_backend()
+            .run_background(terminal_run_request(
+                "true",
+                out_dir.path(),
+                "snap-done-task",
+            ))
+            .await
+            .expect("start short background task");
+        let done = session
+            .terminal_backend()
+            .wait_for_completion(&short.task_id, Some(Duration::from_secs(5)))
+            .await
+            .expect("short background task should complete");
+        assert!(done.completed, "short task must complete: {done:?}");
+        let listed = session.terminal_backend().list_tasks().await;
+        assert!(
+            listed
+                .iter()
+                .any(|t| t.task_id == short.task_id && t.completed && t.is_backgrounded),
+            "precondition: completed BG must still be in list_tasks: {listed:?}"
+        );
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks
+                .iter()
+                .all(|t| t.task_id != short.task_id),
+            "completed BG must not appear: {:?}",
+            snap.background_tasks
+        );
+        assert_eq!(
+            snap.background_tasks.len(),
+            2,
+            "still-running BG tasks remain: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == bg.task_id),
+            "run_background task should still be present: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == "snap-fg-task"),
+            "transitioned FG should still be present: {:?}",
+            snap.background_tasks
+        );
+        session.terminal_backend().kill_task(&bg.task_id).await;
+        session.terminal_backend().kill_task("snap-fg-task").await;
+        let _ = fg_join.await;
     }
     /// Evicting one session while another is live must NOT global-drain (which
     /// would close the shared queue for the survivor) — even when the evicted
@@ -2193,7 +2386,7 @@ mod tests {
             .with_label_values(&[UNKNOWN_METHOD_LABEL, "error"])
             .get();
         let kind_before = WORKSPACE_RPC_ERRORS_TOTAL
-            .with_label_values(&[UNKNOWN_METHOD_LABEL, "hub_error"])
+            .with_label_values(&[UNKNOWN_METHOD_LABEL, "unknown_method"])
             .get();
         let mut stream = handler
             .handle_call(
@@ -2211,7 +2404,7 @@ mod tests {
         );
         assert!(
             WORKSPACE_RPC_ERRORS_TOTAL
-                .with_label_values(&[UNKNOWN_METHOD_LABEL, "hub_error"])
+                .with_label_values(&[UNKNOWN_METHOD_LABEL, "unknown_method"])
                 .get()
                 > kind_before,
             "a failed dispatch must also record its error_kind on the errors counter"
@@ -2496,6 +2689,34 @@ mod tests {
             "error should mention escape: {:?}",
             res.results[0].error
         );
+    }
+    #[tokio::test]
+    async fn dispatch_resolve_file_references_rejects_outside_root_when_confined() {
+        let handle = make_confining_handle();
+        let handler = WorkspaceRpcHandler::new(handle);
+        let secret = std::env::temp_dir().join("h1_3885911_outside_secret.txt");
+        std::fs::write(&secret, "OUTSIDE_SECRET").unwrap();
+        let params = serde_json::json!({
+            "refs": [secret.to_string_lossy(), "../escape.txt"]
+        });
+        let result = handler
+            .dispatch("workspace.resolve_file_references", params, None)
+            .await
+            .expect("dispatch itself should succeed");
+        let arr = result.as_array().expect("results array");
+        assert_eq!(arr.len(), 2);
+        for entry in arr {
+            assert_eq!(entry["exists"], serde_json::Value::Bool(false));
+            assert_eq!(entry["content"], serde_json::Value::Null);
+            assert!(
+                entry["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("escapes workspace root"),
+                "escape should be rejected, not read: {entry:?}"
+            );
+        }
+        std::fs::remove_file(&secret).ok();
     }
     #[tokio::test]
     async fn handle_hook_pause_resume_are_noops() {
@@ -2983,6 +3204,7 @@ mod tests {
         let handler = WorkspaceRpcHandler::new(make_handle());
         let methods = [
             <WorkspaceInfoReq as WorkspaceRpc>::METHOD,
+            <ReposListReq as WorkspaceRpc>::METHOD,
             <GitStatusReq as WorkspaceRpc>::METHOD,
             <DiscoverSkillsReq as WorkspaceRpc>::METHOD,
             <DiscoverAgentsMdReq as WorkspaceRpc>::METHOD,
@@ -2994,6 +3216,7 @@ mod tests {
             <GitUnstageReq as WorkspaceRpc>::METHOD,
             <GitDiscardReq as WorkspaceRpc>::METHOD,
             <GitCommitReq as WorkspaceRpc>::METHOD,
+            <GitSyncBaseReq as WorkspaceRpc>::METHOD,
             <GitCheckoutReq as WorkspaceRpc>::METHOD,
             <GitStashReq as WorkspaceRpc>::METHOD,
             <GitInfoReq as WorkspaceRpc>::METHOD,
@@ -3057,6 +3280,7 @@ mod tests {
             <InstallPluginReq as WorkspaceRpc>::METHOD,
             <RefreshPluginsReq as WorkspaceRpc>::METHOD,
             <DiscoverPluginsReq as WorkspaceRpc>::METHOD,
+            <ExportGithubReq as WorkspaceRpc>::METHOD,
         ];
         let skipped_global_db_mutators = [
             <WorktreeGcReq as WorkspaceRpc>::METHOD,
@@ -3072,5 +3296,53 @@ mod tests {
                 );
             }
         }
+    }
+    /// Mutation-classed methods stamp client-RPC activity (even on invalid
+    /// params — the call itself is the evidence of a live client); reads and
+    /// the deliberate teardown exception never do.
+    #[tokio::test]
+    async fn dispatch_stamps_client_rpc_activity_for_mutations_only() {
+        use crate::file_system::{FsListReq, FsWriteFileReq};
+        use xai_grok_workspace_types::rpc::workspace::DropSessionReq;
+        use xai_tool_protocol::IdleWithholdReason;
+        let handler = WorkspaceRpcHandler::new(make_handle());
+        let tracker = handler.workspace.activity_tracker().clone();
+        assert_eq!(tracker.snapshot().withhold_reason, None);
+        let _ = handler
+            .dispatch(
+                <FsListReq as WorkspaceRpc>::METHOD,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(
+            tracker.snapshot().withhold_reason,
+            None,
+            "a read never stamps"
+        );
+        let _ = handler
+            .dispatch(
+                <DropSessionReq as WorkspaceRpc>::METHOD,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(
+            tracker.snapshot().withhold_reason,
+            None,
+            "drop_session mutates but must not hold the sandbox alive"
+        );
+        let _ = handler
+            .dispatch(
+                <FsWriteFileReq as WorkspaceRpc>::METHOD,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(
+            tracker.snapshot().withhold_reason,
+            Some(IdleWithholdReason::ClientRpc),
+            "a mutation stamps"
+        );
     }
 }

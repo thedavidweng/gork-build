@@ -67,7 +67,7 @@ grok agent --always-approve serve --bind 127.0.0.1:2419 --secret <token>
 | `--always-approve` | Run without interactive tool-permission prompts. Alias: `--yolo`. |
 | `--reauth` | Authenticate before the agent starts. |
 | `--agent-profile <PATH>` | Load an agent profile from a file. |
-| `--leader` / `--no-leader` | Connect to a shared leader process, or force a local agent. |
+| `--leader` / `--no-leader` | Connect to a shared leader process, or force a local agent. When a non-`off` sandbox profile is requested, leader mode is refused so tools stay in-process (see [Sandbox Mode](18-sandbox.md)). |
 
 ---
 
@@ -139,7 +139,7 @@ Each update names its type, so a client can render distinct panels for reasoning
 
 ## Extension methods
 
-Beyond the base ACP protocol, Grok defines extension methods under the `x.ai/` prefix for vendor-specific (x.ai/*) extension methods. These cover:
+Beyond the base ACP protocol, Grok defines extension methods under the `x.ai/` prefix for SpaceXAI-specific functionality. These cover:
 
 | Category                   | Prefix               | Examples                                         |
 | -------------------------- | -------------------- | ------------------------------------------------ |
@@ -153,7 +153,7 @@ Beyond the base ACP protocol, Grok defines extension methods under the `x.ai/` p
 | **Authentication**         | `x.ai/auth/*`        | `get_url`, `submit_code`                         |
 | **Feedback & Telemetry**   | `x.ai/*`             | `feedback`, `telemetry/*`                        |
 
-The tables here show representative methods in each category. The `x.ai/*` set is vendor-specific and may expand across releases, so treat it as non-exhaustive and discover the available methods from the agent's `initialize` response.
+The tables here show representative methods in each category. The `x.ai/*` set is SpaceXAI-specific and may expand across releases, so treat it as non-exhaustive and discover the available methods from the agent's `initialize` response.
 
 ### Notifications (agent to client)
 

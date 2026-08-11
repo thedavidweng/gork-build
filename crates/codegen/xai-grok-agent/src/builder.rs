@@ -362,7 +362,9 @@ impl AgentBuilder {
     /// Mark this session as non-interactive (headless / SDK / stdio /
     /// generic-ACP). Suppresses prompt sections that only make sense when
     /// a human is typing into the TUI prompt input (e.g. the `! <command>`
-    /// shell-prefix tip and the `<user_guide>` TUI pointer).
+    /// shell-prefix tip and the `<user_guide>` TUI pointer), and stamps
+    /// `non_interactive` into the ask_user_question params so an unanswered
+    /// questionnaire returns no-operator text instead of "user declined".
     pub fn with_is_non_interactive(mut self, value: bool) -> Self {
         self.is_non_interactive = value;
         self
@@ -871,6 +873,11 @@ impl AgentBuilder {
                 &["GrokBuild:ask_user_question"],
                 ask_params,
             );
+        }
+        if self.is_non_interactive {
+            let mut ni = serde_json::Map::new();
+            ni.insert("non_interactive".into(), serde_json::Value::Bool(true));
+            merge_tool_params(&mut tool_config, &["GrokBuild:ask_user_question"], &ni);
         }
         if !definition.disallowed_tools.is_empty() {
             let before: std::collections::HashSet<String> =
@@ -1568,6 +1575,64 @@ mod tests {
             "should state the resumed agent must match subagent_type"
         );
     }
+    /// The bridge's full-discovery snapshot must record every discovered
+    /// skill name — including `paths:`-gated and preloaded skills that the
+    /// listing baseline (`slash_skills`) holds back — so session-start
+    /// telemetry can reuse it instead of re-walking the disk.
+    #[tokio::test]
+    async fn discovery_snapshot_records_gated_and_preloaded_skills() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let write_skill = |dir: &str, content: &str| {
+            let d = tmp.path().join(".grok/skills").join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("SKILL.md"), content).unwrap();
+        };
+        write_skill(
+            "snapshot-plain-skill",
+            "---\nname: snapshot-plain-skill\ndescription: plain\n---\nbody\n",
+        );
+        write_skill(
+            "snapshot-gated-skill",
+            "---\nname: snapshot-gated-skill\ndescription: gated\npaths: \"src/**\"\n---\nbody\n",
+        );
+        let mut definition = crate::config::AgentDefinition::default_grok_build();
+        definition.skills = vec!["snapshot-plain-skill".to_string()];
+        let agent = AgentBuilder::new(
+            tmp.path().to_path_buf(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(definition)
+        .build()
+        .await
+        .expect("agent should build with local skill fixtures");
+        let snapshot = agent.tool_bridge().skill_discovery_snapshot_names().await;
+        assert!(
+            snapshot.contains(&"snapshot-plain-skill".to_string()),
+            "preloaded skill missing from snapshot: {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains(&"snapshot-gated-skill".to_string()),
+            "paths:-gated skill missing from snapshot: {snapshot:?}"
+        );
+        let listed: Vec<String> = agent
+            .tool_bridge()
+            .slash_skills()
+            .await
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            !listed.contains(&"snapshot-gated-skill".to_string()),
+            "paths:-gated skill must stay out of the listing baseline: {listed:?}"
+        );
+        assert!(
+            !listed.contains(&"snapshot-plain-skill".to_string()),
+            "preloaded skill must stay out of the listing baseline: {listed:?}"
+        );
+    }
     async fn build_pager_agent(
         profile: crate::config::AgentDefinition,
         subagents_enabled: bool,
@@ -1762,6 +1827,33 @@ mod tests {
             .expect("finalize must insert Params for the injected ask_user_question");
         assert_eq!(applied.0.timeout_enabled, Some(false));
         assert_eq!(applied.0.timeout_secs, Some(5));
+        assert_eq!(applied.0.non_interactive, None);
+    }
+    /// A non-interactive build stamps `non_interactive: true` into the AUQ
+    /// params (session state, not user config) so cancel/timeout return the
+    /// no-operator text.
+    #[tokio::test]
+    async fn non_interactive_build_stamps_ask_user_question_params() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        use xai_grok_tools::types::resources::Params;
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(crate::config::AgentDefinition::default_grok_build())
+        .with_is_non_interactive(true)
+        .build()
+        .await
+        .expect("agent should build");
+        let applied = agent
+            .tool_bridge()
+            .read_resource::<Params<AskUserQuestionParams>>()
+            .await
+            .expect("finalize must insert Params for the injected ask_user_question");
+        assert_eq!(applied.0.non_interactive, Some(true));
     }
     async fn build_with_tools(tools: Vec<String>, disallowed: Vec<String>) -> crate::agent::Agent {
         use xai_grok_tools::computer::local::LocalTerminalBackend;

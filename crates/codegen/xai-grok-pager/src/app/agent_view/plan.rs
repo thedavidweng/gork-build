@@ -9,11 +9,22 @@ use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crate::views::file_search::line_viewer::LineViewerState;
 use crate::views::list_pane::ListItem;
-use crate::views::plan_approval_view::{PlanApprovalFocus, PlanComment, PlanReviewSource};
+use crate::views::plan_approval_view::{
+    PlanApprovalFocus, PlanApprovalViewState, PlanComment, PlanReviewSource,
+};
 use crate::views::prompt_widget::{EnterOutcome, PromptEvent};
 #[cfg(test)]
 use crossterm::event::KeyModifiers;
 use crossterm::event::{KeyCode, KeyEvent};
+/// Telemetry for every way a plan review resolves ("build", "abandon",
+/// "revise").
+fn log_plan_submit(action: &str) {
+    use xai_grok_telemetry::events::PlanSubmit;
+    use xai_grok_telemetry::session_ctx::log_event;
+    log_event(PlanSubmit {
+        action: action.to_string(),
+    });
+}
 impl AgentView {
     /// Resolve the absolute path to the plan file for this session.
     fn plan_file_path(&self) -> Option<std::path::PathBuf> {
@@ -79,7 +90,7 @@ impl AgentView {
     /// the shell-read file body), then falls back to the on-disk plan file.
     /// Request body first keeps file-backed previews working when the path
     /// resolution fails or the file disappears between intercept and open.
-    fn plan_body_for_preview(&self) -> Option<String> {
+    pub(super) fn plan_body_for_preview(&self) -> Option<String> {
         if let Some(content) = self
             .plan_approval_view
             .as_ref()
@@ -193,19 +204,7 @@ impl AgentView {
             None
         };
         pav.send_approved();
-        self.latest_inline_plan_content = None;
-        self.plan_next_comment_id = pav.next_comment_id;
-        self.prompt.restore(pav.stashed_prompt);
-        self.line_viewer = None;
-        self.casual_commenting_range = None;
-        self.casual_editing_comment_id = None;
-        {
-            use xai_grok_telemetry::events::PlanSubmit;
-            use xai_grok_telemetry::session_ctx::log_event;
-            log_event(PlanSubmit {
-                action: "build".to_string(),
-            });
-        }
+        self.close_plan_review(pav, "build");
         if let Some(text) = review_comments {
             return InputOutcome::Action(Action::Interject {
                 text,
@@ -219,6 +218,20 @@ impl AgentView {
             return InputOutcome::Changed;
         };
         pav.send_abandoned();
+        self.close_plan_review(pav, "abandon");
+        InputOutcome::Changed
+    }
+    /// Shared teardown for the two plan-review decisions that end the
+    /// review (approve and abandon). The shell leaves plan mode as a
+    /// result, but its confirming `CurrentModeUpdate("default")` is
+    /// fire-and-forget and only arrives after the exit tool runs — so
+    /// flip the mode indicator optimistically here (a lost update would
+    /// otherwise leave the badge stuck on "plan"), restore the
+    /// pre-review UI, and log the decision.
+    ///
+    /// Not for the revision path (`send_plan_feedback`): the shell
+    /// stays in plan mode there, so the indicator must stay on.
+    fn close_plan_review(&mut self, pav: PlanApprovalViewState, action: &'static str) {
         self.plan_mode_pending = Some(false);
         self.latest_inline_plan_content = None;
         self.plan_next_comment_id = pav.next_comment_id;
@@ -226,14 +239,7 @@ impl AgentView {
         self.line_viewer = None;
         self.casual_commenting_range = None;
         self.casual_editing_comment_id = None;
-        {
-            use xai_grok_telemetry::events::PlanSubmit;
-            use xai_grok_telemetry::session_ctx::log_event;
-            log_event(PlanSubmit {
-                action: "abandon".to_string(),
-            });
-        }
-        InputOutcome::Changed
+        log_plan_submit(action);
     }
     fn send_plan_feedback(&mut self, feedback: Option<String>) -> InputOutcome {
         let Some(mut pav) = self.plan_approval_view.take() else {
@@ -260,13 +266,7 @@ impl AgentView {
         self.line_viewer = None;
         self.prompt.textarea.cancel_undo_group();
         self.show_toast("Plan revision sent.");
-        {
-            use xai_grok_telemetry::events::PlanSubmit;
-            use xai_grok_telemetry::session_ctx::log_event;
-            log_event(PlanSubmit {
-                action: "revise".to_string(),
-            });
-        }
+        log_plan_submit("revise");
         InputOutcome::Changed
     }
     pub(crate) fn reopen_plan_approval(&mut self) {
@@ -301,7 +301,7 @@ impl AgentView {
             .plan_approval_view
             .as_ref()
             .is_some_and(|pav| pav.focus == PlanApprovalFocus::Commenting);
-        if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+        if crate::input::key::RowWalk::from_key(key).is_some() {
             let focus = self.plan_approval_view.as_ref().map(|p| p.focus);
             match focus {
                 Some(PlanApprovalFocus::Prompt) | Some(PlanApprovalFocus::Commenting) => {
@@ -353,6 +353,18 @@ impl AgentView {
             }
             return InputOutcome::Changed;
         }
+        if !is_commenting
+            && key.code == KeyCode::Char('a')
+            && key.modifiers.is_empty()
+            && self.prompt.text().trim().is_empty()
+            && !self.prompt.file_search_visible()
+            && self
+                .plan_approval_view
+                .as_ref()
+                .is_some_and(|pav| pav.comments.is_empty())
+        {
+            return self.approve_plan();
+        }
         match self.prompt.route_enter(key) {
             EnterOutcome::NewlineInserted => return InputOutcome::Changed,
             EnterOutcome::Submit => {
@@ -370,7 +382,8 @@ impl AgentView {
                     .is_some_and(|pav| pav.focus == PlanApprovalFocus::Prompt);
                 if prompt_focused {
                     if text.trim().is_empty() && !has_comments {
-                        return self.approve_plan();
+                        self.show_toast("Type revision notes, or press a to approve.");
+                        return InputOutcome::Changed;
                     }
                     let freeform = if text.trim().is_empty() {
                         None
@@ -870,5 +883,194 @@ mod plan_chip_tests {
             a_on.handle_scrollback_key(&down, &registry),
             InputOutcome::Action(Action::SelectNext)
         ));
+    }
+}
+#[cfg(test)]
+mod plan_approval_enter_tests {
+    use super::test_fixtures::make_agent;
+    use super::*;
+    use crate::views::plan_approval_view::PlanApprovalFocus;
+    fn enter_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+    fn agent_with_revise_prompt() -> AgentView {
+        let mut agent = make_agent();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
+            session_id: "test-session".into(),
+            tool_call_id: "call-1".into(),
+            plan_content: Some("# Plan\n\n## Step 1\nDo something".into()),
+        };
+        let mut pav = crate::views::plan_approval_view::PlanApprovalViewState::new(
+            request,
+            crate::views::prompt_widget::StashedPrompt {
+                text: String::new(),
+                cursor: 0,
+                images: Vec::new(),
+                chip_elements: Vec::new(),
+                image_counter: 0,
+                image_undo_stash: Vec::new(),
+            },
+            tx,
+        );
+        pav.focus = PlanApprovalFocus::Prompt;
+        agent.plan_approval_view = Some(pav);
+        agent.prompt.set_text("");
+        agent
+    }
+    #[test]
+    fn empty_enter_on_revise_prompt_does_not_approve() {
+        let mut agent = agent_with_revise_prompt();
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            agent.plan_approval_view.is_some(),
+            "empty Enter must leave plan approval open"
+        );
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Type revision notes, or press a to approve.")
+        );
+    }
+    #[test]
+    fn enter_with_revision_text_requests_changes() {
+        let mut agent = agent_with_revise_prompt();
+        agent.prompt.set_text("please use auth middleware");
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none());
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Plan revision sent.")
+        );
+    }
+    #[test]
+    fn empty_enter_with_pending_comments_still_requests_changes() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.comments.push(PlanComment {
+                id: 1,
+                line_range: 0..1,
+                text: "nit".into(),
+            });
+        }
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none());
+        assert_eq!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Plan revision sent.")
+        );
+    }
+    #[test]
+    fn a_on_empty_revise_prompt_approves() {
+        let mut agent = agent_with_revise_prompt();
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let outcome = agent.handle_plan_feedback_key(&a);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none(), "`a` must approve");
+        assert_ne!(
+            agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Plan revision sent.")
+        );
+    }
+    #[test]
+    fn a_with_pending_comments_does_not_approve() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.comments.push(PlanComment {
+                id: 1,
+                line_range: 0..1,
+                text: "nit".into(),
+            });
+        }
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let _ = agent.handle_plan_feedback_key(&a);
+        assert!(
+            agent.plan_approval_view.is_some(),
+            "`a` with pending comments must type, not approve"
+        );
+        assert_eq!(agent.prompt.text(), "a");
+    }
+}
+/// The mode indicator renders
+/// `plan_mode_pending.unwrap_or(plan_mode_active)`, and the shell's
+/// confirming `CurrentModeUpdate("default")` only arrives after the exit
+/// tool runs (and can be lost entirely). Resolving the review with a
+/// decision must therefore optimistically clear the effective plan mode
+/// on BOTH decision paths — approve and abandon.
+#[cfg(test)]
+mod plan_approval_optimistic_mode_tests {
+    use super::test_fixtures::make_agent;
+    use super::*;
+    use agent_client_protocol as acp;
+    fn agent_in_plan_mode_with_approval() -> (
+        AgentView,
+        tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<acp::ExtResponse>>,
+    ) {
+        let mut agent = make_agent();
+        agent.plan_mode_active = true;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
+            session_id: "test-session".into(),
+            tool_call_id: "call-1".into(),
+            plan_content: Some("# Plan\n\n## Step 1\nDo something".into()),
+        };
+        let pav = crate::views::plan_approval_view::PlanApprovalViewState::new(
+            request,
+            agent.prompt.stash(),
+            tx,
+        );
+        agent.plan_approval_view = Some(pav);
+        (agent, rx)
+    }
+    fn effective_plan_mode(agent: &AgentView) -> bool {
+        agent.plan_mode_pending.unwrap_or(agent.plan_mode_active)
+    }
+    #[test]
+    fn approve_plan_optimistically_clears_plan_mode() {
+        let (mut agent, mut rx) = agent_in_plan_mode_with_approval();
+        assert!(effective_plan_mode(&agent));
+        agent.approve_plan();
+        assert_eq!(agent.plan_mode_pending, Some(false));
+        assert!(
+            !effective_plan_mode(&agent),
+            "indicator must leave plan mode immediately on approve, \
+             not wait for the shell's CurrentModeUpdate"
+        );
+        let raw = rx
+            .try_recv()
+            .expect("approval response must be sent")
+            .expect("Ok");
+        let parsed: serde_json::Value = serde_json::from_str(raw.0.get()).unwrap();
+        assert_eq!(parsed["outcome"], "approved");
+    }
+    /// Approve with review comments takes the early `Action::Interject`
+    /// return — the optimistic clear must happen before that branch.
+    #[test]
+    fn approve_plan_with_comments_still_clears_plan_mode() {
+        let (mut agent, _rx) = agent_in_plan_mode_with_approval();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.comments
+                .push(crate::views::plan_approval_view::PlanComment {
+                    id: 1,
+                    line_range: 1..2,
+                    text: "use the existing helper".into(),
+                });
+        }
+        let outcome = agent.approve_plan();
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::Interject { .. })
+        ));
+        assert_eq!(agent.plan_mode_pending, Some(false));
+        assert!(!effective_plan_mode(&agent));
+    }
+    #[test]
+    fn abandon_plan_optimistically_clears_plan_mode() {
+        let (mut agent, _rx) = agent_in_plan_mode_with_approval();
+        agent.abandon_plan();
+        assert_eq!(agent.plan_mode_pending, Some(false));
+        assert!(!effective_plan_mode(&agent));
     }
 }

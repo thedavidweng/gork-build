@@ -1,6 +1,8 @@
 pub mod config;
+pub(crate) mod dual_clock;
 pub mod grok_auth_credentials;
 pub mod hooks;
+pub mod limits;
 pub(crate) mod subprocess;
 pub(crate) mod user_identity;
 
@@ -44,7 +46,7 @@ pub(crate) fn is_user_instruction_path(
 /// also tears down the helper instead of leaving it running detached.
 /// Aborting an already-finished task is a no-op, so this is safe to hold
 /// across normal scope exit too.
-pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

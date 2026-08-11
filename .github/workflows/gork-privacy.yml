@@ -20,7 +20,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  RUST_TOOLCHAIN: "1.92.0"
+  RUST_TOOLCHAIN: "1.94.0"
 
 # Pin third-party actions to full commit SHAs (supply-chain).
 # checkout@v7.0.0, rust-toolchain@master, rust-cache@v2.9.1,

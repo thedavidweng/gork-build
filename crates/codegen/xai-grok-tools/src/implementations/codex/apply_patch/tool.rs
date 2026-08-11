@@ -35,12 +35,15 @@ You MUST include a header to specify the action you are taking.
 Each operation starts with one of three headers:
 
 *** Add File: <path> - create a new file. Every following line is a + line (the initial contents).
-*** Delete File: <path> - remove an existing file. Nothing follows.
+*** Delete File: <path> - remove an existing file. No hunks follow this header.
 *** Update File: <path> - patch an existing file in place (optionally with a rename).
 
 May be immediately followed by *** Move to: <new path> if you want to rename the file.
 Then one or more “hunks”, each introduced by @@ (optionally followed by a hunk header).
 Within a hunk each line starts with:
++ for inserted text,
+- for removed text, or
+  (a space) for unchanged context.
 
 For instructions on [context_before] and [context_after]:
 - By default, show 3 lines of code immediately above and 3 lines immediately below each change. If a change is within 3 lines of a previous change, do NOT duplicate the first change’s [context_after] lines in the second change’s [context_before] lines.
@@ -87,9 +90,9 @@ A full patch can combine several operations:
 
 It is important to remember:
 
+- Every patch MUST start with *** Begin Patch and end with *** End Patch, including delete-only patches
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with `+` even when creating a new file
-- File references can only be relative, NEVER ABSOLUTE.
 "#;
 
 // ─── Input ───────────────────────────────────────────────────────────
@@ -277,7 +280,7 @@ impl xai_tool_runtime::Tool for ApplyPatchTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "apply_patch",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 

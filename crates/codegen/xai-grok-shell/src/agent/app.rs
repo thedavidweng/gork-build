@@ -1,33 +1,30 @@
+use crate::agent::config::{Config as AgentConfig, ModelEntry};
+use crate::agent::init::{bootstrap, exit_on_config_error};
+use crate::agent::models::{ModelFetchAuth, prefetch_models_blocking};
+use crate::agent::mvp_agent::MvpAgent;
+#[cfg(test)]
+use crate::auth::AuthMode;
+use crate::auth::{AuthManager, GrokAuth, GrokComConfig, run_auth_flow};
+use crate::leader::protocol::InternalMethod;
+use crate::util::grok_home;
+use agent_client_protocol as acp;
+use dirs;
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-use agent_client_protocol as acp;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, simplex};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio::time::Duration;
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tracing::{debug, info, warn};
-
 use xai_acp_lib::{
     AcpAgentGatewayReceiver as GatewayReceiver, AcpAgentGatewaySender as GatewaySender,
     LineBufferedRead,
 };
-
-use crate::agent::config::{Config as AgentConfig, ModelEntry};
-use crate::agent::init::{bootstrap, exit_on_config_error};
-use crate::agent::models::{ModelFetchAuth, prefetch_models_blocking};
-use crate::agent::mvp_agent::MvpAgent;
-use crate::auth::{AuthManager, AuthMode, GrokAuth, run_auth_flow};
-use crate::util::grok_home;
-use dirs;
-
 const MAX_BUFFER_SIZE: usize = 8 * 1024 * 1024;
-
 use indexmap::IndexMap;
-
 /// Configuration for periodic auto-update checking in leader mode.
 ///
 /// When the leader is running for a long time, it periodically calls `check_fn`
@@ -48,7 +45,6 @@ pub struct LeaderAutoUpdateConfig {
     pub check_fn:
         Box<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync>,
 }
-
 /// Timeout for a single check_fn call. The check_fn may include both a
 /// version check and a binary download, so this must be generous enough to
 /// cover large downloads on slow connections. Kept in sync with the artifact
@@ -58,25 +54,22 @@ pub struct LeaderAutoUpdateConfig {
 /// The select! with the cancellation token ensures the loop remains
 /// responsive to shutdown signals even while waiting.
 const AUTO_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-
 /// How long the auto-update shutdown waits for session actors to flush
-/// before the leader exits. Sessions are idle at this point, so the flush
-/// normally completes in milliseconds; the cap only bounds a wedged actor.
-const AUTO_UPDATE_FLUSH_GRACE: Duration = Duration::from_secs(10);
-
+/// before the leader exits. Aliases the shared
+/// [`crate::agent::activity::SESSION_FLUSH_GRACE`] so this path and the
+/// in-process agent's `/exit` / headless-quit flush cannot drift apart.
+const AUTO_UPDATE_FLUSH_GRACE: Duration = crate::agent::activity::SESSION_FLUSH_GRACE;
 /// Consecutive busy deferrals after which an installed update proceeds
 /// anyway (with the graceful flush). Bounds how long a permanently-"busy"
 /// signal — an orphaned parked interaction, a wedged turn — can pin the
 /// leader to an old binary: ~24h at the default 1h check interval. Mirrors
 /// the bounded-grace semantics of the `RelaunchForUpdate` drain.
 const MAX_AUTO_UPDATE_BUSY_DEFERRALS: u32 = 24;
-
 /// Bounded wait for the leader flock when it is held but no socket is bound yet
 /// (a spawner mid-handoff, an old-flow client holding the flock across its ~10s
 /// spawn window, or a same-version sibling briefly holding it). Exceeds that
 /// old-flow window so a legitimately-spawning peer wins the race.
 const LEADER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// Run the auto-update checker loop.
 ///
 /// Periodically calls `check_fn` to check for, download, and install updates.
@@ -114,21 +107,14 @@ pub(crate) async fn run_auto_update_checker(
     shutdown_tx: tokio::sync::watch::Sender<crate::leader::ShutdownReason>,
 ) {
     let mut interval = tokio::time::interval(config.check_interval);
-    // Skip the first tick (fires immediately)
     interval.tick().await;
     let mut busy_deferrals: u32 = 0;
-
     loop {
         tokio::select! {
             _ = interval.tick() => {}
             _ = cancel.cancelled() => break,
         }
-
         info!("Leader auto-update: running update check");
-
-        // Run check_fn inside a select! with cancellation and a timeout so a
-        // stalled network call cannot block the loop from responding to shutdown.
-        // The check_fn may include a binary download, so the timeout is generous.
         let update_installed = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -142,7 +128,6 @@ pub(crate) async fn run_auto_update_checker(
                 }
             }
         };
-
         if update_installed {
             let busy = agent_busy.load(Ordering::Relaxed) || activity.is_busy();
             if busy && busy_deferrals < MAX_AUTO_UPDATE_BUSY_DEFERRALS {
@@ -161,11 +146,7 @@ pub(crate) async fn run_auto_update_checker(
             } else {
                 info!("Leader auto-update: update installed and agent is idle, shutting down");
             }
-            // Flush session actors BEFORE cancelling — cancellation drops
-            // the LocalSet, which aborts actors mid-instruction.
             activity.flush_all_sessions(AUTO_UPDATE_FLUSH_GRACE).await;
-            // Signal the shutdown reason BEFORE cancelling so the IPC server reads
-            // AutoUpdate when it processes the cancellation.
             let _ = shutdown_tx.send(crate::leader::ShutdownReason::AutoUpdate);
             cancel.cancel();
             break;
@@ -174,25 +155,6 @@ pub(crate) async fn run_auto_update_checker(
         }
     }
 }
-
-/// Prefetch models from the API (must be called outside LocalSet).
-async fn prefetch_models(agent_config: &AgentConfig) -> Option<IndexMap<String, ModelEntry>> {
-    let auth = agent_config.create_auth_manager().current();
-    let endpoints = agent_config.endpoints.clone();
-    let fetch_auth = ModelFetchAuth::resolve(&endpoints, auth.is_some());
-
-    if auth.is_some() || endpoints.has_custom_endpoint() || fetch_auth != ModelFetchAuth::Session {
-        tokio::task::spawn_blocking(move || {
-            prefetch_models_blocking(&endpoints, auth.as_ref(), fetch_auth)
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    }
-}
-
 /// Spawn the agent inside a LocalSet and return a handle to the I/O future.
 fn spawn_agent_local(
     agent_config: AgentConfig,
@@ -206,6 +168,7 @@ fn spawn_agent_local(
     let gateway = GatewaySender::new(gw_tx);
     let mut agent = MvpAgent::new(gateway, &agent_config, auth_manager, prefetched_models)
         .unwrap_or_else(exit_on_config_error);
+    agent.models_manager.spawn_background_refresh();
     if let Some(mc) = memory_config {
         agent.set_memory_config(mc);
     }
@@ -220,30 +183,13 @@ fn spawn_agent_local(
     );
     handle_io
 }
-
-/// Build a newline-terminated JSON-RPC request line for an internal
-/// `x.ai/...` extension method, for injection into the agent's inbound ACP
-/// stream by the leader's own watcher tasks (config hot-reload, skills).
-///
-/// The wire method is written **`_`-prefixed** (`_x.ai/internal/...`):
-/// `agent-client-protocol`'s inbound decoder routes a non-built-in method to
-/// `ext_method` only when it carries the `_` extension prefix and rejects
-/// bare custom methods with `-32601 method_not_found`. These injections were
-/// historically sent un-prefixed, so every watcher-driven hot-reload
-/// (models, skills, MCP servers) was silently rejected at decode — the
-/// watcher-side "change detected" logs fired but the reload handlers never
-/// ran. Keep `method` here as the un-prefixed name; the prefix is a wire
-/// detail added in one place.
-fn internal_reload_request_line(id: &str, method: &str, params: serde_json::Value) -> String {
-    let msg = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": format!("_{method}"),
-        "params": params,
-    });
-    format!("{}\n", msg)
+fn internal_reload_request_line(
+    id: &str,
+    method: InternalMethod,
+    params: serde_json::Value,
+) -> String {
+    crate::leader::protocol::internal_request_line(id, method, params)
 }
-
 /// Start a skills file watcher and wire it to inject `x.ai/internal/reload_skills`
 /// messages into the shared ACP incoming stream when SKILL.md files change on disk.
 ///
@@ -269,17 +215,17 @@ where
             let (id, method) = match change {
                 crate::config::watcher::DiscoveryChange::Skills if !created_discovery_dir => {
                     info!("Skill directory changed on disk, reloading skills for all sessions");
-                    ("skills-reload", "x.ai/internal/reload_skills")
+                    ("skills-reload", InternalMethod::ReloadSkills)
                 }
                 crate::config::watcher::DiscoveryChange::Skills => {
                     info!("Discovery directory created on disk, reloading skills and workflows");
-                    ("skills-reload", "x.ai/internal/reload_skills")
+                    ("skills-reload", InternalMethod::ReloadSkills)
                 }
                 crate::config::watcher::DiscoveryChange::Workflows => {
                     info!(
                         "Workflow directory changed on disk, re-advertising commands for all sessions"
                     );
-                    ("workflows-reload", "x.ai/internal/reload_workflows")
+                    ("workflows-reload", InternalMethod::ReloadWorkflows)
                 }
             };
             let line = internal_reload_request_line(id, method, serde_json::json!({}));
@@ -294,7 +240,6 @@ where
     });
     Some(task)
 }
-
 /// Register the process-lifetime runtime so shared filesystem watchers
 /// ([`xai_fsnotify::shared`]) run their event loops on a runtime that outlives
 /// individual sessions (each session builds its own short-lived runtime).
@@ -302,26 +247,24 @@ where
 fn register_fs_watch_runtime() {
     xai_fsnotify::set_runtime_handle(tokio::runtime::Handle::current());
 }
-
 pub async fn run_stdio_agent(
     agent_config: &AgentConfig,
     prefetched_models: Option<IndexMap<String, ModelEntry>>,
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> anyhow::Result<()> {
     register_fs_watch_runtime();
-    // Stamp binary version into unified log entries so zombie processes
-    // are identifiable by version in diagnostic logs.
+    if let Err(error) = xai_tty_utils::kill_current_process_on_parent_death() {
+        tracing::warn!(
+            %error,
+            "failed to bind to parent death; agent will not die with its \
+             parent — stdin EOF remains the only cleanup"
+        );
+    }
     xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
-
-    // Clean up orphaned upload queue temp files from previous sessions (best-effort).
-    // Uses DEFAULT_MAX_AGE to stay in sync with the upload queue's retry policy.
     xai_file_utils::queue::cleanup_orphaned_uploads(
         &grok_home::grok_home(),
         xai_file_utils::queue::DEFAULT_MAX_AGE,
     );
-
-    // Log the client that launched us (set by grok-desktop when spawning `gork agent stdio`).
-    // This appears early in unified.jsonl and is extremely useful for auth diagnostics.
     if let Ok(version) = std::env::var("GROK_CLIENT_VERSION") {
         crate::unified_log::info(
             "GROK_CLIENT_VERSION",
@@ -329,31 +272,12 @@ pub async fn run_stdio_agent(
             Some(serde_json::json!({ "version": version })),
         );
     }
-
     let _total_timer = crate::instrumentation_timer!("startup.stdio_agent_total");
     let outgoing = tokio::io::stdout().compat_write();
-    let prefetched_models = if prefetched_models.is_some() {
-        prefetched_models
-    } else {
-        let _timer = crate::instrumentation_timer!("startup.stdio_prefetch_models");
-        prefetch_models(agent_config).await
-    };
     let agent_config = agent_config.clone();
-
-    // Use a simplex intermediary between stdin and the agent so we can
-    // inject internal messages (e.g. skill-reload) alongside real client
-    // input. This mirrors the pattern used by `run_leader`.
     let (acp_incoming_rx, acp_incoming_tx) = simplex(MAX_BUFFER_SIZE);
     let incoming = acp_incoming_rx.compat();
     let acp_incoming_tx = Arc::new(TokioMutex::new(acp_incoming_tx));
-
-    // Bridge stdin to the simplex writer. A dedicated OS thread does the
-    // blocking stdin reads (see `xai_acp_lib::spawn_stdin_line_reader`): on
-    // Windows `tokio::io::stdin()` only delivers buffered lines from a
-    // redirected pipe at EOF, so a persistent ACP client (which keeps stdin
-    // open) would hang the `initialize` handshake. The forwarder writes each
-    // complete line to the simplex so injected internal messages (from the
-    // skills watcher) never interleave mid-line with client data.
     let stdin_tx = acp_incoming_tx.clone();
     let (stdin_closed_tx, stdin_closed_rx) = tokio::sync::oneshot::channel();
     let mut stdin_lines = xai_acp_lib::spawn_stdin_line_reader();
@@ -364,19 +288,12 @@ pub async fn run_stdio_agent(
                 break;
             }
         }
-        // Signal that stdin closed. The actual simplex shutdown is performed
-        // on the LocalSet so pending ACP request handlers can flush their
-        // responses first (they run on the same LocalSet and would be
-        // starved by an immediate cross-thread shutdown).
         let _ = stdin_closed_tx.send(());
     });
-
     let _skills_watcher = spawn_skills_file_watcher(&acp_incoming_tx, &agent_config.skills.paths);
-
     let local_set = tokio::task::LocalSet::new();
     let result = local_set
         .run_until(async move {
-            // Shut down the simplex writer on the LocalSet so it's cooperative with ACP handlers.
             let simplex_tx = acp_incoming_tx;
             tokio::task::spawn_local(async move {
                 let _ = stdin_closed_rx.await;
@@ -384,21 +301,11 @@ pub async fn run_stdio_agent(
                 let mut tx = simplex_tx.lock().await;
                 let _ = tx.shutdown().await;
             });
-
-            // Create the auth manager here (not in `spawn_agent_local`) so the session-start refresh can
-            // drive a token refresh before bootstrap reads policy; the same manager goes to the agent.
             let auth_manager = Arc::new(agent_config.create_auth_manager());
-            // Proactive token refresh; runs until process exit.
             auth_manager.start_proactive_refresh(tokio_util::sync::CancellationToken::new());
-            // Pause refreshes across system sleep so an OIDC refresh can't straddle a
-            // suspend (which can revoke the refresh token and force re-login).
-            // `gork agent stdio` is a local/interactive entrypoint (spawned by
-            // grok-desktop), so it needs the gate like the leader and pager paths;
-            // no-op where the OS listener is unavailable.
             auth_manager.start_system_power_listener();
-
-            // Restore managed policy right before bootstrap reads it (no stale window after prefetch).
             crate::managed_config::ensure_managed_policy_present(&auth_manager).await;
+            apply_otel_config(&auth_manager, &agent_config.grok_com_config);
             let handle_io = spawn_agent_local(
                 agent_config,
                 auth_manager,
@@ -411,76 +318,30 @@ pub async fn run_stdio_agent(
             Ok::<(), anyhow::Error>(())
         })
         .await;
-    // Kill PTY child processes so they don't outlive the agent.
     crate::terminal::pty_session::close_all().await;
-
-    // Brief grace period for the upload queue worker to finish in-flight uploads.
-    // The worker runs on the tokio runtime (not the LocalSet), so it continues
-    // after the LocalSet drops. The channel closes when all senders drop (agent
-    // exit), and the worker drains remaining items before exiting.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
     result
 }
-
 pub async fn run_headless(
     agent_config: &AgentConfig,
     reauthenticate: bool,
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> anyhow::Result<()> {
-    run_headless_inner(agent_config, reauthenticate, false, memory_config).await
-}
-
-/// Run the headless agent without opening any browser windows.
-/// If no cached credentials exist, returns an error instead of starting OAuth flow.
-pub async fn run_headless_no_browser(
-    agent_config: &AgentConfig,
-    memory_config: Option<crate::config::MemoryConfig>,
-) -> anyhow::Result<()> {
-    run_headless_inner(agent_config, false, true, memory_config).await
-}
-
-async fn run_headless_inner(
-    agent_config: &AgentConfig,
-    reauthenticate: bool,
-    no_browser: bool,
-    memory_config: Option<crate::config::MemoryConfig>,
-) -> anyhow::Result<()> {
     register_fs_watch_runtime();
     xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
-    // `gork agent [headless]` serves non-TUI automation; stamp proxy requests
-    // as headless. IDE-facing `gork agent stdio` stays interactive.
     crate::http::set_process_client_mode_headless();
-
     use crate::agent::relay::spawn_relay_connection_with_callback;
     use tokio_util::sync::CancellationToken;
-
-    // Headless's only transport is the relay (no IPC fallback), so a session is required.
     const HEADLESS_NO_SESSION: &str = "Headless mode requires a grok.com session. \
-        Run `gork login` to sign in, or use `gork agent stdio` for API-key access.";
-
-    // Clean up orphaned upload queue temp files from previous sessions (best-effort).
-    // Uses DEFAULT_MAX_AGE to stay in sync with the upload queue's retry policy.
+        Run `grok login` to sign in, or use `grok agent stdio` for API-key access.";
     xai_file_utils::queue::cleanup_orphaned_uploads(
         &grok_home::grok_home(),
         xai_file_utils::queue::DEFAULT_MAX_AGE,
     );
-
     let mut agent_config = agent_config.clone();
     agent_config.mode = crate::agent::config::AgentMode::Headless;
-
     let ctx = &agent_config.grok_com_config;
-    let (mut auth, did_browser_flow) = if no_browser {
-        // No-browser mode: only use cached credentials, skip OAuth flow
-        let auth_manager = agent_config.create_auth_manager();
-        match auth_manager.current() {
-            Some(auth) => (auth, false),
-            None if auth_manager.is_expired() => {
-                anyhow::bail!("Session expired. Please run 'grok login' to re-authenticate.")
-            }
-            None => anyhow::bail!("No cached credentials found. Run `gork login`."),
-        }
-    } else if reauthenticate {
+    let (mut auth, did_browser_flow) = if reauthenticate {
         let auth_manager = Arc::new(AuthManager::new(&grok_home::grok_home(), ctx.clone()));
         run_auth_flow(
             &auth_manager,
@@ -493,8 +354,6 @@ async fn run_headless_inner(
         )
         .await?
     } else {
-        // Don't pre-resolve via try_ensure_session_noninteractive: run_auth_flow below
-        // already mints external/devbox creds, so it would run the provider twice.
         let auth_manager = Arc::new(AuthManager::new(&grok_home::grok_home(), ctx.clone()));
         if crate::agent::auth_method::has_xai_api_key_env()
             && ctx.auth_provider_command.is_none()
@@ -513,19 +372,13 @@ async fn run_headless_inner(
         )
         .await?
     };
-
-    // Backfill missing user_id / email from proxy (stale cached credentials).
     if auth.user_id.is_empty() || auth.email.is_none() {
         auth = Arc::new(agent_config.create_auth_manager())
             .update(auth.clone())
             .await?;
     }
-
-    // Prefetch models from the models API before entering the LocalSet.
-    // This must be done via spawn_blocking because reqwest::blocking creates its own runtime.
     let auth_for_prefetch = auth.clone();
     let endpoints_for_prefetch = agent_config.endpoints.clone();
-    // `true` — auth is always established by this point (run_auth_flow above).
     let fetch_auth_for_prefetch = ModelFetchAuth::resolve(&endpoints_for_prefetch, true);
     let prefetched_models = tokio::task::spawn_blocking(move || {
         prefetch_models_blocking(
@@ -537,37 +390,22 @@ async fn run_headless_inner(
     .await
     .ok()
     .flatten();
-
     tracing::info!("Prefetched models: {:?}", prefetched_models);
-
-    // Create channel for websocket -> agent bridging
     let (ws_to_agent_tx, mut ws_to_agent_rx) = mpsc::unbounded_channel::<String>();
-
-    // Create simplex streams for the ACP connection.
-    // The incoming writer is shared so both the WS bridge and the skills file
-    // watcher can inject messages into the agent's ACP stream.
     let (acp_incoming_rx, acp_incoming_tx) = simplex(MAX_BUFFER_SIZE);
     let (acp_outgoing_rx, acp_outgoing_tx) = simplex(MAX_BUFFER_SIZE);
-
     let incoming = acp_incoming_rx.compat();
     let outgoing = acp_outgoing_tx.compat_write();
     let acp_incoming_tx = Arc::new(TokioMutex::new(acp_incoming_tx));
-
     let shared_auth_manager = Arc::new(agent_config.create_auth_manager());
-
     let Some(relay_config) =
         relay_config_for_session(Some(&auth), &agent_config, &shared_auth_manager)
     else {
         anyhow::bail!("{HEADLESS_NO_SESSION}");
     };
-
-    // Capture the grok build URL for the first-connection callback
     let grok_code_url = format!("{}/build", ctx.grok_ws_origin);
-
-    // Create first-connection callback for headless-specific behavior
     let on_first_connect: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
-        if !did_browser_flow && !no_browser {
-            // Print to stderr (not logger) so user sees it
+        if !did_browser_flow {
             eprintln!();
             eprintln!(
                 "Open Grok Build: {} (press Enter to open in browser)",
@@ -582,59 +420,58 @@ async fn run_headless_inner(
             });
         }
     });
-
     let cancel = CancellationToken::new();
-
     let (agent_to_ws_tx, _relay_handle) = spawn_relay_connection_with_callback(
         relay_config,
         ws_to_agent_tx.clone(),
         Some(cancel.clone()),
         Some(on_first_connect),
     );
-
-    // Spawn the agent in a LocalSet that lives for the entire process
     let local_set = tokio::task::LocalSet::new();
     let agent_config_clone = agent_config.clone();
     let memory_config_for_first = memory_config;
     let agent_cancel = cancel.clone();
-
     local_set
         .run_until(async move {
-            // Spawn the agent task - this runs for the lifetime of the process
-            // The agent keeps working even when websocket disconnects
             let _agent_handle = tokio::task::spawn_local(async move {
                 let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
                 let gateway = GatewaySender::new(gw_tx);
                 let auth_manager = shared_auth_manager;
-                // Proactive token refresh for the headless agent.
                 auth_manager.start_proactive_refresh(agent_cancel.clone());
-                // Restore managed policy right before bootstrap reads it (no stale window after relay setup).
-                crate::managed_config::ensure_managed_policy_present(&auth_manager).await;
-                let mut agent =
-                    MvpAgent::new(gateway, &agent_config_clone, auth_manager, prefetched_models)
-                        .unwrap_or_else(exit_on_config_error);
+                crate::managed_config::ensure_managed_policy_present(&auth_manager)
+                    .await;
+                let mut agent = MvpAgent::new(
+                        gateway,
+                        &agent_config_clone,
+                        auth_manager,
+                        prefetched_models,
+                    )
+                    .unwrap_or_else(exit_on_config_error);
+                agent.models_manager.spawn_background_refresh();
                 if let Some(mc) = memory_config_for_first {
                     agent.set_memory_config(mc);
                 }
                 let incoming = LineBufferedRead::spawn_local(incoming);
-                let (conn, handle_io) =
-                    acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
+                let (conn, handle_io) = acp::AgentSideConnection::new(
+                    agent,
+                    outgoing,
+                    incoming,
+                    |fut| {
                         tokio::task::spawn_local(fut);
-                    });
+                    },
+                );
                 tokio::task::spawn_local(
                     GatewayReceiver::new(gw_rx, conn)
-                        .with_on_meta(xai_file_utils::trace_context::span_from_meta_traceparent)
+                        .with_on_meta(
+                            xai_file_utils::trace_context::span_from_meta_traceparent,
+                        )
                         .run(),
                 );
-
-                // Run the agent I/O handler - this processes incoming requests
                 if let Err(e) = handle_io.await {
                     warn!(error = ?e, "Agent I/O handler error");
                 }
                 info!("Agent task completed");
             });
-
-            // Spawn task to bridge ws_to_agent channel to acp simplex stream
             let ws_tx = acp_incoming_tx.clone();
             tokio::task::spawn_local(async move {
                 while let Some(msg) = ws_to_agent_rx.recv().await {
@@ -649,11 +486,10 @@ async fn run_headless_inner(
                 }
                 info!("WS to agent bridge task completed");
             });
-
-            let _skills_watcher =
-                spawn_skills_file_watcher(&acp_incoming_tx, &agent_config.skills.paths);
-
-            // Spawn task to read from agent and forward to relay
+            let _skills_watcher = spawn_skills_file_watcher(
+                &acp_incoming_tx,
+                &agent_config.skills.paths,
+            );
             tokio::task::spawn_local(async move {
                 let mut reader = BufReader::new(acp_outgoing_rx);
                 let mut line = String::new();
@@ -666,14 +502,10 @@ async fn run_headless_inner(
                         }
                         Ok(_) => {
                             let msg = line.trim_end_matches(['\r', '\n']).to_string();
-                            if !msg.is_empty() {
-                                // Send to the relay
-                                if agent_to_ws_tx.send(msg.clone()).is_err() {
-                                    // Relay not connected - message is dropped
-                                    // This is OK because agent persists to disk
-                                    // and client will replay via session/load on reconnect
-                                    debug!("No active websocket, dropping outbound message (persisted to disk)");
-                                }
+                            if !msg.is_empty()
+                                && agent_to_ws_tx.send(msg.clone()).is_err()
+                            {
+                                debug!("No active websocket, dropping outbound message (persisted to disk)");
                             }
                         }
                         Err(e) => {
@@ -684,95 +516,13 @@ async fn run_headless_inner(
                 }
                 info!("Agent to WS bridge task completed");
             });
-
-            // Keep running until cancelled
             cancel.cancelled().await;
             anyhow::Ok(())
         })
         .await?;
-
-    // Brief grace period for the upload queue worker to finish in-flight uploads.
-    // The worker runs on the tokio runtime (not the LocalSet), so it continues
-    // after the LocalSet drops. The channel closes when all senders drop,
-    // and the worker drains remaining items before exiting.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
     Ok(())
 }
-
-/// Migrate a legacy devbox WebLogin token to fresh OIDC in place (mint, persist,
-/// drop the legacy scope). No-op outside a devbox or for non-WebLogin / `None`.
-/// On mint/save failure, returns the existing token so the leader still starts.
-async fn migrate_devbox_auth_if_legacy(
-    auth: Option<GrokAuth>,
-    agent_config: &AgentConfig,
-) -> Option<GrokAuth> {
-    let auth = auth?;
-    if !crate::auth::devbox_login::is_devbox_environment() || auth.auth_mode != AuthMode::WebLogin {
-        return Some(auth);
-    }
-
-    info!("Devbox legacy auth detected, attempting migration to OIDC");
-    xai_grok_telemetry::unified_log::info(
-        "devbox legacy auth migration: starting",
-        None,
-        Some(serde_json::json!({
-            "user_id": auth.user_id,
-            "auth_mode": format!("{:?}", auth.auth_mode),
-        })),
-    );
-
-    // save + remove_scope are two non-atomic writes to auth.json (no lock). Safe
-    // at startup: no concurrent writer yet, and `lookup_auth` prefers the primary
-    // scope if a reader sees the intermediate state.
-    let migration_auth_manager = agent_config.create_auth_manager();
-
-    let new_auth = match crate::auth::devbox_login::mint_devbox_auth(&migration_auth_manager).await
-    {
-        Ok(new_auth) => new_auth,
-        Err(e) => {
-            tracing::warn!(error = ?e, "devbox legacy auth migration: devbox login helper call failed, continuing with legacy auth");
-            xai_grok_telemetry::unified_log::error(
-                "devbox legacy auth migration: mint failed",
-                None,
-                Some(serde_json::json!({ "error": e.to_string() })),
-            );
-            return Some(auth);
-        }
-    };
-    match migration_auth_manager
-        .save_without_enrichment(new_auth)
-        .await
-    {
-        Ok(saved_auth) => {
-            if let Err(e) = migration_auth_manager.remove_scope(crate::auth::LEGACY_AUTH_SCOPE) {
-                tracing::warn!(error = ?e, "Failed to remove legacy auth scope entry (non-fatal)");
-            }
-            xai_grok_telemetry::unified_log::info(
-                "devbox legacy auth migration: succeeded",
-                None,
-                Some(serde_json::json!({
-                    "user_id": saved_auth.user_id,
-                    "has_refresh_token": saved_auth.refresh_token.is_some(),
-                    "expires_at": saved_auth.expires_at.map(|e| e.to_rfc3339()),
-                    "auth_mode": format!("{:?}", saved_auth.auth_mode),
-                })),
-            );
-            info!(user_id = %saved_auth.user_id, "Devbox legacy auth migrated to OIDC successfully");
-            Some(saved_auth)
-        }
-        Err(e) => {
-            tracing::warn!(error = ?e, "devbox legacy auth migration: failed to save new auth, continuing with legacy");
-            xai_grok_telemetry::unified_log::error(
-                "devbox legacy auth migration: save failed",
-                None,
-                Some(serde_json::json!({ "error": e.to_string() })),
-            );
-            Some(auth)
-        }
-    }
-}
-
 /// Whether the relay's shared [`AuthManager`] should be (re)seeded with the
 /// startup-resolved `session`.
 ///
@@ -796,7 +546,6 @@ fn should_seed_shared_session(existing: Option<&GrokAuth>, session: &GrokAuth) -
         }
     }
 }
-
 /// `RelayConfig` for the relay, or `None` for BYOK / no-session. The session
 /// gate is `RelayConfig::for_session` (single source of truth).
 ///
@@ -813,10 +562,6 @@ fn relay_config_for_session(
     shared_auth_manager: &Arc<AuthManager>,
 ) -> Option<crate::agent::relay::RelayConfig> {
     let session = auth?;
-    // Seed the shared manager with the startup-resolved session unless it
-    // already holds an equal-or-fresher token. See `should_seed_shared_session`
-    // for why "seed only when empty" was insufficient (read-only-disk stale
-    // entry) and why a fresher sibling-refreshed token must be preserved.
     if should_seed_shared_session(shared_auth_manager.current_or_expired().as_ref(), session) {
         shared_auth_manager.hot_swap(session.clone());
     }
@@ -827,12 +572,11 @@ fn relay_config_for_session(
         Some(shared_auth_manager.clone()),
     )
 }
-
 /// Start the leader's grok.com relay connection according to the start policy,
-/// returning the slot where the [`RelayHandle`](crate::agent::relay::RelayHandle)
-/// is parked once the connection task is running.
+/// parking the [`RelayHandle`](crate::agent::relay::RelayHandle) in `slot`
+/// once the connection task is running.
 ///
-/// * `relay_on_demand == false` (default — explicit `gork agent leader`
+/// * `relay_on_demand == false` (default — explicit `grok agent leader`
 ///   invocation: devbox / systemd / nohup): connect **eagerly**, right now.
 ///   A bare leader has no local IPC clients; remote prompts arrive *through*
 ///   the relay, so it must be up before any demand signal could ever exist.
@@ -854,37 +598,31 @@ fn relay_config_for_session(
 /// via `session/load`).
 ///
 /// Must be called within a `LocalSet` (uses `spawn_local`). The handle is
-/// parked in a slot rather than returned from the deferred task because
-/// `RelayHandle` cancels its loop on Drop; the leader shutdown path takes it
-/// out of the slot to stop the relay explicitly (the `cancel` token would stop
-/// it anyway).
+/// parked in the caller-owned `slot` rather than returned from the deferred
+/// task because `RelayHandle` cancels its loop on Drop; the leader shutdown
+/// path takes it out of the slot to stop the relay explicitly (the `cancel`
+/// token would stop it anyway). The slot is passed in (not created here) so
+/// a deferred arm ([`DeferredRelayArm`]) parks the handle in the same slot
+/// the shutdown path drains.
 fn spawn_leader_relay(
+    slot: Rc<std::cell::RefCell<Option<crate::agent::relay::RelayHandle>>>,
     relay_config: crate::agent::relay::RelayConfig,
     relay_on_demand: bool,
     mut relay_demand_rx: tokio::sync::watch::Receiver<bool>,
     ws_to_agent_tx: mpsc::UnboundedSender<String>,
     agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     cancel: tokio_util::sync::CancellationToken,
-) -> Rc<std::cell::RefCell<Option<crate::agent::relay::RelayHandle>>> {
+) {
     use crate::agent::relay::spawn_relay_connection;
-
-    let slot: Rc<std::cell::RefCell<Option<crate::agent::relay::RelayHandle>>> =
-        Rc::new(std::cell::RefCell::new(None));
-
     if !relay_on_demand {
         info!("Starting relay connection (eager)");
         let (tx, handle) = spawn_relay_connection(relay_config, ws_to_agent_tx, cancel);
         *agent_to_ws_tx.lock() = Some(tx);
         *slot.borrow_mut() = Some(handle);
-        return slot;
+        return;
     }
-
     let slot_for_task = slot.clone();
     tokio::task::spawn_local(async move {
-        // Wait for the first headless registration (or shutdown).
-        // Re-check `borrow()` at the top of each iteration so a
-        // registration that happened before this task started is
-        // honoured immediately.
         while !*relay_demand_rx.borrow() {
             tokio::select! {
                 biased;
@@ -903,25 +641,103 @@ fn spawn_leader_relay(
         *agent_to_ws_tx.lock() = Some(tx);
         *slot_for_task.borrow_mut() = Some(handle);
     });
-    slot
 }
-
+/// Everything needed to arm the leader's grok.com relay *after* startup.
+///
+/// A leader that boots without auth used to disable the relay forever — the
+/// decision was made once in [`run_leader`] and never revisited. On devboxes
+/// that turned a transient mint-provider outage at provision time into a
+/// permanently invisible box: the external auth provider succeeded minutes
+/// later and the config watcher hot-reloaded the token into the leader, but
+/// the relay never connected, the agent never registered, and tooling
+/// reported the (healthy) box as "not found online" for its whole lifetime.
+///
+/// These parts are captured in the no-auth startup path and consumed by the
+/// config-update loop on the first relay-eligible
+/// [`ConfigUpdate::Auth`](crate::config::reloader::ConfigUpdate::Auth).
+struct DeferredRelayArm {
+    relay_on_demand: bool,
+    relay_demand_rx: tokio::sync::watch::Receiver<bool>,
+    ws_to_agent_tx: mpsc::UnboundedSender<String>,
+    agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    cancel: tokio_util::sync::CancellationToken,
+    /// Shared with [`run_leader`]'s shutdown path, which drains it to stop
+    /// the relay explicitly.
+    slot: Rc<std::cell::RefCell<Option<crate::agent::relay::RelayHandle>>>,
+    grok_com_config: crate::auth::GrokComConfig,
+    alpha_test_key: Option<String>,
+}
+impl DeferredRelayArm {
+    /// Arm the relay for a hot-reloaded session if it is relay-eligible.
+    ///
+    /// Consumes the parts and returns `None` when the relay was armed.
+    /// Returns `Some(self)` when the session is not relay-eligible (BYOK /
+    /// non-x.ai issuer — see
+    /// [`RelayConfig::for_session`](crate::agent::relay::RelayConfig::for_session))
+    /// so a later eligible token can still arm.
+    ///
+    /// Must be called within a `LocalSet` (delegates to
+    /// [`spawn_leader_relay`]).
+    fn arm_if_eligible(self, session: &GrokAuth, auth_manager: &Arc<AuthManager>) -> Option<Self> {
+        let Some(relay_config) = crate::agent::relay::RelayConfig::for_session(
+            session,
+            &self.grok_com_config,
+            self.alpha_test_key.clone(),
+            Some(auth_manager.clone()),
+        ) else {
+            return Some(self);
+        };
+        info!("Relay-eligible auth token appeared after startup — arming grok.com relay");
+        spawn_leader_relay(
+            self.slot,
+            relay_config,
+            self.relay_on_demand,
+            self.relay_demand_rx,
+            self.ws_to_agent_tx,
+            self.agent_to_ws_tx,
+            self.cancel,
+        );
+        None
+    }
+}
+/// Close the external-OTEL gate before telemetry init; see
+/// [`crate::agent::otel_gate`].
+pub fn suppress_otel() {
+    crate::agent::otel_gate::suppress();
+}
+/// Startup external-OTEL gate for an in-process (embedded) agent. Mirrors the
+/// leader startup gate so the pager process is fail-closed by construction at
+/// the agent boundary.
+pub fn apply_otel_config(auth_manager: &AuthManager, grok_com_config: &GrokComConfig) {
+    suppress_otel();
+    let has_session = auth_manager.current().is_some() || auth_manager.read_disk_auth().is_some();
+    if crate::agent::otel_gate::should_open_at_startup(crate::agent::otel_gate::StartupGate {
+        channel: crate::agent::otel_gate::resolved_policy_channel(),
+        has_session,
+        session_pending: crate::agent::otel_gate::is_session_pending(has_session, grok_com_config),
+    }) {
+        crate::agent::otel_gate::open_at_startup();
+    }
+}
 /// Run the agent in leader mode, accepting IPC connections from multiple clients.
 /// When a grok.com session is present, the leader connects to the websocket relay
-/// after startup (post-auth, post-prefetch); BYOK / no-session leaders skip it and
-/// serve clients over IPC only. See [`spawn_leader_relay`] for when the relay
-/// connection is opened (eager by default, demand-gated with `relay_on_demand`).
+/// after startup (post-auth, post-prefetch); BYOK / no-session leaders start
+/// serving clients over IPC only, then arm the relay if a relay-eligible token
+/// is hot-reloaded later (see [`DeferredRelayArm`]). See [`spawn_leader_relay`]
+/// for when the relay connection is opened (eager by default, demand-gated with
+/// `relay_on_demand`).
 ///
 /// Startup sequence (lock-then-socket):
 /// 1. Acquire the leader flock FIRST — bail if another process holds it.
 /// 2. Socket cleanup, channel + readiness-watch creation.
 /// 3. IPC server started (`tokio::spawn`) — socket bound HERE, before auth.
 /// 4. Wait for socket to appear (fast: < 100 ms).
-/// 5. Auth + model prefetch (slow path, but socket already available to clients).
-///    - Auth resolves non-interactively; `None` (BYOK / no session) is not an
-///      error — the relay is gated off and login is deferred to ACP.
-/// 6. `ready_tx.send(true)` — unblocks ACP forwarding in the IPC server.
-/// 7. LocalSet: agent, IPC↔agent bridges, WS↔agent bridges, relay, config watcher.
+/// 5. Lock handoff with spawner (if launched via connect_or_spawn).
+/// 6. Bounded non-interactive auth (no blocking model/settings prefetch; those
+///    stream in after readiness). `None` (BYOK / no session) is not an error:
+///    the relay stays off and a background cold-mint / re-login can start it later.
+/// 7. `ready_tx.send(true)` — unblocks ACP forwarding in the IPC server.
+/// 8. LocalSet: agent, IPC↔agent bridges, WS↔agent bridges, relay, config watcher.
 ///
 /// # Arguments
 ///
@@ -929,7 +745,7 @@ fn spawn_leader_relay(
 /// * `no_exit_on_disconnect` - If true, the leader will not exit when all clients disconnect
 /// * `relay_on_demand` - If true, defer the grok.com relay WebSocket until the
 ///   first headless IPC client registers; if false (default), connect eagerly at
-///   startup. See [`spawn_leader_relay`].
+///   startup; a session acquired later arms it via [`DeferredRelayArm`].
 pub async fn run_leader(
     agent_config: &AgentConfig,
     no_exit_on_disconnect: bool,
@@ -937,51 +753,31 @@ pub async fn run_leader(
     auto_update_check: Option<LeaderAutoUpdateConfig>,
     memory_config: Option<crate::config::MemoryConfig>,
 ) -> anyhow::Result<()> {
-    use crate::agent::relay::RelayConfig;
     use crate::leader::{
         LeaderLock, LeaderServerControlState, LeaderServerMetadata, LockError, ShutdownReason,
         compute_ws_url_suffix, run_leader_server,
     };
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
-
     register_fs_watch_runtime();
     xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
-
-    // Clean up orphaned upload queue temp files from previous sessions
-    // (best-effort). Detached onto a blocking thread so it never stalls leader
-    // startup: the queue can hold up to several GB (DEFAULT_MAX_QUEUE_BYTES) and
-    // the sweep walks/stats/deletes the whole tree synchronously. Running it
-    // inline here blocked the socket bind and lock acquisition below, so clients
-    // could not connect until the sweep finished.
     tokio::task::spawn_blocking(|| {
         xai_file_utils::queue::cleanup_orphaned_uploads(
             &grok_home::grok_home(),
             xai_file_utils::queue::DEFAULT_MAX_AGE,
         );
     });
-
     let mut agent_config = agent_config.clone();
     agent_config.mode = crate::agent::config::AgentMode::Leader;
-
-    // Use the WS URL to determine which socket/lock paths to use.
     let ws_url = &agent_config.grok_com_config.grok_ws_url;
     let mut lock = LeaderLock::new(ws_url);
     let socket_path = lock.socket_path().clone();
-
-    // ── Phase 1: Acquire the leader flock FIRST (lock-then-socket) ────────────
-    //
-    // SINGLE-LEADER INVARIANT: only the flock holder may create/remove the socket
-    // and it holds the flock for its whole lifetime, so a racing leader can never
-    // clobber a live socket.
     match lock.try_acquire() {
         Ok(true) => {
             lock.write_pid()?;
             debug!("Acquired leader lock, proceeding as leader");
         }
         Ok(false) => {
-            // Fast path: a fully-running leader (flock held AND socket bound) →
-            // exit so the client adopts it.
             if crate::leader::listener_is_ready(&socket_path) {
                 info!(
                     "Another process holds the leader lock with a bound socket ({}). \
@@ -993,11 +789,6 @@ pub async fn run_leader(
                     socket_path.display()
                 ));
             }
-
-            // Held but no socket yet: a spawner is mid-handoff, or an old-flow
-            // client holds the flock across its spawn window. Wait (re-opening the
-            // path each poll to tolerate the old client's Drop unlinking the inode)
-            // before conceding.
             match lock.acquire_reopen_timeout(LEADER_ACQUIRE_TIMEOUT).await {
                 Ok(()) => {
                     lock.write_pid()?;
@@ -1014,63 +805,29 @@ pub async fn run_leader(
                         socket_path.display()
                     ));
                 }
-                Err(e) => return Err(anyhow::anyhow!("Failed to acquire leader lock: {}", e)),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to acquire leader lock: {}", e));
+                }
             }
         }
         Err(e) => return Err(anyhow::anyhow!("Failed to acquire leader lock: {}", e)),
     }
-
-    // ── Phase 2: Clean up stale socket (we hold the flock, so this is safe) ────
     lock.cleanup_socket()?;
     info!("Leader server starting");
-
-    // ── Phase 3: Create all channels + readiness watch ────────────────────────
-    //
-    // All channels are created here so the IPC server can start receiving
-    // client connections immediately, before auth/prefetch begin.
-
-    // IPC ↔ agent channels
     let (ipc_to_agent_tx, mut ipc_to_agent_rx) = mpsc::unbounded_channel::<String>();
     let (agent_to_ipc_tx, agent_to_ipc_rx) = mpsc::unbounded_channel::<String>();
-
-    // WS ↔ agent channel
     let (ws_to_agent_tx, mut ws_to_agent_rx) = mpsc::unbounded_channel::<String>();
-
-    // ACP simplex streams for the agent connection
     let (acp_incoming_rx, acp_incoming_tx) = simplex(MAX_BUFFER_SIZE);
     let (acp_outgoing_rx, acp_outgoing_tx) = simplex(MAX_BUFFER_SIZE);
-
     let incoming = acp_incoming_rx.compat();
     let outgoing = acp_outgoing_tx.compat_write();
-
-    // Shared writer so both the IPC bridge and the WS bridge can send to the agent.
     let acp_incoming_tx = Arc::new(TokioMutex::new(acp_incoming_tx));
-
-    // Cancellation token for the entire leader lifetime.
     let cancel = CancellationToken::new();
-
-    // Readiness watch: IPC server gates ACP forwarding until this is `true`.
-    // We hold `ready_tx` here and send `true` after auth + prefetch succeed.
     let (ready_tx, ready_rx) = watch::channel(false);
-
-    // Shutdown-reason watch: default is Manual; the auto-update checker and the
-    // leader's `RelaunchForUpdate` control handler send AutoUpdate before
-    // cancelling so clients receive the correct ShuttingDown reason. The server
-    // derives its own receiver from the sender via `subscribe()`, so we only need
-    // to keep the sender; `_shutdown_reason_rx` is held to keep the channel open.
     let (shutdown_tx, _shutdown_reason_rx) = watch::channel(ShutdownReason::Manual);
-
-    // Relay demand watch: the IPC server flips this to `true` when the first
-    // headless client registers. Only consulted when `relay_on_demand` is set
-    // (leaders auto-spawned by interactive clients); an eager leader connects
-    // the relay at startup and ignores it. See `spawn_leader_relay`.
     let (relay_demand_tx, relay_demand_rx) = watch::channel(false);
-
     let client_count = Arc::new(AtomicUsize::new(0));
     let agent_busy = Arc::new(AtomicBool::new(false));
-    // Agent-derived activity view for the auto-update checker and the IPC
-    // server's relaunch drain: `agent_busy` only sees IPC traffic, not
-    // relay-driven prompts.
     let agent_activity = crate::agent::activity::AgentActivity::default();
     let control_state = LeaderServerControlState::new(LeaderServerMetadata {
         pid: std::process::id(),
@@ -1080,16 +837,7 @@ pub async fn run_leader(
         leader_binary_version: xai_grok_version::VERSION.to_string(),
     })
     .with_default_hub_url(agent_config.hub.url.clone());
-
-    // Cloned before control_state moves into the IPC server; auth wired below.
     let workspace_control = control_state.workspace.clone();
-
-    // ── Phase 4: Bind socket and start IPC server (BEFORE auth/prefetch) ──────
-    //
-    // Starting the server here means connect_or_spawn sees the socket in < 100 ms
-    // regardless of how long auth + model prefetch take. The `ready_rx` gate inside
-    // the server ensures early ACP messages get a structured `leader_starting` error
-    // rather than hanging or silently dropping.
     let ipc_server_cancel = cancel.clone();
     let socket_path_for_server = socket_path.clone();
     let client_count_for_server = client_count.clone();
@@ -1109,7 +857,7 @@ pub async fn run_leader(
             ready_rx,
             relay_demand_tx,
             shutdown_tx_for_server,
-            None, // use LEADER_VERSION constant
+            None,
             control_state,
         )
         .await
@@ -1117,8 +865,6 @@ pub async fn run_leader(
             warn!(error = ?e, "Leader server error");
         }
     });
-
-    // ── Phase 5: Wait for socket to appear (fast: < 100 ms now) ──────────────
     let socket_ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while !crate::leader::listener_is_ready(&socket_path) {
         if tokio::time::Instant::now() >= socket_ready_deadline {
@@ -1130,139 +876,85 @@ pub async fn run_leader(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     debug!("IPC socket created");
-
-    // Keep `lock` alive so its `Drop` removes the lock + socket on exit.
     let _lock = lock;
-
-    // ── Phase 6: Auth + model prefetch ───────────────────────────────────────
-    //
-    // The IPC server is already accepting connections. Clients that send ACP
-    // messages during this window receive a `leader_starting` error and can retry.
-
     let ctx = &agent_config.grok_com_config;
-    // Never interactive: a detached leader has no TTY (forcing OAuth here hung BYOK).
-    let auth: Option<GrokAuth> = crate::auth::try_ensure_session_noninteractive(ctx).await;
-
-    // ── Phase 6b: Legacy devbox auth migration ─────────────────────────────
-    let auth: Option<GrokAuth> = migrate_devbox_auth_if_legacy(auth, &agent_config).await;
-
-    let auth_for_prefetch: Option<GrokAuth> = auth.clone();
-    let endpoints_for_prefetch = agent_config.endpoints.clone();
-    let fetch_auth_for_prefetch = ModelFetchAuth::resolve(&endpoints_for_prefetch, auth.is_some());
-    // The shared pair helper owns the remote_fetch gate for both halves, so a
-    // disabled knob cannot block leader readiness on settings retries.
-    let (prefetched_models, remote_settings) = tokio::task::spawn_blocking(move || {
-        crate::agent::models::prefetch_models_and_settings_blocking(
-            &endpoints_for_prefetch,
-            auth_for_prefetch.as_ref(),
-            fetch_auth_for_prefetch,
-        )
-    })
-    .await
-    .unwrap_or((None, None));
-
-    // Process-wide image normalize cache: off by default, toggled here from
-    // `RemoteSettings.image_normalize_cache_enabled` once at startup.
-    let image_normalize_cache_enabled = remote_settings
-        .as_ref()
-        .and_then(|r| r.image_normalize_cache_enabled)
-        .unwrap_or(false);
-    crate::session::normalize_cache::NormalizeCache::global()
-        .set_enabled(image_normalize_cache_enabled);
-    tracing::debug!(
-        enabled = image_normalize_cache_enabled,
-        "image normalize cache toggle resolved from remote settings"
-    );
-
-    // ── Phase 7: Signal readiness ─────────────────────────────────────────────
-    //
-    // Unblocks ACP forwarding inside the IPC server. From this point on, client
-    // ACP messages are forwarded to the agent as normal.
+    suppress_otel();
+    let auth: Option<GrokAuth> = crate::auth::try_noninteractive_auth_no_mint(ctx).await;
+    let has_session = auth.is_some()
+        || agent_config
+            .create_auth_manager()
+            .read_disk_auth()
+            .is_some();
+    let session_pending =
+        crate::agent::otel_gate::is_session_pending(has_session, &agent_config.grok_com_config);
+    let policy_channel =
+        crate::agent::otel_gate::policy_channel_for(&agent_config.endpoints.proxy_url());
+    if crate::agent::otel_gate::should_open_at_startup(crate::agent::otel_gate::StartupGate {
+        channel: policy_channel,
+        has_session,
+        session_pending,
+    }) {
+        info!(
+            channel = ?policy_channel,
+            has_session,
+            session_pending,
+            "Opening external-OTEL gate at startup: no fleet policy is pending for this leader"
+        );
+        crate::agent::otel_gate::open_at_startup();
+    }
+    let prefetched_models: Option<_> = None;
+    let remote_settings: Option<_> = None;
     let _ = ready_tx.send(true);
-    info!("Leader ready: auth and model prefetch complete, ACP forwarding enabled");
-
-    // ── Phase 8: LocalSet — agent, bridges, relay, config watcher ────────────
-
+    info!(
+        "Leader ready: local-only boot (model/settings refresh runs in background), ACP forwarding enabled"
+    );
     let local_set = tokio::task::LocalSet::new();
-    let remote_settings_for_reloader = remote_settings.clone();
     let mut agent_config_for_spawn = agent_config.clone();
     agent_config_for_spawn.remote_settings = remote_settings;
     crate::util::config::sync_campaign_fields(&mut agent_config_for_spawn);
     let agent_to_ipc_tx_clone = agent_to_ipc_tx.clone();
     let cancel_clone = cancel.clone();
-
     let shared_auth_manager = Arc::new(agent_config_for_spawn.create_auth_manager());
-    // Proactive token refresh for the leader; cancelled on shutdown.
     shared_auth_manager.start_proactive_refresh(cancel_clone.clone());
-    // Pause refreshes across system sleep on this local (laptop) leader
-    // process so a refresh can't straddle a suspend.
     shared_auth_manager.start_system_power_listener();
-
-    // Decided once here; not (re)started if a client authenticates mid-session.
-    // The refresher lands on `shared_auth_manager` during `MvpAgent`
-    // construction below; a relay 401 in the window before that surfaces as
-    // a transient recovery failure and is retried, not a dead end.
-    let relay_config: Option<RelayConfig> =
-        relay_config_for_session(auth.as_ref(), &agent_config, &shared_auth_manager);
-    // Same manager as the leader, so the exposure never writes auth.json itself.
+    if let Some(session) = auth.as_ref()
+        && should_seed_shared_session(shared_auth_manager.current_or_expired().as_ref(), session)
+    {
+        shared_auth_manager.hot_swap(session.clone());
+    }
+    let relay_config = relay_config_for_session(auth.as_ref(), &agent_config, &shared_auth_manager);
     workspace_control.set_auth_manager(shared_auth_manager.clone());
     let auth_manager_for_agent = shared_auth_manager.clone();
-    let auth_manager_for_config = shared_auth_manager;
-
-    // Restore managed policy right before bootstrap reads it (no stale window after the long auth/prefetch phase).
+    let auth_manager_for_config = shared_auth_manager.clone();
+    let auth_manager_for_mint = shared_auth_manager.clone();
     crate::managed_config::ensure_managed_policy_present(&auth_manager_for_agent).await;
-
     let (agent_config_for_spawn, shared_models_manager) = bootstrap(
         &agent_config_for_spawn,
         &auth_manager_for_agent,
         prefetched_models,
     )
     .unwrap_or_else(exit_on_config_error);
+    shared_models_manager.spawn_background_refresh();
     let models_manager_for_agent = shared_models_manager.clone();
     let models_manager_for_config = shared_models_manager;
-
-    // Resolve `mcp.recursive_config_watch`
-    // ONCE here, before the channel is created, so a kill-switch
-    // value of `false` skips channel construction entirely. Previously
-    // the channel was always created and `tx` always installed on
-    // the agent; the drain task only ran when the flag was on, so
-    // every `notify_session_cwd_for_watch` call leaked a `PathBuf`
-    // into a never-drained channel.
     let recursive_config_watch_enabled = {
         let user_cfg = crate::config::load_from_disk().ok();
         let requirements = crate::agent::config::read_requirements_toml();
         crate::util::config::resolve_mcp_recursive_config_watch(
             requirements.as_ref(),
             user_cfg.as_ref(),
-            /* managed */ None,
+            None,
         )
     };
-
     local_set
         .run_until(async move {
-            // Channel for fanning new session cwds from
-            // the agent (each `spawn_and_register_session` call) into
-            // the leader's `ConfigFileWatcher::watch_path`. Both ends
-            // live inside the `LocalSet` so neither needs `Send`. The
-            // tx is installed on the agent before `AgentSideConnection`
-            // moves it; the rx is drained by a small task spawned
-            // alongside the watcher below.
-            //
-            // Only create the channel when the kill-
-            // switch is `true`. With the flag off,
-            // `notify_session_cwd_for_watch` becomes a no-op (no
-            // `tx` installed) and no memory leaks regardless of how
-            // many sessions spawn over the leader's lifetime.
-            let (config_watcher_path_tx, config_watcher_path_rx_opt) =
-                if recursive_config_watch_enabled {
-                    let (tx, rx) = mpsc::unbounded_channel::<std::path::PathBuf>();
-                    (Some(tx), Some(rx))
-                } else {
-                    (None, None)
-                };
+            let (config_watcher_path_tx, config_watcher_path_rx_opt) = if recursive_config_watch_enabled {
+                let (tx, rx) = mpsc::unbounded_channel::<std::path::PathBuf>();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             let mut config_watcher_path_rx = config_watcher_path_rx_opt;
-
-            // Spawn the agent
             let agent_config_watcher_path_tx = config_watcher_path_tx.clone();
             let agent_activity_for_agent = agent_activity.clone();
             tokio::task::spawn_local(async move {
@@ -1282,23 +974,26 @@ pub async fn run_leader(
                     agent.set_config_watcher_path_tx(tx);
                 }
                 let incoming = LineBufferedRead::spawn_local(incoming);
-                let (conn, handle_io) =
-                    acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
+                let (conn, handle_io) = acp::AgentSideConnection::new(
+                    agent,
+                    outgoing,
+                    incoming,
+                    |fut| {
                         tokio::task::spawn_local(fut);
-                    });
+                    },
+                );
                 tokio::task::spawn_local(
                     GatewayReceiver::new(gw_rx, conn)
-                        .with_on_meta(xai_file_utils::trace_context::span_from_meta_traceparent)
+                        .with_on_meta(
+                            xai_file_utils::trace_context::span_from_meta_traceparent,
+                        )
                         .run(),
                 );
-
                 if let Err(e) = handle_io.await {
                     warn!(error = ?e, "Agent I/O handler error");
                 }
                 info!("Agent task completed");
             });
-
-            // Bridge IPC messages to agent (from stdio clients)
             let acp_incoming_tx_ipc = acp_incoming_tx.clone();
             tokio::task::spawn_local(async move {
                 while let Some(msg) = ipc_to_agent_rx.recv().await {
@@ -1311,8 +1006,6 @@ pub async fn run_leader(
                     }
                 }
             });
-
-            // Bridge websocket messages to agent (from grok.com relay)
             let acp_incoming_tx_ws = acp_incoming_tx.clone();
             tokio::task::spawn_local(async move {
                 while let Some(msg) = ws_to_agent_rx.recv().await {
@@ -1325,12 +1018,10 @@ pub async fn run_leader(
                     }
                 }
             });
-
-            // Bridge agent responses to both WS and IPC
-            let agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>> =
-                Rc::new(Mutex::new(None));
+            let agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>> = Rc::new(
+                Mutex::new(None),
+            );
             let agent_to_ws_tx_clone = agent_to_ws_tx.clone();
-
             tokio::task::spawn_local(async move {
                 let mut reader = BufReader::new(acp_outgoing_rx);
                 let mut line = String::new();
@@ -1356,54 +1047,80 @@ pub async fn run_leader(
                     }
                 }
             });
-
-            // Start (or arm) the grok.com relay. Eager by default — a bare
-            // `gork agent leader` (devbox / systemd) has no local IPC clients
-            // and receives remote prompts *through* the relay, so it must
-            // connect unconditionally. Leaders auto-spawned by interactive
-            // clients pass `relay_on_demand` and defer the WebSocket until the
-            // first headless registration. See `spawn_leader_relay`.
-            let relay_handle_slot = if let Some(relay_config) = relay_config {
+            if session_pending {
+                let mint_auth_manager = auth_manager_for_mint;
+                let mint_cancel = cancel_clone.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::select! {
+                        biased;
+                        _ = mint_cancel.cancelled() => {}
+                        minted = crate::auth::mint_session_noninteractive(&mint_auth_manager)
+                            => match minted {
+                            Some(session) => info!(
+                                is_xai = session.is_xai_auth(),
+                                "background cold-mint acquired a session post-readiness"
+                            ),
+                            None => warn!(
+                                "background cold-mint found no session; leader remains session-less"
+                            ),
+                        },
+                    }
+                });
+            }
+            let relay_handle_slot: Rc<
+                std::cell::RefCell<Option<crate::agent::relay::RelayHandle>>,
+            > = Rc::new(std::cell::RefCell::new(None));
+            let mut deferred_relay_arm: Option<DeferredRelayArm> = None;
+            if let Some(relay_config) = relay_config {
                 spawn_leader_relay(
+                    relay_handle_slot.clone(),
                     relay_config,
                     relay_on_demand,
                     relay_demand_rx,
                     ws_to_agent_tx.clone(),
                     agent_to_ws_tx.clone(),
                     cancel_clone.clone(),
-                )
+                );
             } else {
-                info!("Relay disabled: no grok.com session token (BYOK / local-only leader)");
-                Rc::new(std::cell::RefCell::new(None))
-            };
-
-            // Spawn auto-update checker if configured.
+                info!(
+                    "Relay not started: no grok.com session token \
+                     (BYOK / local-only leader); will arm if an eligible \
+                     token is hot-reloaded"
+                );
+                deferred_relay_arm = Some(DeferredRelayArm {
+                    relay_on_demand,
+                    relay_demand_rx,
+                    ws_to_agent_tx: ws_to_agent_tx.clone(),
+                    agent_to_ws_tx: agent_to_ws_tx.clone(),
+                    cancel: cancel_clone.clone(),
+                    slot: relay_handle_slot.clone(),
+                    grok_com_config: agent_config.grok_com_config.clone(),
+                    alpha_test_key: agent_config.endpoints.alpha_test_key.clone(),
+                });
+            }
             let update_cancel = cancel_clone.clone();
             if let Some(update_config) = auto_update_check {
                 let agent_busy_for_update = agent_busy.clone();
                 let agent_activity_for_update = agent_activity.clone();
                 let cancel_for_update = cancel_clone.clone();
-                tokio::spawn(run_auto_update_checker(
-                    update_config,
-                    agent_busy_for_update,
-                    agent_activity_for_update,
-                    cancel_for_update,
-                    shutdown_tx,
-                ));
+                tokio::spawn(
+                    run_auto_update_checker(
+                        update_config,
+                        agent_busy_for_update,
+                        agent_activity_for_update,
+                        cancel_for_update,
+                        shutdown_tx,
+                    ),
+                );
             }
-
-            // Config hot-reload watcher
             let cwd_for_watcher = std::env::current_dir().unwrap_or_default();
             let mut watch_paths = crate::config::find_project_configs(&cwd_for_watcher);
-            watch_paths.extend(crate::util::config::mcp_json_candidate_paths(
-                &cwd_for_watcher,
-            ));
+            watch_paths
+                .extend(crate::util::config::mcp_json_candidate_paths(&cwd_for_watcher));
             if let Some(home) = dirs::home_dir() {
                 watch_paths.push(home.join(".claude.json"));
             }
             let auth_scope = agent_config.grok_com_config.auth_scope();
-            // Gated on user_grok_home() so a cwd-relative .grok/auth.json is never
-            // read as the user auth store when no home resolves.
             let initial_auth_key_hash = xai_grok_config::user_grok_home()
                 .map(|g| g.join("auth.json"))
                 .and_then(|auth_path| crate::auth::read_auth_json(&auth_path).ok())
@@ -1412,38 +1129,18 @@ pub async fn run_leader(
                         .map(|a| crate::config::reloader::hash_auth_key(&a.key))
                 })
                 .unwrap_or(0);
-            let (config_update_tx, mut config_update_rx) =
-                mpsc::unbounded_channel::<crate::config::reloader::ConfigUpdate>();
-
-            // `mcp.recursive_config_watch` (default
-            // `true`) was resolved above (before the async block) so
-            // the per-session-cwd channel could be gated. The
-            // watcher passes `Some(cwd)` here only when the flag is
-            // on. When disabled, behavior reverts to the prior
-            // default: only explicit `extra_paths` are watched (kill
-            // switch for the rollout).
-            let watcher_cwd = recursive_config_watch_enabled.then_some(cwd_for_watcher.as_path());
-
-            let _config_watcher = if let Some((watcher, events_rx)) =
-                crate::config::watcher::ConfigFileWatcher::start(
-                    &grok_home::grok_home(),
-                    &watch_paths,
-                    watcher_cwd,
-                    None,
-                ) {
-                // Share ownership between the leader's
-                // long-lived binding and the per-cwd dynamic
-                // registration drain task. `Rc<RefCell<>>` is safe
-                // because both ends live inside the leader's
-                // `LocalSet` — the watcher type is not `Sync`-needed.
+            let (config_update_tx, mut config_update_rx) = mpsc::unbounded_channel::<
+                crate::config::reloader::ConfigUpdate,
+            >();
+            let watcher_cwd = recursive_config_watch_enabled
+                .then_some(cwd_for_watcher.as_path());
+            let _config_watcher = if let Some((watcher, events_rx)) = crate::config::watcher::ConfigFileWatcher::start(
+                &grok_home::grok_home(),
+                &watch_paths,
+                watcher_cwd,
+                None,
+            ) {
                 let watcher = std::rc::Rc::new(std::cell::RefCell::new(watcher));
-
-                // Dynamic registration drain. Lives only
-                // when the recursive_config_watch flag is on AND the
-                // OS watcher started. With the flag
-                // off the channel itself was never created, so
-                // there's no rx to drain and no `PathBuf` ever
-                // queued (no leak).
                 if let Some(mut rx) = config_watcher_path_rx.take() {
                     let cancel_for_drain = cancel_clone.clone();
                     let watcher_for_drain = watcher.clone();
@@ -1467,7 +1164,7 @@ pub async fn run_leader(
                     initial_auth_key_hash,
                     initial_config,
                     auth_scope,
-                    remote_settings_for_reloader,
+                    None,
                     config_update_tx,
                     agent_config.cli_experimental_memory,
                     agent_config.cli_no_memory,
@@ -1478,10 +1175,10 @@ pub async fn run_leader(
                 warn!("Config file watcher failed to start; hot-reload disabled");
                 None
             };
-
-            let _skills_watcher =
-                spawn_skills_file_watcher(&acp_incoming_tx, &agent_config.skills.paths);
-
+            let _skills_watcher = spawn_skills_file_watcher(
+                &acp_incoming_tx,
+                &agent_config.skills.paths,
+            );
             let ipc_tx_for_config = agent_to_ipc_tx.clone();
             let acp_tx_for_config = acp_incoming_tx.clone();
             tokio::task::spawn_local(async move {
@@ -1497,16 +1194,28 @@ pub async fn run_leader(
                             xai_grok_telemetry::unified_log::info(
                                 "auth hot-swapped from disk",
                                 None,
-                                Some(serde_json::json!({
+                                Some(
+                                    serde_json::json!({
                                     "key_len": auth.key.len(),
                                     "expires_at": auth.expires_at.map(|e| e.to_rfc3339()),
-                                })),
+                                }),
+                                ),
                             );
+                            let session_for_relay = deferred_relay_arm
+                                .is_some()
+                                .then(|| (*auth).clone());
                             auth_manager_for_config.hot_swap(*auth);
+                            if let (Some(arm), Some(session)) = (
+                                deferred_relay_arm.take(),
+                                session_for_relay,
+                            ) {
+                                deferred_relay_arm = arm
+                                    .arm_if_eligible(&session, &auth_manager_for_config);
+                            }
                             models_manager_for_config.on_auth_changed().await;
                             let line = internal_reload_request_line(
                                 "config-auth-reloaded",
-                                "x.ai/internal/reload_all_mcp_servers",
+                                InternalMethod::ReloadAllMcpServers,
                                 serde_json::json!({}),
                             );
                             let mut tx = acp_tx_for_config.lock().await;
@@ -1518,7 +1227,7 @@ pub async fn run_leader(
                             auth_manager_for_config.clear_in_memory();
                             let line = internal_reload_request_line(
                                 "config-auth-cleared",
-                                "x.ai/internal/auth_cleared",
+                                InternalMethod::AuthCleared,
                                 serde_json::json!({}),
                             );
                             let mut tx = acp_tx_for_config.lock().await;
@@ -1537,7 +1246,7 @@ pub async fn run_leader(
                             info!("MCP server config change detected — reloading active sessions");
                             let line = internal_reload_request_line(
                                 "config-reload-mcp",
-                                "x.ai/internal/reload_all_mcp_servers",
+                                InternalMethod::ReloadAllMcpServers,
                                 serde_json::json!({}),
                             );
                             let mut tx = acp_tx_for_config.lock().await;
@@ -1546,21 +1255,13 @@ pub async fn run_leader(
                             }
                         }
                         ConfigUpdate::ProjectMcpServersChanged { cwd } => {
-                            // Scope the reload to
-                            // sessions whose cwd matches `cwd` (or is
-                            // a descendant). The actual filtering
-                            // happens in
-                            // `handle_reload_project_mcp_servers`
-                            // (extensions/session_admin.rs) — this
-                            // arm just injects the ACP method with
-                            // the cwd as a param.
                             info!(
                                 cwd = %cwd.display(),
                                 "project MCP config change detected — reloading matching sessions"
                             );
                             let line = internal_reload_request_line(
                                 "config-reload-project-mcp",
-                                "x.ai/internal/reload_project_mcp_servers",
+                                InternalMethod::ReloadProjectMcpServers,
                                 serde_json::json!({ "cwd": cwd.to_string_lossy() }),
                             );
                             let mut tx = acp_tx_for_config.lock().await;
@@ -1575,7 +1276,7 @@ pub async fn run_leader(
                             info!("Model config change detected — reloading agent model list");
                             let line = internal_reload_request_line(
                                 "config-reload-models",
-                                "x.ai/internal/reload_models",
+                                InternalMethod::ReloadModels,
                                 serde_json::json!({}),
                             );
                             let mut tx = acp_tx_for_config.lock().await;
@@ -1584,24 +1285,10 @@ pub async fn run_leader(
                             }
                         }
                         ConfigUpdate::ModelsCacheChanged => {
-                            // External write to ~/.grok/models_cache.json
-                            // (another grok process fetched a fresher /v1/models
-                            // catalog). Injected into the agent's ACP stream —
-                            // NOT applied directly on the manager — so it is
-                            // serialized behind any `reload_models` from the
-                            // same watcher batch: the `ModelsChanged` arm above
-                            // only *injects* a request that completes
-                            // asynchronously, and a direct call here could
-                            // rebuild the catalog and notify clients before
-                            // `apply_config` decided to accept or reject the
-                            // new config. The agent processes stream requests
-                            // in order, eliminating that interleaving.
-                            // `reload_from_disk_cache` still content-dedupes
-                            // the leader's own cache writes.
                             info!("Models cache change detected — reloading agent model catalog");
                             let line = internal_reload_request_line(
                                 "config-reload-models-cache",
-                                "x.ai/internal/reload_models_cache",
+                                InternalMethod::ReloadModelsCache,
                                 serde_json::json!({}),
                             );
                             let mut tx = acp_tx_for_config.lock().await;
@@ -1630,11 +1317,7 @@ pub async fn run_leader(
                                  (applies on next agent rebuild)"
                             );
                         }
-                        ConfigUpdate::Ui {
-                            theme,
-                            yolo,
-                            fork_secondary_model,
-                        } => {
+                        ConfigUpdate::Ui { theme, yolo, fork_secondary_model } => {
                             info!("UI config change detected by watcher");
                             let notification = serde_json::json!({
                                 "jsonrpc": "2.0",
@@ -1653,9 +1336,6 @@ pub async fn run_leader(
                     }
                 }
             });
-
-            // Wait for IPC server shutdown or cancellation.
-            // ipc_handle is a JoinHandle from tokio::spawn — awaitable directly.
             tokio::select! {
                 biased;
                 _ = ipc_handle => {
@@ -1665,32 +1345,25 @@ pub async fn run_leader(
                     info!("Leader cancelled");
                 }
             }
-
             if let Some(relay_handle) = relay_handle_slot.borrow_mut().take() {
                 relay_handle.stop();
             }
             anyhow::Ok(())
         })
         .await?;
-
-    // Brief grace period for the upload queue worker to finish in-flight uploads.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
-
     /// Create a throwaway shutdown_tx for tests that don't care about the reason.
     fn dummy_shutdown_tx() -> watch::Sender<crate::leader::ShutdownReason> {
         watch::channel(crate::leader::ShutdownReason::Manual).0
     }
-
     /// Helper: build a LeaderAutoUpdateConfig whose check_fn always returns the given value.
     fn always_config(update_available: bool) -> LeaderAutoUpdateConfig {
         LeaderAutoUpdateConfig {
@@ -1698,7 +1371,6 @@ mod tests {
             check_fn: Box::new(move || Box::pin(async move { update_available })),
         }
     }
-
     /// Helper: build a LeaderAutoUpdateConfig that returns `false` for the first
     /// `skip` calls, then `true` for all subsequent calls.
     fn delayed_update_config(skip: u32) -> LeaderAutoUpdateConfig {
@@ -1714,9 +1386,6 @@ mod tests {
             }),
         }
     }
-
-    // ===== relay shared-manager seeding tests =====
-
     fn oidc_session(key: &str, create_time: chrono::DateTime<chrono::Utc>) -> GrokAuth {
         GrokAuth {
             key: key.into(),
@@ -1728,13 +1397,11 @@ mod tests {
             ..GrokAuth::test_default()
         }
     }
-
     #[test]
     fn seed_when_manager_empty() {
         let session = oidc_session("resolved", chrono::Utc::now());
         assert!(should_seed_shared_session(None, &session));
     }
-
     #[test]
     fn skip_when_same_token_already_held() {
         let now = chrono::Utc::now();
@@ -1742,22 +1409,15 @@ mod tests {
         let existing = oidc_session("same", now);
         assert!(!should_seed_shared_session(Some(&existing), &session));
     }
-
     #[test]
     fn seed_over_staler_disk_entry() {
-        // Regression (shared manager stale session seed): a read-only
-        // disk left an older scope entry that login could not overwrite. The
-        // resolved session is newer, so it must replace the stale snapshot.
         let now = chrono::Utc::now();
         let stale = oidc_session("stale-from-disk", now - chrono::Duration::hours(13));
         let session = oidc_session("resolved-at-startup", now);
         assert!(should_seed_shared_session(Some(&stale), &session));
     }
-
     #[test]
     fn keep_fresher_sibling_refreshed_token() {
-        // A sibling refreshed disk in the construction→here window: its token is
-        // newer than the startup session, so it must NOT be clobbered.
         let now = chrono::Utc::now();
         let session = oidc_session("startup", now - chrono::Duration::minutes(5));
         let sibling_fresher = oidc_session("sibling-refreshed", now);
@@ -1766,9 +1426,6 @@ mod tests {
             &session
         ));
     }
-
-    // ===== spawn_leader_relay start-policy tests =====
-
     /// Mock relay WS server: counts accepted WebSocket connections and holds
     /// each open so the relay loop doesn't immediately reconnect.
     async fn spawn_mock_relay_server() -> (std::net::SocketAddr, Arc<AtomicU32>) {
@@ -1787,16 +1444,14 @@ mod tests {
                         return;
                     };
                     count.fetch_add(1, Ordering::SeqCst);
-                    // Hold the connection open until the test ends.
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 });
             }
         });
         (addr, count)
     }
-
-    /// Relay config pointing at the mock server, built through the only
-    /// constructor (`for_session`) with a relay-eligible x.ai OIDC session.
+    /// A `RelayConfig` built via the production constructor (`for_session`) with
+    /// a relay-eligible x.ai OIDC session.
     fn test_relay_config(addr: std::net::SocketAddr) -> crate::agent::relay::RelayConfig {
         let auth = GrokAuth {
             auth_mode: AuthMode::Oidc,
@@ -1811,7 +1466,69 @@ mod tests {
         crate::agent::relay::RelayConfig::for_session(&auth, &cfg, None, None)
             .expect("x.ai OIDC session must be relay-eligible")
     }
-
+    /// The embedded startup gate (every pager `--no-leader` / fallback path) must be
+    /// fail-closed by construction: a session user stays closed until the agent
+    /// resolves settings, even when an env API key is also present (the key must
+    /// not bypass the session's remote policy).
+    #[test]
+    #[serial_test::serial]
+    fn embedded_otel_gate_keeps_a_session_user_fail_closed() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_grok_telemetry::external::{
+            is_settings_gate_open, mark_external_otel_settings_resolved,
+        };
+        unsafe fn set_or_clear(key: &str, value: Option<std::ffi::OsString>) {
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+        /// Restores the api-key env and reopens the gate on drop so no state leaks.
+        struct Restore {
+            key: Option<std::ffi::OsString>,
+            legacy: Option<std::ffi::OsString>,
+            proxy: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    set_or_clear(XAI_API_KEY_ENV_VAR, self.key.take());
+                    set_or_clear(LEGACY_XAI_API_KEY_ENV_VAR, self.legacy.take());
+                    set_or_clear(PROXY_ENV_VAR, self.proxy.take());
+                }
+                mark_external_otel_settings_resolved();
+            }
+        }
+        const PROXY_ENV_VAR: &str = "GROK_CLI_CHAT_PROXY_BASE_URL";
+        let _restore = Restore {
+            key: std::env::var_os(XAI_API_KEY_ENV_VAR),
+            legacy: std::env::var_os(LEGACY_XAI_API_KEY_ENV_VAR),
+            proxy: std::env::var_os(PROXY_ENV_VAR),
+        };
+        let cfg = GrokComConfig::default();
+        unsafe {
+            std::env::set_var(XAI_API_KEY_ENV_VAR, "test-key");
+            std::env::remove_var(LEGACY_XAI_API_KEY_ENV_VAR);
+            std::env::remove_var(PROXY_ENV_VAR);
+        }
+        let session = GrokAuth {
+            expires_at: chrono::DateTime::from_timestamp(9_999_999_999, 0),
+            auth_mode: AuthMode::Oidc,
+            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_string()),
+            ..GrokAuth::test_default()
+        };
+        let with_session = {
+            let dir = tempfile::tempdir().unwrap();
+            let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+            am.hot_swap(session);
+            am
+        };
+        apply_otel_config(&with_session, &cfg);
+        assert!(
+            !is_settings_gate_open(),
+            "a session user must boot fail-closed even with an env key set"
+        );
+    }
     /// Wait until at least one relay connection is accepted, or panic.
     async fn wait_for_connection(count: &Arc<AtomicU32>, context: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1823,9 +1540,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
-
     /// Regression test for the bare-leader relay gating bug: a bare
-    /// `gork agent leader` (devbox/systemd — no local IPC clients,
+    /// `grok agent leader` (devbox/systemd — no local IPC clients,
     /// `relay_on_demand == false`) must connect the grok.com relay eagerly.
     /// Remote prompts arrive *through* the relay, so on such a leader no
     /// headless-registration demand signal can ever fire; gating the relay on
@@ -1839,22 +1555,20 @@ mod tests {
         let (ws_to_agent_tx, _ws_to_agent_rx) = mpsc::unbounded_channel();
         let agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>> =
             Rc::new(Mutex::new(None));
-        // Demand watch is never signalled — exactly like a bare leader that
-        // never sees a headless IPC registration.
         let (_demand_tx, demand_rx) = watch::channel(false);
-
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let slot = spawn_leader_relay(
+                let slot = Rc::new(std::cell::RefCell::new(None));
+                spawn_leader_relay(
+                    slot.clone(),
                     config,
-                    false, // eager: explicit `gork agent leader` invocation
+                    false,
                     demand_rx,
                     ws_to_agent_tx,
                     agent_to_ws_tx.clone(),
                     cancel.clone(),
                 );
-                // Eager mode wires everything synchronously.
                 assert!(
                     slot.borrow().is_some(),
                     "eager mode must park the RelayHandle immediately"
@@ -1868,7 +1582,6 @@ mod tests {
             .await;
         cancel.cancel();
     }
-
     /// With `relay_on_demand == true` (leader auto-spawned by an interactive
     /// client), the relay must stay off until the first headless registration
     /// flips the demand watch, then connect.
@@ -1881,19 +1594,19 @@ mod tests {
         let agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>> =
             Rc::new(Mutex::new(None));
         let (demand_tx, demand_rx) = watch::channel(false);
-
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let _slot = spawn_leader_relay(
+                let slot = Rc::new(std::cell::RefCell::new(None));
+                spawn_leader_relay(
+                    slot.clone(),
                     config,
-                    true, // on-demand: spawned via spawn_leader_subprocess
+                    true,
                     demand_rx,
                     ws_to_agent_tx,
                     agent_to_ws_tx.clone(),
                     cancel.clone(),
                 );
-                // No demand → no connection, no outbound sender installed.
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 assert_eq!(
                     count.load(Ordering::SeqCst),
@@ -1901,26 +1614,162 @@ mod tests {
                     "on-demand relay must not connect before a headless client registers"
                 );
                 assert!(agent_to_ws_tx.lock().is_none());
-
-                // First headless registration → relay connects.
                 demand_tx.send(true).unwrap();
                 wait_for_connection(&count, "after headless demand signal").await;
             })
             .await;
         cancel.cancel();
     }
-
-    /// The watcher-injected internal reload requests must carry the ACP
-    /// wire-level `_` extension prefix. `agent-client-protocol`'s inbound
-    /// decoder routes non-built-in methods to `ext_method` only when
-    /// `_`-prefixed and rejects bare custom methods with `-32601`, so an
-    /// un-prefixed injection means every config-driven hot-reload silently
-    /// dies at decode (watcher logs fire, handlers never run).
+    /// Regression test for the "leader booted without auth is invisible
+    /// forever" bug: a leader that starts with no session (e.g. a devbox
+    /// whose initial mint hit a transient provider outage) must arm the
+    /// relay when a relay-eligible token is later hot-reloaded — and must
+    /// hand the parts back (not consume them) for a non-eligible token, so
+    /// a later eligible one can still arm.
+    #[tokio::test]
+    async fn deferred_arm_connects_relay_when_auth_appears() {
+        let (addr, count) = spawn_mock_relay_server().await;
+        let cancel = CancellationToken::new();
+        let (ws_to_agent_tx, _ws_to_agent_rx) = mpsc::unbounded_channel();
+        let agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>> =
+            Rc::new(Mutex::new(None));
+        let (_demand_tx, demand_rx) = watch::channel(false);
+        let slot = Rc::new(std::cell::RefCell::new(None));
+        let grok_com_config = crate::auth::GrokComConfig {
+            grok_ws_url: format!("ws://{addr}"),
+            grok_ws_origin: format!("http://{addr}"),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_manager = Arc::new(AuthManager::new(tmp.path(), grok_com_config.clone()));
+        let arm = DeferredRelayArm {
+            relay_on_demand: false,
+            relay_demand_rx: demand_rx,
+            ws_to_agent_tx,
+            agent_to_ws_tx: agent_to_ws_tx.clone(),
+            cancel: cancel.clone(),
+            slot: slot.clone(),
+            grok_com_config,
+            alpha_test_key: None,
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let ineligible = GrokAuth::test_default();
+                let arm = arm
+                    .arm_if_eligible(&ineligible, &auth_manager)
+                    .expect("non-eligible token must hand the parts back");
+                assert!(slot.borrow().is_none(), "no handle parked yet");
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    0,
+                    "non-eligible token must not connect the relay"
+                );
+                let eligible = GrokAuth {
+                    auth_mode: AuthMode::Oidc,
+                    oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_string()),
+                    ..GrokAuth::test_default()
+                };
+                assert!(
+                    arm.arm_if_eligible(&eligible, &auth_manager).is_none(),
+                    "eligible token must consume the arm parts"
+                );
+                assert!(
+                    slot.borrow().is_some(),
+                    "handle must be parked in the shared shutdown slot"
+                );
+                assert!(
+                    agent_to_ws_tx.lock().is_some(),
+                    "outbound relay sender must be installed"
+                );
+                wait_for_connection(&count, "deferred arm after auth hot-reload").await;
+            })
+            .await;
+        cancel.cancel();
+    }
+    /// End-to-end for the merge reconciliation: a background cold-mint persists
+    /// a relay-eligible session to auth.json, the config watcher emits
+    /// `ConfigUpdate::Auth`, and that arms the deferred relay.
+    #[tokio::test]
+    async fn cold_mint_auth_write_arms_deferred_relay() {
+        use crate::config::reloader::{ConfigReloader, ConfigUpdate, hash_auth_key};
+        let (addr, _count) = spawn_mock_relay_server().await;
+        let grok_com_config = crate::auth::GrokComConfig {
+            grok_ws_url: format!("ws://{addr}"),
+            grok_ws_origin: format!("http://{addr}"),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = "https://test.example.com".to_string();
+        let session = GrokAuth {
+            auth_mode: AuthMode::Oidc,
+            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_string()),
+            ..GrokAuth::test_default()
+        };
+        let mut store = std::collections::BTreeMap::new();
+        store.insert(scope.clone(), session);
+        std::fs::write(
+            tmp.path().join("auth.json"),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut reloader = ConfigReloader::new(
+            tmp.path().to_path_buf(),
+            hash_auth_key("sessionless-boot"),
+            toml::Value::Table(Default::default()),
+            scope,
+            None,
+            tx,
+            false,
+            false,
+        );
+        reloader.reload_auth().unwrap();
+        let ConfigUpdate::Auth(minted) = rx
+            .try_recv()
+            .expect("cold-mint auth.json write must emit ConfigUpdate::Auth")
+        else {
+            panic!("expected ConfigUpdate::Auth");
+        };
+        let auth_manager = Arc::new(AuthManager::new(tmp.path(), grok_com_config.clone()));
+        let (ws_to_agent_tx, _ws_to_agent_rx) = mpsc::unbounded_channel();
+        let agent_to_ws_tx: Rc<Mutex<Option<mpsc::UnboundedSender<String>>>> =
+            Rc::new(Mutex::new(None));
+        let agent_to_ws_tx_probe = agent_to_ws_tx.clone();
+        let (_demand_tx, demand_rx) = watch::channel(false);
+        let slot = Rc::new(std::cell::RefCell::new(None));
+        let cancel = CancellationToken::new();
+        let arm = DeferredRelayArm {
+            relay_on_demand: false,
+            relay_demand_rx: demand_rx,
+            ws_to_agent_tx,
+            agent_to_ws_tx,
+            cancel: cancel.clone(),
+            slot: slot.clone(),
+            grok_com_config,
+            alpha_test_key: None,
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                assert!(
+                    arm.arm_if_eligible(&minted, &auth_manager).is_none(),
+                    "a cold-minted relay-eligible session must arm the relay"
+                );
+                assert!(slot.borrow().is_some(), "relay handle must be parked");
+                assert!(
+                    agent_to_ws_tx_probe.lock().is_some(),
+                    "outbound relay sender must be installed"
+                );
+            })
+            .await;
+        cancel.cancel();
+    }
     #[test]
-    fn internal_reload_request_line_uses_wire_ext_prefix() {
+    fn internal_reload_request_line_carries_id_params_and_newline() {
         let line = internal_reload_request_line(
             "config-reload-models",
-            "x.ai/internal/reload_models",
+            InternalMethod::ReloadModels,
             serde_json::json!({}),
         );
         assert!(line.ends_with('\n'), "must be a newline-terminated line");
@@ -1932,33 +1781,26 @@ mod tests {
         );
         assert_eq!(msg["id"], "config-reload-models");
         assert_eq!(msg["jsonrpc"], "2.0");
-
-        // Params must pass through verbatim (project-MCP reload carries cwd).
         let line = internal_reload_request_line(
             "config-reload-project-mcp",
-            "x.ai/internal/reload_project_mcp_servers",
+            InternalMethod::ReloadProjectMcpServers,
             serde_json::json!({ "cwd": "/repo/x" }),
         );
         let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(msg["params"]["cwd"], "/repo/x");
-
         let line = internal_reload_request_line(
             "config-auth-cleared",
-            "x.ai/internal/auth_cleared",
+            InternalMethod::AuthCleared,
             serde_json::json!({}),
         );
         let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(msg["method"], "_x.ai/internal/auth_cleared");
     }
-
     #[tokio::test]
     async fn auto_update_cancels_when_update_available_and_agent_idle() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
-
         let config = always_config(true);
-
-        // The checker should cancel the token on its first check (agent idle)
         tokio::time::timeout(
             Duration::from_secs(2),
             run_auto_update_checker(
@@ -1971,17 +1813,13 @@ mod tests {
         )
         .await
         .expect("checker should complete within timeout");
-
         assert!(cancel.is_cancelled(), "cancel token should be triggered");
     }
-
     #[tokio::test]
     async fn auto_update_defers_when_agent_busy() {
-        let agent_busy = Arc::new(AtomicBool::new(true)); // agent is processing a prompt
+        let agent_busy = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
-
-        let config = delayed_update_config(0); // always returns true
-
+        let config = delayed_update_config(0);
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
             config,
@@ -1990,28 +1828,19 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
-        // Wait enough for multiple checks to fire
         tokio::time::sleep(Duration::from_millis(80)).await;
-
-        // Token should NOT be cancelled (agent is busy)
         assert!(
             !cancel_clone.is_cancelled(),
             "cancel token should NOT be triggered when agent is busy"
         );
-
-        // Clean up
         cancel_clone.cancel();
         let _ = checker.await;
     }
-
     #[tokio::test]
     async fn auto_update_no_cancel_when_no_update_available() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
-
         let config = always_config(false);
-
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
             config,
@@ -2020,28 +1849,19 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
-        // Let several checks fire
         tokio::time::sleep(Duration::from_millis(80)).await;
-
         assert!(
             !cancel_clone.is_cancelled(),
             "cancel token should NOT be triggered when no update is available"
         );
-
-        // Clean up
         cancel_clone.cancel();
         let _ = checker.await;
     }
-
     #[tokio::test]
     async fn auto_update_cancels_after_agent_becomes_idle() {
-        let agent_busy = Arc::new(AtomicBool::new(true)); // agent processing initially
+        let agent_busy = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
-
-        // Update is always available, but agent is busy initially
         let config = always_config(true);
-
         let agent_busy_clone = agent_busy.clone();
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
@@ -2051,37 +1871,26 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
-        // Let a few checks fire while agent is busy
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !cancel_clone.is_cancelled(),
             "should not cancel while agent is busy"
         );
-
-        // Simulate agent finishing its work (prompt completes)
         agent_busy_clone.store(false, Ordering::Relaxed);
-
-        // Wait for the next check to fire and trigger cancellation
         tokio::time::timeout(Duration::from_secs(2), checker)
             .await
             .expect("checker should complete within timeout")
             .expect("checker task should not panic");
-
         assert!(
             cancel_clone.is_cancelled(),
             "cancel token should be triggered after agent becomes idle"
         );
     }
-
     #[tokio::test]
     async fn auto_update_stops_when_externally_cancelled() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
-
-        // No update available, so the checker runs indefinitely
         let config = always_config(false);
-
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
             config,
@@ -2090,36 +1899,28 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
-        // Cancel externally
         cancel_clone.cancel();
-
-        // Checker should exit promptly
         tokio::time::timeout(Duration::from_secs(2), checker)
             .await
             .expect("checker should exit within timeout after external cancel")
             .expect("checker task should not panic");
     }
-
     #[tokio::test]
     async fn auto_update_calls_check_fn_multiple_times() {
         let call_count = Arc::new(AtomicU32::new(0));
         let call_count_clone = call_count.clone();
-
-        let agent_busy = Arc::new(AtomicBool::new(true)); // agent busy, so it defers
+        let agent_busy = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
-
         let config = LeaderAutoUpdateConfig {
             check_interval: Duration::from_millis(10),
             check_fn: Box::new(move || {
                 let cc = call_count_clone.clone();
                 Box::pin(async move {
                     cc.fetch_add(1, Ordering::Relaxed);
-                    true // update always available, but won't cancel because agent is busy
+                    true
                 })
             }),
         };
-
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
             config,
@@ -2128,39 +1929,24 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
-        // Let several checks fire. Use a generous timeout to avoid flakiness
-        // in CI where the first check may take longer due to task scheduling.
         tokio::time::sleep(Duration::from_millis(200)).await;
-
         let calls = call_count.load(Ordering::Relaxed);
         assert!(
             calls >= 2,
             "check_fn should have been called multiple times, got {}",
             calls
         );
-
         cancel_clone.cancel();
         let _ = checker.await;
     }
-
     #[tokio::test]
     async fn auto_update_cancels_during_hanging_check_fn() {
-        // Simulates a stalled-HTTP scenario: check_fn hangs (stalled HTTP).
-        // The checker should still respond to cancellation thanks to the select!.
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
-
         let config = LeaderAutoUpdateConfig {
             check_interval: Duration::from_millis(10),
-            check_fn: Box::new(|| {
-                Box::pin(async {
-                    // Simulate a hanging HTTP call that never completes
-                    futures::future::pending::<bool>().await
-                })
-            }),
+            check_fn: Box::new(|| Box::pin(async { futures::future::pending::<bool>().await })),
         };
-
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
             config,
@@ -2169,33 +1955,23 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
-        // Let the checker enter the hanging check_fn
         tokio::time::sleep(Duration::from_millis(30)).await;
-
-        // Cancel externally — should NOT hang
         cancel_clone.cancel();
-
-        // Checker must exit promptly despite the hanging check_fn
         tokio::time::timeout(Duration::from_secs(2), checker)
             .await
             .expect("checker should exit within timeout even with hanging check_fn")
             .expect("checker task should not panic");
     }
-
     /// The IPC `agent_busy` flag never sees relay-driven traffic — the checker
     /// must also defer on the agent-derived activity signal (running turn,
     /// pending interaction, or live subagent).
     #[tokio::test]
     async fn auto_update_defers_when_agent_activity_busy() {
-        let agent_busy = Arc::new(AtomicBool::new(false)); // IPC view: idle
+        let agent_busy = Arc::new(AtomicBool::new(false));
         let activity = crate::agent::activity::AgentActivity::default();
-        // Agent view: a subagent is running (e.g. spawned by a relay prompt).
         activity.subagent_gauge().store(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
-
-        let config = always_config(true); // update always "installed"
-
+        let config = always_config(true);
         let cancel_clone = cancel.clone();
         let checker = tokio::spawn(run_auto_update_checker(
             config,
@@ -2204,14 +1980,11 @@ mod tests {
             cancel.clone(),
             dummy_shutdown_tx(),
         ));
-
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(
             !cancel_clone.is_cancelled(),
             "must not shut down while the agent (not IPC) is busy"
         );
-
-        // Subagent finishes → next tick shuts down.
         activity.subagent_gauge().store(0, Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(2), checker)
             .await
@@ -2219,20 +1992,15 @@ mod tests {
             .expect("checker task should not panic");
         assert!(cancel_clone.is_cancelled());
     }
-
     /// A permanently-busy signal must not pin the leader to an old binary
     /// forever: after MAX_AUTO_UPDATE_BUSY_DEFERRALS the update proceeds.
     #[tokio::test]
     async fn auto_update_forces_shutdown_after_deferral_limit() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let activity = crate::agent::activity::AgentActivity::default();
-        // Permanently busy (e.g. an orphaned parked interaction).
         activity.subagent_gauge().store(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
-
-        let config = always_config(true); // update always "installed"
-
-        // 10ms interval × (24 deferrals + 1) ≈ 250ms — well within timeout.
+        let config = always_config(true);
         tokio::time::timeout(
             Duration::from_secs(10),
             run_auto_update_checker(
@@ -2247,7 +2015,6 @@ mod tests {
         .expect("checker should force shutdown after the deferral limit");
         assert!(cancel.is_cancelled());
     }
-
     /// Before cancelling (which drops the LocalSet and aborts session actors),
     /// the checker must ask every registered session actor to shut down and
     /// wait for it to exit, so buffered state is flushed to disk.
@@ -2257,15 +2024,12 @@ mod tests {
         let activity = crate::agent::activity::AgentActivity::default();
         let (mut cmd_rx, _prompt_id, _pending) = activity.register_for_test("s1");
         let cancel = CancellationToken::new();
-
-        // Simulated session actor: records the Shutdown command, then exits
-        // (dropping cmd_rx, which is how the flush observes completion).
         let got_shutdown = Arc::new(AtomicBool::new(false));
         let got_shutdown_clone = got_shutdown.clone();
         let cancel_for_actor = cancel.clone();
         let actor = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if matches!(cmd, crate::session::SessionCommand::Shutdown) {
+                if matches!(cmd, crate::session::SessionCommand::Shutdown(_)) {
                     assert!(
                         !cancel_for_actor.is_cancelled(),
                         "session flush must happen BEFORE the leader is cancelled"
@@ -2275,7 +2039,6 @@ mod tests {
                 }
             }
         });
-
         let config = always_config(true);
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -2289,7 +2052,6 @@ mod tests {
         )
         .await
         .expect("checker should complete within timeout");
-
         assert!(cancel.is_cancelled());
         actor.await.expect("actor should exit cleanly");
         assert!(
@@ -2297,7 +2059,6 @@ mod tests {
             "session actor must receive SessionCommand::Shutdown before leader cancel"
         );
     }
-
     /// Verify that when an update is installed and the agent is idle, the checker
     /// sends `ShutdownReason::AutoUpdate` via the `shutdown_tx` channel BEFORE
     /// cancelling the token, so the IPC server broadcasts the correct reason.
@@ -2306,9 +2067,7 @@ mod tests {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(crate::leader::ShutdownReason::Manual);
-
-        let config = always_config(true); // update always available
-
+        let config = always_config(true);
         tokio::time::timeout(
             Duration::from_secs(2),
             run_auto_update_checker(
@@ -2321,11 +2080,8 @@ mod tests {
         )
         .await
         .expect("checker should complete within timeout");
-
         assert!(cancel.is_cancelled(), "cancel token should be triggered");
-
-        // The shutdown_tx must have been updated to AutoUpdate before cancel fired.
-        shutdown_rx.mark_changed(); // ensure borrow sees latest value
+        shutdown_rx.mark_changed();
         assert_eq!(
             *shutdown_rx.borrow(),
             crate::leader::ShutdownReason::AutoUpdate,

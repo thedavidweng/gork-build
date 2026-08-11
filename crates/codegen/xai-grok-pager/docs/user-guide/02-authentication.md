@@ -30,11 +30,11 @@ To switch accounts or resolve an authentication problem, run:
 grok login
 ```
 
-Running `grok login` starts the sign-in flow again, replacing your cached session. By default, it opens your browser and signs in through Grok (xAI) OAuth at `auth.x.ai`. Pass a flag to select a different flow:
+Running `grok login` starts the sign-in flow again, replacing your cached session. By default, it opens your browser and signs in through SpaceXAI OAuth at `auth.x.ai`. Pass a flag to select a different flow:
 
 | Flag | Description |
 |------|-------------|
-| `--oauth` | Sign in through Grok (xAI) OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
+| `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
 | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
 
 To sign out, run `grok logout`. It takes no flags and clears your cached credentials.
@@ -179,13 +179,27 @@ export GROK_AUTH_TOKEN_TTL=3600
 
 ### Token Refresh
 
-When Grok needs to refresh an expired token, it re-runs your binary with `GROK_AUTH_EXPIRED=1` set in the environment. Each run fully replaces the stored credential, so emit the same JSON fields (such as `issuer`) on every invocation, including refreshes. Your binary can use this to take a faster silent-refresh path:
+Grok runs your binary on two different contracts, and `GROK_AUTH_EXPIRED` is how
+it tells them apart. Each run fully replaces the stored credential, so emit the
+same JSON fields (such as `issuer`) on every invocation, including refreshes.
+
+- **`GROK_AUTH_EXPIRED=1` — a headless refresh.** Grok is re-minting over a
+  credential it already holds: a near-expiry rotation, or a token the server
+  rejected. Nobody is watching. stdin is closed, your stderr is swallowed, and
+  the binary is given a few seconds before it is killed. Mint silently or exit
+  non-zero — never block.
+- **Unset — a sign-in.** `grok login`, the sign-in screen, or the escalation
+  Grok performs when a headless run couldn't mint. A user is waiting, your
+  stderr reaches them, and you have 300 seconds — enough for a browser round
+  trip or a device code.
 
 ```bash
 #!/bin/sh
 if [ "$GROK_AUTH_EXPIRED" = "1" ]; then
+    # Headless: silent refresh only. Declining is the fast, correct answer
+    # when your SSO session has lapsed and only the user can renew it.
     echo "Refreshing token..." >&2
-    TOKEN=$(my-company-auth --refresh --silent)
+    TOKEN=$(my-company-auth --refresh --silent) || exit 1
 else
     echo "Authenticating via Acme Corp SSO..." >&2
     TOKEN=$(my-company-auth --login --interactive)
@@ -199,6 +213,23 @@ fi
 echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
 ```
 
+When the headless run can't produce a token, Grok stops treating the stored
+credential as usable and starts the sign-in flow instead — the same one you get
+on a machine that has never signed in, with your binary's stderr shown, so a
+device-code URL or a browser prompt reaches you. Exiting promptly on
+`GROK_AUTH_EXPIRED=1` is what makes that handover fast; a binary that blocks
+instead makes you wait out the refresh timeout on every start. Mid-session, the
+turn fails with a re-auth prompt and `/login` re-runs the binary interactively.
+
+One case stays ambiguous, and only in **leader mode** (`--leader`, or
+`[cli] use_leader = true`; off by default): with no credential at all, the
+leader makes one extra attempt in the background just after startup, and that
+run has the variable unset, like a sign-in. A binary that mints without help
+(service account, keytab, mounted token) succeeds there and the session heals
+itself. One that must prompt just sits, up to the 300s sign-in ceiling —
+nothing waits on it, the sign-in screen is already up, and that run's stderr
+goes to `~/.grok/leader.log` rather than to you.
+
 ### Environment Variables
 
 | Variable | Description |
@@ -206,7 +237,7 @@ echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
 | `GROK_AUTH_PROVIDER_COMMAND` | Path to your auth binary |
 | `GROK_AUTH_PROVIDER_LABEL` | Display name on the TUI login screen (e.g., "Acme Corp") |
 | `GROK_AUTH_TOKEN_TTL` | Token lifetime in seconds (for bare-string tokens without `expires_in`) |
-| `GROK_AUTH_EXPIRED` | Set to `1` by Grok when re-running the binary for token refresh |
+| `GROK_AUTH_EXPIRED` | Set to `1` on a headless refresh: don't prompt, and don't hand back a cached token. Unset on a sign-in, where a user is attached |
 | `GROK_AUTH_EARLY_INVALIDATION_SECS` | Seconds before expiry to proactively refresh (default: 300) |
 
 ---
@@ -263,7 +294,7 @@ When more than one login flow is configured, Grok populates the session token fr
 
 1. **External auth provider** (`auth_provider_command`)
 2. **Enterprise OIDC** -- when OIDC is configured, through `[grok_com_config.oidc]` in `config.toml` or the `GROK_OIDC_ISSUER` and `GROK_OIDC_CLIENT_ID` environment variables
-3. **Grok (xAI) OAuth2 browser login** -- the default
+3. **SpaceXAI OAuth2 browser login** -- the default
 
 During a session, the active method handles all mid-session refreshes.
 
@@ -271,7 +302,8 @@ During a session, the active method handles all mid-session refreshes.
 
 ## Related settings
 
-`/privacy` does not change these config knobs:
+Coding-data sharing — **Coding data, retention, and training** in Settings,
+which `/privacy` opens — does not change these config knobs:
 
 | Setting | How to set it |
 |---------|---------------|
@@ -279,10 +311,11 @@ During a session, the active method handles all mid-session refreshes.
 | `[telemetry] trace_upload` | `config.toml` or `GROK_TELEMETRY_TRACE_UPLOAD` |
 | External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*`. See [Monitoring Usage](24-monitoring-usage.md). |
 
-On team accounts, only a team admin can toggle privacy with `/privacy`.
+On team accounts, only a team admin can change coding-data sharing.
 Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
 See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
-When ZDR is on, `/privacy` cannot change coding-data sharing.
+When ZDR is on, coding-data sharing cannot be changed at all — the settings
+row shows `ZDR` in place of the value.
 
 See [Monitoring Usage](24-monitoring-usage.md#related-settings) and [Configuration](05-configuration.md#telemetry).
 
@@ -313,7 +346,7 @@ RUST_LOG=debug grok -p "hello" 2> /tmp/grok.log
 
 | Log message | What it means |
 |-------------|---------------|
-| `auth: running external auth provider` | Grok is running your binary |
+| `auth: running external auth provider (headless refresh)` / `(interactive login)` | Grok is running your binary, and on which contract |
 | `auth: external auth provider returned fresh token` | Grok parsed and stored the token |
 | `auth: external auth provider failed` | Binary exited non-zero or stdout was empty |
 | `auth: external auth provider timed out (likely needs interactive auth), killing` | Binary did not exit before the timeout and was killed |

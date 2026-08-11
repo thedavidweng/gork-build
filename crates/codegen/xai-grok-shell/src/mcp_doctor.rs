@@ -1,14 +1,11 @@
-//! `gork mcp doctor` -- runtime health check for MCP servers.
+//! `grok mcp doctor` -- runtime health check for MCP servers.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use serde::Serialize;
 use xai_grok_tools::types::config_source::ConfigSource;
 
-use crate::auth::GrokComConfig;
-use crate::session::managed_mcp;
 use crate::session::mcp_servers;
 
 // ── Report types ────────────────────────────────────────────────
@@ -238,85 +235,6 @@ fn discover_servers(cwd: &Path) -> (Vec<ConfigSourceStatus>, Vec<DiscoveredServe
     (sources, servers)
 }
 
-// ── Managed (grok.com) server discovery ─────────────────────────
-
-const MANAGED_SOURCE_LABEL: &str = "grok.com";
-
-fn managed_skipped(reason: impl Into<String>) -> (ConfigSourceStatus, Vec<DiscoveredServer>) {
-    (
-        ConfigSourceStatus {
-            path: MANAGED_SOURCE_LABEL.to_string(),
-            status: ConfigSourceState::Skipped {
-                reason: reason.into(),
-            },
-        },
-        vec![],
-    )
-}
-
-fn managed_found(
-    count: usize,
-    servers: Vec<DiscoveredServer>,
-) -> (ConfigSourceStatus, Vec<DiscoveredServer>) {
-    (
-        ConfigSourceStatus {
-            path: MANAGED_SOURCE_LABEL.to_string(),
-            status: ConfigSourceState::Found {
-                server_count: count,
-            },
-        },
-        servers,
-    )
-}
-
-/// Discover managed `grok_com_*` servers if the user has xAI auth on disk.
-async fn try_discover_managed_servers() -> (ConfigSourceStatus, Vec<DiscoveredServer>) {
-    let grok_home = xai_grok_tools::util::grok_home::grok_home();
-    let grok_com_config = GrokComConfig::default();
-    let auth_manager = Arc::new(crate::auth::AuthManager::new(&grok_home, grok_com_config));
-
-    let Some(snapshot) = auth_manager.current_or_expired() else {
-        return managed_skipped("not logged in");
-    };
-    if !snapshot.is_managed_mcp_eligible() {
-        return managed_skipped(format!("{:?} auth (not xAI OIDC)", snapshot.auth_mode));
-    }
-
-    let token = match auth_manager.get_valid_token().await {
-        Ok(key) => key,
-        Err(_) => return managed_skipped("auth expired — run `gork login`"),
-    };
-
-    let proxy_url = crate::agent::config::EndpointsConfig::from_effective_config().proxy_url();
-
-    let configs = match managed_mcp::fetch_managed_configs(&proxy_url, &token).await {
-        Ok(configs) => configs,
-        Err(e) => return managed_skipped(format!("fetch failed: {e}")),
-    };
-    if configs.is_empty() {
-        return managed_found(0, vec![]);
-    }
-
-    let mut servers: Vec<agent_client_protocol::McpServer> = vec![];
-    managed_mcp::auto_inject_managed_servers_with_disabled(
-        &mut servers,
-        &configs,
-        &Default::default(),
-    );
-    managed_mcp::inject_managed_headers(&mut servers, &configs);
-
-    let source = ConfigSource::Managed { path: None };
-    let discovered: Vec<DiscoveredServer> = servers
-        .into_iter()
-        .map(|server| DiscoveredServer {
-            server,
-            source: source.clone(),
-        })
-        .collect();
-
-    managed_found(discovered.len(), discovered)
-}
-
 // ── Check functions ─────────────────────────────────────────────
 
 fn resolve_command(command: &str) -> Option<String> {
@@ -363,17 +281,8 @@ async fn check_server_start(
 ) -> Result<(mcp_servers::McpClient, Check), Check> {
     let start = std::time::Instant::now();
     let noop = xai_file_utils::events::EventWriter::noop();
-    match mcp_servers::start_mcp_server(
-        acp_server,
-        None,
-        Some(cwd),
-        None,
-        None,
-        &noop,
-        mcp_servers::OauthInteractivity::Interactive,
-    )
-    .await
-    {
+    let ctx = mcp_servers::McpSpawnCtx::session_less(&noop);
+    match mcp_servers::start_mcp_server(acp_server, Some(cwd), None, None, &ctx).await {
         Ok(client) => {
             let elapsed = start.elapsed();
             Ok((
@@ -514,11 +423,7 @@ async fn check_server(
 // ── Entry point ─────────────────────────────────────────────────
 
 pub async fn run_doctor(cwd: &Path, name_filter: Option<&str>) -> DoctorReport {
-    let (mut sources, mut discovered) = discover_servers(cwd);
-
-    let (managed_source, managed_servers) = try_discover_managed_servers().await;
-    sources.push(managed_source);
-    discovered.extend(managed_servers);
+    let (mut sources, discovered) = discover_servers(cwd);
 
     let allowlist = &xai_grok_workspace::permission::resolution::managed_settings().mcp_allowlist;
     if allowlist.is_restricted() {
@@ -551,13 +456,13 @@ pub async fn run_doctor(cwd: &Path, name_filter: Option<&str>) -> DoctorReport {
 
     let disabled_names = crate::util::config::disabled_mcp_server_names(cwd);
 
-    // Folder-trust gate: `gork mcp doctor` actually STARTS each server
+    // Folder-trust gate: `grok mcp doctor` actually STARTS each server
     // (`check_server_start`), so in an untrusted clone it would spawn the repo's
     // project-scoped servers. Resolve the doctor cwd once (no prompt), then skip
     // (do not start) any project-scoped server when untrusted. Reuses the same
     // name primitive as the session/agent-pool gates.
     //
-    // `remote = None` is intentional: standalone `gork mcp doctor` has no loaded
+    // `remote = None` is intentional: standalone `grok mcp doctor` has no loaded
     // `RemoteSettings`, so a remote-only org `folder_trust_enabled = false`
     // opt-out isn't seen here — gating conservatively (treating the feature as
     // enabled) is the deliberate fail-secure direction. Local env/user/managed
@@ -657,7 +562,7 @@ pub fn print_report(report: &DoctorReport) {
 
     if report.servers.is_empty() {
         println!("  No MCP servers configured.");
-        println!("  Run `gork mcp add --help` to get started.");
+        println!("  Run `grok mcp add --help` to get started.");
         println!();
         return;
     }
@@ -687,7 +592,7 @@ pub fn print_report(report: &DoctorReport) {
         report.healthy_count,
         report.failing_count,
         if report.failing_count > 0 {
-            " Run `gork mcp doctor --json` for full diagnostics."
+            " Run `grok mcp doctor --json` for full diagnostics."
         } else {
             ""
         }

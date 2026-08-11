@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::extensions::notification::SessionNotification;
@@ -7,9 +7,7 @@ use crate::sampling::ConversationItem;
 use crate::session::info::Info;
 use crate::session::persistence::Summary;
 use crate::session::signals::SessionSignals;
-use crate::session::wire_tags::{
-    AVAILABLE_COMMANDS_UPDATE_PREFIX, REWIND_MARKER, USER_MESSAGE_CHUNK,
-};
+use crate::session::wire_tags::{REWIND_MARKER, USER_MESSAGE_CHUNK};
 use crate::tools::todo::TodoState;
 use agent_client_protocol as acp;
 use xai_grok_sampling_types::ReasoningEffort;
@@ -18,9 +16,15 @@ use xai_grok_workspace::session::file_state::RewindPoint;
 pub mod jsonl;
 #[allow(dead_code)] // Transaction APIs remain deferred until later protocol wiring.
 pub(crate) mod relocation;
+mod replay;
+#[cfg(test)]
+mod replay_tests;
 pub mod search;
+mod search_bootstrap;
+mod search_content;
+mod search_db;
 pub mod search_fts;
-pub mod search_remote_sync;
+mod search_recovery;
 pub(crate) mod summary_write;
 
 /// On-disk file names, relative to a session directory. Single source of truth for
@@ -489,22 +493,6 @@ impl UpdatesIterator {
         }))
     }
 
-    /// Create a new iterator starting at the given byte offset.
-    /// Returns None if the file doesn't exist.
-    /// Used for delta replay: read only updates appended after a known offset.
-    pub fn open_at(path: &Path, offset: u64) -> io::Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = std::fs::File::open(path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(offset))?;
-        Ok(Some(Self {
-            reader,
-            line_buffer: String::new(),
-        }))
-    }
-
     /// Returns the current byte position in the underlying file.
     /// After iterating, this is the offset of the next unread byte (i.e., EOF
     /// if all updates were consumed). Used to record the replay end offset for
@@ -934,28 +922,32 @@ impl UserRunTurnTracker {
     }
 }
 
-/// Calculate how many updates to keep for a given target prompt index (0-based, inclusive).
-///
-/// Progressive: unmarked user runs before the first `_meta.promptIndex` count
-/// as turns; after the first marker only marked runs count (phantoms omit it).
-pub fn updates_truncate_for_prompt(updates: &[SessionUpdate], target_prompt_index: usize) -> usize {
+/// How many items to keep for `target_prompt_index` (0-based, inclusive):
+/// the scan cuts at the opening chunk of the next counted turn. Unmarked
+/// user runs count as turns only before the first `_meta.promptIndex`.
+fn truncate_for_prompt_by<T>(
+    items: &[T],
+    target_prompt_index: usize,
+    classify: impl Fn(&T) -> RewindStep,
+) -> usize {
     let mut user_turn_count = 0;
     let mut tracker = UserRunTurnTracker::new();
 
-    for (i, update) in updates.iter().enumerate() {
-        if is_acp_user_message_chunk(update) && !is_host_turn_update(update) {
-            if tracker.on_user_chunk(acp_user_chunk_prompt_index(update)) {
-                user_turn_count += 1;
-                if user_turn_count > target_prompt_index + 1 {
-                    return i;
+    for (i, item) in items.iter().enumerate() {
+        match classify(item) {
+            RewindStep::UserChunk { prompt_index } => {
+                if tracker.on_user_chunk(prompt_index) {
+                    user_turn_count += 1;
+                    if user_turn_count > target_prompt_index + 1 {
+                        return i;
+                    }
                 }
             }
-        } else {
-            tracker.on_non_user();
+            RewindStep::Rewind { .. } | RewindStep::Other => tracker.on_non_user(),
         }
     }
 
-    updates.len()
+    items.len()
 }
 
 #[derive(Debug)]
@@ -1013,6 +1005,21 @@ pub trait StorageAdapter: Send + Sync {
         info: &Info,
         session_title: String,
     ) -> io::Result<bool>;
+
+    /// Clear a manual `/rename` pin (`/rename --auto`). Sets
+    /// `title_is_manual = false` and, when a pin was present, blanks
+    /// `generated_title` and `session_summary` so `display_title()` is
+    /// empty. Returns `true` iff a manual pin was actually cleared.
+    /// Idempotent when the title is not manual.
+    async fn reset_title_to_auto(&self, info: &Info) -> io::Result<bool>;
+
+    /// Replace or clear (`None`) the per-turn dashboard summary
+    /// (`(text, prompt_id)`) in `summary.json`; last-writer-wins.
+    async fn set_last_turn_summary(
+        &self,
+        info: &Info,
+        summary: Option<(String, String)>,
+    ) -> io::Result<()>;
 
     /// Append a session update (ACP update or xAI extension update) and increment counter
     async fn append_update(&self, info: &Info, update: &SessionUpdate) -> io::Result<()>;
@@ -1269,6 +1276,13 @@ pub trait StorageAdapter: Send + Sync {
 }
 
 pub use jsonl::JsonlStorageAdapter;
+#[cfg(any(test, feature = "test-support"))]
+pub use replay::load_updates_for_replay_at;
+pub use replay::{
+    PreparedReplay, ReplayEmission, ReplayPathHint, load_updates_for_replay, prepare_replay_lines,
+    stream_replay_updates_at, stream_replay_updates_at_hinted,
+};
+pub(crate) use replay::{ReplayToolCollapser, filter_delta_replay_lines};
 
 /// Extracts `method` and raw `params` from an updates.jsonl envelope
 /// without parsing the notification payload.
@@ -1294,6 +1308,8 @@ pub(crate) struct RawUpdatePeek<'a> {
     #[serde(rename = "sessionUpdate")]
     pub session_update: &'a str,
     #[serde(default)]
+    pub status: Option<&'a str>,
+    #[serde(default)]
     pub target_prompt_index: Option<usize>,
     /// Chunk `_meta.promptIndex` when present (owned; not borrowed).
     #[serde(default, rename = "_meta")]
@@ -1308,81 +1324,120 @@ pub(crate) struct RawChunkMetaPeek {
     pub host_turn: Option<bool>,
 }
 
-/// Filter rewind dead branches from raw JSONL lines.
-/// Skips parsing entirely when no rewind markers are present.
-///
-/// This is the canonical implementation of rewind dead-branch filtering,
-/// used by both the initial replay and delta replay paths.
-pub(crate) fn filter_rewind_lines<'a>(lines: Vec<&'a str>) -> Vec<&'a str> {
-    let has_rewinds = lines.iter().any(|l| l.contains(&*REWIND_MARKER));
-    if !has_rewinds {
-        return lines;
-    }
+/// Role of one item in the rewind timeline, as seen by [`filter_rewind_by`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RewindStep {
+    /// Rewind marker: truncate survivors back to `target`'s prompt boundary.
+    Rewind { target: usize },
+    /// User-message chunk opening (or continuing) a prompt run.
+    UserChunk { prompt_index: Option<usize> },
+    /// Anything else: kept, but ends the current user run.
+    Other,
+}
 
-    let mut result: Vec<&str> = Vec::with_capacity(lines.len());
+/// Shared rewind dead-branch filter. `classify` maps each item to its
+/// [`RewindStep`]; the driver tracks prompt boundaries and, on a marker,
+/// truncates survivors back to the target prompt. [`filter_rewind_lines`] and
+/// [`filter_rewind_updates`] wrap this over raw JSONL and typed updates so the
+/// two paths share one algorithm.
+fn filter_rewind_by<T>(items: Vec<T>, classify: impl Fn(&T) -> RewindStep) -> Vec<T> {
+    let mut result: Vec<T> = Vec::with_capacity(items.len());
     let mut prompt_starts: Vec<usize> = Vec::new();
     let mut tracker = UserRunTurnTracker::new();
 
-    for line in &lines {
-        let (raw_params, is_xai) = if let Ok(env) = serde_json::from_str::<RawLinePeek<'_>>(line) {
-            let raw = env.params.map(|p| p.get()).unwrap_or(line);
-            let xai = env.method == Some(XAI_SESSION_UPDATE_METHOD);
-            (raw, xai)
-        } else {
-            (*line, false)
-        };
-
-        let peek = serde_json::from_str::<RawParamsPeek<'_>>(raw_params)
-            .ok()
-            .and_then(|p| p.update);
-        let tag = peek
-            .as_ref()
-            .map(|u| (u.session_update, u.target_prompt_index));
-
-        if is_xai
-            && let Some((s, Some(target))) = tag.as_ref().map(|(s, t)| (*s, *t))
-            && s == *REWIND_MARKER
-        {
-            let trunc = prompt_starts.get(target).copied().unwrap_or(result.len());
-            result.truncate(trunc);
-            prompt_starts.truncate(target);
-            tracker.on_non_user();
-            continue;
-        }
-
-        let is_host_turn = peek
-            .as_ref()
-            .and_then(|u| u.meta.as_ref())
-            .and_then(|m| m.host_turn)
-            .unwrap_or(false);
-        let is_user_chunk = !is_xai
-            && !is_host_turn
-            && tag
-                .as_ref()
-                .map(|(s, _)| *s == *USER_MESSAGE_CHUNK)
-                .unwrap_or(false);
-        if is_user_chunk {
-            let pi = peek.as_ref().and_then(|u| {
-                u.meta
-                    .as_ref()
-                    .and_then(|m| m.prompt_index.map(|v| v as usize))
-            });
-            if tracker.on_user_chunk(pi) {
-                prompt_starts.push(result.len());
+    for item in items {
+        match classify(&item) {
+            RewindStep::Rewind { target } => {
+                // Out-of-range target keeps every survivor: fold to `result.len()`.
+                let trunc = prompt_starts.get(target).copied().unwrap_or(result.len());
+                result.truncate(trunc);
+                prompt_starts.truncate(target);
+                tracker.on_non_user();
+                continue;
             }
-        } else {
-            tracker.on_non_user();
+            RewindStep::UserChunk { prompt_index } => {
+                if tracker.on_user_chunk(prompt_index) {
+                    prompt_starts.push(result.len());
+                }
+            }
+            RewindStep::Other => tracker.on_non_user(),
         }
-        result.push(line);
+        result.push(item);
     }
     result
 }
 
+/// Classify a raw JSONL line by peeking at its tag and `_meta` without fully
+/// deserializing the payload.
+fn rewind_step_for_line(line: &str) -> RewindStep {
+    let (raw_params, is_xai) = if let Ok(env) = serde_json::from_str::<RawLinePeek<'_>>(line) {
+        let raw = env.params.map(|p| p.get()).unwrap_or(line);
+        (raw, env.method == Some(XAI_SESSION_UPDATE_METHOD))
+    } else {
+        (line, false)
+    };
+
+    let Some(u) = serde_json::from_str::<RawParamsPeek<'_>>(raw_params)
+        .ok()
+        .and_then(|p| p.update)
+    else {
+        return RewindStep::Other;
+    };
+
+    if is_xai
+        && u.session_update == *REWIND_MARKER
+        && let Some(target) = u.target_prompt_index
+    {
+        return RewindStep::Rewind { target };
+    }
+
+    let is_host_turn = u.meta.as_ref().and_then(|m| m.host_turn).unwrap_or(false);
+    if !is_xai && !is_host_turn && u.session_update == *USER_MESSAGE_CHUNK {
+        let prompt_index = u
+            .meta
+            .as_ref()
+            .and_then(|m| m.prompt_index.map(|v| v as usize));
+        return RewindStep::UserChunk { prompt_index };
+    }
+
+    RewindStep::Other
+}
+
+/// Classify a typed `SessionUpdate`.
+fn rewind_step_for_update(update: &SessionUpdate) -> RewindStep {
+    if let SessionUpdate::Xai(n) = update
+        && let crate::extensions::notification::SessionUpdate::RewindMarker {
+            target_prompt_index,
+            ..
+        } = &n.update
+    {
+        return RewindStep::Rewind {
+            target: *target_prompt_index,
+        };
+    }
+    if is_acp_user_message_chunk(update) && !is_host_turn_update(update) {
+        return RewindStep::UserChunk {
+            prompt_index: acp_user_chunk_prompt_index(update),
+        };
+    }
+    RewindStep::Other
+}
+
+/// Filter rewind dead branches from raw JSONL lines.
+///
+/// Canonical raw-line rewind filter used by the initial and delta replay paths.
+/// Skips parsing entirely when no rewind markers are present.
+pub(crate) fn filter_rewind_lines(lines: Vec<&str>) -> Vec<&str> {
+    if !lines.iter().any(|l| l.contains(&*REWIND_MARKER)) {
+        return lines;
+    }
+    filter_rewind_by(lines, |line| rewind_step_for_line(line))
+}
+
 /// Filter rewind dead branches from typed `SessionUpdate` values.
 ///
-/// This is the typed equivalent of [`filter_rewind_lines`] — same algorithm
-/// (prompt-boundary tracking + truncation on `RewindMarker`) but operates on
-/// fully-deserialized updates instead of raw JSON strings.
+/// Typed equivalent of [`filter_rewind_lines`] over the same
+/// [`filter_rewind_by`] driver, operating on fully-deserialized updates.
 pub fn filter_rewind_updates(updates: Vec<SessionUpdate>) -> Vec<SessionUpdate> {
     let has_rewinds = updates.iter().any(|u| {
         matches!(
@@ -1396,39 +1451,7 @@ pub fn filter_rewind_updates(updates: Vec<SessionUpdate>) -> Vec<SessionUpdate> 
     if !has_rewinds {
         return updates;
     }
-
-    let mut result: Vec<SessionUpdate> = Vec::with_capacity(updates.len());
-    let mut prompt_starts: Vec<usize> = Vec::new();
-    let mut tracker = UserRunTurnTracker::new();
-
-    for update in updates {
-        // Check for rewind marker — truncate back to the target prompt.
-        if let SessionUpdate::Xai(ref n) = update
-            && let crate::extensions::notification::SessionUpdate::RewindMarker {
-                target_prompt_index,
-                ..
-            } = &n.update
-        {
-            let trunc = prompt_starts
-                .get(*target_prompt_index)
-                .copied()
-                .unwrap_or(result.len());
-            result.truncate(trunc);
-            prompt_starts.truncate(*target_prompt_index);
-            tracker.on_non_user();
-            continue;
-        }
-
-        if is_acp_user_message_chunk(&update) && !is_host_turn_update(&update) {
-            if tracker.on_user_chunk(acp_user_chunk_prompt_index(&update)) {
-                prompt_starts.push(result.len());
-            }
-        } else {
-            tracker.on_non_user();
-        }
-        result.push(update);
-    }
-    result
+    filter_rewind_by(updates, rewind_step_for_update)
 }
 
 /// Strip `<fork-context>` and `<resume-context>` XML wrappers from user
@@ -1457,317 +1480,13 @@ pub fn strip_context_wrappers(update: acp::SessionUpdate) -> acp::SessionUpdate 
     acp::SessionUpdate::UserMessageChunk(chunk)
 }
 
-/// Load session updates from disk, ready for replay or export.
-///
-/// This is the canonical way to get replay-ready typed updates from a session
-/// ID. It:
-/// 1. Locates the session directory via [`find_session_dir_by_id`]
-/// 2. Opens `updates.jsonl` via [`UpdatesIterator`]
-/// 3. Collects all parseable updates (skipping malformed lines)
-/// 4. Filters rewind dead branches via [`filter_rewind_updates`]
-/// 5. Strips `<fork-context>` / `<resume-context>` wrappers from user messages
-///    via [`strip_context_wrappers`]
-///
-/// Returns `None` if the session is not found or has no `updates.jsonl`.
-/// Returns only `SessionUpdate::Acp` updates (xAI-extension updates like
-/// rewind markers and compaction signals are consumed by the filter and not
-/// included in the output).
-pub fn load_updates_for_replay(
-    session_id: &str,
-) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
-    let Some(session_dir) =
-        crate::session::persistence::find_persisted_session_dir_by_id_result(session_id)?
-    else {
-        return Ok(None);
-    };
-    load_updates_for_replay_from_dir(&session_dir)
-}
-
-/// Like [`load_updates_for_replay`], but resolves the session under a specific grok home.
-pub fn load_updates_for_replay_at(
-    session_id: &str,
-    grok_home: &std::path::Path,
-) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
-    let sessions_root = grok_home.join("sessions");
-    let Some(session_dir) =
-        crate::session::persistence::find_persisted_session_dir_by_id_in_root_result(
-            session_id,
-            &sessions_root,
-        )?
-    else {
-        return Ok(None);
-    };
-    load_updates_for_replay_from_dir(&session_dir)
-}
-
-fn load_updates_for_replay_from_dir(
+/// The session dir's `updates.jsonl` path if it exists, else `None`. Sole owner
+/// of the "does this dir have a replayable updates file" gate.
+pub(crate) fn replay_updates_path_in_dir(
     session_dir: &std::path::Path,
-) -> std::io::Result<Option<Vec<acp::SessionUpdate>>> {
+) -> Option<std::path::PathBuf> {
     let updates_path = session_dir.join(UPDATES_FILE);
-    let Some(iter) = UpdatesIterator::open(&updates_path)? else {
-        return Ok(None);
-    };
-
-    let all: Vec<SessionUpdate> = iter.filter_map(|r| r.ok()).collect();
-    let filtered = filter_rewind_updates(all);
-
-    let acp_updates: Vec<acp::SessionUpdate> = filtered
-        .into_iter()
-        .filter_map(|u| match u {
-            SessionUpdate::Acp(notif) => Some(strip_context_wrappers(notif.update)),
-            SessionUpdate::Xai(_) => None,
-        })
-        .collect();
-
-    Ok(Some(acp_updates))
-}
-
-pub(crate) struct PreparedReplay<'a> {
-    pub lines: Vec<&'a str>,
-    pub mark_replay: bool,
-    pub last_tokens: u64,
-    /// Highest `eventId` counter across all live (rewind-filtered) lines, used
-    /// to re-seed the process-global event counter on resume so post-load live
-    /// events keep monotonically increasing ids (see
-    /// [`crate::util::event_id::ensure_event_counter_at_least`]). `None` when no
-    /// line carried a parseable `eventId` (older shell).
-    pub max_event_seq: Option<u64>,
-    pub total_live: usize,
-    /// Replayed spawns with no matching finish (a rewind can drop the finish) —
-    /// `(subagent_id, child_session_id)`, reconciled on load.
-    pub unfinished_subagents: Vec<(String, String)>,
-}
-
-/// Unpaired spawns across the rewind-filtered timeline. Substring pre-filter
-/// keeps non-subagent lines off the JSON path.
-fn collect_unfinished_subagents(filtered: &[&str]) -> Vec<(String, String)> {
-    use crate::extensions::notification::SessionUpdate as Update;
-    let mut pending: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for line in filtered {
-        if !line.contains("subagent_spawned") && !line.contains("subagent_finished") {
-            continue;
-        }
-        // Parse the typed notification. Envelope lines nest it under `params`;
-        // legacy lines put it at the top level (fall back to the whole line,
-        // matching `filter_rewind_lines`).
-        let raw = serde_json::from_str::<RawLinePeek<'_>>(line)
-            .ok()
-            .and_then(|e| e.params.map(|p| p.get()))
-            .unwrap_or(line);
-        let Ok(notification) = serde_json::from_str::<SessionNotification>(raw) else {
-            continue;
-        };
-        match notification.update {
-            Update::SubagentSpawned {
-                subagent_id,
-                child_session_id,
-                ..
-            } => {
-                pending.insert(subagent_id, child_session_id);
-            }
-            Update::SubagentFinished { subagent_id, .. } => {
-                pending.remove(&subagent_id);
-            }
-            _ => {}
-        }
-    }
-    pending.into_iter().collect()
-}
-
-/// The raw `_meta` object of a persisted line, if any, without allocating a
-/// `serde_json::Value`. Handles both the enveloped (`{method,params}`) and legacy
-/// (params-at-top-level) on-disk formats.
-fn line_meta(line: &str) -> Option<&serde_json::value::RawValue> {
-    let env = serde_json::from_str::<RawLinePeek<'_>>(line).ok()?;
-    let raw = env.params.map(|p| p.get()).unwrap_or(line);
-    serde_json::from_str::<RawParamsPeek<'_>>(raw).ok()?.meta
-}
-
-/// The `"update":` object key (a protocol key, not an enum discriminant). The
-/// structural `params.update` is the FIRST occurrence in a persisted line: the
-/// envelope prefix has no `"update":`, and any nested `"update"` (in `_meta` or a
-/// tool's `rawInput`/`rawOutput`) is serialized after it, so the first match delimits it.
-const UPDATE_KEY: &str = r#""update":"#;
-
-/// Is this persisted line an `available_commands_update`?
-///
-/// The slash-command catalog is re-advertised in full after every `session/load`,
-/// so the historical copies in `updates.jsonl` are redundant on replay and
-/// dominate large sessions (~51% of bytes in pathological cases). The lines stay
-/// on disk; this only skips forwarding them to the client.
-///
-/// A cheap [`AVAILABLE_COMMANDS_UPDATE_PREFIX`] substring pre-filter, then a
-/// positional confirm that the value at the first [`UPDATE_KEY`] begins with the
-/// ACU discriminant. Reads only the prefix (never the huge `availableCommands`
-/// array), so it can't be fooled by the discriminant embedded in `_meta` or a
-/// tool payload (never the first `"update":`).
-pub(crate) fn line_is_available_commands_update(line: &str) -> bool {
-    if !line.contains(&*AVAILABLE_COMMANDS_UPDATE_PREFIX) {
-        return false;
-    }
-    line.find(UPDATE_KEY)
-        .map(|pos| {
-            line[pos + UPDATE_KEY.len()..]
-                .trim_start()
-                .starts_with(&*AVAILABLE_COMMANDS_UPDATE_PREFIX)
-        })
-        .unwrap_or(false)
-}
-
-// `_meta` protocol field names (not enum discriminants).
-/// `_meta` key holding the running token count. The serde `rename` below must
-/// match it by hand (serde attrs can't reference a const).
-const TOTAL_TOKENS_KEY: &str = "totalTokens";
-/// `_meta` key holding the per-event id used for cursor-based reconnect.
-const EVENT_ID_KEY: &str = "eventId";
-
-/// Extract `_meta.totalTokens` from a persisted update line without allocating a
-/// `serde_json::Value`. Returns `None` when the line carries no token count.
-fn line_total_tokens(line: &str) -> Option<u64> {
-    if !line.contains(TOTAL_TOKENS_KEY) {
-        return None;
-    }
-    #[derive(serde::Deserialize)]
-    struct TokensPeek {
-        #[serde(rename = "totalTokens")]
-        total_tokens: Option<u64>,
-    }
-    serde_json::from_str::<TokensPeek>(line_meta(line)?.get())
-        .ok()
-        .and_then(|t| t.total_tokens)
-}
-
-/// This line's `_meta.eventId`, if any. Cheap peek (no `Value`).
-fn line_event_id(line: &str) -> Option<std::borrow::Cow<'_, str>> {
-    if !line.contains(EVENT_ID_KEY) {
-        return None;
-    }
-    #[derive(serde::Deserialize)]
-    struct EventIdPeek<'a> {
-        // `Cow` so an escaped eventId still parses and compares equal
-        // (`Option<Cow>` always deserializes owned; `&str` would error).
-        #[serde(rename = "eventId", borrow)]
-        event_id: Option<std::borrow::Cow<'a, str>>,
-    }
-    serde_json::from_str::<EventIdPeek<'_>>(line_meta(line)?.get())
-        .ok()
-        .and_then(|e| e.event_id)
-}
-
-/// Does this line's `_meta.eventId` equal `cursor_id`?
-fn line_has_event_id(line: &str, cursor_id: &str) -> bool {
-    line_event_id(line).as_deref() == Some(cursor_id)
-}
-
-/// Rewind-filter, resolve the reconnect cursor, drop redundant command catalogs,
-/// and scan `totalTokens`. Pure data processing — no gateway, no async.
-///
-/// The cursor is resolved BEFORE dropping ACUs: ACUs carry `_meta.eventId` and the
-/// post-load re-advertise is usually the *last* persisted event, so an idle client
-/// commonly reconnects with an ACU's eventId as its cursor. Resolving against the
-/// ACU-inclusive set keeps incremental reconnect cheap instead of a full replay.
-pub(crate) fn prepare_replay_lines<'a>(
-    raw_contents: &'a str,
-    cursor: Option<&str>,
-) -> PreparedReplay<'a> {
-    let filtered = filter_rewind_lines(
-        raw_contents
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect(),
-    );
-
-    // Highest `eventId` counter across all live (rewind-filtered) lines, used to
-    // re-seed the process-global event counter on resume so post-load live events
-    // keep monotonically increasing ids. eventId is "{sessionId}-{counter}" and
-    // session ids contain dashes, so the counter is the suffix after the LAST '-'.
-    let mut max_event_seq: Option<u64> = None;
-    for line in &filtered {
-        if line.contains("eventId")
-            && let Ok(env) = serde_json::from_str::<RawLinePeek<'_>>(line)
-            && let Some(raw) = env.params.map(|p| p.get())
-            && let Ok(pp) = serde_json::from_str::<RawParamsPeek<'_>>(raw)
-            && let Some(meta_raw) = pp.meta
-            && let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_raw.get())
-            && let Some(seq) = meta
-                .get("eventId")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.rsplit('-').next())
-                .and_then(|c| c.parse::<u64>().ok())
-        {
-            max_event_seq = Some(max_event_seq.map_or(seq, |m| m.max(seq)));
-        }
-    }
-
-    // Last live update carrying `_meta.totalTokens` (reverse scan, last-wins) over
-    // the full surviving timeline, so the count reflects total session state.
-    // ACUs never carry `totalTokens`, so scanning the ACU-inclusive set is safe.
-    let last_tokens = filtered
-        .iter()
-        .rev()
-        .find_map(|l| line_total_tokens(l))
-        .unwrap_or(0);
-
-    // Resolve the reconnect cursor against the ACU-inclusive set. `mark_replay`
-    // is true for a full historical replay (no cursor, or cursor not found).
-    //
-    // The cursor is refused when a FORWARDED tail line lacks an `eventId`:
-    // such a line cannot be covered by a future cursor and has no client-side
-    // dedup, so re-delivering it as live would re-apply it. Full replay is
-    // the safe fallback — the client swaps it in wholesale. Id-less lines
-    // come from older binaries or any emitter outside the stamping
-    // chokepoints (see `ensure_event_id_meta`). ACU lines are exempt: they
-    // are dropped below, never forwarded.
-    let cursor_pos = cursor
-        .and_then(|id| filtered.iter().rposition(|l| line_has_event_id(l, id)))
-        .filter(|&pos| {
-            let bounded = filtered[pos + 1..]
-                .iter()
-                .all(|l| line_is_available_commands_update(l) || line_event_id(l).is_some());
-            if !bounded {
-                tracing::warn!(
-                    "replay: post-cursor tail contains eventId-less lines; full replay instead"
-                );
-            }
-            bounded
-        });
-    let mark_replay = cursor_pos.is_none();
-    let start = cursor_pos.map_or(0, |pos| pos + 1);
-
-    // Single pass: drop ACUs (kept on disk), collect the post-cursor tail to
-    // forward, and count the full ACU-free live set for the skip log.
-    let mut lines: Vec<&str> = Vec::with_capacity(filtered.len().saturating_sub(start));
-    let mut total_live = 0usize;
-    for (i, &line) in filtered.iter().enumerate() {
-        if line_is_available_commands_update(line) {
-            continue;
-        }
-        total_live += 1;
-        if i >= start {
-            lines.push(line);
-        }
-    }
-
-    PreparedReplay {
-        lines,
-        mark_replay,
-        last_tokens,
-        max_event_seq,
-        total_live,
-        unfinished_subagents: collect_unfinished_subagents(&filtered),
-    }
-}
-
-/// Blank-strip, drop redundant command catalogs, and rewind-filter a raw
-/// `updates.jsonl` segment. Shared by the delta-replay path (which has no
-/// reconnect cursor); the initial replay path is [`prepare_replay_lines`], which
-/// additionally resolves a cursor (and so must see ACUs) before dropping them.
-pub(crate) fn filter_delta_replay_lines(contents: &str) -> Vec<&str> {
-    let live: Vec<&str> = contents
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !line_is_available_commands_update(l))
-        .collect();
-    filter_rewind_lines(live)
+    updates_path.exists().then_some(updates_path)
 }
 
 // ============================================================================
@@ -2687,6 +2406,48 @@ mod tests {
         )))
     }
 
+    /// The fork copy classifies raw lines while replay parity tests classify
+    /// typed updates; a divergence between the two classifiers would silently
+    /// shift fork truncation boundaries.
+    #[test]
+    fn rewind_step_classifiers_agree_on_serialized_updates() {
+        let rewind = SessionUpdate::Xai(Box::new(
+            crate::extensions::notification::SessionNotification {
+                session_id: acp::SessionId::new("s"),
+                update: crate::extensions::notification::SessionUpdate::RewindMarker {
+                    target_prompt_index: 2,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                meta: None,
+            },
+        ));
+        let host_turn_chunk = {
+            let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                "host".to_string(),
+            )))
+            .meta(serde_json::json!({ "hostTurn": true }).as_object().cloned());
+            SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+                acp::SessionId::new("s"),
+                acp::SessionUpdate::UserMessageChunk(chunk),
+            )))
+        };
+        for update in [
+            user_chunk("plain", None),
+            user_chunk("marked", Some(4)),
+            host_turn_chunk,
+            agent_chunk("agent"),
+            rewind,
+        ] {
+            let envelope = SessionUpdateEnvelope::from_update(&update).unwrap();
+            let line = serde_json::to_string(&envelope).unwrap();
+            assert_eq!(
+                rewind_step_for_line(&line),
+                rewind_step_for_update(&update),
+                "raw and typed classification must agree for {line}"
+            );
+        }
+    }
+
     #[test]
     fn updates_truncate_ignores_unmarked_phantoms_when_markers_present() {
         let updates = vec![
@@ -2700,7 +2461,7 @@ mod tests {
             agent_chunk("A2"),
         ];
         // Keep through P1 (indices 0,1); cut at start of P2 run.
-        let cut = updates_truncate_for_prompt(&updates, 1);
+        let cut = truncate_for_prompt_by(&updates, 1, rewind_step_for_update);
         assert_eq!(cut, 6);
         assert!(matches!(
             &updates[cut],
@@ -2718,9 +2479,18 @@ mod tests {
             .map(|i| user_chunk(&format!("P{i}"), Some(i)))
             .collect();
         // Target 2 keeps turns 0 and 1; cut at P2 (index 2).
-        assert_eq!(updates_truncate_for_prompt(&updates, 1), 2);
-        assert_eq!(updates_truncate_for_prompt(&updates, 2), 3);
-        assert_eq!(updates_truncate_for_prompt(&updates, 5), 6);
+        assert_eq!(
+            truncate_for_prompt_by(&updates, 1, rewind_step_for_update),
+            2
+        );
+        assert_eq!(
+            truncate_for_prompt_by(&updates, 2, rewind_step_for_update),
+            3
+        );
+        assert_eq!(
+            truncate_for_prompt_by(&updates, 5, rewind_step_for_update),
+            6
+        );
     }
 
     /// Mixed stream: unmarked runs before the first promptIndex still count.
@@ -2739,10 +2509,19 @@ mod tests {
             agent_chunk("A3"),
         ];
         // Target 1 keeps old0+old1; cut at new2.
-        assert_eq!(updates_truncate_for_prompt(&updates, 1), 4);
+        assert_eq!(
+            truncate_for_prompt_by(&updates, 1, rewind_step_for_update),
+            4
+        );
         // Target 2 keeps through A2 (and phantom run does not add a turn); cut at new3.
-        assert_eq!(updates_truncate_for_prompt(&updates, 2), 8);
-        assert_eq!(updates_truncate_for_prompt(&updates, 0), 2);
+        assert_eq!(
+            truncate_for_prompt_by(&updates, 2, rewind_step_for_update),
+            8
+        );
+        assert_eq!(
+            truncate_for_prompt_by(&updates, 0, rewind_step_for_update),
+            2
+        );
     }
 
     #[test]
@@ -2913,6 +2692,42 @@ mod tests {
     }
 
     #[test]
+    fn filter_rewind_ignores_a_malformed_middle_line() {
+        let user_message_1 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first"}}"#,
+        );
+        let agent_message_1 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resp1"}}"#,
+        );
+        let user_message_2 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"second"}}"#,
+        );
+        let agent_message_2 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resp2"}}"#,
+        );
+        let rewind_to_1 = xai_envelope(
+            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":1,"created_at":"2024-01-01"}"#,
+        );
+        let torn = "{ torn, unparseable jsonl line";
+
+        // The malformed line is kept but not counted as a prompt boundary, so
+        // the rewind still drops prompt 1.
+        let survivors = filter_rewind_lines(vec![
+            user_message_1.as_str(),
+            agent_message_1.as_str(),
+            torn,
+            user_message_2.as_str(),
+            agent_message_2.as_str(),
+            rewind_to_1.as_str(),
+        ]);
+
+        pretty_assertions::assert_eq!(
+            survivors,
+            vec![user_message_1.as_str(), agent_message_1.as_str(), torn]
+        );
+    }
+
+    #[test]
     fn filter_rewind_to_zero_clears_all() {
         let u1 = acp_envelope(
             r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"only"}}"#,
@@ -2994,613 +2809,91 @@ mod tests {
         assert!(result[2].contains("final"));
     }
 
-    // ── prepare_replay_lines tests ───────────────────────────────────────────
-
-    /// Envelope with _meta at the params level (where the real agent puts it).
-    fn acp_envelope_with_meta(session_update_json: &str, meta_json: &str) -> String {
-        format!(
-            r#"{{"timestamp":1,"method":"session/update","params":{{"sessionId":"s","update":{session_update_json},"_meta":{meta_json}}}}}"#
-        )
-    }
-
+    /// The raw-line filter and the typed filter must truncate an identical
+    /// rewind timeline to the same surviving updates, in the same order.
     #[test]
-    fn prepare_replay_cursor_skips_to_position() {
-        let u1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old"}}"#,
-            r#"{"eventId":"ev1"}"#,
-        );
-        let a1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old resp"}}"#,
-            r#"{"eventId":"ev2"}"#,
-        );
-        let u2 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"new"}}"#,
-            r#"{"eventId":"ev3"}"#,
-        );
-        let raw = format!("{u1}\n{a1}\n{u2}\n");
-
-        let prepared = prepare_replay_lines(&raw, Some("ev2"));
-        // Should skip ev1 and ev2, return only ev3
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(!prepared.mark_replay);
-        assert!(prepared.lines[0].contains("new"));
-        assert_eq!(prepared.total_live, 3);
-    }
-
-    #[test]
-    fn prepare_replay_cursor_not_found_returns_all() {
-        let u1 = acp_envelope(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
-        );
-        let raw = format!("{u1}\n");
-
-        let prepared = prepare_replay_lines(&raw, Some("nonexistent"));
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(prepared.mark_replay); // fallback to full replay
-    }
-
-    /// A resolved cursor is refused when the tail contains an eventId-less
-    /// line (older-binary history): the line has no client-side dedup and no
-    /// future cursor can cover it, so an incremental tail would re-apply it.
-    /// Full replay is the safe fallback.
-    #[test]
-    fn prepare_replay_cursor_refused_when_tail_has_event_id_less_line() {
-        let a1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"seen"}}"#,
-            r#"{"eventId":"ev1"}"#,
-        );
-        // xAI-style line persisted by an older binary: no _meta at all.
-        let old_xai = r#"{"timestamp":2,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"hook_annotation","message":"trailing"}}}"#;
-        let raw = format!("{a1}\n{old_xai}\n");
-
-        let prepared = prepare_replay_lines(&raw, Some("ev1"));
-        assert!(
-            prepared.mark_replay,
-            "an unbounded tail must force a full replay"
-        );
-        assert_eq!(prepared.lines.len(), 2, "full history is replayed");
-
-        // Same history with the trailing line stamped resolves incrementally.
-        let new_xai = r#"{"timestamp":2,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"hook_annotation","message":"trailing"},"_meta":{"eventId":"ev2"}}}"#;
-        let raw = format!("{a1}\n{new_xai}\n");
-        let prepared = prepare_replay_lines(&raw, Some("ev1"));
-        assert!(!prepared.mark_replay);
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(prepared.lines[0].contains("trailing"));
-
-        // An id-less ACU in the tail is exempt from the refusal — ACUs are
-        // dropped before forwarding, so they can never be re-applied.
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let raw = format!("{a1}\n{acu}\n");
-        let prepared = prepare_replay_lines(&raw, Some("ev1"));
-        assert!(
-            !prepared.mark_replay,
-            "a trailing id-less ACU must not force a full replay"
-        );
-        assert!(
-            prepared.lines.is_empty(),
-            "the ACU is dropped, never forwarded"
-        );
-    }
-
-    #[test]
-    fn prepare_replay_extracts_max_event_seq() {
-        // eventId is "{sessionId}-{counter}" and session ids contain dashes, so
-        // the counter is the suffix after the LAST '-'. max_event_seq is the
-        // highest counter across all live lines — used to re-seed the global
-        // event counter on resume so post-load live events stay monotonic and
-        // don't get dropped by the client's eventId dedup.
-        let a1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a"}}"#,
-            r#"{"eventId":"019e-abcd-7","totalTokens":100}"#,
-        );
-        let a2 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"b"}}"#,
-            r#"{"eventId":"019e-abcd-42","totalTokens":250}"#,
-        );
-        // Out-of-order counter (lower than the max) must not lower the result.
-        let a3 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"c"}}"#,
-            r#"{"eventId":"019e-abcd-13","totalTokens":250}"#,
-        );
-        let raw = format!("{a1}\n{a2}\n{a3}\n");
-
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(
-            prepared.max_event_seq,
-            Some(42),
-            "max counter across all lines (suffix after last '-')"
-        );
-        assert_eq!(prepared.last_tokens, 250);
-    }
-
-    #[test]
-    fn prepare_replay_no_event_ids_yields_none_max_seq() {
-        // Lines without a parseable numeric eventId suffix (older shell) yield
-        // None, so the counter is left untouched on resume.
-        let a1 = acp_envelope(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a"}}"#,
-        );
-        let raw = format!("{a1}\n");
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(prepared.max_event_seq, None);
-    }
-
-    // ── available_commands_update skip (T1) + single-pass equivalence ─────────
-
-    #[test]
-    fn acu_line_detection_exact_and_no_false_positive() {
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        assert!(line_is_available_commands_update(&acu));
-
-        // A user message that merely mentions the phrase must NOT match.
-        let user_mentions = acp_envelope(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"what is available_commands_update?"}}"#,
-        );
-        assert!(!line_is_available_commands_update(&user_mentions));
-    }
-
-    /// The anchor must reject the discriminant when it sits inside `_meta` (not
-    /// at the `params.update` position) — the real update here is a non-ACU.
-    #[test]
-    fn acu_anchor_ignores_discriminant_in_meta() {
-        let line = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}"#,
-            r#"{"sessionUpdate":"available_commands_update"}"#,
-        );
-        // The exact `"sessionUpdate":"available_commands_update"` substring IS
-        // present (in _meta), but it's not anchored to `"update":{`.
-        assert!(line.contains(r#""sessionUpdate":"available_commands_update""#));
-        assert!(!line_is_available_commands_update(&line));
-    }
-
-    /// A NON-ACU line whose `_meta` embeds the FULL unescaped nested anchor
-    /// (`{"update":{"sessionUpdate":"available_commands_update",...}}`) passes the
-    /// cheap substring pre-filter but must be REJECTED by the positional confirm
-    /// (its real `params.update` is a `tool_call`) — so it is never dropped.
-    #[test]
-    fn acu_confirm_rejects_nested_update_anchor_in_meta() {
-        let line = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"tool_call","toolCallId":"t","title":"x"}"#,
-            r#"{"echo":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}"#,
-        );
-        // The discriminant prefix IS present (in _meta) — pre-filter would match...
-        assert!(line.contains(&*AVAILABLE_COMMANDS_UPDATE_PREFIX));
-        // ...but the structural params.update is a tool_call, so NOT an ACU.
-        assert!(!line_is_available_commands_update(&line));
-
-        // And the non-ACU line survives replay (is not dropped).
-        let raw = format!("{line}\n");
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(prepared.lines.len(), 1, "non-ACU line must not be dropped");
-        assert!(prepared.lines[0].contains("tool_call"));
-    }
-
-    /// Pin the cross-crate assumption behind [`line_is_available_commands_update`]:
-    /// the structural `params.update` serializes BEFORE the optional `_meta`. Run a
-    /// genuine ACU through the real write path ([`SessionUpdateEnvelope::from_update`])
-    /// and assert its first `"update":` precedes any `"_meta":`, and the detector accepts it.
-    #[test]
-    fn acu_real_write_path_serializes_update_before_meta() {
-        let notif = acp::SessionNotification::new(
-            acp::SessionId::new("s"),
-            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![])),
-        )
-        .meta(serde_json::json!({ "eventId": "ev1" }).as_object().cloned());
-        let envelope =
-            SessionUpdateEnvelope::from_update(&SessionUpdate::Acp(Box::new(notif))).unwrap();
-        let line = serde_json::to_string(&envelope).unwrap();
-
-        let update_idx = line
-            .find(UPDATE_KEY)
-            .expect("serialized ACU line must contain an \"update\" key");
-        if let Some(meta_idx) = line.find(r#""_meta":"#) {
-            assert!(
-                update_idx < meta_idx,
-                "params.update must serialize before _meta: {line}"
-            );
-        }
-        assert!(line_is_available_commands_update(&line));
-    }
-
-    #[test]
-    fn prepare_replay_drops_available_commands_update() {
-        let u = acp_envelope(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
-        );
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let a = acp_envelope(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"yo"}}"#,
-        );
-        let raw = format!("{u}\n{acu}\n{a}\n");
-
-        let prepared = prepare_replay_lines(&raw, None);
-        // ACU dropped; the two real updates kept in original order.
-        assert_eq!(prepared.lines.len(), 2);
-        assert_eq!(prepared.total_live, 2);
-        assert!(
-            prepared
-                .lines
-                .iter()
-                .all(|l| !l.contains("available_commands_update"))
-        );
-        assert!(prepared.lines[0].contains("hi"));
-        assert!(prepared.lines[1].contains("yo"));
-        assert!(prepared.mark_replay);
-    }
-
-    #[test]
-    fn prepare_replay_scans_last_total_tokens_across_kept_lines() {
-        let u = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
-            r#"{"totalTokens":10}"#,
-        );
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let a = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"yo"}}"#,
-            r#"{"totalTokens":42}"#,
-        );
-        let raw = format!("{u}\n{acu}\n{a}\n");
-
-        let prepared = prepare_replay_lines(&raw, None);
-        // Last totalTokens wins; ACU lines (no tokens) don't disturb it.
-        assert_eq!(prepared.last_tokens, 42);
-        assert_eq!(prepared.lines.len(), 2);
-    }
-
-    #[test]
-    fn prepare_replay_rewind_truncates_and_drops_acu() {
-        let u0 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p0"}}"#,
-            r#"{"totalTokens":5}"#,
-        );
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let a0 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a0"}}"#,
-            r#"{"totalTokens":7}"#,
-        );
-        let rw = xai_envelope(
-            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":0,"created_at":"2024-01-01"}"#,
-        );
-        let u1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p1"}}"#,
-            r#"{"totalTokens":9}"#,
-        );
-        let raw = format!("{u0}\n{acu}\n{a0}\n{rw}\n{u1}\n");
-
-        let prepared = prepare_replay_lines(&raw, None);
-        // Rewind to 0 kills u0/a0; ACU dropped; only the new p1 survives.
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(prepared.lines[0].contains("p1"));
-        assert_eq!(prepared.total_live, 1);
-        // last_tokens recomputed from the surviving timeline (p1 = 9).
-        assert_eq!(prepared.last_tokens, 9);
-        assert!(prepared.mark_replay);
-    }
-
-    /// The single-pass implementation must match an independent reference that
-    /// drops ACU then applies the (canonical) rewind filter — for a mixed input.
-    #[test]
-    fn prepare_replay_single_pass_matches_reference() {
-        let lines_src = [
-            acp_envelope_with_meta(
-                r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p0"}}"#,
-                r#"{"totalTokens":3}"#,
-            ),
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#),
-            acp_envelope_with_meta(
-                r#"{"sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed"}"#,
-                r#"{"totalTokens":11}"#,
-            ),
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#),
-            acp_envelope(
-                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a0"}}"#,
-            ),
-        ];
-        let raw = format!("{}\n", lines_src.join("\n"));
-
-        // Reference: filter blanks + ACU, then canonical rewind filter, count.
-        let reference: Vec<&str> = filter_rewind_lines(
-            raw.lines()
-                .filter(|l| !l.trim().is_empty() && !line_is_available_commands_update(l))
-                .collect(),
-        );
-
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(prepared.lines, reference);
-        assert_eq!(prepared.total_live, reference.len());
-        assert_eq!(prepared.last_tokens, 11); // last kept line carrying tokens
-    }
-
-    /// The prompt-extract fast-reject must not be fooled by lines that merely
-    /// contain the discriminant substring inside their content — the full parse
-    /// still classifies them by the real `sessionUpdate` tag.
-    #[test]
-    fn fast_reject_handles_discriminant_substring_in_content() {
-        let line = acp_envelope(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the user_message_chunk format"}}"#,
-        );
-        assert_eq!(
-            parse_prompt_extract_event(&line),
-            PromptExtractEvent::NotUserMessage
-        );
-    }
-
-    /// A `rewind_marker` appearing only inside content must NEVER become a
-    /// `RewindTo` (which would corrupt prompt_index / turn numbering).
-    #[test]
-    fn fast_reject_rewind_marker_in_content() {
-        // (a) agent message mentioning rewind_marker → NotUserMessage.
-        let agent = acp_envelope(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"about rewind_marker semantics"}}"#,
-        );
-        assert_eq!(
-            parse_prompt_extract_event(&agent),
-            PromptExtractEvent::NotUserMessage
-        );
-
-        // (b) an ACP (non-xai) update carrying rewind_marker in content is NOT a
-        // real xai rewind_marker → NotUserMessage (no RewindTo).
-        let acp_rewindish = acp_envelope(
-            r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"rewind_marker"}}"#,
-        );
-        assert_eq!(
-            parse_prompt_extract_event(&acp_rewindish),
-            PromptExtractEvent::NotUserMessage
-        );
-
-        // (c) a user_message_chunk whose text contains rewind_marker → still the
-        // user text (the discriminant is user_message_chunk).
-        let user = acp_envelope(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"explain rewind_marker please"}}"#,
-        );
-        assert_eq!(
-            parse_prompt_extract_event(&user),
-            PromptExtractEvent::user_text("explain rewind_marker please")
-        );
-    }
-
-    /// A user prompt whose text contains the literal escaped-JSON ACU
-    /// discriminant must NOT be dropped as an `available_commands_update` — the
-    /// `"update":{` anchor only matches the real structural discriminant, not the
-    /// escaped fragment in content.
-    #[test]
-    fn acu_drop_ignores_escaped_json_in_content() {
-        let line = acp_envelope(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"paste: {\"sessionUpdate\":\"available_commands_update\"}"}}"#,
-        );
-        // The bare phrase appears in the (escaped) content, but it's not at the
-        // structural `"update":{"sessionUpdate":...` position, so it's kept.
-        assert!(line.contains("available_commands_update"));
-        assert!(!line_is_available_commands_update(&line));
-
-        let raw = format!("{line}\n");
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(prepared.lines.len(), 1, "user prompt must survive replay");
-        assert!(prepared.lines[0].contains("available_commands_update"));
-    }
-
-    /// An idle client reconnecting with the cursor pointing at the LAST persisted
-    /// event — an ACU (the post-load re-advertise) — must resolve the cursor on the
-    /// ACU-inclusive set rather than fall back to full replay.
-    #[test]
-    fn prepare_replay_cursor_on_dropped_acu_resolves() {
-        let u = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
-            r#"{"eventId":"ev1"}"#,
-        );
-        let a = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"yo"}}"#,
-            r#"{"eventId":"ev2"}"#,
-        );
-        let acu = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#,
-            r#"{"eventId":"ev3"}"#,
-        );
-        let raw = format!("{u}\n{a}\n{acu}\n");
-
-        // Cursor == the ACU's eventId → resolved; nothing after → no replay,
-        // and crucially NOT a full replay.
-        let prepared = prepare_replay_lines(&raw, Some("ev3"));
-        assert!(!prepared.mark_replay, "must not fall back to full replay");
-        assert!(prepared.lines.is_empty(), "client is already caught up");
-
-        // Cursor == ev1 → replay ev2, ev3; the ACU (ev3) is dropped from the tail.
-        let prepared = prepare_replay_lines(&raw, Some("ev1"));
-        assert!(!prepared.mark_replay);
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(prepared.lines[0].contains("yo"));
-    }
-
-    /// A trailing `rewind_marker` empties the live set and yields
-    /// `last_tokens == 0` (the `unwrap_or(0)` path).
-    #[test]
-    fn prepare_replay_trailing_rewind_marker_empties() {
-        let u0 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p0"}}"#,
-            r#"{"totalTokens":5}"#,
-        );
-        let rw = xai_envelope(
-            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":0,"created_at":"2024-01-01"}"#,
-        );
-        let raw = format!("{u0}\n{rw}\n");
-        let prepared = prepare_replay_lines(&raw, None);
-        assert!(prepared.lines.is_empty());
-        assert_eq!(prepared.total_live, 0);
-        assert_eq!(prepared.last_tokens, 0);
-    }
-
-    /// An ACU as the final line is dropped without disturbing tokens.
-    #[test]
-    fn prepare_replay_trailing_acu_dropped() {
-        let u = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}"#,
-            r#"{"totalTokens":7}"#,
-        );
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let raw = format!("{u}\n{acu}\n");
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(prepared.lines[0].contains("hi"));
-        assert_eq!(prepared.last_tokens, 7);
-        assert_eq!(prepared.total_live, 1);
-    }
-
-    /// Rewind + cursor + ACU together, with explicit expected values.
-    #[test]
-    fn prepare_replay_rewind_then_cursor_with_acu() {
-        let u0 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p0"}}"#,
-            r#"{"eventId":"e0","totalTokens":2}"#,
-        );
-        let a0 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a0"}}"#,
-            r#"{"eventId":"e1"}"#,
-        );
-        let acu0 =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let rw = xai_envelope(
-            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":0,"created_at":"2024-01-01"}"#,
-        );
-        let u1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p1"}}"#,
-            r#"{"eventId":"e2","totalTokens":9}"#,
-        );
-        let acu1 =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
-        let a1 = acp_envelope_with_meta(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a1"}}"#,
-            r#"{"eventId":"e3","totalTokens":12}"#,
-        );
-        let raw = format!("{u0}\n{a0}\n{acu0}\n{rw}\n{u1}\n{acu1}\n{a1}\n");
-
-        // Rewind to 0 kills u0/a0/acu0; surviving live = [u1(e2), acu1, a1(e3)].
-        // Cursor on e2 → tail = [acu1, a1]; drop acu1 → lines = [a1].
-        let prepared = prepare_replay_lines(&raw, Some("e2"));
-        assert!(!prepared.mark_replay);
-        assert_eq!(prepared.lines.len(), 1);
-        assert!(prepared.lines[0].contains("a1"));
-        assert_eq!(prepared.last_tokens, 12); // last token-bearing survivor
-        assert_eq!(prepared.total_live, 2); // ACU-free survivors: u1, a1
-    }
-
-    /// The delta-replay helper (shared with the initial path) drops blanks + ACUs
-    /// and applies the canonical rewind filter.
-    #[test]
-    fn filter_delta_replay_drops_blank_acu_and_rewinds() {
+    fn filter_rewind_lines_and_updates_agree() {
         let u1 = acp_envelope(
             r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p1"}}"#,
         );
-        let acu =
-            acp_envelope(r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#);
         let a1 = acp_envelope(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a1"}}"#,
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"r1"}}"#,
         );
-        // A second prompt that a trailing rewind_marker then discards.
         let u2 = acp_envelope(
-            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p2-dead"}}"#,
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p2"}}"#,
         );
         let a2 = acp_envelope(
-            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a2-dead"}}"#,
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"r2"}}"#,
         );
-        let rw = xai_envelope(
+        let rw1 = xai_envelope(
+            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":2,"created_at":"2024-01-01"}"#,
+        );
+        let u3 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p3"}}"#,
+        );
+        let a3 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"r3"}}"#,
+        );
+        let rw2 = xai_envelope(
             r#"{"sessionUpdate":"rewind_marker","target_prompt_index":1,"created_at":"2024-01-01"}"#,
         );
-        let raw = format!("{u1}\n\n{acu}\n{a1}\n{u2}\n{a2}\n{rw}\n");
-
-        let live = filter_delta_replay_lines(&raw);
-        // Blank + ACU dropped; the rewind to prompt 1 truncates the dead branch
-        // (u2/a2) and consumes the marker, leaving only p1/a1.
-        assert_eq!(live.len(), 2);
-        assert!(
-            live.iter()
-                .all(|l| !l.contains("available_commands_update"))
+        let u4 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"final"}}"#,
         );
-        assert!(live[0].contains("p1"));
-        assert!(live[1].contains("a1"));
-        assert!(live.iter().all(|l| !l.contains("dead")));
-        assert!(live.iter().all(|l| !l.contains("rewind_marker")));
-    }
 
-    #[test]
-    fn prepare_replay_reports_spawn_without_finish() {
-        let spawn = |id: &str, child: &str| {
-            format!(
-                r#"{{"method":"_x.ai/session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"subagent_spawned","subagent_id":"{id}","parent_session_id":"s","child_session_id":"{child}","subagent_type":"general-purpose","description":"task"}},"_meta":{{"eventId":"s-1"}}}}}}"#
-            )
-        };
-        let finish = |id: &str| {
-            format!(
-                r#"{{"method":"_x.ai/session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"subagent_finished","subagent_id":"{id}","child_session_id":"c{id}","status":"completed","tool_calls":0,"turns":0,"duration_ms":0}},"_meta":{{"eventId":"s-2"}}}}}}"#
-            )
-        };
-        // `a` spawns and finishes (paired); `b` only spawns (orphan).
-        let raw = format!(
-            "{}\n{}\n{}\n",
-            spawn("a", "ca"),
-            finish("a"),
-            spawn("b", "cb")
-        );
-        let prepared = prepare_replay_lines(&raw, None);
-        assert_eq!(
-            prepared.unfinished_subagents,
-            vec![("b".to_string(), "cb".to_string())]
-        );
-    }
-
-    /// Legacy lines put `sessionId`/`update` at the top level (no `params`
-    /// envelope); orphan detection must still pair them.
-    #[test]
-    fn collect_unfinished_subagents_handles_legacy_top_level_lines() {
         let lines = vec![
-            r#"{"sessionId":"s","update":{"sessionUpdate":"subagent_spawned","subagent_id":"a","parent_session_id":"s","child_session_id":"ca","subagent_type":"general-purpose","description":"task"}}"#,
-            r#"{"sessionId":"s","update":{"sessionUpdate":"subagent_finished","subagent_id":"a","child_session_id":"ca","status":"completed","tool_calls":0,"turns":0,"duration_ms":0}}"#,
-            r#"{"sessionId":"s","update":{"sessionUpdate":"subagent_spawned","subagent_id":"b","parent_session_id":"s","child_session_id":"cb","subagent_type":"general-purpose","description":"task"}}"#,
+            u1.as_str(),
+            a1.as_str(),
+            u2.as_str(),
+            a2.as_str(),
+            rw1.as_str(),
+            u3.as_str(),
+            a3.as_str(),
+            rw2.as_str(),
+            u4.as_str(),
         ];
-        // `a` is paired (spawn+finish); `b` only spawned → orphan.
-        assert_eq!(
-            collect_unfinished_subagents(&lines),
-            vec![("b".to_string(), "cb".to_string())]
-        );
+
+        let ser = |u: &SessionUpdate| serde_json::to_string(u).unwrap();
+        let via_lines: Vec<String> = filter_rewind_lines(lines.clone())
+            .iter()
+            .map(|l| ser(&SessionUpdateEnvelope::from_str(l).unwrap()))
+            .collect();
+        let typed: Vec<SessionUpdate> = lines
+            .iter()
+            .map(|l| SessionUpdateEnvelope::from_str(l).unwrap())
+            .collect();
+        let via_updates: Vec<String> = filter_rewind_updates(typed).iter().map(ser).collect();
+
+        assert_eq!(via_lines, via_updates);
     }
 
-    /// Resume idempotency seam: the finish the stream reconcile emits must
-    /// re-pair the orphan's spawn on the next resume (emit→serialize→collect),
-    /// so a second resume doesn't re-emit. Guards a `SubagentFinished` shape drift.
+    /// An out-of-range rewind target folds to `result.len()` (the
+    /// `unwrap_or(result.len())` branch in `filter_rewind_by`), so truncation is
+    /// a no-op and every survivor is kept.
     #[test]
-    fn collect_pairs_a_reconcile_emitted_finish_with_its_spawn() {
-        use crate::extensions::notification::{SessionNotification, SessionUpdate};
-
-        let spawn = r#"{"sessionId":"s","update":{"sessionUpdate":"subagent_spawned","subagent_id":"sa","parent_session_id":"s","child_session_id":"ca","subagent_type":"general-purpose","description":"task"}}"#.to_string();
-        // Build the finish exactly as the stream reconcile emits it.
-        let finish = serde_json::to_string(&SessionNotification {
-            session_id: acp::SessionId::new("s"),
-            update: SessionUpdate::SubagentFinished {
-                subagent_id: "sa".into(),
-                child_session_id: "ca".into(),
-                status: "cancelled".into(),
-                error: Some("interrupted by process restart".into()),
-                tool_calls: 0,
-                turns: 0,
-                duration_ms: 0,
-                tokens_used: 0,
-                output: None,
-                will_wake: false,
-            },
-            meta: None,
-        })
-        .unwrap();
-
-        assert!(
-            collect_unfinished_subagents(&[spawn.as_str(), finish.as_str()]).is_empty(),
-            "the emitted finish must re-pair the spawn so a 2nd resume doesn't re-emit"
+    fn filter_rewind_out_of_range_target_keeps_all() {
+        let u1 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p1"}}"#,
         );
+        let a1 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"r1"}}"#,
+        );
+        // Only prompt index 0 exists; target 5 is out of range.
+        let rw = xai_envelope(
+            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":5,"created_at":"2024-01-01"}"#,
+        );
+        let u2 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"p2"}}"#,
+        );
+
+        let lines = vec![u1.as_str(), a1.as_str(), rw.as_str(), u2.as_str()];
+        let result = filter_rewind_lines(lines);
+
+        // Marker is dropped; the three ACP survivors remain in order.
+        assert_eq!(result.len(), 3);
+        assert!(result[0].contains("p1"));
+        assert!(result[1].contains("r1"));
+        assert!(result[2].contains("p2"));
     }
 
     // ── collect_assistant_text / collect_tool_metadata tests ──────────────────

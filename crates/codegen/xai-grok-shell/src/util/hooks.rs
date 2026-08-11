@@ -7,14 +7,17 @@ use xai_grok_hooks::discovery::HookSource;
 use xai_grok_hooks::error::HookError;
 
 /// Owned paths for hook sources. Callers borrow via `as_sources()`.
-pub struct HookSourcePaths {
+pub(crate) struct HookSourcePaths {
     pub global: Vec<PathBuf>,
     pub project: Vec<PathBuf>,
 }
 
 impl HookSourcePaths {
     /// Borrow as `HookSource` refs. Project sources are excluded when untrusted.
-    pub fn as_sources(&self, include_project: bool) -> (Vec<HookSource<'_>>, Vec<HookSource<'_>>) {
+    pub(crate) fn as_sources(
+        &self,
+        include_project: bool,
+    ) -> (Vec<HookSource<'_>>, Vec<HookSource<'_>>) {
         let global = self.global.iter().map(|p| path_to_source(p)).collect();
         let project = if include_project {
             self.project.iter().map(|p| path_to_source(p)).collect()
@@ -43,8 +46,8 @@ fn include_cursor_hooks(compat: &xai_grok_tools::types::compat::CompatConfig) ->
 }
 
 /// Global + project hook source paths. Registry file is never a discovery
-/// source; Claude/Cursor globals are appended when gates are on.
-pub fn discover_hook_source_paths(
+/// source; compatible vendor globals are appended when their gates are on.
+pub(crate) fn discover_hook_source_paths(
     git_root: Option<&Path>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
 ) -> HookSourcePaths {
@@ -105,12 +108,42 @@ pub fn discover_hook_source_paths(
 /// Single load entry point: build compat-aware sources, gate project sources on
 /// trust, then load. Every session-startup and mid-session reload site routes
 /// through here so the source policy stays in one place.
-pub fn discover_hooks(
+pub(crate) fn discover_hooks(
     git_root: Option<&Path>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
     trusted: bool,
 ) -> (xai_grok_hooks::discovery::HookRegistry, Vec<HookError>) {
+    // Read fresh each call (not cached): a mid-session `/hooks` reload must see an
+    // updated `config.toml` / `managed_config.toml`. This is lighter than
+    // `ConfigLayers::load` (only the small per-layer files, no campaigns, version
+    // overrides, or MDM).
+    let config_layers = xai_grok_config::hook_config_layers();
+    assemble_hooks(&config_layers, git_root, compat, trusted)
+}
+
+/// Pure, injectable core: combine config-layer hooks with file-source hooks and
+/// dedup once. Config-layer specs are placed first so that, under the first-wins
+/// dedup in [`xai_grok_hooks::discovery::registry_from_specs_deduped`], a config
+/// hook wins over a byte-identical file hook. `config_layers` is a parameter (not
+/// read here) so tests can drive it with hand-built layers.
+pub(crate) fn assemble_hooks(
+    config_layers: &[xai_grok_config::HookConfigLayer],
+    git_root: Option<&Path>,
+    compat: &xai_grok_tools::types::compat::CompatConfig,
+    trusted: bool,
+) -> (xai_grok_hooks::discovery::HookRegistry, Vec<HookError>) {
+    let (mut specs, mut errors) =
+        xai_grok_hooks::config::parse_hooks_from_config_layers(config_layers);
+
     let source_paths = discover_hook_source_paths(git_root, compat);
     let (global_sources, project_sources) = source_paths.as_sources(trusted);
-    xai_grok_hooks::discovery::load_hooks_from_sources(&global_sources, &project_sources)
+    let (file_specs, file_errors) =
+        xai_grok_hooks::discovery::collect_specs_from_sources(&global_sources, &project_sources);
+    specs.extend(file_specs);
+    errors.extend(file_errors);
+
+    (
+        xai_grok_hooks::discovery::registry_from_specs_deduped(specs),
+        errors,
+    )
 }

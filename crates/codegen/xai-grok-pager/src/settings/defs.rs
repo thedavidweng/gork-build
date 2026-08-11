@@ -130,6 +130,8 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
 // can fail. Commit on Enter only.
 // ---------------------------------------------------------------------------
 
+// The setting's own description carries the full explanation, so the choices
+// are bare labels — an empty description collapses each to a single line.
 const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[EnumChoice {
     canonical: "opt-out",
     display: "Opt out (locked)",
@@ -307,9 +309,10 @@ const SCREEN_MODE_CHOICES: &[EnumChoice] = &[
 ];
 
 // Voice-capture-mode catalog. SHELL-owned, persisted to `[ui].voice_capture_mode`.
-// `hold` is only offered on terminals that report key releases (Kitty keyboard
-// protocol); `effective_enum_choices` hides it elsewhere, and it falls back to
-// `toggle` at runtime.
+// `hold` is gated on `kitty_releases_reported`; `effective_enum_choices` hides it
+// elsewhere, and it falls back to `toggle` at runtime. "Kitty-protocol terminal"
+// in the copy below is a deliberate user-facing simplification: Alacritty <= 0.14
+// negotiates the protocol yet never reports releases, so hold stays hidden there.
 const VOICE_CAPTURE_MODE_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: "toggle",
@@ -618,6 +621,20 @@ pub fn default_settings() -> Vec<SettingMeta> {
             keywords: &["queue", "combine", "batch", "follow-up", "merge", "pending"],
             kind: SettingKind::Bool {
                 default: ui_default.combine_queued_prompts.unwrap_or(false),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "confirm_before_rewind",
+            category: SettingCategory::Editor,
+            owner: SettingOwner::Shared,
+            label: "Confirm before rewind",
+            description: "Ask before rewinding conversation history. Turn off to rewind \
+                          immediately when you pick a turn.",
+            keywords: &["rewind", "confirm", "undo", "history", "ask", "prompt"],
+            kind: SettingKind::Bool {
+                default: ui_default.confirm_before_rewind_enabled(),
             },
             restart_required: false,
             hidden_in_minimal: false,
@@ -1305,9 +1322,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Advanced,
             owner: SettingOwner::Shell,
             label: "Auto-update",
-            description: "Unused in Gork Build. Vendor (x.ai) auto-update is hard-disabled so \
-                          this fork is never overwritten by official Grok Build installers. \
-                          Update by rebuilding from the gork-build repository.",
+            description: "Unused in Gork Build. Vendor (x.ai) auto-update is hard-disabled so                           this fork is never overwritten by official Grok Build installers.                           Update by rebuilding from the gork-build repository.",
             keywords: &[
                 "auto", "update", "updates", "upgrade", "version", "install", "channel",
             ],

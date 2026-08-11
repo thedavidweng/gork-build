@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Davy <95214375+thedavidweng@users.noreply.github.com>
-Date: Fri, 17 Jul 2026 01:03:26 -0700
+From ec3e6e845f2e0e3ac905ba0a27805652915d7b4c Mon Sep 17 00:00:00 2001
+From: Gork <gork-ci@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 03:09:53 -0700
 Subject: [PATCH] product-identity: CLI binary name and entry surface
 
 Gork-Patch-Id: product-identity
@@ -8,16 +8,18 @@ Gork-Invariant: product-cli-gork
 Gork-Risk: medium
 ---
  crates/codegen/xai-grok-pager-bin/Cargo.toml  | 18 ++++++-----
- crates/codegen/xai-grok-pager-bin/src/main.rs | 20 ++++++------
+ crates/codegen/xai-grok-pager-bin/src/main.rs | 22 +++++++------
+ crates/codegen/xai-grok-pager/src/app/cli.rs  | 12 ++++---
  .../xai-grok-pager/src/completions_cmd.rs     | 31 +++++++++++++------
- 3 files changed, 44 insertions(+), 25 deletions(-)
+ crates/codegen/xai-grok-pager/src/lib.rs      |  2 +-
+ 5 files changed, 54 insertions(+), 31 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
-index 5cb2c00930c8c0ea31eae949cd028d0ccbdcff8a..f2d1fdbbfd84fe9d3f6f33fe5c02fb8d08244c17 100644
+index 39ccb43..4a5cc59 100644
 --- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
 @@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
- version = "0.2.111"
+ version = "1.0.0"
  edition.workspace = true
  license = "Apache-2.0"
 -authors = ["xAI"]
@@ -43,7 +45,7 @@ index 5cb2c00930c8c0ea31eae949cd028d0ccbdcff8a..f2d1fdbbfd84fe9d3f6f33fe5c02fb8d
  name = "xai-grok-pager"
  path = "src/main.rs"
 diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
-index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadfb3fa7e93 100644
+index b97dd4e..a9f45c4 100644
 --- a/crates/codegen/xai-grok-pager-bin/src/main.rs
 +++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
 @@ -3,7 +3,8 @@
@@ -56,7 +58,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
  )]
  #[cfg(all(feature = "jemalloc", unix))]
  #[global_allocator]
-@@ -154,7 +155,7 @@ async fn run_setup_command(json: bool) {
+@@ -156,7 +157,7 @@ async fn run_setup_command(json: bool) {
      if !managed_config::has_principal() {
          eprintln!("No deployment key or team sign-in found.");
          eprintln!();
@@ -65,7 +67,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
          eprintln!("or set a deployment key:");
          eprintln!();
          if cfg!(unix) {
-@@ -162,7 +163,7 @@ async fn run_setup_command(json: bool) {
+@@ -164,7 +165,7 @@ async fn run_setup_command(json: bool) {
          } else {
              eprintln!("  $env:GROK_DEPLOYMENT_KEY=\"<your-key>\"");
          }
@@ -74,7 +76,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
          eprintln!();
          eprintln!("Or add the key to ~/.grok/config.toml:");
          eprintln!();
-@@ -202,7 +203,7 @@ async fn run_setup_command(json: bool) {
+@@ -204,7 +205,7 @@ async fn run_setup_command(json: bool) {
          }
          SetupOutcome::Skipped => {
              eprintln!(
@@ -83,7 +85,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
              );
          }
          SetupOutcome::Failed(e) => {
-@@ -426,14 +427,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
+@@ -442,14 +443,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
          WorkspaceGate::Enabled => {}
          WorkspaceGate::Disabled => {
              anyhow::bail!(
@@ -101,7 +103,16 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
               try again."
              )
          }
-@@ -1621,7 +1622,8 @@ fn install_heap_profile_hooks() {
+@@ -1106,7 +1107,7 @@ async fn run_agent_command(
+     let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
+     if !is_stdio && !is_leader {
+         eprintln!(
+-            "Grok Build (pager) - v{}",
++            "Gork Build (pager) - v{}",
+             xai_grok_version::display_version_with_commit(
+                 env!("VERSION_WITH_COMMIT"),
+                 xai_grok_update::channel_label(),
+@@ -1788,7 +1789,8 @@ fn install_heap_profile_hooks() {
  }
  fn version_text(channel_label: &str) -> String {
      format!(
@@ -111,7 +122,7 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
          xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
      )
  }
-@@ -2331,7 +2333,7 @@ mod tests {
+@@ -2587,7 +2589,7 @@ mod tests {
              let mut output = Vec::new();
              write_version(&mut output, label).unwrap();
              let output = String::from_utf8(output).unwrap();
@@ -120,8 +131,45 @@ index c824312a903f7f43855b497f13a4b055340249dd..ef2b1b04f8321ce9d15b0c2f6ecdeadf
              assert!(output.contains(env!("VERSION_WITH_COMMIT")));
              assert!(output.ends_with(expected_suffix), "{output:?}");
          }
+diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
+index 70f029f..53453be 100644
+--- a/crates/codegen/xai-grok-pager/src/app/cli.rs
++++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
+@@ -401,9 +401,9 @@ pub struct LeaderArgs {
+ }
+ #[derive(Debug, Clone, Parser)]
+ #[command(
+-    name = "grok",
++    name = "gork",
+     version = env!("VERSION_WITH_COMMIT"),
+-    about = "Grok Build TUI",
++    about = "Gork Build TUI",
+     disable_version_flag = true,
+     next_display_order = None,
+     help_template = "\
+@@ -822,14 +822,18 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
+ impl PagerArgs {
+     /// Parse CLI arguments without applying side effects.
+     pub fn parse_cli() -> Self {
++        // Gork Build ships as PRODUCT_CLI ("gork"); keep "grok"/"agent" as
++        // recognized invocation names for path/compat aliases.
+         let bin_name = std::env::args()
+             .next()
+             .as_deref()
+             .map(std::path::Path::new)
+             .and_then(|p| p.file_name())
+             .and_then(|n| n.to_str())
+-            .filter(|n| *n == "grok" || *n == "agent")
+-            .unwrap_or("grok")
++            .filter(|n| {
++                *n == xai_grok_version::PRODUCT_CLI || *n == "gork" || *n == "grok" || *n == "agent"
++            })
++            .unwrap_or(xai_grok_version::PRODUCT_CLI)
+             .to_owned();
+         Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
+     }
 diff --git a/crates/codegen/xai-grok-pager/src/completions_cmd.rs b/crates/codegen/xai-grok-pager/src/completions_cmd.rs
-index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab4eba9241 100644
+index 176f49d..8dcd337 100644
 --- a/crates/codegen/xai-grok-pager/src/completions_cmd.rs
 +++ b/crates/codegen/xai-grok-pager/src/completions_cmd.rs
 @@ -58,18 +58,25 @@ fn fix_zsh_root_prompt_positional(script: &str) -> String {
@@ -188,17 +236,16 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
 +        );
      }
  }
-
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
-prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
-prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
-prerequisite-patch-id: a52276cc5d5a3f41e35f0a9442966519c69eef05
-prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
-prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
-prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
-prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
+diff --git a/crates/codegen/xai-grok-pager/src/lib.rs b/crates/codegen/xai-grok-pager/src/lib.rs
+index 949379f..000b558 100644
+--- a/crates/codegen/xai-grok-pager/src/lib.rs
++++ b/crates/codegen/xai-grok-pager/src/lib.rs
+@@ -1,4 +1,4 @@
+-//! xai-grok-pager — Grok Build TUI.
++//! xai-grok-pager — Gork Build TUI.
+ //!
+ //! A clean-room implementation built on the v3 pager rendering engine.
+ 
 -- 
 2.50.1 (Apple Git-155)
 

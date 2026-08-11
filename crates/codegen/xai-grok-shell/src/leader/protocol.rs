@@ -19,7 +19,9 @@ pub enum ProtocolError {
     ConnectionClosed,
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, ProtocolError> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -39,7 +41,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<(), ProtocolError> {
@@ -182,7 +184,7 @@ pub struct LeaderCapabilities {
     pub workspace_exposure: bool,
     /// Whether the leader supports [`ControlCommand::RelaunchForUpdate`] — a
     /// disruptive, bounded-grace relaunch onto a freshly-installed binary
-    /// (driven by `gork update`). Old leaders default to `false`, so a new
+    /// (driven by `grok update`). Old leaders default to `false`, so a new
     /// client falls back to advising a manual restart (graceful degradation).
     #[serde(default)]
     pub relaunch_v1: bool,
@@ -210,12 +212,12 @@ pub enum ControlCommand {
     WorkspaceStop,
     WorkspaceStatus,
     /// Ask the leader to relaunch onto a freshly-installed binary (driven by
-    /// `gork update`). The leader stops admitting new turns, waits a bounded
+    /// `grok update`). The leader stops admitting new turns, waits a bounded
     /// grace period for in-flight turns to finish, flushes session state, then
     /// exits with [`ShutdownReason::AutoUpdate`] so connected clients reconnect
     /// onto the new binary and restore their sessions via `session/load`.
     ///
-    /// `to_version` is the version `gork update` just installed; the leader uses
+    /// `to_version` is the version `grok update` just installed; the leader uses
     /// it to decline if it is already running that version or newer.
     RelaunchForUpdate {
         to_version: String,
@@ -389,6 +391,71 @@ pub enum ServerMessage {
     /// finishes initialising. The client should treat this as the signal that
     /// ACP traffic will now be forwarded correctly.
     LeaderReady,
+}
+
+/// Extension methods injected into the agent, named as the agent matches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumIter)]
+pub(crate) enum InternalMethod {
+    AuthCleared,
+    EvictSessions,
+    ReloadAllMcpServers,
+    ReloadModels,
+    ReloadModelsCache,
+    ReloadProjectMcpServers,
+    ReloadSkills,
+    ReloadWorkflows,
+}
+
+impl InternalMethod {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::AuthCleared => "x.ai/internal/auth_cleared",
+            Self::EvictSessions => "x.ai/internal/evict_sessions",
+            Self::ReloadAllMcpServers => "x.ai/internal/reload_all_mcp_servers",
+            Self::ReloadModels => "x.ai/internal/reload_models",
+            Self::ReloadModelsCache => "x.ai/internal/reload_models_cache",
+            Self::ReloadProjectMcpServers => "x.ai/internal/reload_project_mcp_servers",
+            Self::ReloadSkills => "x.ai/internal/reload_skills",
+            Self::ReloadWorkflows => "x.ai/internal/reload_workflows",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        use strum::IntoEnumIterator;
+
+        Self::iter().find(|method| method.name() == name)
+    }
+
+    /// The decoder routes a custom method to `ext_method` / `ext_notification`
+    /// only when it carries the `_` prefix, and rejects the bare name.
+    fn wire_name(self) -> String {
+        format!("_{}", self.name())
+    }
+}
+
+/// Not newline-terminated: the `acp_tx` forwarding loop appends the terminator.
+pub(crate) fn internal_notification(method: InternalMethod, params: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method.wire_name(),
+        "params": params,
+    })
+    .to_string()
+}
+
+/// Newline-terminated for direct injection.
+pub(crate) fn internal_request_line(
+    id: &str,
+    method: InternalMethod,
+    params: serde_json::Value,
+) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method.wire_name(),
+        "params": params,
+    });
+    format!("{msg}\n")
 }
 
 #[cfg(test)]
@@ -713,6 +780,25 @@ mod tests {
                 assert_eq!(delay_ms, 2000);
             }
             _ => panic!("Expected ShuttingDown, got {:?}", received),
+        }
+    }
+
+    #[test]
+    fn every_internal_method_carries_the_routable_prefix() {
+        use strum::IntoEnumIterator;
+
+        for method in InternalMethod::iter() {
+            for line in [
+                internal_notification(method, serde_json::json!({})),
+                internal_request_line("id", method, serde_json::json!({})),
+            ] {
+                let json: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+                assert_eq!(
+                    json["method"].as_str().and_then(|m| m.strip_prefix('_')),
+                    Some(method.name()),
+                    "unroutable wire method: {line}"
+                );
+            }
         }
     }
 

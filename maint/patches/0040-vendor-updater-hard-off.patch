@@ -40,7 +40,7 @@ index 0cc1ece75532c4ce34b2499a2b268a1244bc7aa5..12e58922411638c740a517ef333da13c
  anyhow = { workspace = true }
  futures = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa73426978d035446 100644
+index a4abba95c6a89a56dae234c720ac3e631dd998c7..fdf0ea3a6738c22333c45c3edba5d0acc76b02dd 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
 @@ -25,23 +25,68 @@ pub enum UpdateRunMode {
@@ -322,7 +322,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
              current_version, latest_version, channel_label
          );
          if interactive {
-@@ -763,6 +842,11 @@ pub async fn run_install_script(
+@@ -765,6 +844,11 @@ pub async fn run_install_script(
      target: Option<&str>,
      update_config: &UpdateConfig,
  ) -> Result<()> {
@@ -334,7 +334,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
      let result = match installer {
          "npm" => install_npm(
              target,
-@@ -1163,6 +1247,12 @@ async fn download_cli_artifact_from_gcs(
+@@ -1165,6 +1249,12 @@ async fn download_cli_artifact_from_gcs(
  }
  
  async fn install_internal(target: Option<&str>, update_config: &UpdateConfig) -> Result<()> {
@@ -347,7 +347,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
      install_internal_from_bases(target, update_config, crate::version::CLI_BASE_URLS).await
  }
  
-@@ -1400,7 +1490,7 @@ fn relative_symlink_target(target: &std::path::Path, link: &std::path::Path) ->
+@@ -1487,7 +1577,7 @@ fn relative_symlink_target(target: &std::path::Path, link: &std::path::Path) ->
  ///
  /// `grok` and `agent` are first-class entry points that the bootstrap
  /// installers (`install.sh`, `install.ps1`, `install-enterprise.sh`)
@@ -356,7 +356,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
  /// leaves `agent` pinned at the previous version.
  ///
  /// Unix: atomic symlink swap with relative target (survives Docker
-@@ -2245,7 +2335,7 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>)
+@@ -2332,7 +2422,7 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>)
      warn_if_other_grok_processes_running();
  
      let version_arg = match target {
@@ -365,7 +365,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
          None => {
              // All current callers resolve the version via get_latest_version
              // (which applies max(stable, alpha) for the alpha channel) before
-@@ -2256,7 +2346,7 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>)
+@@ -2343,7 +2433,7 @@ fn install_npm(target: Option<&str>, channel: &str, npm_registry: Option<&str>)
                  "install_npm called without a resolved version, falling back to dist-tag"
              );
              format!(
@@ -374,7 +374,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
                  if channel == "alpha" {
                      "alpha"
                  } else {
-@@ -2321,7 +2411,7 @@ pub async fn apply_channel_switch(channel_switch: Option<&str>, update_config: &
+@@ -2408,7 +2498,7 @@ pub async fn apply_channel_switch(channel_switch: Option<&str>, update_config: &
      }
  }
  
@@ -383,7 +383,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
  /// version is present on disk afterwards — either installed by this call or
  /// found already installed (e.g. by a concurrent background download); returns
  /// `Ok(None)` when there is no installer or no applicable target. Callers use
-@@ -2335,6 +2425,11 @@ pub async fn run_update(
+@@ -2422,6 +2512,11 @@ pub async fn run_update(
      channel_switch: Option<&str>,
      update_config: &mut UpdateConfig,
  ) -> Result<Option<String>> {
@@ -395,7 +395,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
      apply_channel_switch(channel_switch, update_config).await;
      let installer = match get_installer().await {
          Some(i) => i,
-@@ -2534,11 +2629,11 @@ async fn refresh_deployment_config() {
+@@ -2621,11 +2716,11 @@ async fn refresh_deployment_config() {
      match xai_grok_shell::managed_config::sync().await {
          Ok(true) => eprintln!("  Applied managed configuration."),
          Ok(false) => tracing::debug!("no managed configuration to apply"),
@@ -409,7 +409,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
          }
          Err(e) => eprintln!("  Couldn't apply managed configuration. {e}"),
      }
-@@ -3537,40 +3632,35 @@ mod tests {
+@@ -3624,40 +3719,35 @@ mod tests {
          let hint = reinstall_hint("npm");
          assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
          assert!(
@@ -465,8 +465,8 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
      }
  
      #[test]
-@@ -3587,6 +3677,241 @@ mod tests {
-         assert_eq!(hint, reinstall_hint("internal"));
+@@ -3701,6 +3791,241 @@ mod tests {
+         assert_eq!(truncate_err("abcdefghij", 8), "abcde...");
      }
  
 +    // ──────────────────────────────────────────────────────────────────────
@@ -707,7 +707,7 @@ index 388fa7c8ce127e3563d8637723b820f8002ffab3..b8c5e3005735570b18d8494fa7342697
      // ──────────────────────────────────────────────────────────────────────
      // UpdateStatus serialization (camelCase contract for --json clients)
      // ──────────────────────────────────────────────────────────────────────
-@@ -4290,7 +4615,7 @@ mod tests {
+@@ -4404,7 +4729,7 @@ mod tests {
          );
          assert_eq!(
              MSG_RUN_UPDATE_MANUAL,
@@ -785,7 +785,7 @@ index 9845e49f8c839f88525d460d3e13b178c9f61ce8..ce98ee8d3cba9cae2365cf3e8b6ebc95
          path
      })
 diff --git a/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs b/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs
-index abdc72b8dde4a936d7b952b42cf71f3a19fb010e..512995322fa1ca6a01de9fbb952757f33bef782f 100644
+index 7db620f1b9699bbf472a70e0abb48273318b7fe5..548c0d5d7733c6435ac0846ad9271adf5e9608be 100644
 --- a/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs
 +++ b/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs
 @@ -1,3 +1,7 @@
@@ -833,7 +833,7 @@ index db207ccd7c8a2aaf1cc910bbe5dd49851818f1eb..0392a32fb7534b2f0c791d29e09e3afc
  //!
  //! Covers every combination of:
 diff --git a/crates/codegen/xai-grok-update/tests/test_install_internal.rs b/crates/codegen/xai-grok-update/tests/test_install_internal.rs
-index 21dacc6cf8a164f86878b8740e96bf657f4cba48..1f8bf608f89afdb40e37e49ce74c36e79d7d5447 100644
+index 7bbf9f2a482fa939436d1b1f78f446798e3e89cd..4dbf9e4914168dc2440f44191bddeacda03adfc2 100644
 --- a/crates/codegen/xai-grok-update/tests/test_install_internal.rs
 +++ b/crates/codegen/xai-grok-update/tests/test_install_internal.rs
 @@ -1,3 +1,7 @@
@@ -877,11 +877,11 @@ index b031ee7b03995634ff473163fe48fe7a05abdb57..fcfbd73b5264eece266eb581ccaf7cd4
          log[0]
      );
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: b13fa526f5112c0b20dad5f1f2300d3d3b127895
+prerequisite-patch-id: e91e5a7076a517f7a2ce2b292e6c4c2fd9c2b7af
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: 7fc2a0a03f544bf3478b514b932a21302680f815
-prerequisite-patch-id: 532ec7baa0b81e65c17a7ad4f6a89834db1a3cf3
+prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
+prerequisite-patch-id: 617239e7751ed22f5f782d0efaa7709ec7674532
 -- 
 2.50.1 (Apple Git-155)
 

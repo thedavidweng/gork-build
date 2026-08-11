@@ -21,6 +21,7 @@ pub mod keys {
     pub const Q: &[u8] = b"q";
     pub const DOWN: &[u8] = b"\x1b[B";
     pub const UP: &[u8] = b"\x1b[A";
+    pub const RIGHT: &[u8] = b"\x1b[C";
     pub const PGDN: &[u8] = b"\x1b[6~";
     pub const PGUP: &[u8] = b"\x1b[5~";
     pub const ENTER: &[u8] = b"\r";
@@ -28,6 +29,8 @@ pub mod keys {
     /// Ctrl+R (0x12) — prompt history search / scrollback mouse-reporting toggle.
     pub const CTRL_R: &[u8] = b"\x12";
     pub const ESC: &[u8] = b"\x1b";
+    /// F2 (SS3 `ESC O Q`, the xterm encoding crossterm parses) — opens the settings modal.
+    pub const F2: &[u8] = b"\x1bOQ";
 }
 
 /// One explicit environment mutation applied after the TestSandbox baseline.
@@ -134,6 +137,7 @@ impl PtyController {
         // portable-pty calls setsid on Unix. Windows Job enrollment is a
         // best-effort post-spawn attachment, so a very short-lived descendant
         // may escape before enrollment; diagnostics preserve that downgrade.
+        #[allow(clippy::disallowed_methods)]
         let child = pair.slave.spawn_command(cmd)?;
         #[cfg(unix)]
         let process_pid = child
@@ -527,6 +531,16 @@ fn cache_exit_status(
 
 const CLIPBOARD_SINK_ENV_VARS: &[&str] = &["GROK_OSC52_SINK", "LC_GROK_OSC52_SINK"];
 
+/// Host / wrap appearance hints that would make `theme=auto` non-deterministic
+/// in PTY tests (layout depends on the resolved palette).
+const APPEARANCE_ENV_VARS: &[&str] = &[
+    "GROK_APPEARANCE",
+    "LC_GROK_APPEARANCE",
+    "GROK_THEME",
+    "LC_GROK_THEME",
+    "COLORFGBG",
+];
+
 /// Host terminal identity markers stripped from the child environment.
 ///
 /// The pager's terminal detection
@@ -571,6 +585,7 @@ const HOST_TERMINAL_ENV_VARS: &[&str] = &[
     "CMUX_SOCKET_PATH",
     "CMUX_PANEL_ID",
     "CMUX_BUNDLE_ID",
+    "HERDR_ENV",
     // Embedded editor markers (embedded_editor_from_env).
     "NVIM",
     "NVIM_LISTEN_ADDRESS",
@@ -616,6 +631,9 @@ fn apply_child_env(cmd: &mut CommandBuilder, sandbox: Option<&TestSandbox>, env:
     // through `env` after this hygiene pass.
     for sink_var in CLIPBOARD_SINK_ENV_VARS {
         cmd.env_remove(sink_var);
+    }
+    for appearance_var in APPEARANCE_ENV_VARS {
+        cmd.env_remove(appearance_var);
     }
     // Neutralize parent-terminal identity bleed: agent hosts often export
     // TERM_PROGRAM=ghostty/iTerm/etc. (and mux/editor markers) which make
@@ -944,6 +962,9 @@ mod tests {
         for sink_var in CLIPBOARD_SINK_ENV_VARS {
             cmd.env(sink_var, "polluted");
         }
+        for appearance_var in APPEARANCE_ENV_VARS {
+            cmd.env(appearance_var, "polluted");
+        }
         // Sandboxed launches remove unrelated inherited variables before
         // re-applying the baseline and explicit overrides.
         cmd.env("GROK_SCROLL_LOG", "/tmp/scroll.jsonl");
@@ -973,6 +994,12 @@ mod tests {
             assert!(
                 cmd.get_env(sink_var).is_none(),
                 "clipboard sink marker {sink_var} leaked into the child env"
+            );
+        }
+        for appearance_var in APPEARANCE_ENV_VARS {
+            assert!(
+                cmd.get_env(appearance_var).is_none(),
+                "appearance hint {appearance_var} leaked into the child env"
             );
         }
         assert_eq!(

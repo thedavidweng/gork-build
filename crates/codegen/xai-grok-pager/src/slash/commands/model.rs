@@ -242,6 +242,7 @@ mod tests {
             bundle_state: &EMPTY_BUNDLE,
             screen_mode: crate::app::ScreenMode::Inline,
             billing_surface_visible: true,
+            usage_command_visible: true,
             pager_state: crate::settings::PagerLocalSnapshot {
                 multiline_mode: false,
                 yolo_mode: false,
@@ -278,8 +279,10 @@ mod tests {
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
             billing_surface_visible: true,
+            usage_command_visible: true,
             workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         let items = cmd.suggest_args(&ctx, "").unwrap();
         assert_eq!(items.len(), 2, "model phase: one row per logical model");
@@ -310,8 +313,10 @@ mod tests {
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
             billing_surface_visible: true,
+            usage_command_visible: true,
             workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         // Args query has a trailing space -> effort phase. Items come out
         // ordered xhigh -> low (strongest first) per EFFORT_LEVELS.
@@ -341,8 +346,10 @@ mod tests {
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
             billing_surface_visible: true,
+            usage_command_visible: true,
             workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         // Still in effort phase; matcher upstream narrows to high / xhigh.
         let items = cmd.suggest_args(&ctx, "Reasoning X h").unwrap();
@@ -361,8 +368,10 @@ mod tests {
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
             billing_surface_visible: true,
+            usage_command_visible: true,
             workflows_available: true,
             screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
         };
         // No trailing space, user is still typing the model name.
         let items = cmd.suggest_args(&ctx, "Reason").unwrap();

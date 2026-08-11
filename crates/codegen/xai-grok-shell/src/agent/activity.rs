@@ -29,11 +29,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::session::pending_interaction::PendingInteractions;
-use crate::session::{SessionCommand, SessionHandle};
+use crate::session::{SessionCommand, SessionHandle, ShutdownKind};
 
 /// How often [`AgentActivity::flush_all_sessions`] re-polls actors that have
 /// not yet exited.
 const FLUSH_POLL: Duration = Duration::from_millis(50);
+
+/// Default bound on a process-exit session flush ([`AgentActivity::flush_all_sessions`]):
+/// leader auto-update shutdown and the in-process agent's `/exit` / headless-quit
+/// path both use it, so one wedged actor delays exit by the same amount everywhere.
+/// Sessions are normally idle by then and the flush completes in milliseconds.
+///
+/// Known gap: a `SessionEnd` hook configured with a longer `timeout` than this
+/// is still cut off at the grace. Aligning the two needs the hook registry's
+/// configured timeouts at flush time, which this layer does not see — tracked as
+/// a follow-up rather than hardcoding a larger bound for every exit.
+pub const SESSION_FLUSH_GRACE: Duration = Duration::from_secs(10);
 
 /// Per-session slice of state shared with the session actor (the same `Arc`s
 /// the actor mutates — see the matching `SessionHandle` fields).
@@ -131,9 +142,13 @@ impl AgentActivity {
     /// with a fresh actor gets its own signal), all against one deadline —
     /// `grace` bounds the **total** shutdown delay.
     ///
-    /// Call **before** cancelling the leader's root token so session state
-    /// is durable before the `LocalSet` drop aborts remaining tasks. Actors
-    /// that miss the grace are logged and abandoned.
+    /// Callers: the leader's auto-update / `RelaunchForUpdate` shutdown, and
+    /// the in-process agent worker on `/exit` / headless quit. In the leader
+    /// case, call **before** cancelling the root token; in the in-process case,
+    /// **after** the cancel that ends the worker's run loop but before its
+    /// `LocalSet` drops — either way, session state must be durable before the
+    /// drop aborts remaining tasks. Actors that miss the grace are logged and
+    /// abandoned.
     pub async fn flush_all_sessions(&self, grace: Duration) {
         let deadline = tokio::time::Instant::now() + grace;
         // Every distinct channel signaled so far (id kept for logging).
@@ -148,8 +163,8 @@ impl AgentActivity {
                 .collect();
             for (id, tx) in snapshot {
                 if !signaled.iter().any(|(_, s)| s.same_channel(&tx)) {
-                    tracing::info!(session_id = %id, "leader shutdown: flushing session");
-                    let _ = tx.send(SessionCommand::Shutdown);
+                    tracing::info!(session_id = %id, "shutdown: flushing session");
+                    let _ = tx.send(SessionCommand::Shutdown(ShutdownKind::Graceful));
                     signaled.push((id, tx));
                 }
             }
@@ -162,7 +177,7 @@ impl AgentActivity {
                     if !tx.is_closed() {
                         tracing::warn!(
                             session_id = %id,
-                            "leader shutdown: session actor did not exit within grace; proceeding"
+                            "shutdown: session actor did not exit within grace; proceeding"
                         );
                     }
                 }
@@ -237,7 +252,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<bool> {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                if matches!(cmd, SessionCommand::Shutdown) {
+                if matches!(cmd, SessionCommand::Shutdown(_)) {
                     tokio::time::sleep(delay).await;
                     return true;
                 }
@@ -373,7 +388,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let (mut rx2, _p2, _i2) = activity_late.register_for_test("s2");
             while let Some(cmd) = rx2.recv().await {
-                if matches!(cmd, SessionCommand::Shutdown) {
+                if matches!(cmd, SessionCommand::Shutdown(_)) {
                     return true;
                 }
             }

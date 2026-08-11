@@ -20,6 +20,17 @@ use crate::views::picker::{PickerEntry, PickerField, PickerRow, PickerState};
 /// they don't collide with fuzzy-entry indices.
 pub const CONTENT_EXPAND_OFFSET: usize = 100_000;
 
+/// Session id for free-text Enter (`SubmitQuery` with no selectable rows).
+///
+/// Only a trimmed UUID is loadable — pasted garbage must not call
+/// `LoadSession` (that left the TUI stuck mid-load).
+pub fn session_id_for_direct_load(query: &str) -> Option<&str> {
+    let q = query.trim();
+    // `Uuid::try_parse` rejects empty, multi-line, and non-UUID text.
+    uuid::Uuid::try_parse(q).ok()?;
+    Some(q)
+}
+
 /// Derive a short repo display name from a CWD path.
 ///
 /// Uses the last 2 normal path components joined by `-`. For paths with
@@ -76,6 +87,89 @@ fn order_repo_groups(groups: &mut IndexMap<&str, Vec<usize>>, current_repo: Opti
 pub enum PickerItem {
     Fuzzy { original_index: usize },
     Content { hit_index: usize },
+}
+
+/// A session armed for deletion, captured on `d` so the `y` confirm keeps
+/// a valid `(source, session_id, cwd)` even if the lists shift. Shared by
+/// the welcome and modal `/resume` pickers so they can't drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDelete {
+    pub source: String,
+    pub session_id: String,
+    pub cwd: String,
+}
+
+/// Outcome of routing a key through an armed [`PendingDelete`] confirm.
+pub(crate) enum PendingDeleteKey {
+    /// `y`: caller should delete this session.
+    Confirm(PendingDelete),
+    /// `n`: arm cleared; caller should redraw.
+    Cancel,
+    /// Other key: arm cleared, but the key should still be processed.
+    Disarmed,
+    /// Nothing armed, or not an unmodified key press.
+    NotArmed,
+}
+
+/// Arm a [`PendingDelete`] from the selected row, or `None` if it can't be
+/// deleted (foreign source or non-selectable position).
+pub(crate) fn pending_delete_from_selection(
+    selected: usize,
+    entry_map: &[Option<PickerItem>],
+    entries: Option<&[SessionPickerEntry]>,
+    content_results: Option<&[xai_grok_shell::extensions::session_search::SearchSessionHit]>,
+) -> Option<PendingDelete> {
+    match entry_map.get(selected).and_then(|e| e.as_ref())? {
+        PickerItem::Fuzzy { original_index } => entries
+            .and_then(|e| e.get(*original_index))
+            .filter(|entry| !crate::app::is_foreign_picker_source(&entry.source))
+            .map(|e| PendingDelete {
+                source: e.source.clone(),
+                session_id: e.id.clone(),
+                cwd: e.cwd.clone(),
+            }),
+        PickerItem::Content { hit_index } => {
+            content_results
+                .and_then(|h| h.get(*hit_index))
+                .map(|h| PendingDelete {
+                    source: "local".into(),
+                    session_id: h.session_id.clone(),
+                    cwd: h.cwd.clone(),
+                })
+        }
+    }
+}
+
+/// Route a key through an armed [`PendingDelete`]: `y` confirms, `n`
+/// cancels, any other unmodified key disarms and falls through.
+pub(crate) fn handle_pending_delete_key(
+    pending: &mut Option<PendingDelete>,
+    ev: &crossterm::event::Event,
+) -> PendingDeleteKey {
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+    if pending.is_none() {
+        return PendingDeleteKey::NotArmed;
+    }
+    let Event::Key(k) = ev else {
+        return PendingDeleteKey::NotArmed;
+    };
+    if k.kind != KeyEventKind::Press || !k.modifiers.is_empty() {
+        return PendingDeleteKey::NotArmed;
+    }
+    match k.code {
+        KeyCode::Char('y') => pending
+            .take()
+            .map(PendingDeleteKey::Confirm)
+            .unwrap_or(PendingDeleteKey::Cancel),
+        KeyCode::Char('n') => {
+            *pending = None;
+            PendingDeleteKey::Cancel
+        }
+        _ => {
+            *pending = None;
+            PendingDeleteKey::Disarmed
+        }
+    }
 }
 
 /// Owned data for a single session picker row. Built once per frame and
@@ -1015,6 +1109,7 @@ mod tests {
             branch: None,
             repo_name: repo.into(),
             worktree_label: None,
+            last_turn_summary: None,
             card_detail: None,
         }
     }
@@ -1646,5 +1741,17 @@ mod tests {
             map[1],
             Some(PickerItem::Fuzzy { original_index: 0 })
         ));
+    }
+
+    #[test]
+    fn session_id_for_direct_load_accepts_uuid_only() {
+        let sid = "019fb61a-85a5-7ba0-a4ec-24647dca1893";
+        assert_eq!(session_id_for_direct_load(sid), Some(sid));
+        assert_eq!(session_id_for_direct_load(&format!("  {sid}  ")), Some(sid));
+        assert_eq!(session_id_for_direct_load("not-a-uuid"), None);
+        assert_eq!(session_id_for_direct_load(""), None);
+        assert_eq!(session_id_for_direct_load("pasted garbage!!!"), None);
+        assert_eq!(session_id_for_direct_load("hello\nworld"), None);
+        assert_eq!(session_id_for_direct_load(&format!("{sid}\nextra")), None);
     }
 }

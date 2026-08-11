@@ -3,6 +3,7 @@
 use crate::session::commands::SessionCommand;
 use crate::session::commands::{NotificationPriority, NotificationSource};
 use crate::session::persistence::{DurableAppendError, PersistenceHandle, PersistenceMsg};
+use crate::tools::task_completed_frame;
 use agent_client_protocol::{self as acp, Client as _};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use xai_grok_workspace::session::file_state::FileStateTracker;
 use xai_hunk_tracker::HunkTrackerHandle;
 const TASK_WAKE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 /// Configuration for the notification bridge.
-pub struct NotificationBridgeConfig {
+pub(crate) struct NotificationBridgeConfig {
     /// ACP gateway for sending streaming updates to TUI
     pub gateway: GatewaySender,
     /// ACP session ID
@@ -184,7 +185,9 @@ async fn handle_scheduled_task_removed(
 }
 /// Create a `ToolNotificationHandle` and spawn a bridge task that
 /// translates notifications into shell-native systems.
-pub fn spawn_notification_bridge(config: NotificationBridgeConfig) -> ToolNotificationHandle {
+pub(crate) fn spawn_notification_bridge(
+    config: NotificationBridgeConfig,
+) -> ToolNotificationHandle {
     let (handle, mut rx) = ToolNotificationHandle::acknowledged_channel();
     tokio::task::spawn_local(async move {
         let mut offsets: HashMap<String, usize> = HashMap::new();
@@ -278,11 +281,7 @@ async fn handle_notification(
                     )]))
                     .raw_output(serde_json::to_value(&bash_output).ok()),
             ));
-            let mut notification = acp::SessionNotification::new(config.session_id.clone(), update);
-            stamp_event_id(config, &mut notification.meta);
-            let _ = config.persistence.tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
-            ));
+            let notification = acp::SessionNotification::new(config.session_id.clone(), update);
             if config
                 .gateway_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -582,15 +581,14 @@ async fn handle_notification(
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
             }
-            let _ = config.persistence.tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-            let params = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-                .ok();
-            if let Some(params) = params {
-                let notification: acp::ExtNotification =
-                    acp::ExtNotification::new("x.ai/task_completed", params.into());
+            if let Some(params) = task_completed_frame::encode(&mut notification) {
+                let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                ));
+                let notification: acp::ExtNotification = acp::ExtNotification::new(
+                    task_completed_frame::METHOD,
+                    params.into_inner().into(),
+                );
                 config.gateway.forward_fire_and_forget(notification);
             }
             let _ = config
@@ -937,6 +935,8 @@ mod tests {
             explicitly_killed: false,
             owner_session_id: None,
             description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         }
     }
     #[tokio::test]
@@ -1589,13 +1589,11 @@ mod tests {
             _ => panic!("expected PersistenceMsg::Update(Xai(ScheduledTaskCreated))"),
         }
     }
-    /// Persisted⇒stamped contract at the bridge's highest-frequency emitter:
-    /// the persisted bash-output line carries an `eventId`, and the live
-    /// broadcast carries the SAME id (the meta is minted before the
-    /// persist/broadcast fork — divergent ids would re-deliver the line on a
-    /// cursor reconnect).
+    /// InProgress bash chunks stream live to the TUI but are not persisted —
+    /// Completed/Failed tool results (emitted on the tool-result path, not this
+    /// 100ms ticker) remain the replay source of truth.
     #[tokio::test]
-    async fn bash_output_chunk_persists_and_broadcasts_one_event_id() {
+    async fn bash_output_chunk_forwards_live_without_persisting() {
         let (config, mut gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
         let notification = ToolNotification::BashOutputChunk(
             xai_grok_tools::notification::types::BashOutputChunk {
@@ -1611,28 +1609,99 @@ mod tests {
         );
         let mut offsets = HashMap::new();
         handle_notification(&config, notification, &mut offsets).await;
-        let persisted_id = match persistence_rx.try_recv().expect("chunk must be persisted") {
-            PersistenceMsg::Update(crate::session::storage::SessionUpdate::Acp(notif)) => notif
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("eventId"))
-                .and_then(|v| v.as_str())
-                .expect("persisted ACP bridge lines must carry an eventId")
-                .to_string(),
-            other => panic!("expected PersistenceMsg::Update(Acp(..)), got {other:?}"),
-        };
-        let broadcast_id = match gateway_rx.try_recv().expect("chunk must be broadcast") {
+        assert!(
+            persistence_rx.try_recv().is_err(),
+            "InProgress bash chunks must not be persisted"
+        );
+        match gateway_rx.try_recv().expect("chunk must be broadcast") {
+            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                assert!(
+                    args.request
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("eventId"))
+                        .is_none(),
+                    "live-only InProgress must not mint a reconnect cursor eventId"
+                );
+                match &args.request.update {
+                    acp::SessionUpdate::ToolCallUpdate(u) => {
+                        assert_eq!(u.fields.status, Some(acp::ToolCallStatus::InProgress));
+                    }
+                    other => panic!("expected ToolCallUpdate, got {other:?}"),
+                }
+            }
+            other => panic!("expected SessionNotification, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn live_in_progress_event_id_is_not_a_prepare_replay_cursor() {
+        let (config, mut gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
+        handle_notification(
+            &config,
+            ToolNotification::BashOutputChunk(
+                xai_grok_tools::notification::types::BashOutputChunk {
+                    base: xai_grok_tools::notification::types::BashNotificationBase {
+                        tool_call_id: "call-cursor".into(),
+                        command: "echo hi".into(),
+                        output: b"hi\n".to_vec(),
+                        total_bytes: 3,
+                        truncated: false,
+                        cwd: PathBuf::from("/tmp"),
+                    },
+                },
+            ),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert!(persistence_rx.try_recv().is_err());
+        let live_id = match gateway_rx.try_recv().unwrap() {
             xai_acp_lib::AcpClientMessage::SessionNotification(args) => args
                 .request
                 .meta
                 .as_ref()
                 .and_then(|m| m.get("eventId"))
                 .and_then(|v| v.as_str())
-                .expect("broadcast must carry the eventId")
-                .to_string(),
+                .map(str::to_owned),
             other => panic!("expected SessionNotification, got {other:?}"),
         };
-        assert_eq!(persisted_id, broadcast_id);
+        assert!(live_id.is_none());
+        let persisted = crate::session::storage::prepare_replay_lines(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}},"_meta":{"eventId":"s-1"}}}"#,
+            live_id.as_deref().or(Some("ghost-live-id")),
+        );
+        assert!(
+            persisted.mark_replay,
+            "a non-persisted live id must not resolve as a reconnect cursor"
+        );
+    }
+    #[tokio::test]
+    async fn bash_output_chunk_skips_persist_when_gateway_closed() {
+        let (config, mut gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
+        config
+            .gateway_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let notification = ToolNotification::BashOutputChunk(
+            xai_grok_tools::notification::types::BashOutputChunk {
+                base: xai_grok_tools::notification::types::BashNotificationBase {
+                    tool_call_id: "call-closed".into(),
+                    command: "echo hi".into(),
+                    output: b"hi\n".to_vec(),
+                    total_bytes: 3,
+                    truncated: false,
+                    cwd: PathBuf::from("/tmp"),
+                },
+            },
+        );
+        let mut offsets = HashMap::new();
+        handle_notification(&config, notification, &mut offsets).await;
+        assert!(
+            persistence_rx.try_recv().is_err(),
+            "closed gateway must not persist InProgress bash either"
+        );
+        assert!(
+            gateway_rx.try_recv().is_err(),
+            "closed gateway must not forward"
+        );
     }
     #[tokio::test]
     async fn scheduled_task_removed_is_persisted() {
@@ -2224,6 +2293,8 @@ mod tests {
             explicitly_killed: false,
             owner_session_id: None,
             description: None,
+            is_backgrounded: false,
+            output_total_bytes: 0,
         }
     }
     /// Extract the auto-wake prompt text emitted on the session command channel.
@@ -2322,6 +2393,53 @@ mod tests {
         assert!(
             prompt.contains("bg-disk-2"),
             "auto-wake-disabled: prompt must reference task id"
+        );
+    }
+    /// Completions must go through the size limit, and the copy persisted
+    /// for replay must be the copy that was sent. The limit itself is
+    /// tested in `task_completed_frame`.
+    #[tokio::test]
+    async fn task_completed_notification_is_frame_bounded() {
+        let (mut config, mut gateway_rx, mut persistence_rx, mut cmd_rx) =
+            make_test_config_full_raw();
+        config.auto_wake_enabled = false;
+        let mut snapshot = make_task_snapshot("bg-output-clamp", TaskKind::Bash);
+        snapshot.output = "Z".repeat(2 * 1024 * 1024);
+        snapshot.output_file = PathBuf::from("/tmp/bg-output-clamp.log");
+        snapshot.is_backgrounded = true;
+        let mut offsets = HashMap::new();
+        handle_notification(
+            &config,
+            ToolNotification::TaskCompleted(snapshot),
+            &mut offsets,
+        )
+        .await;
+        while cmd_rx.try_recv().is_ok() {}
+        let mut params = None;
+        while let Ok(msg) = gateway_rx.try_recv() {
+            if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = msg
+                && args.request.method.as_ref() == "x.ai/task_completed"
+            {
+                params = Some(args.request.params.get().to_string());
+            }
+        }
+        let params = params.expect("expected an x.ai/task_completed notification");
+        assert!(
+            params.len() <= task_completed_frame::FRAME_MAX_BYTES,
+            "params is {} bytes",
+            params.len()
+        );
+        assert!(params.contains("/tmp/bg-output-clamp.log"));
+        let mut persisted = None;
+        while let Ok(msg) = persistence_rx.try_recv() {
+            if let PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(saved)) = msg
+            {
+                persisted = Some(serde_json::to_value(&*saved).unwrap());
+            }
+        }
+        assert_eq!(
+            persisted.expect("the completion must be persisted"),
+            serde_json::from_str::<serde_json::Value>(&params).unwrap(),
         );
     }
 }

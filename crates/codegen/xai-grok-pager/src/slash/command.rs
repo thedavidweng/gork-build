@@ -12,6 +12,7 @@
 use crate::acp::model_state::ModelState;
 use crate::app::actions::Action;
 use crate::app::bundle::BundleState;
+use crate::slash::mode_support::ModeSupport;
 use agent_client_protocol as acp;
 
 /// Provisional scheduled task info for immediate display in the tasks pane.
@@ -110,12 +111,18 @@ pub struct AppCtx<'a> {
     pub has_session_announcements: bool,
     /// Consumer billing surface (`AppView::usage_visible`). Gates `/usage` subcommands.
     pub billing_surface_visible: bool,
+    /// Whether `/usage` is offered and executable. False for external-auth
+    /// deployments with no grok.com billing session.
+    pub usage_command_visible: bool,
     pub workflows_available: bool,
     /// Effective render mode of this process (gates `/minimal` and
     /// `/fullscreen` visibility). Same source of truth as
     /// [`CommandExecCtx::screen_mode`], carried by the owning
     /// [`SlashController`](crate::slash::SlashController).
     pub(crate) screen_mode: crate::app::ScreenMode,
+    /// Current session title for `/rename` ghost-prefill (`display_name`,
+    /// else `generated_session_title`). `None` when there is no title yet.
+    pub current_title: Option<&'a str>,
 }
 
 /// Mutable execution context for `SlashCommand::run()`.
@@ -129,12 +136,40 @@ pub struct CommandExecCtx<'a> {
     pub(crate) screen_mode: crate::app::ScreenMode,
     /// Consumer billing surface (`AppView::usage_visible`). Gates `/usage` subcommands.
     pub billing_surface_visible: bool,
+    /// Whether `/usage` is offered and executable. False for external-auth
+    /// deployments with no grok.com billing session.
+    pub usage_command_visible: bool,
     /// Snapshot of the active agent's PAGER-owned settings, built at
     /// command-build time by the dispatcher. Slash commands like
     /// `/multiline` read this to compute `!current` and dispatch a
     /// typed `Action::SetX(new)` — the dispatcher remains the single
     /// source of truth for the actual state mutation.
     pub(crate) pager_state: crate::settings::PagerLocalSnapshot,
+}
+
+/// Origin of a slash command. The dropdown renderer turns this into badge
+/// text via [`CommandProvenance::badge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandProvenance {
+    Builtin,
+    /// Non-skill ACP command (e.g. `/flush`).
+    Shell,
+    /// Skill; `source` is the plugin install name or scope.
+    Skill {
+        source: String,
+    },
+}
+
+impl CommandProvenance {
+    /// Right-aligned slash-menu badge. Shell commands render as `built-in`
+    /// too — the badge only has to separate a skill from whoever kept the
+    /// bare name.
+    pub fn badge(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Builtin | Self::Shell => std::borrow::Cow::Borrowed("built-in"),
+            Self::Skill { source } => std::borrow::Cow::Owned(format!("skill · {source}")),
+        }
+    }
 }
 
 /// A slash command.
@@ -154,6 +189,11 @@ pub trait SlashCommand: Send + Sync {
 
     /// Short human-readable description shown in the dropdown.
     fn description(&self) -> &str;
+
+    /// Origin for the slash-menu provenance badge. Defaults to builtin.
+    fn provenance(&self) -> CommandProvenance {
+        CommandProvenance::Builtin
+    }
 
     /// Usage string shown in help. E.g., `"/model <name>"`.
     fn usage(&self) -> &str;
@@ -246,24 +286,26 @@ pub trait SlashCommand: Send + Sync {
         false
     }
 
-    /// Whether this command functions in the scrollback-native **minimal**
-    /// mode (`gork --minimal`).
+    /// Which render modes this command functions in.
     ///
-    /// Minimal mode deletes the interactive fullscreen scrollback pane, the
-    /// in-app mouse selection path, and the agent dashboard, handing scroll /
-    /// search / selection back to the terminal (K7). Commands that drive those
-    /// deleted surfaces — `/find`, `/dashboard` — have nothing to act on, so
-    /// the central dispatch gate refuses them with a "/<x> is not available in
-    /// minimal mode" message (committed as a system block). Clipboard helpers
-    /// like `/copy` stay available: they read scrollback state and do not need
-    /// the fullscreen pane.
+    /// Minimal mode (`grok --minimal`) deletes the interactive fullscreen
+    /// scrollback pane, the in-app mouse selection path, and the agent
+    /// dashboard, handing scroll / search / selection back to the terminal
+    /// (K7); a few commands exist only there, because the full TUI solves the
+    /// same problem with a pane or a chord. Declaring the mode here is the
+    /// single source for both behaviors: the command is hidden from every
+    /// completion surface in the modes it does not support (`command_offered`),
+    /// and a fully-typed invocation is refused with an actionable hint by the
+    /// central dispatch gate instead of running against a surface that does not
+    /// exist.
     ///
-    /// Defaults to `true` — a **denylist, not an allowlist**: the many
-    /// mode-agnostic commands keep working and new commands are available in
-    /// minimal by default (the mode is converging toward parity). Override to
-    /// `false` only for genuinely fullscreen-pane-dependent commands.
-    fn available_in_minimal(&self) -> bool {
-        true
+    /// Defaults to [`ModeSupport::Both`] — a **denylist, not an allowlist**:
+    /// the many mode-agnostic commands keep working and new commands are
+    /// available everywhere by default (minimal is converging toward parity).
+    /// Clipboard helpers like `/copy` stay `Both`: they read scrollback state
+    /// and do not need the fullscreen pane.
+    fn mode_support(&self) -> ModeSupport {
+        ModeSupport::Both
     }
 
     /// Placeholder text shown in the prompt when args are empty.

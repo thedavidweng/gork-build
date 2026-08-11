@@ -14,6 +14,7 @@ async fn queue_send_now_keeps_prompt_block_images_on_promoted_row() {
                 let mut state = actor.state.lock().await;
                 state.pending_inputs.push_back(user_item("running", "A"));
                 state.running_task = Some(running_task_stub("running"));
+                state.front_message_committed = true;
                 let mut item = user_item("p1", "A");
                 item.prompt_blocks
                     .push(acp::ContentBlock::Image(test_image_content()));
@@ -48,6 +49,59 @@ async fn queue_send_now_keeps_prompt_block_images_on_promoted_row() {
                 actor.pending_interjections.is_empty(),
                 "send-now never buffers into the running turn"
             );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn goal_send_now_routes_text_and_image_as_planner_steering_and_interjection() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.running_task = Some(running_task_stub("running"));
+            }
+            actor.goal_tracker.lock().create_goal(
+                "goal".into(),
+                "objective".into(),
+                None,
+                0,
+                "2026-01-01T00:00:00Z".into(),
+                None,
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            actor.goal_tracker.lock().start_planner_run(cancel.clone());
+
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            let cancelled = actor
+                .queue_input(QueueInputRequest {
+                    send_now: true,
+                    ..queue_input_request(
+                        vec![
+                            acp::ContentBlock::Text(acp::TextContent::new("steer")),
+                            acp::ContentBlock::Image(test_image_content()),
+                        ],
+                        "steer-image",
+                        respond_to,
+                    )
+                })
+                .await;
+
+            assert!(!cancelled);
+            assert!(cancel.is_cancelled());
+            assert!(matches!(
+                response_rx.await.unwrap().unwrap().completion_kind,
+                PromptCompletionKind::RemovedFromQueue
+            ));
+            let run = actor.goal_tracker.lock().take_planner_run().unwrap();
+            assert_eq!(run.steering, ["steer"]);
+            let interjections = actor.pending_interjections.drain_all();
+            assert_eq!(interjections.len(), 1);
+            assert_eq!(interjections[0].text, "steer");
+            assert_eq!(interjections[0].attachments.len(), 1);
         })
         .await;
 }
@@ -330,7 +384,7 @@ async fn flush_stranded_interjections_converts_to_front_prompts_in_order() {
                 attachments: vec![],
             });
 
-            assert!(actor.flush_stranded_interjections().await);
+            assert_eq!(actor.flush_stranded_interjections().await, 2);
             assert!(
                 actor.pending_interjections.is_empty(),
                 "flush must drain the buffer"
@@ -365,7 +419,7 @@ async fn flush_stranded_interjections_noop_when_empty() {
     local
         .run_until(async {
             let (actor, _rx) = build_actor().await;
-            assert!(!actor.flush_stranded_interjections().await);
+            assert_eq!(actor.flush_stranded_interjections().await, 0);
             assert!(actor.state.lock().await.pending_inputs.is_empty());
         })
         .await;

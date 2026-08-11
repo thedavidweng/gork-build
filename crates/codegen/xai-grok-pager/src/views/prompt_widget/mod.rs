@@ -158,10 +158,8 @@ pub struct PromptStyle {
     /// Only used when `chrome` is true.
     pub chrome_pad_left: u16,
     pub chrome_pad_right: u16,
-    /// Override the background color. When `Some`, the prompt uses this bg
-    /// instead of computing one from focus state. Useful for rendering the
-    /// prompt inline within another widget (e.g., question view).
-    pub bg_override: Option<ratatui::style::Color>,
+    /// Background surface for the prompt; see [`PromptBg`].
+    pub bg: PromptBg,
     /// Override the accent line color. When `Some`, uses this color instead
     /// of the default `accent_user` / `gray_dim`. Used for plan mode (golden).
     pub accent_color_override: Option<ratatui::style::Color>,
@@ -172,10 +170,11 @@ pub struct PromptStyle {
     /// When `Some((str, color))`, replaces the default `❯` prefix.
     /// Used for bash mode (`"! "` in yellow).
     pub prefix_override: Option<(&'static str, ratatui::style::Color)>,
-    /// Override the placeholder text shown when the textarea is empty.
+    /// Override the placeholder text shown when the textarea is empty (e.g. remember mode).
     /// When `Some(text)`, uses this instead of the default `"Build anything"`.
-    /// Used for feedback mode (`"Type your feedback..."`).
     pub placeholder_override: Option<&'static str>,
+    /// The main composer hides the empty-textarea placeholder on focus; the feedback box keeps it visible.
+    pub placeholder_when_focused: bool,
     /// Compact mode (currently unused for info_block sizing).
     pub compact: bool,
     /// Show the accent line (`┃`) on the left edge of the chrome.
@@ -194,6 +193,35 @@ pub struct PromptStyle {
     pub image_preview: bool,
 }
 
+/// Background for the prompt widget.
+///
+/// Paste chips bake `theme.paste_bg` — a badge color tuned for the default
+/// canvas — into their display `Line` at paste time, so the background says
+/// what *kind* of surface the prompt sits on, not just its color.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptBg {
+    /// The standalone prompt's default fill (`theme.bg_base`).
+    #[default]
+    Default,
+    /// Explicit canvas color for prompts rendered inline within another
+    /// widget whose surface matches the main prompt's (dashboard dispatch
+    /// box, peek reply). Chips keep their badge background.
+    Canvas(ratatui::style::Color),
+    /// Inline panel color (question freeform input, permission follow-up).
+    /// Chip cells are repainted to blend into the panel.
+    Panel(ratatui::style::Color),
+}
+
+impl PromptBg {
+    /// Effective fill color; `default` is the standalone prompt's.
+    fn color(self, default: ratatui::style::Color) -> ratatui::style::Color {
+        match self {
+            Self::Default => default,
+            Self::Canvas(c) | Self::Panel(c) => c,
+        }
+    }
+}
+
 impl Default for PromptStyle {
     fn default() -> Self {
         Self {
@@ -203,10 +231,11 @@ impl Default for PromptStyle {
             chrome: true,
             chrome_pad_left: 2,
             chrome_pad_right: 1,
-            bg_override: None,
+            bg: PromptBg::Default,
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
+            placeholder_when_focused: false,
             placeholder_override: None,
             compact: false,
             show_accent_line: false,
@@ -237,10 +266,11 @@ impl PromptStyle {
             chrome: false,
             chrome_pad_left: 0,
             chrome_pad_right: 0,
-            bg_override: Some(bg),
+            bg: PromptBg::Panel(bg),
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
+            placeholder_when_focused: false,
             placeholder_override: None,
             compact: false,
             show_accent_line: false,
@@ -279,6 +309,9 @@ pub struct PromptFlag<'a> {
 }
 
 /// Optional info line rendered below the prompt text.
+///
+/// The default is blank: a caller that wants the bottom border without any info text passes it, and [`Self::is_blank`] then skips the text pass.
+#[derive(Default)]
 pub struct PromptInfo<'a> {
     /// Primary label to display on the info line (left side).
     pub model_name: &'a str,
@@ -291,6 +324,15 @@ pub struct PromptInfo<'a> {
     /// When true the warning uses the yellow warning color (<=5% left);
     /// when false it uses dim grey text (5-10% left).
     pub usage_warning_critical: bool,
+}
+
+impl PromptInfo<'_> {
+    pub fn is_blank(&self) -> bool {
+        self.model_name.is_empty()
+            && self.flags.is_empty()
+            && !self.multiline
+            && self.usage_warning.is_none()
+    }
 }
 
 /// Live voice-capture overlay for the prompt.
@@ -491,9 +533,8 @@ pub struct PromptWidget {
 
     /// Predicted-next-prompt controller (tab autocomplete ghost text).
     pub(crate) prompt_suggestion: crate::views::prompt_suggestion::PromptSuggestionController,
-    /// Per-frame gate for the prompt-suggestion ghost, set by `AgentView`
-    /// before each draw/key dispatch: false while a turn is running, in
-    /// bash/remember/feedback input modes, or while editing a queued prompt.
+    /// Per-frame gate for the prompt-suggestion ghost, set by `AgentView` before each draw or key dispatch.
+    /// False while a turn is running, in bash/remember input modes, or while editing a queued prompt.
     pub(crate) prompt_suggestion_active: bool,
 
     // -- Image paste state ---------------------------------------------------
@@ -986,6 +1027,17 @@ impl PromptWidget {
         self.update_file_search_context();
     }
 
+    /// [`Self::set_text`] unless the buffer already holds exactly `text`.
+    ///
+    /// Skipping the no-op swap keeps chip elements, images, and undo history
+    /// intact when a surface reloads an unchanged draft (the question view's
+    /// freeform slots); any real content change takes the normal reset path.
+    pub fn set_text_preserving(&mut self, text: &str) {
+        if self.text() != text {
+            self.set_text(text);
+        }
+    }
+
     /// Append plain text at the end without replacing existing chip elements.
     pub fn append_text(&mut self, text: &str) {
         if text.is_empty() {
@@ -1001,9 +1053,19 @@ impl PromptWidget {
 
     // -- Slash command state sync -------------------------------------------
 
+    pub fn set_slash_current_title(&mut self, title: Option<String>) {
+        self.slash_controller.set_current_title(title);
+    }
+
+    pub fn slash_current_title(&self) -> Option<&str> {
+        self.slash_controller.current_title()
+    }
+
     /// Refresh the slash snapshot from current text + cursor.
     ///
-    /// Called by `AgentView` after every `PromptEvent::Edited`.
+    /// Called by `AgentView` after every `PromptEvent::Edited`, and when
+    /// `current_title` changes while the dropdown is already open (so the
+    /// `/rename` ghost is not left stale until the next keystroke).
     /// This is the only way to update the slash snapshot -- `AgentView`
     /// never touches `slash_controller` or `slash_state` directly.
     ///
@@ -1788,6 +1850,8 @@ impl PromptWidget {
                     terminal.multiplexer = %evt.terminal.multiplexer,
                     terminal.is_ssh = evt.terminal.is_ssh,
                     terminal.term_var = %evt.terminal.term_var,
+                    terminal.term_version = %evt.terminal.term_version,
+                    terminal.term_version_source = %evt.terminal.term_version_source,
                     key.code = %evt.key_code,
                     key.modifiers = %evt.key_modifiers,
                     key.kind = %evt.key_kind,
@@ -1976,10 +2040,11 @@ impl PromptWidget {
             // try_replace appends `/` and stays open. A file selected in dir-mode
             // falls through to the ref branch (see FileSearchState::try_replace).
             if let Some(r) = self.file_search.try_replace(self.textarea.text()) {
-                let dismiss = r.dismiss;
                 self.textarea.replace_range(r.range, &r.text);
                 self.textarea.set_cursor(r.cursor);
-                if !dismiss {
+                if r.dismiss {
+                    self.file_search.clear_context();
+                } else {
                     // Anchor the drilled child so a whitespace name stays open
                     // (reuse the buffer; only a `./` prefix re-allocs).
                     let mut p = res.path.to_string();
@@ -2856,11 +2921,7 @@ impl PromptWidget {
         }
 
         let theme = Theme::current();
-        let bg = if let Some(override_bg) = style.bg_override {
-            override_bg
-        } else {
-            theme.bg_base
-        };
+        let bg = style.bg.color(theme.bg_base);
 
         let border_color = style.border_color_override.unwrap_or(if style.focused {
             theme.prompt_border_active
@@ -2986,6 +3047,21 @@ impl PromptWidget {
         self.textarea_area = ta_area;
 
         (&self.textarea).render_ref(ta_area, buf, &mut self.textarea_state);
+
+        // Chip bg remap (see `PromptBg::Panel`): chip `Line`s bake in
+        // `paste_bg` at paste time and the same element can render on
+        // multiple surfaces, so restyle at paint time.
+        if matches!(style.bg, PromptBg::Panel(_)) && bg != theme.paste_bg {
+            for y in ta_area.top()..ta_area.bottom() {
+                for x in ta_area.left()..ta_area.right() {
+                    if let Some(cell) = buf.cell_mut((x, y))
+                        && cell.bg == theme.paste_bg
+                    {
+                        cell.bg = bg;
+                    }
+                }
+            }
+        }
 
         // Slash overlays: teal command name + args ghost text. Both use the
         // same snapshot, so clone once. Capture flags for later ghost text
@@ -3128,17 +3204,20 @@ impl PromptWidget {
             false
         };
 
-        // Placeholder text when empty and unfocused
+        // Placeholder text when empty (unfocused, or opted in while focused).
         if self.textarea.text().is_empty()
             && ta_area.width > 0
-            && !style.focused
+            && (!style.focused || style.placeholder_when_focused)
             && !voice_interim_shown
         {
             let placeholder = style.placeholder_override.unwrap_or("Build anything");
+            // `set_string` clips at the buffer edge, not at the textarea, so a placeholder longer than the box would paint over its border.
+            let truncated =
+                crate::render::line_utils::truncate_str(placeholder, ta_area.width as usize);
             buf.set_string(
                 ta_area.x,
                 ta_area.y,
-                placeholder,
+                &truncated,
                 Style::default().fg(theme.gray).bg(bg),
             );
         }
@@ -3182,7 +3261,8 @@ impl PromptWidget {
                     cell.set_style(div_style);
                 }
             }
-            if let Some(info) = info {
+            // A blank info line still writes its padding spaces, which would punch holes in the divider it sits on.
+            if let Some(info) = info.filter(|i| !i.is_blank()) {
                 let info_rect = Rect {
                     x: content_area.x,
                     y: div_y,
@@ -3194,8 +3274,8 @@ impl PromptWidget {
         }
 
         // Unfocused dimming: blend fg toward bg (bg already precomputed above).
-        // Skip when bg_override is set — the prompt is inline in another widget.
-        if !style.focused && style.bg_override.is_none() {
+        // Skip when the bg is overridden — the prompt is inline in another widget.
+        if !style.focused && style.bg == PromptBg::Default {
             // Dim only the content inside the box (skip all border chars).
             let dim_area = Rect {
                 x: area.x + 1,

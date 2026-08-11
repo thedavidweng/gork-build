@@ -887,8 +887,18 @@ impl SessionActor {
                     hook_reg.remove_by_prefix("plugin/");
                     hook_reg.append_specs(new_specs);
                 } else if !new_specs.is_empty() {
-                    let (mut new_reg, _) =
-                        xai_grok_hooks::discovery::load_hooks_from_sources(&[], &[]);
+                    // No registry yet: bootstrap config-layer and file hooks (as
+                    // reload_hooks_impl does), not empty sources, so a plugin-first
+                    // snapshot doesn't drop config hooks.
+                    let git_root =
+                        xai_grok_workspace::session::git::find_git_root_from_path(session_cwd).ok();
+                    let is_trusted =
+                        crate::agent::folder_trust::resolve_and_record(session_cwd, None, false);
+                    let (mut new_reg, _errs) = crate::util::hooks::discover_hooks(
+                        git_root.as_deref(),
+                        &self.rebuild_spec.compat,
+                        is_trusted,
+                    );
                     new_reg.append_specs(new_specs);
                     *reg = Some(Arc::new(new_reg));
                 }
@@ -913,17 +923,9 @@ impl SessionActor {
         // the order-sensitive `update_configs` would cause (merge order is
         // non-deterministic). Mirrors the `UpdateMcpServers` command handler.
         let t_mcp = std::time::Instant::now();
-        let managed_configs = {
-            let mcp_handle = self.managed_mcp_handle.lock().await;
-            match &mcp_handle.cache {
-                crate::session::managed_mcp::ManagedMcpCache::Ready(configs) => configs.clone(),
-                _ => vec![],
-            }
-        };
         let new_mcp_servers = crate::session::managed_mcp::merge_managed_mcp_servers(
             self.initial_client_mcp_servers.clone(),
             session_cwd,
-            &managed_configs,
             new_registry_snapshot.as_deref(),
             &self.rebuild_spec.compat,
         );

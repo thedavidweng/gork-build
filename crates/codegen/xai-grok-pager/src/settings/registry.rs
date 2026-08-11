@@ -226,6 +226,26 @@ pub enum SettingValue {
     Int(i64),
 }
 
+/// Why `coding_data_sharing` cannot be changed in the settings modal.
+/// Computed by `AppView::coding_data_sharing_lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingDataSharingLock {
+    Zdr,
+    TeamManaged,
+    /// Gork Build privacy lock: opt-in is not available.
+    PrivacyBuild,
+}
+
+impl CodingDataSharingLock {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Zdr => "Your team has Zero Data Retention.",
+            Self::TeamManaged => "Managed by your team admin.",
+            Self::PrivacyBuild => "Gork Build locks coding data retention to opt-out.",
+        }
+    }
+}
+
 /// Snapshot of pager-local state captured when the modal opens.
 /// Used by `current_value_for` to render against LIVE state rather
 /// than the on-disk `UiConfig`. Refreshed by
@@ -252,6 +272,8 @@ pub struct PagerLocalSnapshot {
     /// `opt_out == false` → canonical "opt-in". Snapshot default is
     /// `true` (opted out) to match the safer consumer default.
     pub coding_data_sharing_opt_out: bool,
+    /// Why `coding_data_sharing` cannot be changed here (`None` = editable).
+    pub coding_data_sharing_lock: Option<CodingDataSharingLock>,
     /// Whether plan mode is active. Uses effective state
     /// (`pending.unwrap_or(active)`) so rapid toggles don't double-send.
     /// Refreshed on all mutation paths including ACP `CurrentModeUpdate`.
@@ -281,6 +303,11 @@ pub struct PagerLocalSnapshot {
     /// language actually in effect when `[ui].voice_stt_language` is unset but
     /// an explicit `[voice].language` applies.
     pub voice_stt_language: String,
+    /// Mirrors `AgentView::scheduler_background_loops` — the value the shell
+    /// pinned for THIS session — falling back to
+    /// `AppView::scheduler_background_loops_seed` before the session response
+    /// lands. `/loop` reads it to describe where a scheduled fire runs.
+    pub scheduler_background_loops: bool,
 }
 
 impl Default for PagerLocalSnapshot {
@@ -293,6 +320,7 @@ impl Default for PagerLocalSnapshot {
             available_models: Vec::new(),
             // Gork Build: privacy by default.
             coding_data_sharing_opt_out: true,
+            coding_data_sharing_lock: None,
             plan_mode_active: false,
             show_tips: None,
             auto_update: None,
@@ -305,6 +333,8 @@ impl Default for PagerLocalSnapshot {
             auto_mode_gate: false,
             ask_user_question_timeout_enabled: None,
             voice_stt_language: xai_grok_voice::STT_LANGUAGE_DEFAULT.to_string(),
+            // Matches `resolve_scheduler_background_loops`'s default.
+            scheduler_background_loops: true,
         }
     }
 }
@@ -495,6 +525,7 @@ pub fn current_value_for(
         "combine_queued_prompts" => Some(SettingValue::Bool(
             crate::appearance::cache::load_combine_queued_prompts(),
         )),
+        "confirm_before_rewind" => Some(SettingValue::Bool(ui.confirm_before_rewind_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
@@ -671,18 +702,31 @@ pub fn current_value_for(
         // CLI batch: snapshot mirrors; `None` → effective default `true`.
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
         "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(false))),
-        // fork_secondary_model: baseline value folds to empty string.
+        // fork_secondary_model: baseline value folds to empty string. The
+        // mirror persists the ModelId slug but the DynamicEnum canonicals
+        // are catalog display names, so resolve via the snapshot; a stale
+        // id passes through raw.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
             if ui.fork_secondary_model == baseline {
                 String::new()
             } else {
-                ui.fork_secondary_model.clone()
+                pager
+                    .available_models
+                    .iter()
+                    .find(|(_, id)| id.0.as_ref() == ui.fork_secondary_model.as_str())
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| ui.fork_secondary_model.clone())
             }
         })),
 
         _ => None,
     }
+}
+
+/// Consent chooser: no docs tip, and no `d` reset (hint or key).
+pub fn is_consent_chooser(key: &str) -> bool {
+    key == "coding_data_sharing"
 }
 
 /// Default value for `key`, derived from the registry metadata.
@@ -802,6 +846,13 @@ mod tests {
                         "page_flip_on_send default drifts from UiConfig::default()"
                     );
                 }
+                ("confirm_before_rewind", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.confirm_before_rewind_enabled(),
+                        "confirm_before_rewind default drifts from UiConfig::default()"
+                    );
+                }
                 ("combine_queued_prompts", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
@@ -909,8 +960,7 @@ mod tests {
                 ("auto_update", SettingKind::Bool { default }) => {
                     assert!(
                         !*default,
-                        "auto_update registry default must be false in Gork Build \
-                         (no silent x.ai channel updates)"
+                        "auto_update registry default must be false in Gork Build                          (no silent x.ai channel updates)"
                     );
                 }
                 // vim_mode: Option<bool>; None → false.
@@ -1409,6 +1459,51 @@ mod tests {
         let pager = PagerLocalSnapshot::default();
         let value = current_value_for("auto_dark_theme", &ui, &pager).expect("must resolve");
         assert_eq!(value, SettingValue::Enum("groknight"));
+    }
+
+    /// The persisted `fork_secondary_model` slug resolves to the catalog
+    /// display name (matching the `default_model` row and the DynamicEnum
+    /// picker canonicals); the baseline still folds to the empty sentinel
+    /// and a slug missing from the catalog passes through raw.
+    #[test]
+    fn fork_secondary_model_current_value_resolves_display_name() {
+        let slug = "grok-4.5-fast";
+        assert_ne!(
+            slug,
+            xai_grok_shell::models::default_model(),
+            "test slug must differ from the baseline or the empty-fold arm masks the lookup",
+        );
+        let pager = PagerLocalSnapshot {
+            available_models: vec![(
+                "Grok 4.5 Fast".to_string(),
+                acp::ModelId::new(std::sync::Arc::from(slug)),
+            )],
+            ..Default::default()
+        };
+        let ui = UiConfig {
+            fork_secondary_model: slug.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("fork_secondary_model", &ui, &pager),
+            Some(SettingValue::String("Grok 4.5 Fast".to_string())),
+        );
+
+        // Baseline folds to the empty "no override" sentinel.
+        assert_eq!(
+            current_value_for("fork_secondary_model", &UiConfig::default(), &pager),
+            Some(SettingValue::String(String::new())),
+        );
+
+        // Stale slug (not in the catalog) passes through unresolved.
+        let stale_ui = UiConfig {
+            fork_secondary_model: "retired-model".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("fork_secondary_model", &stale_ui, &pager),
+            Some(SettingValue::String("retired-model".to_string())),
+        );
     }
 
     /// Keywords must be lowercase and non-empty.

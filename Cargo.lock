@@ -19,11 +19,22 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher 0.4.4",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66bd29a732b644c0431c6140f370d097879203d79b80c94a6747ba0872adaef8"
 dependencies = [
- "cipher",
+ "cipher 0.5.1",
  "cpubits",
  "cpufeatures 0.3.0",
 ]
@@ -1518,6 +1529,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+dependencies = [
+ "bzip2-sys",
+]
+
+[[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "cached"
 version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1583,7 +1613,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98db6aeaef0eeef2c1e3ce9a27b739218825dae116076352ac3777076aa22225"
 dependencies = [
- "cipher",
+ "cipher 0.5.1",
 ]
 
 [[package]]
@@ -1696,12 +1726,22 @@ dependencies = [
 
 [[package]]
 name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common 0.1.6",
+ "inout 0.1.4",
+]
+
+[[package]]
+name = "cipher"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e34d8227fe1ba289043aeb13792056ff80fd6de1a9f49137a5f499de8e8c78ea"
 dependencies = [
  "crypto-common 0.2.1",
- "inout",
+ "inout 0.2.2",
 ]
 
 [[package]]
@@ -2339,6 +2379,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec09e802f5081de6157da9a75701d6c713d8dc3ba52571fd4bd25f412644e8a6"
+dependencies = [
+ "ctor-proc-macro",
+ "dtor",
+]
+
+[[package]]
+name = "ctor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2521,6 +2577,12 @@ dependencies = [
  "serde",
  "uuid",
 ]
+
+[[package]]
+name = "deflate64"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26bf8fc351c5ed29b5c2f0cbbac1b209b74f60ecd62e675a998df72c49af5204"
 
 [[package]]
 name = "deltae"
@@ -2807,6 +2869,21 @@ checksum = "cd1511a7b6a56299bd043a9c167a6d2bfb37bf84a6dfceaba651168adfb43c87"
 dependencies = [
  "dtoa",
 ]
+
+[[package]]
+name = "dtor"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97cbdf2ad6846025e8e25df05171abfb30e3ababa12ee0a0e44b9bbe570633a8"
+dependencies = [
+ "dtor-proc-macro",
+]
+
+[[package]]
+name = "dtor-proc-macro"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
 
 [[package]]
 name = "dunce"
@@ -5315,12 +5392,12 @@ checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
 
 [[package]]
 name = "indexmap"
-version = "2.12.0"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6717a8d2a5a929a1a2eb43a12812498ed141a0bcfb7e8f7844fbdbe4303bba9f"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "serde",
  "serde_core",
 ]
@@ -5383,6 +5460,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -5471,6 +5557,15 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
@@ -5640,6 +5735,15 @@ dependencies = [
  "sha2 0.10.9",
  "signature",
  "simple_asn1",
+]
+
+[[package]]
+name = "kamadak-exif"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef4fc70d0ab7e5b6bafa30216a6b48705ea964cdfc29c050f2412295eba58077"
+dependencies = [
+ "mutate_once",
 ]
 
 [[package]]
@@ -5956,6 +6060,27 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "url",
+]
+
+[[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
+
+[[package]]
+name = "lzma-sys"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -6297,6 +6422,12 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
+name = "mutate_once"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13d2233c9842d08cfe13f9eac96e207ca6a2ea10b80259ebe8ad0268be27d2af"
 
 [[package]]
 name = "ndk"
@@ -7217,12 +7348,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
 name = "pdf_oxide"
 version = "0.3.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba152347f68db3aa3fbecc2b0104724d74aad532b186d3d9f4d5541681ddd91"
 dependencies = [
- "aes",
+ "aes 0.9.0",
  "base64",
  "bitflags 2.13.0",
  "brotli 8.0.2",
@@ -7880,6 +8021,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus-parse"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "811031bea65e5a401fb2e1f37d802cca6601e204ac463809a3189352d13b78a5"
+dependencies = [
+ "chrono",
+ "itertools 0.12.1",
+ "once_cell",
+ "regex",
+]
+
+[[package]]
 name = "proptest"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7937,6 +8090,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "prost-reflect"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "590aa145fee8f7a26b5a6055365e7c5e89a5c1caae9869de76ec0ee73181a2f9"
+dependencies = [
+ "prost",
+ "prost-types",
 ]
 
 [[package]]
@@ -8278,9 +8441,9 @@ dependencies = [
 
 [[package]]
 name = "rayon"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",
@@ -8294,6 +8457,19 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
 ]
 
 [[package]]
@@ -9549,10 +9725,11 @@ dependencies = [
 
 [[package]]
 name = "signal-hook-registry"
-version = "1.4.6"
+version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
+ "errno",
  "libc",
 ]
 
@@ -12884,6 +13061,7 @@ name = "xai-circuit-breaker"
 version = "0.1.0"
 dependencies = [
  "log",
+ "tonic",
 ]
 
 [[package]]
@@ -12977,6 +13155,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "prometheus",
+ "prometheus-parse",
  "prost",
  "reqwest 0.12.24",
  "schemars 1.0.4",
@@ -13231,6 +13410,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-extra-ca"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.24",
+ "rustls",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "xai-grok-hooks"
 version = "0.1.0"
 dependencies = [
@@ -13243,6 +13432,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "url",
  "xai-grok-config",
@@ -13258,6 +13448,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "xai-grok-auth",
+ "xai-grok-extra-ca",
  "xai-grok-sampler",
  "xai-grok-telemetry",
  "xai-grok-version",
@@ -13282,6 +13473,7 @@ dependencies = [
  "syntect",
  "textwrap",
  "two-face",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
  "url",
  "xai-grok-markdown-core",
@@ -13324,6 +13516,7 @@ dependencies = [
  "xai-computer-hub-sdk",
  "xai-file-utils",
  "xai-grok-config",
+ "xai-grok-extra-ca",
  "xai-grok-telemetry",
  "xai-grok-tools",
  "xai-grok-version",
@@ -13395,7 +13588,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager"
-version = "0.2.111"
+version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
@@ -13453,6 +13646,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wait-timeout",
+ "walkdir",
  "windows-sys 0.59.0",
  "xai-acp-lib",
  "xai-crash-handler",
@@ -13485,7 +13679,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager-bin"
-version = "0.2.111"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -13661,6 +13855,8 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "xai-grok-auth",
+ "xai-grok-extra-ca",
  "xai-grok-sampling-types",
  "xai-grok-test-support",
  "xai-grok-version",
@@ -13680,6 +13876,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "xai-circuit-breaker",
  "xai-grok-compaction",
  "xai-grok-tools",
 ]
@@ -13749,7 +13946,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-shell"
-version = "0.2.111"
+version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -13765,6 +13962,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "ctor",
  "dashmap",
  "dhat",
  "dirs 6.0.0",
@@ -13795,6 +13993,7 @@ dependencies = [
  "obfstr",
  "parking_lot",
  "portable-pty",
+ "pretty_assertions",
  "process-wrap",
  "prod-mc-cli-chat-proxy-types",
  "prost",
@@ -13854,6 +14053,7 @@ dependencies = [
  "xai-grok-compaction",
  "xai-grok-config",
  "xai-grok-config-types",
+ "xai-grok-extra-ca",
  "xai-grok-hooks",
  "xai-grok-http",
  "xai-grok-mcp",
@@ -13919,21 +14119,16 @@ dependencies = [
 name = "xai-grok-shell-session-support"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
  "axum",
- "chrono",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "tracing",
  "xai-file-utils",
  "xai-grok-http",
- "xai-grok-shell-base",
  "xai-grok-version",
- "xai-grok-workspace",
 ]
 
 [[package]]
@@ -13961,8 +14156,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "chrono",
+ "ctor",
  "dirs 5.0.1",
  "filetime",
  "futures-executor",
@@ -13977,7 +14174,9 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "prost",
+ "rcgen",
  "reqwest 0.12.24",
+ "rustls",
  "sentry",
  "serde",
  "serde_json",
@@ -13993,11 +14192,13 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
  "whoami",
  "xai-file-utils",
  "xai-grok-auth",
  "xai-grok-config",
  "xai-grok-env",
+ "xai-grok-extra-ca",
  "xai-grok-sampler",
  "xai-grok-secrets",
  "xai-mixpanel",
@@ -14045,9 +14246,11 @@ dependencies = [
  "command-fds",
  "crc32fast",
  "derive_more 2.1.1",
+ "dhat",
  "dirs 5.0.1",
  "dunce",
  "educe",
+ "encoding_rs",
  "flate2",
  "fs2",
  "futures",
@@ -14058,11 +14261,13 @@ dependencies = [
  "image",
  "indexmap",
  "infer 0.19.0",
+ "kamadak-exif",
  "libc",
  "minijinja",
  "nix 0.30.1",
  "parking_lot",
  "pdf_oxide",
+ "pretty_assertions",
  "pulldown-cmark",
  "quick-xml 0.38.3",
  "regex",
@@ -14073,6 +14278,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_yaml",
+ "sha2 0.10.9",
  "shellexpand",
  "similar",
  "strip-ansi-escapes",
@@ -14085,6 +14291,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "uuid",
  "which",
@@ -14094,9 +14301,12 @@ dependencies = [
  "xai-computer-hub-core",
  "xai-computer-hub-sdk",
  "xai-file-utils",
+ "xai-grok-auth",
  "xai-grok-config",
  "xai-grok-env",
+ "xai-grok-extra-ca",
  "xai-grok-sandbox",
+ "xai-grok-test-support",
  "xai-grok-tools-api",
  "xai-grok-version",
  "xai-grok-workspace-types",
@@ -14149,7 +14359,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-version"
-version = "0.2.111"
+version = "1.0.0"
 dependencies = [
  "semver",
 ]
@@ -14205,6 +14415,7 @@ dependencies = [
  "infer 0.19.0",
  "libc",
  "md5",
+ "nix 0.30.1",
  "nohash-hasher",
  "nucleo",
  "parking_lot",
@@ -14216,6 +14427,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "smallvec",
  "tar",
@@ -14233,6 +14445,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "wait-timeout",
  "windows 0.61.3",
  "xai-acp-lib",
  "xai-codebase-graph",
@@ -14264,6 +14477,7 @@ dependencies = [
  "xai-tool-types",
  "xai-tracing",
  "xai-tty-utils",
+ "zip",
  "zstd",
 ]
 
@@ -14272,6 +14486,7 @@ name = "xai-grok-workspace-client"
 version = "0.1.0"
 dependencies = [
  "schemars 1.0.4",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -14357,6 +14572,7 @@ dependencies = [
  "anyhow",
  "pbjson-build",
  "prost-build",
+ "prost-reflect",
  "tempfile",
  "tonic-prost-build",
 ]
@@ -14562,6 +14778,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
+name = "xz2"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
+dependencies = [
+ "lzma-sys",
+]
+
+[[package]]
 name = "yaml-rust"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14575,6 +14800,15 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
+]
 
 [[package]]
 name = "yoke"
@@ -14761,11 +14995,25 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12598812502ed0105f607f941c386f43d441e00148fce9dec3ca5ffb0bde9308"
 dependencies = [
+ "aes 0.8.4",
  "arbitrary",
+ "bzip2",
+ "constant_time_eq",
  "crc32fast",
+ "deflate64",
  "flate2",
+ "getrandom 0.3.4",
+ "hmac",
  "indexmap",
+ "lzma-rs",
  "memchr",
+ "pbkdf2",
+ "sha1",
+ "time",
+ "xz2",
+ "zeroize",
+ "zopfli",
+ "zstd",
 ]
 
 [[package]]
@@ -14785,6 +15033,18 @@ name = "zmij"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ff05f8caa9038894637571ae6b9e29466c1f4f829d26c9b28f869a29cbe3445"
+
+[[package]]
+name = "zopfli"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]
 
 [[package]]
 name = "zstd"

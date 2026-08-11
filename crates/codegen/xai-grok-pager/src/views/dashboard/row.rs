@@ -253,7 +253,9 @@ fn build_local_rows(
     rows
 }
 /// Map a leader [`RosterActivity`] to the dashboard's coarse [`RowState`].
-fn roster_activity_to_state(activity: RosterActivity) -> RowState {
+/// Public so the dispatcher can gate roster-row deletion through the very
+/// same `RowState::allows_delete` predicate the renderer paints `[✗]` with.
+pub fn roster_activity_to_state(activity: RosterActivity) -> RowState {
     match activity {
         RosterActivity::Working => RowState::Working,
         RosterActivity::NeedsInput => RowState::NeedsInput,
@@ -335,8 +337,9 @@ fn append_roster_rows(
             state,
             activity,
             secondary_line: entry
-                .model_id
+                .last_turn_summary
                 .as_deref()
+                .or(entry.model_id.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(sanitize),
@@ -375,6 +378,7 @@ pub fn classify_top_level(agent: &AgentView) -> RowState {
         return RowState::NeedsInput;
     }
     if !agent.session.state.is_idle()
+        || agent.wake_turn_active()
         || agent.session.turn_activity().is_some()
         || !agent.session.pending_prompts.is_empty()
     {
@@ -735,7 +739,11 @@ fn top_level_secondary_line(
         | RowState::Inactive
         | RowState::Completed
         | RowState::Failed
-        | RowState::Blocked => last_agent_message_preview(agent),
+        | RowState::Blocked => agent
+            .last_turn_summary
+            .as_deref()
+            .map(sanitize)
+            .or_else(|| last_agent_message_preview(agent)),
     }
 }
 /// Walk the scrollback from the end, returning the first
@@ -1505,6 +1513,7 @@ mod tests {
             model_id: None,
             yolo: false,
             activity: RosterActivity::Dormant,
+            last_turn_summary: None,
             resident: false,
             last_change_unix_ms,
             origin: RosterOrigin::default(),
@@ -1675,6 +1684,22 @@ mod tests {
         let rows = collect_roster(&[entry], &empty);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].secondary_line.as_deref(), Some("grok-4.5"));
+    }
+    /// The last-turn summary wins the secondary line over the model id.
+    #[test]
+    fn append_roster_rows_prefers_last_turn_summary() {
+        let empty = std::collections::BTreeSet::new();
+        let entry = RosterEntry {
+            model_id: Some("grok-4.5".to_string()),
+            last_turn_summary: Some("Fixed the roster merge".to_string()),
+            ..roster_entry_with("m", Some("Fix the bug"), RosterActivity::Dormant)
+        };
+        let rows = collect_roster(&[entry], &empty);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].secondary_line.as_deref(),
+            Some("Fixed the roster merge")
+        );
     }
     /// Without a model id there's genuinely nothing to show, so the
     /// second line stays empty rather than rendering a placeholder.

@@ -1,17 +1,19 @@
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
-    #[error("Not logged in. Run `gork login`.")]
+    #[error("Not logged in. Run `grok login`.")]
     NotLoggedIn,
 
     /// Token expired and no refresh authority available.
-    #[error("Token expired. Run `gork login` to re-authenticate.")]
+    #[error("Token expired. Run `grok login` to re-authenticate.")]
     TokenExpiredNoRefresh,
 
     /// Server rejected the token (401) with no recovery path.
-    #[error("Authentication rejected by server. Run `gork login` to re-authenticate.")]
+    #[error("Authentication rejected by server. Run `grok login` to re-authenticate.")]
     ServerRejectedNoRecovery,
 
     /// All recovery strategies exhausted.
@@ -20,11 +22,11 @@ pub enum AuthError {
 
     /// A session's team principal violates the `force_login_team_uuid` pin.
     /// `message` states which team is required vs. returned.
-    #[error("{message} Run `gork login` to sign in with the required team.")]
+    #[error("{message} Run `grok login` to sign in with the required team.")]
     PinnedTeamMismatch { message: String },
 
     /// Cached API-key session rejected because API-key auth is disabled.
-    #[error("API-key auth is disabled by your administrator. Run `gork login` to authenticate.")]
+    #[error("API-key auth is disabled by your administrator. Run `grok login` to authenticate.")]
     ApiKeyAuthDisabled,
 
     /// Outcome of a refresh-authority attempt. Recoverability (and, for
@@ -84,9 +86,12 @@ pub enum RefreshTokenFailedReason {
     RefreshTokenRejected,
     /// `invalid_client` — the client/app credential was rejected.
     ClientRejected,
-    /// Escalation from repeated transient failures (OIDC) or a single
-    /// external-binary failure. Never a raw IdP code: an unrecognized terminal
-    /// code is classified transient, not `Other` (see `classify_terminal`).
+    /// The operator's `auth_provider_command` could not mint a credential in a
+    /// headless run (`GROK_AUTH_EXPIRED=1`).
+    ProviderInteractiveRequired,
+    /// Escalation from repeated transient failures (OIDC). Never a raw IdP
+    /// code: an unrecognized terminal code is classified transient, not
+    /// `Other` (see `classify_terminal`).
     Other,
 }
 
@@ -97,24 +102,50 @@ impl RefreshTokenFailedReason {
     pub(crate) fn is_sticky(self) -> bool {
         match self {
             Self::RefreshTokenRejected => true,
+            Self::ClientRejected | Self::ProviderInteractiveRequired | Self::Other => false,
+        }
+    }
+
+    /// Whether the verdict rules out an unattended retry for as long as it
+    /// stands. Orthogonal to [`Self::is_sticky`], which is about whether the
+    /// verdict ever ages out.
+    pub(crate) fn blocks_unattended_retry(self) -> bool {
+        match self {
+            Self::RefreshTokenRejected | Self::ProviderInteractiveRequired => true,
             Self::ClientRejected | Self::Other => false,
         }
     }
 
     /// User-facing copy for a terminal refresh failure; the raw IdP code stays
     /// in logs.
-    pub(crate) fn user_message(self) -> &'static str {
+    pub(crate) fn user_message(self) -> Cow<'static, str> {
         match self {
             Self::RefreshTokenRejected => {
-                "Your session has expired. Run `gork login` to sign in again."
+                "Your session has expired. Run `grok login` to sign in again.".into()
             }
             Self::ClientRejected => {
-                "Authentication is temporarily unavailable. Run `gork login` if this persists."
+                "Authentication is temporarily unavailable. Run `grok login` if this persists."
+                    .into()
             }
+            Self::ProviderInteractiveRequired => provider_login_message(None),
             Self::Other => {
-                "Authentication could not be refreshed. Run `gork login` to sign in again."
+                "Authentication could not be refreshed. Run `grok login` to sign in again.".into()
             }
         }
+    }
+}
+
+/// `label` is the operator's `auth_provider_label`, where the surface has one.
+pub(crate) fn provider_login_message(label: Option<&str>) -> Cow<'static, str> {
+    match label {
+        Some(label) => format!(
+            "Your session expired and {label} could not renew it in the background. \
+             Run /login to sign in again."
+        )
+        .into(),
+        None => "Your session expired and your sign-in helper could not renew it in the \
+                 background. Run /login to sign in again."
+            .into(),
     }
 }
 

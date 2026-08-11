@@ -10,6 +10,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::appearance::AppearanceConfig;
 use crate::render::wrapping::word_wrap_lines;
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{AccentStyle, BlockContext, BlockLine, BlockOutput};
@@ -260,6 +261,13 @@ impl ContextInfoBlock {
             snapshot,
             model: model.into(),
         }
+    }
+
+    /// Build the styled lines for an arbitrary content width. Reused by the
+    /// usage modal's "Context usage" tab so the modal and the minimal-mode
+    /// scrollback block render the same breakdown.
+    pub(crate) fn lines_for_width(&self, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+        self.build_lines(theme, BarLayout::for_width(width))
     }
 
     /// Build the styled lines using the supplied theme and bar layout.
@@ -633,7 +641,7 @@ impl BlockContent for ContextInfoBlock {
         None
     }
 
-    fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
         false // Compact like SystemMessageBlock
     }
 

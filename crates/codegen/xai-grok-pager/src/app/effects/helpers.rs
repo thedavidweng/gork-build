@@ -8,9 +8,48 @@ use super::agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::{
     RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
+    http_status_from_error,
 };
 use xai_grok_shell::session::ExtMethodResult;
 use xai_grok_shell::session::unified_list::ListScope;
+/// Floor for the session create/load RPCs.
+const SESSION_RPC_FLOOR: std::time::Duration = std::time::Duration::from_secs(180);
+/// Headroom over the agent-side `.envrc` budget for the rest of session setup.
+const SESSION_RPC_SLACK: std::time::Duration = std::time::Duration::from_secs(50);
+/// Always covers the agent-side `.envrc` budget so the backstop cannot fire
+/// before the agent's own deadline. Reads `GROK_ENVRC_TIMEOUT_SECS` in this
+/// process; the agent inherits the same environment.
+pub(super) fn session_rpc_timeout() -> std::time::Duration {
+    SESSION_RPC_FLOOR.max(xai_grok_workspace::envrc::loader_budget() + SESSION_RPC_SLACK)
+}
+/// `acp_send` bounded by [`session_rpc_timeout`]; on expiry, an error naming
+/// `action` instead of an eternal spinner.
+pub(super) async fn acp_send_bounded<R, T>(
+    request: T,
+    tx: &tokio::sync::mpsc::UnboundedSender<R>,
+    action: &str,
+) -> Result<T::Response, acp::Error>
+where
+    T: xai_acp_lib::AcpRequest,
+    R: From<xai_acp_lib::AcpArgs<T>> + std::fmt::Debug,
+{
+    let timeout = session_rpc_timeout();
+    match tokio::time::timeout(timeout, acp_send(request, tx)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            Err(
+                acp::Error::new(
+                    acp::ErrorCode::InternalError.into(),
+                    format!(
+                "{action} timed out after {}s. It may still finish in the background; \
+                 retrying right away can run into the same delay.",
+                timeout.as_secs()
+            ),
+                ),
+            )
+        }
+    }
+}
 /// Typed progress message for session restore.
 /// Keeps the progress channel from accepting arbitrary `TaskResult` variants.
 pub(crate) struct RestoreProgressMsg {
@@ -88,7 +127,8 @@ pub(super) async fn fetch_plugin_cta_mcps(
 /// Rate-limit errors: free-usage paywall, else server detail (with API-key
 /// rewrite when the body pushes personal SuperGrok), else auth-aware fallback
 /// (see [`format_rate_limited_user_message`]).
-/// All other errors are sanitized to remove internal service names and jargon.
+/// All other errors render as the formatted request-failure banner text
+/// (status headline + sanitized detail).
 pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> String {
     if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
         let detail = err.data.as_ref().and_then(error_detail_from_data);
@@ -99,9 +139,20 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
     if err.code == acp::ErrorCode::InvalidParams && let Some(data) = &err.data
         && let Some(msg) = error_detail_from_data(data) && !msg.is_empty()
     {
-        return msg;
+        return sanitize_user_error(&msg);
     }
-    sanitize_user_error(&err.to_string())
+    let raw = err
+        .data
+        .as_ref()
+        .and_then(error_detail_from_data)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| err.to_string());
+    crate::app::error_display::format_request_failure(
+            http_status_from_error(err),
+            None,
+            &raw,
+        )
+        .message()
 }
 /// Format a Duration for user-visible restore progress messages.
 pub(super) fn format_restore_elapsed(d: std::time::Duration) -> String {
@@ -168,8 +219,27 @@ pub(crate) fn parse_session_load_running_prompt_id(
         .and_then(|v| v.as_str())
         .map(String::from)
 }
+/// CANONICAL wire parser for the `session/new` / `session/load` response
+/// `_meta[SCHEDULER_BACKGROUND_LOOPS_META_KEY]`.
+///
+/// Carries whether THIS session's scheduled fires run as detached background
+/// subagents, as the shell resolved it when the session's actor spawned. The
+/// pager stores it per session and must not re-resolve the setting: a
+/// mid-session flip would then make `/loop`'s wording describe a runtime the
+/// already-spawned session will never use. `None` when the shell predates the
+/// key (or for gateway chat sessions, which have no local fires), leaving the
+/// reader on the startup seed.
+pub(crate) fn parse_session_scheduler_background_loops(
+    resp_meta: Option<&acp::Meta>,
+) -> Option<bool> {
+    resp_meta
+        .and_then(|m| {
+            m.get(xai_grok_shell::session::SCHEDULER_BACKGROUND_LOOPS_META_KEY)
+        })
+        .and_then(|v| v.as_bool())
+}
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
-fn is_disk_full_error(raw: &str) -> bool {
+pub(crate) fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)
         || raw.contains(xai_fast_worktree::ENOSPC_OS_MESSAGE)
         || raw.contains("Disk quota exceeded") || raw.contains("Out of disk space")
@@ -252,6 +322,9 @@ pub(crate) struct SessionFlags {
     /// Mutual exclusivity with Build plan profiles: profiles are omitted and a
     /// warn is logged when plan flags are also set (K12).
     pub chat_mode: bool,
+    /// Local-workspace stamp for ACP `_meta` (scrub still strips envId / Direct hub).
+    #[cfg(feature = "local-workspace")]
+    pub local_workspace: Option<crate::app::session_startup::LocalWorkspaceConfig>,
     /// Effective screen mode label (`ScreenMode::meta_label`), stamped into
     /// every `PromptRequest._meta.screenMode` for minimal-vs-regular usage
     /// telemetry. `None` (key omitted) only under `Default` in tests; real
@@ -308,6 +381,10 @@ impl SessionFlags {
         }
         if self.chat_mode {
             meta.insert("x.ai/session".into(), serde_json::json!({ "kind": "chat" }));
+            #[cfg(feature = "local-workspace")]
+            if let Some(ref lw) = self.local_workspace {
+                stamp_local_workspace_meta(&mut meta, lw);
+            }
         }
         if !self.ask_user {
             meta.insert("askUserQuestion".into(), serde_json::json!(false));
@@ -323,12 +400,25 @@ impl SessionFlags {
         if meta.is_empty() { None } else { Some(meta) }
     }
 }
-/// Workspace-bind `_meta` keys forbidden on chat create/load: backend owns
-/// workspace for `kind=chat`; the client must not bind Direct/envId/attach.
+/// Workspace-bind `_meta` keys **always** forbidden on chat create/load.
+///
+/// `x.ai/cloud_existing_workspace` is intentionally omitted: scrub keeps it
+/// iff `x.ai/local_workspace.mode == "attach"`.
+#[allow(dead_code)]
 pub(super) const CHAT_FORBIDDEN_WORKSPACE_BIND_KEYS: &[&str] = &[
     "envId",
     "x.ai/cloud_server_id",
-    "x.ai/cloud_existing_workspace",
+];
+/// FS-only tool ids for local existing workspace (chat attach/own).
+#[cfg(feature = "local-workspace")]
+pub(super) const LOCAL_WORKSPACE_FS_ONLY_TOOL_IDS: &[&str] = &[
+    "workspace.fs_list",
+    "workspace.fs_exists",
+    "workspace.fs_read_file",
+    "workspace.fs_write_file",
+    "workspace.fs_delete_file",
+    "workspace.put_files",
+    "workspace.get_files",
 ];
 /// Stamp `_meta["x.ai/session"].kind = "chat"` and strip Build `agentProfile` (K12).
 pub(super) fn apply_chat_kind_meta(meta: &mut Option<acp::Meta>) {
@@ -336,13 +426,164 @@ pub(super) fn apply_chat_kind_meta(meta: &mut Option<acp::Meta>) {
     obj.insert("x.ai/session".into(), serde_json::json!({ "kind": "chat" }));
     obj.remove("agentProfile");
 }
+/// Stamp chat+local intent. Attach also stamps `x.ai/cloud_existing_workspace`.
+/// Own leaves `server_id` unset — shell supervisor mints before handshake.
+///
+/// Never stamps `envId` or `x.ai/cloud_server_id`.
+#[cfg(feature = "local-workspace")]
+pub(super) fn stamp_local_workspace_meta(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    cfg: &crate::app::session_startup::LocalWorkspaceConfig,
+) {
+    use crate::app::session_startup::LocalWorkspaceMode;
+    let mut local = serde_json::Map::new();
+    let mode = match cfg.mode {
+        LocalWorkspaceMode::Attach => "attach",
+        LocalWorkspaceMode::Own => "own",
+    };
+    local.insert("mode".into(), serde_json::json!(mode));
+    if let Some(ref sid) = cfg.server_id {
+        local.insert("server_id".into(), serde_json::json!(sid));
+    }
+    if let Some(ref cwd) = cfg.cwd {
+        local
+            .insert("cwd".into(), serde_json::json!(cwd.to_string_lossy().into_owned()));
+    }
+    meta.insert("x.ai/local_workspace".into(), serde_json::Value::Object(local));
+    tracing::info!(
+        target: crate::views::welcome::workspace_mode::WORKSPACE_MODE_LOG,
+        event = "acp_meta_stamped",
+        mode,
+        server_id = cfg.server_id.as_deref(),
+        cwd = cfg.cwd.as_ref().map(|p| p.display().to_string()),
+        "stamped x.ai/local_workspace onto session meta"
+    );
+    if cfg.mode == LocalWorkspaceMode::Attach && let Some(ref sid) = cfg.server_id {
+        let mut existing = serde_json::Map::new();
+        existing.insert("server_id".into(), serde_json::json!(sid));
+        if let Some(ref cwd) = cfg.cwd {
+            existing
+                .insert(
+                    "cwd".into(),
+                    serde_json::json!(cwd.to_string_lossy().into_owned()),
+                );
+        }
+        meta.insert(
+            "x.ai/cloud_existing_workspace".into(),
+            serde_json::Value::Object(existing),
+        );
+    }
+}
+/// Apply [`stamp_local_workspace_meta`] onto optional ACP meta.
+#[cfg(feature = "local-workspace")]
+pub(super) fn apply_local_workspace_meta(
+    meta: &mut Option<acp::Meta>,
+    cfg: &crate::app::session_startup::LocalWorkspaceConfig,
+) {
+    let obj = meta.get_or_insert_with(acp::Meta::new);
+    stamp_local_workspace_meta(obj, cfg);
+}
+/// Shared chat create/load/worktree meta finalize: kind + local stamp + scrub.
+pub(super) fn finalize_chat_session_meta(
+    meta: &mut Option<acp::Meta>,
+    is_chat_path: bool,
+    #[cfg_attr(not(feature = "local-workspace"), allow(unused_variables))]
+    session_flags: &SessionFlags,
+) {
+    if !is_chat_path {
+        return;
+    }
+    apply_chat_kind_meta(meta);
+    #[cfg(feature = "local-workspace")]
+    if let Some(ref lw) = session_flags.local_workspace {
+        apply_local_workspace_meta(meta, lw);
+    }
+    scrub_chat_workspace_bind_meta(meta);
+}
 /// Remove client workspace-bind keys from chat create/load meta (defense in depth).
+///
+/// Narrow scrub exception: keep `x.ai/cloud_existing_workspace` when local
+/// intent is **attach**. Own stamps intent only (shell mints `server_id`).
+/// Never keep `envId` or Direct hub `x.ai/cloud_server_id`.
 pub(super) fn scrub_chat_workspace_bind_meta(meta: &mut Option<acp::Meta>) {
     let Some(obj) = meta.as_mut() else {
         return;
     };
     for key in CHAT_FORBIDDEN_WORKSPACE_BIND_KEYS {
         obj.remove(*key);
+    }
+    #[cfg(feature = "local-workspace")]
+    {
+        let allow_existing_attach = obj
+            .get("x.ai/local_workspace")
+            .and_then(|v| v.get("mode"))
+            .and_then(|m| m.as_str()) == Some("attach");
+        if !allow_existing_attach {
+            obj.remove("x.ai/cloud_existing_workspace");
+        }
+    }
+    {
+        obj.remove("x.ai/cloud_existing_workspace");
+    }
+}
+/// Params for shell ACP `x.ai/session/add_local_workspace`.
+///
+/// v1 surface is **shell ACP-only** (no pager slash/command wiring). Pager
+/// dogfood / headless clients call the extension directly with this payload.
+/// No remove path until session end.
+#[cfg(feature = "local-workspace")]
+#[allow(dead_code)]
+pub(crate) fn mid_session_add_local_workspace_params(
+    session_id: &str,
+    cfg: &crate::app::session_startup::LocalWorkspaceConfig,
+) -> serde_json::Value {
+    let mut meta = serde_json::Map::new();
+    stamp_local_workspace_meta(&mut meta, cfg);
+    let mut opt = Some(meta);
+    scrub_chat_workspace_bind_meta(&mut opt);
+    serde_json::json!({
+        "sessionId": session_id,
+        "meta": opt.unwrap_or_default(),
+    })
+}
+/// Fail closed on operator attestation outside the FS-only allowlist.
+/// `None` / empty attested set → uncheckable → refuse. Live server is not probed.
+#[cfg(feature = "local-workspace")]
+pub(crate) fn reject_non_fs_only_advertised_tools(
+    advertised_tool_ids: Option<&[&str]>,
+) -> Result<(), String> {
+    let Some(ids) = advertised_tool_ids else {
+        return Err(
+            "operator attestation GROK_CHAT_LOCAL_WORKSPACE_ADVERTISED_TOOLS is unset \
+             (uncheckable); refuse attach. Live workspace_server was not inspected — set \
+             the env to a comma-separated FS-only catalog."
+                .into(),
+        );
+    };
+    if ids.is_empty() {
+        return Err(
+            "operator attestation GROK_CHAT_LOCAL_WORKSPACE_ADVERTISED_TOOLS is empty \
+             (uncheckable); refuse attach. Live workspace_server was not inspected."
+                .into(),
+        );
+    }
+    let forbidden: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| !LOCAL_WORKSPACE_FS_ONLY_TOOL_IDS.contains(id))
+        .collect();
+    if forbidden.is_empty() {
+        Ok(())
+    } else {
+        Err(
+                format!(
+            "operator attestation lists tools outside the FS-only allowlist: {}. \
+             Live workspace_server was not inspected. Fix \
+             GROK_CHAT_LOCAL_WORKSPACE_ADVERTISED_TOOLS or restart workspace_server \
+             with --require-explicit-toolset and an FS-only catalog.",
+            forbidden.join(", ")
+        ),
+            )
     }
 }
 /// Metadata returned from effect execution so the event loop can patch
@@ -594,6 +835,11 @@ pub(super) fn parse_session_picker_entries(
                 .or_else(|| v.get("worktree_label"))
                 .and_then(|s| s.as_str())
                 .map(String::from);
+            let last_turn_summary = v
+                .get("lastTurnSummary")
+                .or_else(|| v.get("last_turn_summary"))
+                .and_then(|s| s.as_str())
+                .map(String::from);
             let repo_name = crate::views::session_picker::repo_name_from_cwd(&cwd_str);
             Some(SessionPickerEntry {
                 id,
@@ -609,6 +855,7 @@ pub(super) fn parse_session_picker_entries(
                 branch,
                 repo_name,
                 worktree_label,
+                last_turn_summary,
                 card_detail: None,
             })
         })
@@ -649,6 +896,7 @@ pub(super) fn session_picker_entry_to_roster(
         model_id: e.model_id.clone(),
         yolo: false,
         activity: RosterActivity::Dormant,
+        last_turn_summary: e.last_turn_summary.clone(),
         resident: false,
         last_change_unix_ms: last_change.timestamp_millis(),
         origin: RosterOrigin {
@@ -826,6 +1074,14 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("page_flip_on_send", "Bool", &value));
             };
             xai_grok_shell::util::config::set_page_flip_on_send(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "confirm_before_rewind" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("confirm_before_rewind", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_confirm_before_rewind(b)
                 .await
                 .map_err(|e| e.to_string())
         }

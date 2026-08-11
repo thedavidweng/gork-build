@@ -1,7 +1,6 @@
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::tool::{ToolKind, ToolNamespace};
 
-use super::task::MAX_SUBAGENT_DEPTH;
 use super::task::types::SubagentDepthCounter;
 
 pub use xai_grok_tools_api::slash_commands::WORKFLOW_TOOL_NAME;
@@ -170,9 +169,9 @@ impl crate::types::tool_metadata::ToolMetadata for WorkflowTool {
     }
 
     fn description_template(&self) -> &str {
-        r##"Launch a workflow: a Rhai script that orchestrates subagents as one background run. Provide exactly one source: `name` (a registered workflow — built-in, or from the project `.grok/workflows/` or user `~/.grok/workflows/`), an inline `script`, or a `script_path`. Optionally pass `args` (bound to the script's `args`) and `agent_budget`, an absolute cap on cumulative child-agent calls: every agent() and parallel() item consumes one slot (schema retries do not); default 128. The call returns immediately; progress appears in `/workflows` and completion is reported automatically — do not poll or sleep-wait.
+        r##"Launch a workflow: a Rhai script that orchestrates subagents as one background run. Provide exactly one source: `name` (a registered workflow — built-in, or from the project `.grok/workflows/` or user `~/.grok/workflows/`), an inline `script`, or a `script_path`. Optionally pass `args` (bound to the script's `args`) and `agent_budget`, an absolute cap on cumulative child-agent calls: every agent() and parallel() item consumes one slot (schema retries do not); default 128. The host also caps live children per run (32 by default, host-configured) — larger parallel() panels are queued and still act as a barrier. The call returns immediately; progress appears in `/workflows`${%- if system_reminders_enabled %} and completion is reported automatically — do not poll or sleep-wait${%- endif %}.
 
-Prefer a registered workflow when one fits; author a script for bounded fan-out over a known work list, staged research and verification, or several independent perspectives, and confirm unusually large fan-out first. Before writing or editing a script, read the `create-workflow` skill's SKILL.md. `validate_only: true` runs a path-specific smoke check (metadata, compile, one canned-host path) — not proof that every branch or live tool works.
+Prefer a registered workflow when one fits; author a script for bounded fan-out over a known work list, staged research and verification, or several independent perspectives. Before writing or editing a script, read the `create-workflow` skill's SKILL.md. `validate_only: true` runs a path-specific smoke check (metadata, compile, one canned-host path) — not proof that every branch or live tool works.
 
 A started run gets a session-unique display name (e.g. `review-changes`, `review-changes-2`) — the handle to show the user and use with `/workflow pause|resume|stop <name>`; keep run IDs internal. Each launch persists an editable `script_path`; edit it and launch as a new run to iterate. Use `resume_from_run_id` only for a same-process paused run (process restarts are terminal); a budget-limited run resumes only with a higher `agent_budget`. Save reusable scripts to `.grok/workflows/<name>.rhai`."##
     }
@@ -200,7 +199,7 @@ impl xai_tool_runtime::Tool for WorkflowTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             WORKFLOW_TOOL_NAME,
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -237,7 +236,8 @@ impl xai_tool_runtime::Tool for WorkflowTool {
             (depth, sender)
         };
 
-        if depth >= MAX_SUBAGENT_DEPTH {
+        // Workflows stay top-level-only regardless of configurable subagent depth.
+        if depth > 0 {
             return Err(xai_tool_runtime::ToolError::custom(
                 "workflow_depth_exceeded",
                 "Workflows can only be launched from a top-level session (subagents and \

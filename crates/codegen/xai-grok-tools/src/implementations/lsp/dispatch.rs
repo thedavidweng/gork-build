@@ -111,10 +111,10 @@ async fn bootstrap_lsp(
         mgr.restartable_servers()
     };
     for name in restartable {
-        let mgr_clone = lsp_manager.clone();
-        tokio::spawn(crate::implementations::lsp::restart_monitor(
-            mgr_clone, name,
-        ));
+        // Hand the monitor a `Weak` so it never keeps the manager (and its
+        // language-server children) alive past the owning session.
+        let mgr_weak = Arc::downgrade(&lsp_manager);
+        tokio::spawn(crate::implementations::lsp::restart_monitor(mgr_weak, name));
     }
     Ok(())
 }
@@ -267,30 +267,27 @@ impl super::LspBackend for LspBackendAdapter {
             let mut file_diagnostics = Vec::new();
 
             for client in mgr.clients.values() {
-                let map = client.diagnostics.read().unwrap_or_else(|e| e.into_inner());
-                if let Some(diags) = map.get(&uri_str) {
-                    for d in diags {
-                        let severity = match d.severity {
-                            Some(async_lsp::lsp_types::DiagnosticSeverity::ERROR) => {
-                                super::DiagnosticSeverityLevel::Error
-                            }
-                            Some(async_lsp::lsp_types::DiagnosticSeverity::WARNING) => {
-                                super::DiagnosticSeverityLevel::Warning
-                            }
-                            _ => continue,
-                        };
-                        file_diagnostics.push(super::DiagnosticEntry {
-                            severity,
-                            // LSP uses 0-based positions; convert to 1-based
-                            // for display (L{line}:{column}).
-                            line: d.range.start.line + 1,
-                            column: d.range.start.character + 1,
-                            message: d.message.clone(),
-                            source: d.source.clone(),
-                            code: None,
-                            is_stale: false,
-                        });
-                    }
+                for d in client.diagnostics.items(&uri_str) {
+                    let severity = match d.severity {
+                        Some(async_lsp::lsp_types::DiagnosticSeverity::ERROR) => {
+                            super::DiagnosticSeverityLevel::Error
+                        }
+                        Some(async_lsp::lsp_types::DiagnosticSeverity::WARNING) => {
+                            super::DiagnosticSeverityLevel::Warning
+                        }
+                        _ => continue,
+                    };
+                    file_diagnostics.push(super::DiagnosticEntry {
+                        severity,
+                        // LSP uses 0-based positions; convert to 1-based
+                        // for display (L{line}:{column}).
+                        line: d.range.start.line + 1,
+                        column: d.range.start.character + 1,
+                        message: d.message.clone(),
+                        source: d.source.clone(),
+                        code: None,
+                        is_stale: false,
+                    });
                 }
             }
 

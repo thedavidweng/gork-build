@@ -1,9 +1,9 @@
 [package]
 name = "xai-grok-pager"
-version = "0.2.111"
+version = "1.0.0"
 edition.workspace = true
 license = "Apache-2.0"
-authors = ["Gork Build contributors"]
+authors = ["xAI"]
 
 [dependencies]
 # TTY safety — detach subprocesses from the controlling terminal
@@ -110,6 +110,7 @@ xai-grok-agent = { workspace = true }
 xai-grok-plugin-marketplace = { path = "../xai-grok-plugin-marketplace" }
 xai-hooks-plugins-types = { path = "../xai-hooks-plugins-types" }
 wait-timeout = { workspace = true }
+walkdir = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 
 # Base64 encoding for image data
@@ -161,8 +162,8 @@ core-foundation = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
-# Enable the render crate's test-only helpers for the pager's test build.
 xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
+xai-grok-shell = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
@@ -194,6 +195,10 @@ harness = false
 
 [[bench]]
 name = "edit_highlight"
+harness = false
+
+[[bench]]
+name = "resize"
 harness = false
 
 # PTY integration tests are split into coherent scheduling families. The test
@@ -286,7 +291,9 @@ default-bazel = [
     "jemalloc",
     "sandbox-enforce",
     "test-support",
+    "local-workspace",
     ]
+local-workspace = ["xai-grok-shell/local-workspace"]
 # No-op on this crate: the actual `#[global_allocator]` (and the
 # `tikv-jemallocator` dep) live on the composition-root binary
 # `xai-grok-pager-bin`, which owns `main.rs`. Kept as an empty feature so the

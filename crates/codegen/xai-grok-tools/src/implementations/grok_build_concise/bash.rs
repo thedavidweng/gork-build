@@ -14,8 +14,8 @@ use crate::util::truncate::format_bytes;
 fn annotations(bash: &BashOutput) -> String {
     let mut s = String::new();
     if bash.truncated {
-        let shown = format_bytes(bash.output.len());
-        let total = format_bytes(bash.total_bytes);
+        let shown = format_bytes(bash.output.len() as u64);
+        let total = format_bytes(bash.total_bytes as u64);
         s.push_str(&format!(
             " [truncated: showing last {} of {} - full output at: {}]",
             shown, total, bash.output_file
@@ -63,8 +63,8 @@ fn format_concise_foreground_prompt(bash: &BashOutput) -> String {
 fn format_concise_background_prompt(bash: &BashOutput) -> String {
     let raw = String::from_utf8_lossy(&bash.output);
     let output_str = strip_str(&raw).to_string();
-    let shown = format_bytes(bash.output.len());
-    let total = format_bytes(bash.total_bytes);
+    let shown = format_bytes(bash.output.len() as u64);
+    let total = format_bytes(bash.total_bytes as u64);
     format!(
         "[Command moved to background]\n\n\
          Partial output ({} of {} total):\n\n\
@@ -128,7 +128,7 @@ impl xai_tool_runtime::Tool for BashConciseTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "run_terminal_cmd",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -265,9 +265,8 @@ mod tests {
         // to_prompt_format() is a passthrough — it must NOT add another header.
         let mut bash = make_bash(0, "hello world\n");
         // Pre-bake DEFAULT (what BashTool::run() does)
-        bash.output_for_prompt = crate::implementations::grok_build::bash::format_default_prompt(
-            &bash, /* append_noop_reminder */ true,
-        );
+        bash.output_for_prompt =
+            crate::implementations::grok_build::bash::format_default_prompt(&bash);
         assert!(bash.output_for_prompt.starts_with("exit: 0"));
 
         // Concise post-processing (what BashConciseTool::run() does)

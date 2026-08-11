@@ -1,8 +1,6 @@
-# Gork Build User Guide
+# Grok Build User Guide
 
-Learn how to install, configure, and extend **Gork Build** — the community
-VSCodium-style distribution of Grok Build (vendor telemetry and branding
-removed). Model access still uses your Grok / xAI credentials.
+Learn how to install, configure, and extend Grok Build, the terminal-based AI coding assistant from SpaceXAI.
 
 ---
 
@@ -22,7 +20,7 @@ Start here. These guides cover what you need on your first day.
 
 ## Tier 2: Core Feature Docs
 
-Customize and extend Gork Build.
+Customize and extend Grok Build.
 
 | # | Document | Description |
 |---|----------|-------------|
@@ -39,7 +37,7 @@ Customize and extend Gork Build.
 
 ## Tier 3: Advanced Usage Docs
 
-Automate, script, and integrate Gork Build with other systems.
+Automate, script, and integrate Grok Build with other systems.
 
 | # | Document | Description |
 |---|----------|-------------|
