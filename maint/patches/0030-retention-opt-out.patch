@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Davy <95214375+thedavidweng@users.noreply.github.com>
-Date: Tue, 11 Aug 2026 01:35:27 -0700
+From e40fc753996554857d8ffcd6534bc957b16472ef Mon Sep 17 00:00:00 2001
+From: Gork <gork-ci@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:39:39 -0700
 Subject: [PATCH] retention-opt-out: lock coding-data retention to opt-out
 
 Gork-Patch-Id: retention-opt-out
@@ -9,21 +9,21 @@ Gork-Risk: critical
 ---
  .../xai-grok-pager/src/app/app_view.rs        |  11 ++
  .../xai-grok-pager/src/app/dispatch/status.rs |   5 +
- .../src/app/dispatch/tests/status.rs          | 140 ++++--------------
+ .../src/app/dispatch/tests/status.rs          | 142 +++---------------
  .../xai-grok-pager/src/settings/defs.rs       |  38 ++---
  .../xai-grok-pager/src/settings/registry.rs   |  22 +--
  .../src/slash/commands/privacy.rs             |   4 +-
  .../src/views/settings_modal/tests.rs         |   2 +
- .../xai-grok-pager/tests/settings_e2e.rs      |  28 ++--
+ .../xai-grok-pager/tests/settings_e2e.rs      |  20 +--
  .../xai-grok-shell/src/auth/manager.rs        |  10 +-
  .../src/auth/manager/enrichment.rs            |   5 +-
  .../xai-grok-shell/src/auth/manager_tests.rs  |  78 ++++------
  .../codegen/xai-grok-shell/src/auth/model.rs  |  10 +-
  .../xai-grok-shell/src/extensions/privacy.rs  |  21 ++-
- 13 files changed, 143 insertions(+), 231 deletions(-)
+ 13 files changed, 138 insertions(+), 230 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-index e8ec17fbb8b363fc6f8bbb17e6a5579df91839ad..eb2d1c71c2e0e6da814388ef3ee89341b7276d36 100644
+index e8ec17f..eb2d1c7 100644
 --- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
 @@ -1269,6 +1269,10 @@ impl AppView {
@@ -53,7 +53,7 @@ index e8ec17fbb8b363fc6f8bbb17e6a5579df91839ad..eb2d1c71c2e0e6da814388ef3ee89341
              return false;
          }
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs
-index c1d928dc93e3344e5bdcc0cd1e09366522d42368..e3c70f2fb343d62d948d5fd1adf38a6b4451bec6 100644
+index c1d928d..e3c70f2 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs
 @@ -201,6 +201,11 @@ pub(super) fn set_coding_data_sharing(
@@ -69,7 +69,7 @@ index c1d928dc93e3344e5bdcc0cd1e09366522d42368..e3c70f2fb343d62d948d5fd1adf38a6b
      if app.is_zdr {
          app.show_toast("\u{2717} Cannot change: Zero Data Retention enabled");
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
-index b2216e37f492065993c6b8590787bdbac31e0b8e..3a5d449a7abbd465f825c1dcbc4fb67a3e5a5ff8 100644
+index b2216e3..82b53c0 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
 @@ -579,11 +579,18 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
@@ -94,7 +94,7 @@ index b2216e37f492065993c6b8590787bdbac31e0b8e..3a5d449a7abbd465f825c1dcbc4fb67a
      );
  }
  
-@@ -602,138 +609,41 @@ fn privacy_banner_ready_app() -> AppView {
+@@ -602,136 +609,35 @@ fn privacy_banner_ready_app() -> AppView {
      app
  }
  
@@ -195,8 +195,7 @@ index b2216e37f492065993c6b8590787bdbac31e0b8e..3a5d449a7abbd465f825c1dcbc4fb67a
      assert!(
          app.coding_data_retention_opt_out,
 -        "rollback restores opt-out"
-+        "OptIn must not opt the user in"
-     );
+-    );
 -    let toast = app
 -        .welcome_toast
 -        .as_ref()
@@ -205,7 +204,8 @@ index b2216e37f492065993c6b8590787bdbac31e0b8e..3a5d449a7abbd465f825c1dcbc4fb67a
 -    assert!(
 -        toast.contains("coding data sharing"),
 -        "welcome toast on [Opt in] failure: {toast}"
--    );
++        "OptIn must not opt the user in"
+     );
 -    assert!(toast.contains("server error"), "error in toast: {toast}");
 -}
 -
@@ -220,8 +220,8 @@ index b2216e37f492065993c6b8590787bdbac31e0b8e..3a5d449a7abbd465f825c1dcbc4fb67a
 +    assert!(app.privacy_banner_acked.is_none());
  
      let effects = dispatch(Action::PrivacyBannerOptOut, &mut app);
-     assert!(
-         effects.is_empty(),
+-    assert!(
+-        effects.is_empty(),
 -        "[Opt out] during an inflight [Opt in] must be a no-op: {effects:?}"
 -    );
 -    assert!(app.privacy_banner_acked.is_none(), "no ack while inflight");
@@ -239,17 +239,14 @@ index b2216e37f492065993c6b8590787bdbac31e0b8e..3a5d449a7abbd465f825c1dcbc4fb67a
 -    assert!(
 -        app.privacy_banner_should_show(),
 -        "a failed [Opt in] must keep the banner even after a raced [Opt out]"
-+        "OptOut must emit nothing: {effects:?}"
-     );
+-    );
++    assert!(effects.is_empty(), "OptOut must emit nothing: {effects:?}");
 +    assert!(app.privacy_banner_acked.is_none());
  }
  
-+
  /// The ack must not hinge on the round trip, unlike `[Opt in]`'s.
- #[test]
- fn privacy_banner_opt_out_acks_now_and_records_decline() {
 diff --git a/crates/codegen/xai-grok-pager/src/settings/defs.rs b/crates/codegen/xai-grok-pager/src/settings/defs.rs
-index 642d8c6438b2e062cd2ee521823d68e26c52a35b..815a0f7efe0643a29e3bcadfb29d994596a03336 100644
+index 642d8c6..815a0f7 100644
 --- a/crates/codegen/xai-grok-pager/src/settings/defs.rs
 +++ b/crates/codegen/xai-grok-pager/src/settings/defs.rs
 @@ -132,18 +132,11 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
@@ -326,7 +323,7 @@ index 642d8c6438b2e062cd2ee521823d68e26c52a35b..815a0f7efe0643a29e3bcadfb29d9945
              hidden_in_minimal: false,
          },
 diff --git a/crates/codegen/xai-grok-pager/src/settings/registry.rs b/crates/codegen/xai-grok-pager/src/settings/registry.rs
-index c719471e28c9a30cb665415cba3155b29faf0280..82b5d5511ee2ff8e294f4cd7a3166badb1ddcab8 100644
+index c719471..82b5d55 100644
 --- a/crates/codegen/xai-grok-pager/src/settings/registry.rs
 +++ b/crates/codegen/xai-grok-pager/src/settings/registry.rs
 @@ -232,6 +232,8 @@ pub enum SettingValue {
@@ -405,7 +402,7 @@ index c719471e28c9a30cb665415cba3155b29faf0280..82b5d5511ee2ff8e294f4cd7a3166bad
                  }
                  // vim_mode: Option<bool>; None → false.
 diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs b/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
-index 83cb440fc8861e47d7fe9b477e2da9404b627e0a..91fd775ead4707dd5b7156e94962cebdab0b616a 100644
+index 83cb440..91fd775 100644
 --- a/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
 +++ b/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
 @@ -14,8 +14,8 @@ impl SlashCommand for PrivacyCommand {
@@ -420,7 +417,7 @@ index 83cb440fc8861e47d7fe9b477e2da9404b627e0a..91fd775ead4707dd5b7156e94962cebd
  
      fn usage(&self) -> &str {
 diff --git a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
-index 747eab5c2a109c3d21f6ee76a857286b0f83212f..5ec9d1a7dc6349d43aacff6641bbc4e8641a7a18 100644
+index 747eab5..5ec9d1a 100644
 --- a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
 +++ b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
 @@ -7972,6 +7972,7 @@ fn locked_coding_data_sharing_row_does_not_open_picker() {
@@ -440,7 +437,7 @@ index 747eab5c2a109c3d21f6ee76a857286b0f83212f..5ec9d1a7dc6349d43aacff6641bbc4e8
          let mut s = make_locked_state(lock);
          s.selected = coding_data_sharing_row_idx(&s);
 diff --git a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
-index e971a3affaff8a2c7d530f6b60af0b6677655593..1f20c5da39124649d25059c0b7f96d72fe6128c8 100644
+index e971a3a..196de60 100644
 --- a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
 +++ b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
 @@ -2010,7 +2010,7 @@ fn defaults_round_trip_through_registry() {
@@ -452,13 +449,7 @@ index e971a3affaff8a2c7d530f6b60af0b6677655593..1f20c5da39124649d25059c0b7f96d72
              "fork_secondary_model" => SettingValue::String(String::new()),
              "show_thinking_blocks" => SettingValue::Bool(true),
              "prompt_suggestions" => SettingValue::Bool(true),
-@@ -4903,25 +4903,15 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
- #[test]
- fn pr9_coding_data_sharing_choices_use_canonical_strings() {
-     let reg = SettingsRegistry::defaults();
-     let meta = reg.find("coding_data_sharing").unwrap();
-     let canonicals: Vec<&str> = match &meta.kind {
-         SettingKind::Enum { choices, .. } => choices.iter().map(|c| c.canonical).collect(),
+@@ -4909,19 +4909,9 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
          _ => panic!("coding_data_sharing must be Enum"),
      };
      assert_eq!(
@@ -491,7 +482,7 @@ index e971a3affaff8a2c7d530f6b60af0b6677655593..1f20c5da39124649d25059c0b7f96d72
              .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
          assert_eq!(
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager.rs b/crates/codegen/xai-grok-shell/src/auth/manager.rs
-index 06b3b1bd429397a409b45d4569b0a8dcd16c2348..736738e9b94ad8f6e962bc4591050bddcfb2204c 100644
+index 06b3b1b..736738e 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager.rs
 @@ -794,6 +794,10 @@ impl AuthManager {
@@ -526,7 +517,7 @@ index 06b3b1bd429397a409b45d4569b0a8dcd16c2348..736738e9b94ad8f6e962bc4591050bdd
                  // the on-disk credentials. `pick_up_sibling_token` only
                  // mutates inner when the disk holds a *different valid*
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs b/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs
-index 03749b2927ac24b22a4abd1902818e59a12eaff5..75d192bf96d8582541f4ce74c825e8358da269c4 100644
+index 03749b2..75d192b 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs
 @@ -255,7 +255,10 @@ pub(super) fn apply_user_info_enrichment(disk: &mut GrokAuth, user_info: UserInf
@@ -542,7 +533,7 @@ index 03749b2927ac24b22a4abd1902818e59a12eaff5..75d192bf96d8582541f4ce74c825e835
      }
      if let Some(ref email) = user_info.email
 diff --git a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
-index 75a6f09aa8cfa931a550ed139f845cca08817f42..05363703b4113898c1f8cb8dcc58d2da4059dc9d 100644
+index 75a6f09..0536370 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
 @@ -443,41 +443,30 @@ fn clear_does_not_remove_legacy_scope() {
@@ -709,7 +700,7 @@ index 75a6f09aa8cfa931a550ed139f845cca08817f42..05363703b4113898c1f8cb8dcc58d2da
  
  // ── force_login_team_uuid spine enforcement ───────────────────────────
 diff --git a/crates/codegen/xai-grok-shell/src/auth/model.rs b/crates/codegen/xai-grok-shell/src/auth/model.rs
-index d1c69387df2728f51a5af53f58dce21ee339c34a..be4a8accd3b253fc1edbdc5bcb0cfc33ee194fcb 100644
+index d1c6938..be4a8ac 100644
 --- a/crates/codegen/xai-grok-shell/src/auth/model.rs
 +++ b/crates/codegen/xai-grok-shell/src/auth/model.rs
 @@ -11,7 +11,7 @@ const DEFAULT_EARLY_INVALIDATION_SECS: u64 = 300; // 5 minutes
@@ -751,7 +742,7 @@ index d1c69387df2728f51a5af53f58dce21ee339c34a..be4a8accd3b253fc1edbdc5bcb0cfc33
  /// server-side which fails at high volume.  Skipping them here forces
  /// affected users to re-authenticate via OIDC on next launch.
 diff --git a/crates/codegen/xai-grok-shell/src/extensions/privacy.rs b/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
-index 9161dc76ce6d63b395a12dedac080ce065fc6815..b332a5729ef2e5bdcc70ab177a75876239a750c9 100644
+index 9161dc7..b332a57 100644
 --- a/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
 +++ b/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
 @@ -26,10 +26,23 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
@@ -801,11 +792,6 @@ index 9161dc76ce6d63b395a12dedac080ce065fc6815..b332a5729ef2e5bdcc70ab177a758762
 +        "codingDataRetentionOptOut": opt_out,
      }))
  }
-
-base-commit: b13fa526f5112c0b20dad5f1f2300d3d3b127895
-prerequisite-patch-id: e91e5a7076a517f7a2ce2b292e6c4c2fd9c2b7af
-prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
 -- 
 2.50.1 (Apple Git-155)
 

@@ -636,13 +636,9 @@ fn privacy_banner_opt_in_and_opt_out_are_inert_in_gork_build() {
     assert!(app.privacy_banner_acked.is_none());
 
     let effects = dispatch(Action::PrivacyBannerOptOut, &mut app);
-    assert!(
-        effects.is_empty(),
-        "OptOut must emit nothing: {effects:?}"
-    );
+    assert!(effects.is_empty(), "OptOut must emit nothing: {effects:?}");
     assert!(app.privacy_banner_acked.is_none());
 }
-
 
 /// The ack must not hinge on the round trip, unlike `[Opt in]`'s.
 #[test]
