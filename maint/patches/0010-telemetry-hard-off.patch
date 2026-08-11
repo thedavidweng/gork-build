@@ -15,7 +15,7 @@ Gork-Risk: critical
  5 files changed, 49 insertions(+), 79 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-telemetry/Cargo.toml b/crates/codegen/xai-grok-telemetry/Cargo.toml
-index 04b543c2d1fc62866d3dfe733d2f2862c72b4fd4..6d0fa1e856b45eb31fb04014f1b0e0b19ada2d9b 100644
+index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..180372c12b9635f4f787baf538a9ec8bbbdec524 100644
 --- a/crates/codegen/xai-grok-telemetry/Cargo.toml
 +++ b/crates/codegen/xai-grok-telemetry/Cargo.toml
 @@ -3,8 +3,8 @@ license = "Apache-2.0"
@@ -30,10 +30,10 @@ index 04b543c2d1fc62866d3dfe733d2f2862c72b4fd4..6d0fa1e856b45eb31fb04014f1b0e0b1
  [features]
  default = []
 diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
-index 65101dae6105f415f306d09d8ba700cf8bdf166e..e7ab6b074bbf2a206442245eabb7bf992811848c 100644
+index e84bc51acc937045941677c8b418010524f9bc51..49f3f639b2800afd710ce894da6cea53957d4e4d 100644
 --- a/crates/codegen/xai-grok-telemetry/src/client.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/client.rs
-@@ -75,14 +75,10 @@ impl TelemetryClient {
+@@ -85,14 +85,10 @@ impl TelemetryClient {
          subscription_tier: Option<String>,
          http_client: reqwest::Client,
      ) -> Self {
@@ -236,8 +236,8 @@ index 94a1a836706b674827af4fcde1c61bfab17505d1..437e3634849f2e8ec7b473111b2e36c5
      }
  }
 
-base-commit: 6e386420825bd44ae648c63e7c8cba12fcec9401
-prerequisite-patch-id: bb7229a0e513e7118798176028c217c461bd1500
+base-commit: b13fa526f5112c0b20dad5f1f2300d3d3b127895
+prerequisite-patch-id: e91e5a7076a517f7a2ce2b292e6c4c2fd9c2b7af
 -- 
 2.50.1 (Apple Git-155)
 

@@ -7,9 +7,6 @@ use super::*;
 fn send_prompt_clears_active_ephemeral_tip() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
-    // Keep the project picker from intercepting the prompt in tests.
-    app.mark_project_picker_done();
-
     let agent = app.agents.get_mut(&id).unwrap();
     let _ = agent.ephemeral_tip.show(
         crate::tips::EphemeralTip::new("t", ratatui::text::Line::from("hint")),
@@ -526,7 +523,6 @@ fn small_screen_trigger_out_of_band_consumes_without_showing() {
 fn send_prompt_keeps_ambient_small_screen_tip() {
     use crate::tips::small_screen::SMALL_SCREEN_TIP_SEEN_KEY;
     let mut app = test_app_with_agent();
-    app.mark_project_picker_done();
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 24);
 
@@ -603,7 +599,6 @@ fn ambient_tip_ttl_freezes_while_row_cannot_paint() {
 fn small_screen_tip_lifecycle_shows_once_across_submit_and_occlusion() {
     use crate::tips::small_screen::SMALL_SCREEN_TIP_SEEN_KEY;
     let mut app = test_app_with_agent();
-    app.mark_project_picker_done();
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().last_terminal_size = (100, 24);
 
@@ -1735,7 +1730,10 @@ fn prompt_response_context_overflow_suppresses_turn_failed_and_toast() {
         (has_turn_failed, app.deferred_notification.is_some())
     }
 
-    // Control: with no ContextTooLarge block, a failed turn pushes TurnFailed + a toast.
+    // Control: with no ContextTooLarge block, PromptResponse still ends the
+    // turn with TurnFailed + a toast. Overflow copy in the error string must
+    // not change that — only a prior ContextTooLarge banner (from RetryState
+    // `error_type=context_length`) suppresses the marker.
     let (failed_block, toast) = run_failed_turn(false);
     assert!(failed_block, "baseline: a failed turn pushes TurnFailed");
     assert!(toast, "baseline: a failed turn emits an error toast");
@@ -1747,6 +1745,206 @@ fn prompt_response_context_overflow_suppresses_turn_failed_and_toast() {
         "context overflow must suppress the redundant TurnFailed block"
     );
     assert!(!toast, "context overflow must suppress the error toast");
+}
+
+#[test]
+fn prompt_response_request_failed_banner_suppresses_turn_failed_and_toast() {
+    fn run_failed_turn(banner_shown: bool) -> (bool, bool) {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+            agent.turn_started_at = Some(std::time::Instant::now());
+            if banner_shown {
+                // Mirror the RetryState handler pushing the formatted banner.
+                agent.scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::RequestFailed {
+                        status: Some(500),
+                        headline: "Server error (500)".into(),
+                        detail: "Something went wrong on our side.".into(),
+                    },
+                ));
+            }
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::PromptResponse {
+                agent_id: id,
+                result: Err(
+                    "Server error (500) \u{2014} Something went wrong on our side.".to_string(),
+                ),
+                http_status: Some(500),
+                prompt_id: None,
+            }),
+            &mut app,
+        );
+        let has_turn_failed = (0..app.agents[&id].scrollback.len()).any(|idx| {
+            matches!(
+                app.agents[&id].scrollback.entry(idx).map(|e| &e.block),
+                Some(RenderBlock::SessionEvent(ev))
+                    if matches!(ev.event, SessionEvent::TurnFailed { .. })
+            )
+        });
+        (has_turn_failed, app.deferred_notification.is_some())
+    }
+
+    let (failed_block, toast) = run_failed_turn(false);
+    assert!(failed_block, "baseline: a failed turn pushes TurnFailed");
+    assert!(toast, "baseline: a failed turn emits an error toast");
+
+    let (failed_block, toast) = run_failed_turn(true);
+    assert!(
+        !failed_block,
+        "a RequestFailed banner must suppress the redundant TurnFailed"
+    );
+    assert!(
+        !toast,
+        "a RequestFailed banner must suppress the error toast"
+    );
+}
+
+/// The 401/402 race fallbacks must fire on the banner-formatted error text
+/// PromptResponse now carries (the RetryState notification may lose the race,
+/// so no ReAuthRequired block exists yet).
+#[test]
+fn prompt_response_formatted_401_suppresses_turn_failed_and_stashes_prompt() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+        agent.session.in_flight_prompt = Some(crate::app::agent::InFlightPrompt {
+            text: "resend me".into(),
+            images: Vec::new(),
+            scrollback_entry: crate::scrollback::entry::EntryId::new(1),
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+    }
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err("Request failed (401) \u{2014} Invalid or expired credentials".to_string()),
+            http_status: Some(401),
+            prompt_id: None,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    let has_turn_failed = (0..agent.scrollback.len()).any(|idx| {
+        matches!(
+            agent.scrollback.entry(idx).map(|e| &e.block),
+            Some(RenderBlock::SessionEvent(ev))
+                if matches!(ev.event, SessionEvent::TurnFailed { .. })
+        )
+    });
+    assert!(
+        !has_turn_failed,
+        "401 must suppress the redundant TurnFailed"
+    );
+    assert_eq!(
+        agent
+            .reauth_stashed_prompt
+            .as_ref()
+            .map(|p| p.text.as_str()),
+        Some("resend me"),
+        "401 must stash the prompt for auto-resubmit after /login"
+    );
+}
+
+#[test]
+fn prompt_response_formatted_402_takes_credit_limit_path() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.turn_started_at = Some(std::time::Instant::now());
+    }
+    // http_status field absent (older shell): the status must be recovered
+    // from the formatted text.
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Err(
+                "Request failed (402) \u{2014} Grok Build usage balance exhausted".to_string(),
+            ),
+            http_status: None,
+            prompt_id: None,
+        }),
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    let has_turn_failed = (0..agent.scrollback.len()).any(|idx| {
+        matches!(
+            agent.scrollback.entry(idx).map(|e| &e.block),
+            Some(RenderBlock::SessionEvent(ev))
+                if matches!(ev.event, SessionEvent::TurnFailed { .. })
+        )
+    });
+    assert!(
+        !has_turn_failed,
+        "a credit-limit 402 shows the upsell, not TurnFailed"
+    );
+}
+
+#[test]
+fn prompt_response_disk_full_suppresses_turn_failed_and_toast() {
+    fn run(pre_seed_disk_full: bool, with_user_echo: bool) -> (bool, bool, usize) {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+            agent.turn_started_at = Some(std::time::Instant::now());
+            if pre_seed_disk_full {
+                agent
+                    .scrollback
+                    .push_block(RenderBlock::session_event(SessionEvent::DiskFull));
+            }
+            if with_user_echo {
+                agent
+                    .scrollback
+                    .push_block(RenderBlock::user_prompt("try again"));
+            }
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::PromptResponse {
+                agent_id: id,
+                result: Err(xai_fast_worktree::ENOSPC_OS_MESSAGE.to_string()),
+                http_status: None,
+                prompt_id: None,
+            }),
+            &mut app,
+        );
+        let disk_fulls = (0..app.agents[&id].scrollback.len())
+            .filter(|idx| {
+                matches!(
+                    app.agents[&id].scrollback.entry(*idx).map(|e| &e.block),
+                    Some(RenderBlock::SessionEvent(ev))
+                        if matches!(ev.event, SessionEvent::DiskFull)
+                )
+            })
+            .count();
+        let failed = (0..app.agents[&id].scrollback.len()).any(|idx| {
+            matches!(
+                app.agents[&id].scrollback.entry(idx).map(|e| &e.block),
+                Some(RenderBlock::SessionEvent(ev))
+                    if matches!(ev.event, SessionEvent::TurnFailed { .. })
+            )
+        });
+        (failed, app.deferred_notification.is_some(), disk_fulls)
+    }
+
+    let (failed, toast, disk_fulls) = run(true, false);
+    assert!(!failed && !toast && disk_fulls == 1);
+
+    let (failed, toast, disk_fulls) = run(false, false);
+    assert!(!failed && !toast && disk_fulls == 1);
+
+    let (failed, toast, disk_fulls) = run(true, true);
+    assert!(!failed && !toast && disk_fulls == 2);
 }
 
 #[test]
@@ -2352,6 +2550,30 @@ fn bash_while_idle_stays_on_local_path() {
     assert!(app.agents[&id].bash_turn);
 }
 
+/// A bash command submitted before the session binds is queued, clears the composer, and still lands
+/// in up-arrow history with its `! ` prefix. It waits for the drain rather than emitting an effect.
+#[test]
+fn bash_before_the_session_binds_is_queued_and_recorded() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().session.session_id = None;
+
+    let effects = dispatch(Action::SendBashCommand("ls -la".into()), &mut app);
+
+    assert!(effects.is_empty(), "nothing may send yet, got {effects:?}");
+    let agent = &app.agents[&id];
+    assert_eq!(agent.session.queue_len(), 1, "the command must be queued");
+    assert!(
+        agent.prompt.text().is_empty(),
+        "the composer must be cleared"
+    );
+    assert_eq!(
+        agent.session.prompt_history.first().map(String::as_str),
+        Some("! ls -la"),
+        "up-arrow history must record the command"
+    );
+}
+
 // ── Reconnect-pending dispatch guards ─────────────────────────────
 
 #[test]
@@ -2775,7 +2997,6 @@ fn prompt_history_loaded_refreshes_open_history_search_with_current_query() {
 fn agent_send_before_paste_probe_keeps_image() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = test_app_with_agent();
-    app.project_picker_shown = true; // don't intercept the send with the picker
     let id = AgentId(0);
     {
         let agent = app.agents.get_mut(&id).unwrap();
@@ -2942,7 +3163,6 @@ fn interject_before_paste_probe_keeps_image() {
 fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = test_app_with_agent(); // agent A = AgentId(0), active view
-    app.project_picker_shown = true;
     let a = AgentId(0);
     let b = AgentId(1);
     // A second agent B for the user to switch to mid-probe.
@@ -3025,59 +3245,34 @@ fn agent_paste_completion_after_switch_does_not_send_to_other_agent() {
     );
 }
 
+/// A prompt submitted before the session binds is held in the agent's queue rather than dropped.
+/// `maybe_drain_queue` emits nothing until `SessionCreated` arrives.
 #[test]
-fn slash_passthrough_in_non_project_dir_creates_session() {
-    let mut app = project_picker_app();
+fn prompt_before_the_session_binds_is_queued() {
+    let mut app = test_app();
     dispatch(Action::NewSession, &mut app);
     let id = AgentId(0);
-
-    let effects =
-        dispatch_send_prompt_inner(&mut app, "/notarealcommandxyz".into(), true, false, false);
-
     assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::CreateSession { .. })),
-        "picker-bypassing pass-through must create the deferred session"
+        app.agents[&id].session.session_id.is_none(),
+        "precondition: session not bound yet"
     );
-    assert!(app.project_picker_shown);
-    assert_eq!(app.agents[&id].session.queue_len(), 1);
-}
 
-#[test]
-fn local_slash_in_non_project_dir_does_not_create_session() {
-    let mut app = project_picker_app();
-    dispatch(Action::NewSession, &mut app);
+    let effects = dispatch_send_prompt_inner(&mut app, "fix the bug".into(), true, false, false);
 
-    let effects = dispatch_send_prompt_inner(&mut app, "/dashboard".into(), true, false, false);
-
+    assert_eq!(
+        app.agents[&id].session.queue_len(),
+        1,
+        "the prompt must be queued, not dropped"
+    );
     assert!(
         !effects
             .iter()
-            .any(|e| matches!(e, Effect::CreateSession { .. })),
-        "pager-local commands must not create sessions"
+            .any(|e| matches!(e, Effect::SendPrompt { .. })),
+        "nothing may go to the wire before the session binds, got {effects:?}"
     );
 }
 
-#[test]
-fn slash_and_exit_input_does_not_trigger_project_picker() {
-    // Real prompts are eligible.
-    assert!(input_can_trigger_project_picker("fix the bug"));
-    assert!(input_can_trigger_project_picker("  hello world  "));
-    // Slash commands (e.g. /models, /help) must pass through untouched.
-    assert!(!input_can_trigger_project_picker("/models"));
-    assert!(!input_can_trigger_project_picker("/help"));
-    assert!(!input_can_trigger_project_picker("  /dashboard  "));
-    // Exit aliases and empty input never send a prompt.
-    assert!(!input_can_trigger_project_picker("exit"));
-    assert!(!input_can_trigger_project_picker("quit"));
-    assert!(!input_can_trigger_project_picker(":q"));
-    assert!(!input_can_trigger_project_picker(":wq!"));
-    assert!(!input_can_trigger_project_picker(""));
-    assert!(!input_can_trigger_project_picker("   "));
-}
-
-// ── Minimal-mode slash gate tests ───────────────────────────────────
+// ── Screen-mode slash gate tests ────────────────────────────────────
 
 /// Returns true if any system block in agent 0's scrollback contains
 /// `needle`. Avoids `last_system_text`'s "last block must be System" panic
@@ -3105,20 +3300,52 @@ fn minimal_mode_blocks_fullscreen_pane_slash_command() {
         before + 1,
         "the gate should commit exactly one system block"
     );
+    let refusal = last_system_text(&app, AgentId(0));
     assert!(
-        last_system_text(&app, AgentId(0)).contains("not available in minimal mode"),
-        "got: {:?}",
-        last_system_text(&app, AgentId(0))
+        refusal.starts_with("/find isn't available in minimal mode"),
+        "got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("Run /fullscreen"),
+        "the refusal must name the way out, got: {refusal:?}"
     );
 }
 
+#[test]
+fn fullscreen_mode_blocks_minimal_only_slash_command() {
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Fullscreen;
+    let effects = dispatch_send_prompt(&mut app, "/expand".to_string());
+    assert!(effects.is_empty(), "got: {effects:?}");
+    let refusal = last_system_text(&app, AgentId(0));
+    assert_eq!(
+        refusal,
+        "/expand isn't available in fullscreen mode — press Tab to focus the scrollback, \
+         then → on the block."
+    );
+}
+
+#[test]
+fn mode_switcher_in_its_own_mode_says_you_are_already_there() {
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    let effects = dispatch_send_prompt(&mut app, "/minimal".to_string());
+    assert!(effects.is_empty(), "got: {effects:?}");
+    assert_eq!(
+        last_system_text(&app, AgentId(0)),
+        "You're already in minimal mode."
+    );
+}
+
+/// Inline (`--no-alt-screen`) is a full TUI, so fullscreen-only commands run
+/// there — the gate keys off "is minimal", not "is `ScreenMode::Fullscreen`".
 #[test]
 fn non_minimal_mode_allows_fullscreen_pane_slash_command() {
     let mut app = test_app_with_agent();
     app.screen_mode = crate::app::ScreenMode::Inline;
     let _ = dispatch_send_prompt(&mut app, "/find foo".to_string());
     assert!(
-        !scrollback_has_system_text(&app, AgentId(0), "not available in minimal mode"),
+        !scrollback_has_system_text(&app, AgentId(0), "isn't available"),
         "the gate must not fire outside minimal mode"
     );
 }
@@ -3130,7 +3357,7 @@ fn minimal_mode_allows_mode_agnostic_slash_command() {
     // `/help` is a minimal-native command (opens the command palette).
     let _ = dispatch_send_prompt(&mut app, "/help".to_string());
     assert!(
-        !scrollback_has_system_text(&app, AgentId(0), "not available in minimal mode"),
+        !scrollback_has_system_text(&app, AgentId(0), "isn't available"),
         "denylist default must keep mode-agnostic commands available"
     );
 }
@@ -3251,7 +3478,7 @@ fn plain_cancel_still_pushes_cancelled_marker() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     dispatch(Action::SendPrompt("first".into()), &mut app);
-    // Turn already produced output → Ctrl+C takes the standard cancel path, not the pristine rewind.
+    // Turn already produced output → Ctrl+C takes the standard cancel path, not the rewind.
     app.agents.get_mut(&id).unwrap().session.in_flight_prompt = None;
     let _ = dispatch(Action::CancelTurn, &mut app);
     assert!(app.agents[&id].session.state.is_cancelling());
@@ -3293,6 +3520,7 @@ fn send_prompt_now_dispatch_arms_expectation_and_suppresses_marker() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     dispatch(Action::SendPrompt("first".into()), &mut app);
+    app.agents.get_mut(&id).unwrap().front_message_committed = true;
 
     let effects = dispatch(
         Action::SendPromptNow {
@@ -3320,9 +3548,10 @@ fn send_prompt_now_dispatch_arms_expectation_and_suppresses_marker() {
     );
 }
 
-/// Older-shell fallback: a plain `SendPrompt` during a held wait arms the expectation.
+/// Older-shell control: a plain `SendPrompt` during a held wait stays unarmed,
+/// so a meta-less cancel still renders its marker.
 #[test]
-fn plain_send_during_blocking_wait_arms_expectation_and_suppresses_marker() {
+fn plain_send_during_blocking_wait_does_not_arm_and_meta_less_cancel_is_visible() {
     use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
 
     let mut app = test_app_with_agent();
@@ -3335,40 +3564,195 @@ fn plain_send_during_blocking_wait_arms_expectation_and_suppresses_marker() {
     simulate_task_output_wait(app.agents.get_mut(&id).unwrap(), "bg-1");
 
     let effects = dispatch(Action::SendPrompt("wake up and do this".into()), &mut app);
+    let prompt_id = match effects.as_slice() {
+        [Effect::SendPrompt { prompt_id, .. }] => prompt_id.clone(),
+        other => panic!("mid-turn plain prompt takes the immediate server send, got {other:?}"),
+    };
+    let agent = &app.agents[&id];
     assert!(
-        matches!(effects.as_slice(), [Effect::SendPrompt { .. }]),
-        "mid-turn plain prompt takes the immediate server send, got {effects:?}"
+        agent.expect_send_now_cancel.is_none(),
+        "a plain send into a held wait must not arm send-now"
     );
     assert!(
-        app.agents[&id].expect_send_now_cancel.is_some(),
-        "a plain send into a held wait must arm the send-now cancel expectation"
+        agent.follow_without_jump_prompt_id.is_none(),
+        "a plain send must not pin follow-without-jump"
+    );
+    assert!(
+        !agent.send_now_painted_blocks.contains_key(&prompt_id),
+        "a plain send must not paint a speculative send-now block"
     );
 
     let _ = dispatch(cancelled_prompt_response(id, None), &mut app);
     assert_eq!(
         count_cancelled_markers(&app, id),
-        0,
-        "the shell-side auto send-now cancel must not render the cancelled marker"
+        1,
+        "older-shell meta-less cancel after an unarmed plain send stays visible"
     );
 }
 
-/// Same fallback for a foreground-subagent wait.
+/// Modern shell: wire `cancelTrigger=send_now` suppresses the marker without a pager arm.
 #[test]
-fn plain_send_during_subagent_wait_arms_expectation() {
-    use crate::app::agent_view::test_fixtures::simulate_subagent_wait;
+fn plain_send_during_blocking_wait_trusts_wire_send_now_trigger() {
+    use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
 
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     dispatch(Action::SendPrompt("first".into()), &mut app);
+    simulate_task_output_wait(app.agents.get_mut(&id).unwrap(), "bg-1");
+
+    let effects = dispatch(Action::SendPrompt("wake up and do this".into()), &mut app);
+    let prompt_id = match effects.as_slice() {
+        [Effect::SendPrompt { prompt_id, .. }] => prompt_id.clone(),
+        other => panic!("mid-turn plain prompt takes the immediate server send, got {other:?}"),
+    };
+    let agent = &app.agents[&id];
+    assert!(agent.expect_send_now_cancel.is_none());
+    assert!(agent.follow_without_jump_prompt_id.is_none());
+    assert!(!agent.send_now_painted_blocks.contains_key(&prompt_id));
+
+    let _ = dispatch(cancelled_prompt_response(id, Some("send_now")), &mut app);
+    assert_eq!(count_cancelled_markers(&app, id), 0);
+    assert_eq!(
+        count_completed_markers(&app, id),
+        0,
+        "no substitute completed marker for a wire send-now cancel"
+    );
+}
+
+/// Pending foreground-subagent UI: a confirmed held row stays reachable and actionable.
+#[test]
+fn plain_send_during_pending_subagent_wait_keeps_confirmed_queue_row_reachable() {
+    use crate::app::agent_view::{ActivePane, test_fixtures::simulate_subagent_wait};
+    use crate::app::app_view::InputOutcome;
+    use crate::app::prompt_queue::QueueEntryWire;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use xai_acp_lib::AcpClientMessage;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendPrompt("first".into()), &mut app);
+    let running_prompt_id = app.agents[&id]
+        .session
+        .current_prompt_id
+        .clone()
+        .expect("idle drain starts a running turn");
     simulate_subagent_wait(app.agents.get_mut(&id).unwrap());
 
-    let _ = dispatch(
-        Action::SendPrompt("interrupt the subagent".into()),
+    const HELD: &str = "interrupt the subagent";
+    let effects = dispatch(Action::SendPrompt(HELD.into()), &mut app);
+    let prompt_id = match effects.as_slice() {
+        [Effect::SendPrompt { prompt_id, .. }] => prompt_id.clone(),
+        other => panic!("plain prompt takes the immediate server send, got {other:?}"),
+    };
+    {
+        let agent = &app.agents[&id];
+        assert!(agent.expect_send_now_cancel.is_none());
+        assert!(agent.follow_without_jump_prompt_id.is_none());
+        assert!(!agent.send_now_painted_blocks.contains_key(&prompt_id));
+    }
+
+    const AUTH_VERSION: u64 = 3;
+    let params = serde_json::json!({
+        "sessionId": "test-session",
+        "entries": [{
+            "id": prompt_id,
+            "version": AUTH_VERSION,
+            "kind": "prompt",
+            "text": HELD,
+            "position": 0,
+        }],
+        "runningPromptId": running_prompt_id,
+    });
+    let (response_tx, _rx) = tokio::sync::oneshot::channel();
+    crate::app::acp_handler::handle(
+        AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+            request: acp::ExtNotification::new(
+                "x.ai/queue/changed",
+                std::sync::Arc::from(serde_json::value::to_raw_value(&params).unwrap()),
+            ),
+            response_tx,
+        }),
         &mut app,
     );
+
+    {
+        let agent = &app.agents[&id];
+        assert_eq!(
+            agent.shared_queue.as_slice(),
+            [QueueEntryWire {
+                id: prompt_id.clone(),
+                version: AUTH_VERSION,
+                owner: None,
+                last_editor: None,
+                kind: "prompt".into(),
+                text: HELD.into(),
+                position: 0,
+                combined_texts: None,
+            }]
+        );
+    }
+
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.sync_queue_pane();
+        assert!(!agent.visible_queue_is_empty());
+        let ids = agent.queue.entry_ids();
+        assert_eq!(ids.len(), 1, "confirmed held row must be the only pane row");
+        let row = agent
+            .queue
+            .row_ref(ids[0])
+            .expect("synced pane row is resolvable");
+        assert_eq!(row.server_id.as_deref(), Some(prompt_id.as_str()));
+        assert_eq!(row.version, AUTH_VERSION);
+    }
+
+    let _ = dispatch(Action::ShowQueue, &mut app);
+    let queue_text = last_system_text(&app, id);
     assert!(
-        app.agents[&id].expect_send_now_cancel.is_some(),
-        "a plain send during a subagent wait must arm the send-now expectation"
+        queue_text.contains(HELD),
+        "/queue must list the confirmed prompt, got {queue_text:?}"
+    );
+
+    app.registry = crate::actions::ActionRegistry::non_vscode_for_test();
+    app.agents.get_mut(&id).unwrap().hide_queue_pane();
+    let outcome = app.handle_input(&Event::Key(KeyEvent::new(
+        KeyCode::Char(';'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(
+        matches!(outcome, InputOutcome::Changed),
+        "Ctrl+; must toggle the queue overlay, got {outcome:?}"
+    );
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        assert!(agent.queue.overlay.visible, "Ctrl+; must show the overlay");
+        assert!(agent.queue.overlay.focused, "Ctrl+; must focus the overlay");
+        assert_eq!(agent.active_pane, ActivePane::Queue);
+        let ids = agent.queue.entry_ids();
+        assert_eq!(ids.len(), 1);
+        let row = agent
+            .queue
+            .row_ref(ids[0])
+            .expect("overlay still has the row");
+        assert_eq!(row.server_id.as_deref(), Some(prompt_id.as_str()));
+        assert_eq!(row.version, AUTH_VERSION);
+        agent.queue.list_state.select_by_id(ids[0]);
+    }
+
+    let outcome = app.handle_input(&Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL,
+    )));
+    assert!(
+        matches!(
+            outcome,
+            InputOutcome::Action(Action::QueueInterjectShared {
+                ref id,
+                expected_version,
+                new_text: None,
+            }) if id == &prompt_id && expected_version == AUTH_VERSION
+        ),
+        "queue send-now must target the confirmed row, got {outcome:?}"
     );
 }
 
@@ -3400,6 +3784,7 @@ fn queue_interject_shared_arms_expectation_while_running() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     dispatch(Action::SendPrompt("first".into()), &mut app);
+    app.agents.get_mut(&id).unwrap().front_message_committed = true;
 
     let effects = dispatch(
         Action::QueueInterjectShared {
@@ -3418,6 +3803,7 @@ fn queue_interject_shared_arms_expectation_while_running() {
         Some("srv-row-1"),
         "server-row send-now must arm the cancel expectation"
     );
+    assert!(app.agents[&id].is_self_originated_prompt("srv-row-1"));
 }
 
 /// During an active goal the shell promotes a send-now WITHOUT cancelling, so
@@ -3428,8 +3814,11 @@ fn send_now_during_active_goal_does_not_arm_expectation() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     dispatch(Action::SendPrompt("first".into()), &mut app);
-    app.agents.get_mut(&id).unwrap().goal_state =
-        Some(crate::app::agent::GoalDisplayState::test_stub());
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.front_message_committed = true;
+        agent.goal_state = Some(crate::app::agent::GoalDisplayState::test_stub());
+    }
 
     let effects = dispatch(
         Action::SendPromptNow {
@@ -3443,6 +3832,7 @@ fn send_now_during_active_goal_does_not_arm_expectation() {
         app.agents[&id].expect_send_now_cancel.is_none(),
         "goal turns promote without cancelling; the expectation must stay unarmed"
     );
+    assert_eq!(app.agents[&id].send_now_painted_blocks.len(), 1);
 
     let effects = dispatch(
         Action::QueueInterjectShared {
@@ -3459,6 +3849,141 @@ fn send_now_during_active_goal_does_not_arm_expectation() {
     assert!(
         app.agents[&id].expect_send_now_cancel.is_none(),
         "server-row send-now during a goal must stay unarmed too"
+    );
+}
+
+/// Bug 1 (Bugbot "Send Now block retired early"): an active-goal Send Now
+/// paints an optimistic user block and relies on the interjection notification
+/// to claim it in place. The prompt's RPC resolves as removed-without-running
+/// (the expected outcome of routing the Send Now as an interjection), taking
+/// the non-running `PromptResponse` path — but that must NOT retire the painted
+/// block before its interjection claim arrives, or the message is dropped and
+/// re-pushed at the scrollback end (flicker / reorder).
+#[test]
+fn goal_send_now_painted_block_survives_removed_from_queue_response() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendPrompt("first".into()), &mut app);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.front_message_committed = true;
+        agent.goal_state = Some(crate::app::agent::GoalDisplayState::test_stub());
+    }
+
+    let effects = dispatch(
+        Action::SendPromptNow {
+            text: "goal steer".into(),
+            images: vec![],
+        },
+        &mut app,
+    );
+    let painted_pid = match effects.as_slice() {
+        [Effect::SendPromptNow { prompt_id, .. }] => prompt_id.clone(),
+        other => panic!("goal send-now takes the immediate server send, got {other:?}"),
+    };
+    let block_entry = {
+        let agent = &app.agents[&id];
+        assert!(agent.is_self_originated_prompt(&painted_pid));
+        assert!(
+            agent.is_send_now_awaiting_interjection_claim(&painted_pid),
+            "the goal Send Now block must be awaiting its interjection claim"
+        );
+        agent.send_now_painted_blocks[&painted_pid].0
+    };
+
+    // The queued prompt's RPC resolves without becoming the running turn.
+    dispatch(
+        Action::TaskComplete(TaskResult::PromptResponse {
+            agent_id: id,
+            result: Ok(acp::PromptResponse::new(acp::StopReason::EndTurn).meta(
+                serde_json::json!({ "promptId": painted_pid })
+                    .as_object()
+                    .cloned(),
+            )),
+            http_status: None,
+            prompt_id: None,
+        }),
+        &mut app,
+    );
+
+    let agent = &app.agents[&id];
+    assert!(
+        agent.send_now_painted_blocks.contains_key(&painted_pid),
+        "the painted block must survive the removed-from-queue response",
+    );
+    assert!(
+        agent.scrollback.index_of_id(block_entry).is_some(),
+        "the block must stay in place (not dropped / re-pushed at the end)",
+    );
+}
+
+/// Bug 1 companion: a `queue/changed` broadcast that no longer lists a
+/// CONFIRMED active-goal Send Now row (the shell converted it into an
+/// interjection and dropped the queue row) must NOT retire its painted block
+/// before the interjection notification claims it.
+#[test]
+fn goal_send_now_painted_block_survives_queue_changed_removal() {
+    use xai_acp_lib::AcpClientMessage;
+
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendPrompt("first".into()), &mut app);
+    let running_prompt_id = app.agents[&id].session.current_prompt_id.clone();
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.front_message_committed = true;
+        agent.goal_state = Some(crate::app::agent::GoalDisplayState::test_stub());
+    }
+
+    let effects = dispatch(
+        Action::SendPromptNow {
+            text: "goal steer".into(),
+            images: vec![],
+        },
+        &mut app,
+    );
+    let painted_pid = match effects.as_slice() {
+        [Effect::SendPromptNow { prompt_id, .. }] => prompt_id.clone(),
+        other => panic!("goal send-now takes the immediate server send, got {other:?}"),
+    };
+    let block_entry = app.agents[&id].send_now_painted_blocks[&painted_pid].0;
+    // Model the row as CONFIRMED shell-side: the finding's race is a confirmed
+    // row (optimistic echo already cleared) that then disappears from a later
+    // broadcast when the Send Now is merged as an interjection.
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .optimistic_queue_ids
+        .remove(&painted_pid);
+    assert!(app.agents[&id].is_send_now_awaiting_interjection_claim(&painted_pid));
+
+    // A broadcast that no longer lists the row, still naming the running goal
+    // turn (so no adoption side-effects fire).
+    let params = serde_json::json!({
+        "sessionId": "test-session",
+        "entries": [],
+        "runningPromptId": running_prompt_id,
+    });
+    let (response_tx, _rx) = tokio::sync::oneshot::channel();
+    crate::app::acp_handler::handle(
+        AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+            request: acp::ExtNotification::new(
+                "x.ai/queue/changed",
+                std::sync::Arc::from(serde_json::value::to_raw_value(&params).unwrap()),
+            ),
+            response_tx,
+        }),
+        &mut app,
+    );
+
+    let agent = &app.agents[&id];
+    assert!(
+        agent.send_now_painted_blocks.contains_key(&painted_pid),
+        "the confirmed goal Send Now block must survive the row's removal",
+    );
+    assert!(
+        agent.scrollback.index_of_id(block_entry).is_some(),
+        "the block must stay in place for handle_interjection to claim",
     );
 }
 
@@ -3700,33 +4225,30 @@ fn interactive_cancel_supersedes_send_now_expectation() {
     );
 }
 
-/// The parked "Worked for" marker stays the only marker across a send-now cancel.
+/// A modern send-now cancel out of a park leaves no markers: the park is
+/// markerless and wire `cancelTrigger=send_now` suppresses the cancel marker.
 #[test]
-fn send_now_cancel_after_park_leaves_single_parked_marker() {
-    use crate::app::agent_view::test_fixtures::{count_parked, simulate_task_output_wait};
+fn send_now_cancel_after_park_leaves_no_markers() {
+    use crate::app::agent_view::test_fixtures::{count_turn_markers, simulate_task_output_wait};
 
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     dispatch(Action::SendPrompt("first".into()), &mut app);
     simulate_task_output_wait(app.agents.get_mut(&id).unwrap(), "bg-1");
-    app.agents.get_mut(&id).unwrap().maybe_push_parked_marker();
-    assert_eq!(count_parked(&app.agents[&id]), 1);
+    assert_eq!(
+        count_turn_markers(&app.agents[&id]),
+        0,
+        "a park writes no marker"
+    );
 
-    // Typing into the parked wait: plain send arms the expectation; cancel arrives meta-less.
     let _ = dispatch(Action::SendPrompt("next thing".into()), &mut app);
-    let _ = dispatch(cancelled_prompt_response(id, None), &mut app);
+    let _ = dispatch(cancelled_prompt_response(id, Some("send_now")), &mut app);
 
     assert_eq!(count_cancelled_markers(&app, id), 0);
     assert_eq!(
         count_completed_markers(&app, id),
-        1,
-        "the parked marker stays the only completed line (no duplicate)"
-    );
-    app.agents.get_mut(&id).unwrap().maybe_push_parked_marker();
-    assert_eq!(
-        count_parked(&app.agents[&id]),
-        1,
-        "no late parked marker after the send-now cancel"
+        0,
+        "no completed marker renders for the cancelled parked turn"
     );
 }
 

@@ -11,6 +11,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use super::tool::HookRunEntry;
+use crate::appearance::AppearanceConfig;
 use crate::render::wrapping::word_wrap_lines;
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{
@@ -85,6 +86,17 @@ pub enum SessionEvent {
         /// Used to match known error patterns without fragile string matching.
         error_type: Option<String>,
     },
+    /// A non-success API / HTTP response (or similar terminal request error).
+    /// Rendered like [`SessionEvent::ReAuthRequired`]: warning color + accent,
+    /// no JSON dump.
+    RequestFailed {
+        /// HTTP status when known. `None` for transport / idle-timeout / etc.
+        status: Option<u16>,
+        /// Short headline, e.g. `"Server error (500)"`.
+        headline: String,
+        /// Sanitized one-line detail (server message or fallback guidance).
+        detail: String,
+    },
     /// The server rejected the credentials (401 / auth error) and automatic
     /// recovery was exhausted. Rendered as a prominent call-to-action that
     /// points the user at `/login` to re-authenticate, replacing the raw
@@ -95,6 +107,8 @@ pub enum SessionEvent {
     /// vs the server's max_prompt_length, or compaction suppressed/failed). One actionable
     /// prompt, replacing the CompactionFailed + RetryFailed + TurnFailed stack.
     ContextTooLarge,
+    /// Session disk is full.
+    DiskFull,
     /// Manual `/compact` command completed.
     CompactCompleted {
         /// Wall-clock elapsed time for the command.
@@ -205,7 +219,10 @@ impl SessionEvent {
             }
             SessionEvent::CompactionCancelled => "Compaction cancelled.".to_string(),
             SessionEvent::RetryFailed { error, error_type } => {
-                if error_type.as_deref() == Some("encrypted_content_mismatch") {
+                use crate::app::error_display::WireErrorType;
+                if WireErrorType::parse(error_type.as_deref())
+                    == WireErrorType::EncryptedContentMismatch
+                {
                     "This session's conversation history is incompatible with the \
                      current model. Please start a new session."
                         .to_string()
@@ -213,6 +230,9 @@ impl SessionEvent {
                     format!("Retry failed: {error}")
                 }
             }
+            SessionEvent::RequestFailed {
+                headline, detail, ..
+            } => crate::app::error_display::banner_message(headline, detail),
             SessionEvent::ReAuthRequired => {
                 "Authentication required \u{2014} your session has expired or your \
                  credentials were rejected. Run /login to re-authenticate, then resend \
@@ -223,6 +243,9 @@ impl SessionEvent {
                 "This conversation is too large for the model's context window. \
                  Use /new to start a new session."
                     .to_string()
+            }
+            SessionEvent::DiskFull => {
+                xai_grok_shell::extensions::notification::DISK_FULL_USER_MESSAGE.to_string()
             }
             SessionEvent::CompactCompleted { elapsed } => {
                 format!("Compaction completed in {}.", format_duration(*elapsed))
@@ -269,12 +292,29 @@ impl SessionEvent {
         }
     }
 
+    /// Failures and actionable prompts stand out (warning color + accent bar).
+    fn is_warning_banner(&self) -> bool {
+        matches!(
+            self,
+            SessionEvent::ReAuthRequired
+                | SessionEvent::ContextTooLarge
+                | SessionEvent::DiskFull
+                | SessionEvent::CompactionFailed { .. }
+                | SessionEvent::RequestFailed { .. }
+                | SessionEvent::RetryFailed { .. }
+                | SessionEvent::TurnFailed { .. }
+        )
+    }
+
     /// Whether this event marks the end of an agent turn (the "Turn
     /// completed/cancelled/failed" markers). These are the only events that
-    /// can carry the turn's stop/stop_failure hook runs inline — but a
-    /// parked marker renders mid-turn while the turn is still running
-    /// shell-side, before any Stop hook fires, so hook eligibility is the
-    /// block-level [`SessionEventBlock::accepts_stop_hooks`].
+    /// can carry the turn's stop/stop_failure hook runs inline.
+    ///
+    /// [`SessionEvent::RequestFailed`] is intentionally excluded — same as
+    /// [`SessionEvent::ReAuthRequired`]. RetryState may push it before
+    /// PromptResponse; treating it as terminal would change stop-hook
+    /// attribution. Dedicated banners skip the TurnFailed marker and flush
+    /// hooks standalone.
     pub fn is_turn_terminal(&self) -> bool {
         matches!(
             self,
@@ -312,12 +352,6 @@ pub struct SessionEventBlock {
     /// The prompt turn a terminal marker belongs to, when known. Gates
     /// which stop-hook batches may merge into it.
     pub prompt_id: Option<String>,
-    /// The marker was pushed at park time (user-interruptible blocking
-    /// wait): the turn is still running shell-side, so it must never accept
-    /// stop hooks. Rendering is unchanged — a parked wait reads as stopped.
-    /// Cleared when the completion folds into the uncommitted tail marker;
-    /// a committed tail (minimal print-once) gets a fresh row instead.
-    pub parked: bool,
 }
 
 impl SessionEventBlock {
@@ -327,7 +361,6 @@ impl SessionEventBlock {
             event,
             stop_hooks: Vec::new(),
             prompt_id: None,
-            parked: false,
         }
     }
 
@@ -342,15 +375,7 @@ impl SessionEventBlock {
             event,
             stop_hooks,
             prompt_id,
-            parked: false,
         }
-    }
-
-    /// Whether this marker may carry/accept stop-hook runs: a turn-terminal
-    /// event that is not a parked line (which renders while the turn is
-    /// still running shell-side, before any Stop hook fires).
-    pub fn accepts_stop_hooks(&self) -> bool {
-        self.event.is_turn_terminal() && !self.parked
     }
 
     /// Whether any attached stop hook actually ran (non-skipped). Gates the
@@ -536,12 +561,7 @@ impl BlockContent for SessionEventBlock {
         let theme = Theme::current();
         // Failures and re-auth / context-overflow prompts are actionable, not
         // informational — render them in the warning color, not muted noise.
-        let style = if matches!(
-            self.event,
-            SessionEvent::ReAuthRequired
-                | SessionEvent::ContextTooLarge
-                | SessionEvent::CompactionFailed { .. }
-        ) {
+        let style = if self.event.is_warning_banner() {
             ratatui::style::Style::default().fg(theme.warning)
         } else {
             theme.muted()
@@ -584,12 +604,7 @@ impl BlockContent for SessionEventBlock {
             return (ctx.mode != DisplayMode::Collapsed)
                 .then(|| AccentStyle::static_color(theme.accent_tool));
         }
-        if matches!(
-            self.event,
-            SessionEvent::ReAuthRequired
-                | SessionEvent::ContextTooLarge
-                | SessionEvent::CompactionFailed { .. }
-        ) {
+        if self.event.is_warning_banner() {
             Some(AccentStyle::static_color(theme.warning))
         } else {
             None
@@ -608,7 +623,7 @@ impl BlockContent for SessionEventBlock {
         self.accent(ctx)
     }
 
-    fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
         false // Compact like SystemMessageBlock
     }
 
@@ -795,6 +810,26 @@ mod tests {
             accent.map(|a| a.color),
             Some(theme.warning),
             "re-auth prompt must stand out with a warning accent"
+        );
+    }
+
+    #[test]
+    fn request_failed_message_and_warning_accent() {
+        let event = SessionEvent::RequestFailed {
+            status: Some(500),
+            headline: "Server error (500)".into(),
+            detail: "upstream exploded".into(),
+        };
+        assert_eq!(
+            event.message(),
+            "Server error (500) \u{2014} upstream exploded"
+        );
+        let block = SessionEventBlock::new(event);
+        let theme = Theme::current();
+        assert_eq!(
+            block.accent(&ctx()).map(|a| a.color),
+            Some(theme.warning),
+            "request-failed banner must stand out like re-auth"
         );
     }
 
@@ -1344,44 +1379,16 @@ mod tests {
         );
     }
 
-    /// A parked marker block — the shape `maybe_push_parked_marker` pushes.
-    fn parked_marker() -> SessionEventBlock {
-        SessionEventBlock {
-            event: SessionEvent::TurnCompleted {
-                elapsed: Some(Duration::from_secs(24)),
-            },
-            stop_hooks: Vec::new(),
-            prompt_id: None,
-            parked: true,
-        }
-    }
-
     #[test]
-    fn parked_markers_never_accept_stop_hooks() {
-        // A parked marker renders mid-turn, before any Stop hook fires.
-        let block = parked_marker();
-        assert!(!block.accepts_stop_hooks(), "parked marker refuses hooks");
-
-        // The real terminal marker accepts.
+    fn only_turn_terminal_events_accept_stop_hooks() {
         let settled = SessionEventBlock::new(SessionEvent::TurnCompleted {
             elapsed: Some(Duration::from_secs(24)),
         });
-        assert!(settled.accepts_stop_hooks());
-        // Non-terminal events never accept, parked or not.
+        assert!(settled.event.is_turn_terminal());
         let recap = SessionEventBlock::new(SessionEvent::Recap {
             summary: "did stuff".into(),
             auto: false,
         });
-        assert!(!recap.accepts_stop_hooks());
-    }
-
-    #[test]
-    fn parked_marker_output_reads_as_plain_completed_marker() {
-        // The parked marker renders the plain event text — still-running
-        // background work is the status row's "… still running" cue, never a
-        // transcript suffix.
-        let block = parked_marker();
-        let out = block.output(&ctx());
-        assert_eq!(plain(&out.lines[0]), "Worked for 24s");
+        assert!(!recap.event.is_turn_terminal());
     }
 }

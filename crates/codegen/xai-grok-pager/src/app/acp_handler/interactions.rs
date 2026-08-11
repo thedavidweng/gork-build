@@ -56,7 +56,7 @@ pub(crate) fn handle_ask_user_question(
 
     // If a question is already active, cancel it before replacing.
     if let Some(mut old_qv) = agent.question_view.take() {
-        agent.turn_paused_duration += old_qv.opened_at.elapsed();
+        agent.record_question_pause(&old_qv);
         tracing::warn!(
             old_tool_call_id = %old_qv.tool_call_id,
             new_tool_call_id = %ext_req.tool_call_id,
@@ -68,13 +68,10 @@ pub(crate) fn handle_ask_user_question(
                 .expect("Cancelled serialization should not fail");
             old_tx.send(Ok(acp::ExtResponse::new(raw.into()))).ok();
         }
-        // Restore the old stashed prompt before stashing the new one.
-        agent.prompt.restore(old_qv.stashed_prompt);
-        // Inverse-collision: the displaced question was a
-        // local one (e.g. /fork, /new) -- surface a system-block marker so
-        // the user understands why their modal vanished. The directive
-        // payload (if any) is dropped; the user can re-issue the command
-        // after answering the model's question.
+        agent.restore_card_prompt(old_qv.stashed_prompt);
+
+        // Local question displaced by an ACP ask, so surface why it vanished.
+        // Any directive it carried is dropped; the user re-issues the command after answering.
         if let Some(ref kind) = old_qv.local_kind {
             use crate::views::question_view::LocalQuestionKind;
             let cmd = match kind {
@@ -83,8 +80,9 @@ pub(crate) fn handle_ask_user_question(
                 LocalQuestionKind::CreditLimitUpsell { .. } => "credit-limit upsell",
                 LocalQuestionKind::FreeUsageUpsell { .. } => "SuperGrok upsell",
                 LocalQuestionKind::AgentTypeMismatch { .. } => "model switch",
-                LocalQuestionKind::ProjectSelect { .. } => "project select",
                 LocalQuestionKind::DoctorFix { .. } => "/doctor fix",
+                LocalQuestionKind::DeleteCurrentSession => "/delete",
+                LocalQuestionKind::Feedback => "/feedback",
             };
             let message = if matches!(kind, LocalQuestionKind::DoctorFix { .. }) {
                 "/doctor fix was cancelled because another question opened.".to_owned()
@@ -95,7 +93,7 @@ pub(crate) fn handle_ask_user_question(
         }
     }
 
-    // Stash the current prompt and create the question view.
+    // Stash the composer so it comes back when this question closes.
     agent.question_view = Some(QuestionViewState::with_response_tx(
         ext_req.tool_call_id,
         ext_req.questions,

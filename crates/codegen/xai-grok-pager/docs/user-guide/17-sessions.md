@@ -11,7 +11,7 @@ A session is a persistent conversation with full history. It includes:
 - All user prompts and agent responses
 - Tool calls and their results
 - TODO/task list state
-- File snapshots for rewind
+- Rewind points for undoing later turns
 - Token usage and turn counts
 - Subagent sessions (when enabled)
 
@@ -29,7 +29,7 @@ Grok stores each session in its own directory, grouped by working directory. It 
   updates.jsonl           # ACP session update stream (conversation + tool calls)
   chat_history.jsonl      # raw chat messages sent to the model
   plan.json               # TODO/task list state
-  rewind_points.jsonl     # file snapshots for /rewind undo
+  rewind_points.jsonl     # rewind points for /rewind undo
   signals.json            # session signals (token usage, tool/turn counters)
   feedback.jsonl          # user feedback and ratings
   compaction_checkpoints/ # saved state from compaction (manual or auto)
@@ -62,6 +62,14 @@ End the session and quit Grok:
 
 Alias: `/exit`. To leave the current session but stay in Grok, use `/home` to return to the welcome screen.
 
+### Delete the current session
+
+```
+/delete
+```
+
+Confirms, then permanently removes the session history. Returns to the welcome screen, or to the dashboard when you opened the session from the dashboard. From `/resume` or the welcome session list, press `d` then `y`. On the [Agent Dashboard](23-dashboard.md), `Ctrl+X` twice (or hover `[✗]`) permanently deletes.
+
 ---
 
 ## Resuming Sessions
@@ -78,7 +86,7 @@ This opens a session picker that lists recent sessions for the current workspace
 
 Typing in the picker filters the list by title and also searches your conversation content as you type; content matches appear under an "Extended search results" heading. Press `Ctrl+/` to search immediately without the brief pause.
 
-To switch between, rename, or close the sessions that are currently active (the parent session and any forks), use `/dashboard` (or its alias `/sessions`) instead.
+For the live top-level sessions in this pager (parent and forks) — switch, rename, peek, dispatch, or close — use the [Agent Dashboard](23-dashboard.md): `/dashboard` (aliases `/sessions`, `/agents-dashboard`) or `Ctrl+\`.
 
 ### From the Command Line
 
@@ -116,30 +124,31 @@ Rename the current session's title:
 
 ```
 /rename <title>
+/rename --auto
 ```
 
-Alias: `/title`.
+Alias: `/title`. `/rename --auto` clears a manual title and re-enables auto-titling.
 
 ---
 
 ## The /rewind Command
 
-`/rewind` undoes recent changes by restoring files to their state at an earlier point in the conversation. Use it to recover from mistakes.
+`/rewind` (alias `/undo`) rewinds the conversation to an earlier turn, dropping later turns. File changes made after that turn are left as-is on disk.
 
 ```
 /rewind
+/undo
 ```
 
-When you run `/rewind` (or press **Esc Esc** within 800ms while idle with an empty prompt and conversation messages), Grok:
+When you run `/rewind` or `/undo` (or press **Esc Esc** within 800ms while idle with an empty prompt and conversation messages), Grok:
 
 1. Shows a list of rewind points (one per user prompt)
 2. Lets you select which point to rewind to
-3. Restores all files to their state at that point
-4. Truncates the conversation history to that point
+3. Truncates the conversation history to that point
 
-File snapshots are recorded at each prompt, so you can go back to any previous state.
+When **Confirm before rewind** is on (default in `/settings`), every pick asks for confirmation (Yes / Yes, and don't ask again / No). **Yes, and don't ask again** turns that setting off. With the setting off, picks run immediately.
 
-**Important:** `/rewind` modifies files on disk. The changes it reverts are lost unless you have them in git.
+**Important:** `/rewind` does not restore files on disk. Only conversation history is truncated.
 
 ---
 
@@ -172,7 +181,7 @@ This shows:
 
 - Session title (when set)
 - Shell version
-- Auth method (OAuth vs API key) and where to manage account and credits (https://grok.com/?_s=billing for OAuth, console.x.ai for API key; API-key sessions also suggest `grok login` for SuperGrok)
+- Auth method (OAuth vs API key; API-key sessions also suggest `grok login` for SuperGrok)
 - Session ID
 - Working directory
 - Model (with a model hash for coding models)
@@ -262,6 +271,39 @@ Worktree sessions are managed internally through the `x.ai/git/worktree/*` exten
 
 Resume a session in a fresh worktree with `grok -w -r <session-id>`.
 
+### Checking Disk Usage
+
+`grok du` (alias: `grok disk-usage`) reports what the grok home (`~/.grok`) uses on disk. It lists each top-level directory, largest first, then each worktree with its size, type, age, label, and path. Worktrees the registry does not track appear as `untracked`. Pass `--json` for the same report as machine-readable output.
+
+```text
+Disk usage for ~/.grok
+    412.3 GB  worktrees
+      1.2 GB  sessions
+    412.0 MB  (top-level files)
+    413.9 GB  total
+  Worktree clones share storage with their source, so the total can exceed real disk use.
+
+Worktrees
+        SIZE  TYPE                AGE        LABEL  PATH
+    380.0 GB  session             12d ago    my-fix ~/.grok/worktrees/xai/worktree-abc
+     32.3 GB  untracked (session) 40d ago           ~/.grok/worktrees/xai/worktree-old
+
+To reclaim space, run `grok worktree gc --max-age 7d --dry-run`, then the same command without `--dry-run`. Without `--max-age`, gc expires nothing.
+Untracked rows are not in the registry, so gc never visits them. Remove one with `grok worktree rm --dry-run <path>`, then without `--dry-run`.
+```
+
+`AGE` is the value `grok worktree gc` measures: time since the worktree was last accessed, or since it was created when that is more recent. Session and agent activity update it; a shell or editor left open in the directory does not. An untracked worktree has no registry entry, so its age comes from the newest file underneath it.
+
+Sizes are physical block counts on Unix and logical file sizes elsewhere, matching what `grok worktree show` reports. A worktree clone shares storage with its source and each copy counts in full, so the total can exceed both `du -sh` and the space actually in use. When the total exceeds the used space on the volume, the report says so. `--json` carries the same figures as `volume_capacity_bytes` and `volume_available_bytes`.
+
+The report measures a single filesystem, the one holding the grok home. A directory on any other filesystem stays out of the total and is counted in `other_filesystem_dirs`, and its worktree rows show `-` for size (`null` in `--json`). A top-level symlink to a directory, such as a relocated `worktrees`, is counted in `unfollowed_dir_symlinks`; its target stays out of the total, though the rows below it are still sized. Directories and entries the report could not read are counted in `unreadable_dirs` and `unstatable_entries`. Run `RUST_LOG=debug grok du` to name each one.
+
+Every worktree row in `--json` also carries `created_at`, `last_accessed_at`, and `last_modified_at` in unix seconds, plus `repo_name` and `git_ref`. Registry fields are `null` for untracked rows. `git_ref` is the branch recorded when the worktree was registered, not the branch checked out now.
+
+When the registry is unavailable, every row appears as `untracked` and the report names the reason. The `--json` `registry` field carries the same value: `read`, `absent`, `busy`, `unopenable`, or `corrupt`. A `busy` registry is held by another process, so retry. An `unopenable` one has a permission or I/O problem, so check the file. A `corrupt` one is the only case that calls for deletion: remove the file the report names, then run `grok worktree db rebuild`.
+
+To reclaim space, run `grok worktree gc --max-age 7d`, which removes tracked worktrees older than the age you give. Without `--max-age`, gc expires nothing, and it visits only worktrees the registry tracks. Remove an untracked worktree with `grok worktree rm <path>`. Both commands take `--dry-run` and report what they would do: gc counts the worktrees it would remove, and `rm` names the path. Neither inspects the working tree for uncommitted or unpushed work, so read the preview first.
+
 ---
 
 ## Session Storage Details
@@ -290,7 +332,7 @@ The smaller state files -- `summary.json`, `plan.json`, and `signals.json` -- ar
 
 ### Disk Usage
 
-Rewind point snapshots (copies of modified files) are the largest contributor to disk usage in sessions that modify many files. Use `/compact` to reduce history size.
+Session history (`updates.jsonl`, `chat_history.jsonl`) dominates disk usage in long sessions. Use `/compact` to reduce history size.
 
 ---
 
@@ -298,6 +340,6 @@ Rewind point snapshots (copies of modified files) are the largest contributor to
 
 - Use `/new` to start fresh when your current context is no longer relevant.
 - Use `/compact` proactively in long sessions to keep the context window effective.
-- Use `/rewind` to undo mistakes; it restores actual file snapshots instead of relying on the agent to reconstruct earlier state.
+- Use `/rewind` to undo mistakes; it rewinds the conversation to an earlier turn (file changes from removed turns are left as-is).
 - In headless mode, capture the `sessionId` from JSON output and pass it to `-r` to build multi-step automations that maintain context.
 - Check `/session-info` to see how much of your context window has been used.

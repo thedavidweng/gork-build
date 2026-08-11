@@ -24,6 +24,10 @@ pub(crate) type PendingInterjection = xai_interjection_core::PendingInterjection
 /// `x.ai/session/interjection` broadcast, so a live echo would duplicate it.
 pub(crate) const INTERJECT_FALLBACK_PROMPT_PREFIX: &str = "interject-fallback-";
 
+pub(crate) fn is_interject_fallback(prompt_id: &str) -> bool {
+    prompt_id.starts_with(INTERJECT_FALLBACK_PROMPT_PREFIX)
+}
+
 impl SessionActor {
     /// Convert a stranded interjection into a queued prompt turn.
     ///
@@ -61,7 +65,7 @@ impl SessionActor {
         };
         let (respond_to, _) = tokio::sync::oneshot::channel();
         // User message (skips queue_input); invalidate in-flight recap now.
-        self.cancel_pending_recap_for_new_prompt();
+        self.invalidate_side_calls_for_new_prompt();
         let item = InputItem {
             prompt_id,
             prompt_blocks,
@@ -98,21 +102,17 @@ impl SessionActor {
         tracing::info!("Converted stranded interjection into a queued prompt turn");
     }
 
-    /// Flush interjections that missed the completed turn's final drain into
-    /// queued prompt turns (front of the queue, original order). Returns
-    /// whether anything was flushed; the caller kicks
-    /// `maybe_start_running_task`.
-    pub(super) async fn flush_stranded_interjections(&self) -> bool {
+    /// Convert interjections that missed their turn's final drain into queued
+    /// prompt turns, front of the queue in original order. Returns the count.
+    pub(super) async fn flush_stranded_interjections(&self) -> usize {
         let stranded = self.pending_interjections.drain_all();
-        if stranded.is_empty() {
-            return false;
-        }
+        let count = stranded.len();
         // Reversed push_fronts keep entry 0 front-most.
         for entry in stranded.into_iter().rev() {
             self.queue_interjection_fallback_prompt(entry.text, entry.attachments, true)
                 .await;
         }
-        true
+        count
     }
     /// Normalize interjection images for injection (shared pipeline above);
     /// notices append to `wrapped` (TEXT side only). Returns the images to
@@ -150,12 +150,8 @@ impl SessionActor {
     }
 
     /// Broadcast a mid-turn interjection to every attached client.
-    /// Fan it out (sessionId-routed, fire-and-forget) so every pane viewing the
-    /// session renders the interjection block — not just the originator. The
-    /// originating pager rendered an optimistic block locally and dedups this
-    /// echo by `id`; other panes (which never minted the id) render it. `id` is
-    /// to chat state. Shared by `add_followup_message_as_user_turn` (which
-    /// `None` only for older clients, in which case every pane renders.
+    /// The originator uses `id` to claim its optimistic prompt block; other
+    /// clients render the notification normally.
     pub(super) fn broadcast_interjection(&self, text: &str, id: Option<&str>) {
         let mut payload = serde_json::json!({
             "sessionId": self.session_info.id.0.as_ref(),
@@ -243,8 +239,7 @@ impl SessionActor {
         if !text.trim_start().starts_with('/') {
             return None;
         }
-        let bridge = self.agent.borrow().tool_bridge().clone();
-        let slash_skills = bridge.slash_skills().await;
+        let slash_skills = self.slash_skills_for_resolve().await;
         // Availability without `command_availability()`'s goal-reconciliation
         // side effects — this runs mid-turn inside the drain.
         let tool_names = self.registered_tool_names().await;
@@ -266,6 +261,7 @@ impl SessionActor {
                 xai_grok_telemetry::events::SkillDispatched {
                     skill_name: sk.name.clone(),
                     plugin_source: sk.plugin_name.clone(),
+                    trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
                 },
             );
         }
@@ -283,7 +279,6 @@ impl SessionActor {
     /// compaction, replay, and analytics see the user's steering text as its
     /// own user turn.
     ///
-    /// Returns `true` if any interjections were drained (caller may want to
     /// Returns `true` if any interjections were drained (caller may want to
     /// `continue` the turn loop so the model sees them on the next iteration).
     pub(super) async fn drain_pending_interjections(&self) -> bool {

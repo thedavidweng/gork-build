@@ -17,7 +17,7 @@ use super::session::modal::dispatch_sessions_confirm_close;
 use super::turn::dispatch_cancel_turn;
 use super::voice::{merge_prompt_with_voice_interim, voice_stop_on_submit};
 use crate::app::actions::{Action, Effect};
-use crate::app::agent::AgentId;
+use crate::app::agent::{AgentId, DeferredModelSwitch};
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView, DashboardReturn, TrustState};
 use agent_client_protocol as acp;
@@ -56,14 +56,23 @@ pub(super) fn ensure_dashboard_state(app: &mut AppView) {
     state.set_voice_visible(app.voice_mode_enabled);
     state.set_restricted_commands(&app.tier_restricted_commands);
     let billing = app.usage_visible;
+    let usage_cmd = !app.has_external_auth_provider;
     state
         .dispatch
         .slash_controller
         .set_billing_surface_visible(billing);
     state
+        .dispatch
+        .slash_controller
+        .set_usage_command_visible(usage_cmd);
+    state
         .peek_reply
         .slash_controller
         .set_billing_surface_visible(billing);
+    state
+        .peek_reply
+        .slash_controller
+        .set_usage_command_visible(usage_cmd);
     app.dashboard = Some(state);
 }
 
@@ -183,7 +192,7 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
             && let Some(agent) = app.agents.get_mut(&id)
         {
             agent.current_branch = info.branch;
-            agent.is_worktree = info.is_worktree;
+            agent.is_worktree = info.is_worktree || agent.session.is_worktree;
             agent.main_repo = info.main_repo;
             agent.worktree_label = info.worktree_label;
         }
@@ -251,6 +260,12 @@ pub(super) fn dispatch_exit_dashboard(app: &mut AppView) -> Vec<Effect> {
     if let Some(d) = app.dashboard.as_mut() {
         d.restore_peek_viewport(&mut app.agents);
         d.close_popup();
+        // Dashboard state is preserved across reopen; clear a leftover exit
+        // alias so the next Enter does not quit.
+        if crate::slash::commands::exit::is_exit_alias(d.dispatch.text()) {
+            d.dispatch.set_text("");
+            d.error_toast = None;
+        }
     }
     log_dashboard_closed(app);
     let preferred = app
@@ -484,13 +499,14 @@ fn clear_pending_overlay_stop(app: &mut AppView) {
 /// `app_view::handle_input` and the `DashboardOverlayStop` def both
 /// point here):
 ///
-/// - First press, turn RUNNING → `Action::CancelTurn` (the agent
-///   view's Ctrl+C behaviour: keep-subagents prompt, prompt rewind).
-///   Never arms, so mashing Ctrl+X to stop a turn can't close the
-///   session.
-/// - First press, any other state (idle, command in flight, cancel
+/// - First press, stoppable activity running (turn, `/compact`, or a
+///   streaming wake turn; `arm_dashboard_stop`) → `Action::CancelTurn`
+///   (the agent view's Ctrl+C behaviour: keep-subagents prompt, prompt
+///   rewind). Never arms, so mashing Ctrl+X to stop a turn can't close
+///   the session.
+/// - First press, any other state (idle, cancel
 ///   pending) → arms `AppView::pending_action` with the dashboard's
-///   2s `STOP_CONFIRM_WINDOW`; the shortcuts bar paints "press Ctrl+x
+///   2s `CONFIRM_WINDOW`; the shortcuts bar paints "press Ctrl+x
 ///   again to close this session". Cancel can't help in the non-idle
 ///   variants of this arm — `dispatch_cancel_turn` no-ops unless a
 ///   turn is running, and command cancellation isn't implemented (see
@@ -510,10 +526,8 @@ pub(super) fn dispatch_dashboard_overlay_stop(app: &mut AppView) -> Vec<Effect> 
     let Some(id) = app.dashboard.as_ref().and_then(|d| d.attached_agent) else {
         return vec![];
     };
-    if app
-        .agents
-        .get(&id)
-        .is_some_and(|a| a.session.state.is_turn_running())
+    if let Some(agent) = app.agents.get_mut(&id)
+        && agent.arm_dashboard_stop()
     {
         return dispatch_cancel_turn(app);
     }
@@ -802,11 +816,9 @@ pub(super) fn dispatch_dashboard_open_location_picker(app: &mut AppView) -> Vec<
     }
 
     let cwd = app.cwd.clone();
-    // Same pattern as `open_project_question` — the recent-dirs source is
-    // async; block the current runtime thread briefly to collect it.
+    // The recent-dirs source is async; block the current runtime thread briefly to collect it.
     let recent = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(crate::project_picker::sources::collect_recent_dirs(10))
+        tokio::runtime::Handle::current().block_on(crate::recent_dirs::collect_recent_dirs(10))
     });
 
     // Worktree label index (root path → label), built once and reused to
@@ -820,17 +832,14 @@ pub(super) fn dispatch_dashboard_open_location_picker(app: &mut AppView) -> Vec<
     let mut candidates: Vec<LocationCandidate> = Vec::new();
     candidates.push(LocationCandidate {
         label: location_picker_label(&cwd),
-        detail: format!(
-            "{}  (current)",
-            crate::project_picker::sources::display_path(&cwd)
-        ),
+        detail: format!("{}  (current)", crate::recent_dirs::display_path(&cwd)),
         worktree: worktree_label(&cwd),
         path: cwd.clone(),
     });
     for (path, ts) in recent.into_iter().filter(|(p, _)| p != &cwd) {
         let detail = format!(
             "{}  ({})",
-            crate::project_picker::sources::display_path(&path),
+            crate::recent_dirs::display_path(&path),
             crate::views::session_title::format_relative_time(
                 (chrono::Utc::now() - ts).to_std().unwrap_or_default()
             ),
@@ -893,7 +902,7 @@ pub(super) fn dispatch_dashboard_change_location(app: &mut AppView, input: Strin
     );
 
     let changed = app.cwd != path;
-    let display = crate::project_picker::sources::display_path(&path);
+    let display = crate::recent_dirs::display_path(&path);
     app.cwd = path.clone();
     // Keep the git-repo flag in sync with the new cwd (it's otherwise only
     // computed at startup). Worktree dispatch reads it.
@@ -1111,6 +1120,14 @@ pub(super) fn dispatch_dashboard_dispatch(
         return vec![];
     }
     let trimmed = text.trim().to_string();
+    // Match agent-prompt send; do not spawn a session.
+    if crate::slash::commands::exit::is_exit_alias(&trimmed) {
+        if let Some(d) = app.dashboard.as_mut() {
+            d.dispatch.set_text("");
+            d.error_toast = None;
+        }
+        return dispatch(Action::Quit, app);
+    }
     // Reject only an empty / whitespace-only prompt; any non-empty
     // input (even a single character) dispatches a new session. The
     // keyboard path already filters empty input upstream (see
@@ -1189,10 +1206,7 @@ pub(super) fn dispatch_dashboard_dispatch(
         });
     let (prompt_text, mut pasted_images, chip_elements) = prompt_state.into_submission();
     log_dashboard_launched("prompt");
-    let saved_shown = app.project_picker_shown;
-    app.project_picker_shown = true;
     let (new_id, effects) = dispatch_new_session_inner_with_id(app, model_id);
-    app.project_picker_shown = saved_shown;
     let policy_block = app.yolo_policy_block;
     if let Some(agent) = app.agents.get_mut(&new_id) {
         agent.session.enqueue_prompt(prompt_text);
@@ -1253,8 +1267,9 @@ pub(super) fn dispatch_dashboard_dispatch(
 /// limited than the agent view's:
 ///
 ///   - Builtin commands that return `CommandResult::Action(...)` (e.g.
-///     `/dashboard`, `/exit`, `/theme`, `/settings`, `/help`, `/model`,
-///     `/mcps`, `/plugin`, …) are dispatched identically to the agent path.
+///     `/dashboard`, `/exit`, `/quit`, `/theme`, `/settings`, `/help`,
+///     `/model`, `/mcps`, `/plugin`, …) are dispatched identically to the
+///     agent path (`/exit`/`/quit` quit the CLI; `/home` leaves the dashboard).
 ///   - `CommandResult::Message` / `Error` surface as an `error_toast`
 ///     on the dashboard (no scrollback to push into). `Error` strings
 ///     get the `✗` prefix via `set_error_toast`; `Message` strings are
@@ -1270,9 +1285,10 @@ pub(super) fn dispatch_dashboard_dispatch(
 ///
 /// Offer / execute tri-state (matches completion's [`command_offered`]):
 ///   - **Unknown** token → [`dispatch_dashboard_dispatch`] (new session prompt).
-///   - **Registered, not offered** (session-scoped hidden on this surface,
-///     or `dashboard_only` off-dashboard) → clear dispatch + error toast;
-///     do **not** spawn with the slash text as the prompt.
+///   - **Registered, session-scoped** (hidden on this surface) → clear
+///     dispatch + error toast; do **not** spawn with the slash as a prompt.
+///   - **Registered, not visible** (auth/feature gate, e.g. `/usage` on
+///     external auth) → still `command.run` so the command owns the error.
 ///   - **Registered, offered** → MRU + `command.run` (e.g. `/model` /
 ///     `/plan` stage the next spawn).
 pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String) -> Vec<Effect> {
@@ -1286,12 +1302,16 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
     }
 
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
+    let coding_data_sharing_lock_from_app = app.coding_data_sharing_lock();
     let show_tips_from_app = app.show_tips;
     let auto_update_from_app = app.auto_update;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    // Dashboard commands run before any session exists, so the startup seed is
+    // the only answer available here.
+    let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
 
     // Build the execution context from app-wide state. The dashboard
     // is session-less, so `session_id` is `None`. Offered session-less
@@ -1346,14 +1366,16 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
             // path so the text becomes a new session's prompt.
             return dispatch_dashboard_dispatch(app, text, /* attach */ false);
         };
-        // Registered but not offered on this surface (session-scoped
-        // hidden from the dropdown, or non-dashboard `dashboard_only`):
-        // error toast — never spawn a session whose first prompt is the
-        // slash text (that was worse than the old loud Action toasts).
+        // Registered but not offered on this surface:
+        //   - session-scoped → toast; never spawn with the slash as a prompt
+        //   - `visible() == false` (e.g. `/usage` on external auth) → still
+        //     `run()` so the command owns the refusal message
         if !dashboard
             .dispatch
             .slash_controller
             .is_command_offered(command.as_ref(), &app.models)
+            && command.session_scoped()
+            && !command.offered_when_session_less()
         {
             let name = command.name();
             if let Some(d) = app.dashboard.as_mut() {
@@ -1377,6 +1399,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
             bundle_state: &app.bundle_state,
             screen_mode: app.screen_mode,
             billing_surface_visible: app.usage_visible,
+            usage_command_visible: !app.has_external_auth_provider,
             pager_state: crate::settings::PagerLocalSnapshot {
                 multiline_mode: dashboard_multiline,
                 yolo_mode: app.default_yolo,
@@ -1390,6 +1413,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                     .map(|(id, info)| (info.name.clone(), id.clone()))
                     .collect(),
                 coding_data_sharing_opt_out: coding_data_sharing_opt_out_from_app,
+                coding_data_sharing_lock: coding_data_sharing_lock_from_app,
                 plan_mode_active: false,
                 show_tips: show_tips_from_app,
                 auto_update: auto_update_from_app,
@@ -1399,6 +1423,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app,
+                scheduler_background_loops: scheduler_background_loops_seed,
             },
         };
         command.run(&mut ctx, invocation.args)
@@ -1575,7 +1600,12 @@ pub(super) fn apply_pending_dispatch_config(
         // deferred switch when an explicit effort must be pushed. Setting it
         // (or clearing to `None`) also overrides any CLI `-m` default so the
         // dashboard's `/model` choice wins.
-        agent.session.deferred_model_switch = m.effort.map(|e| (m.id.clone(), Some(e)));
+        agent.session.deferred_model_switch = m.effort.map(|e| DeferredModelSwitch {
+            model_id: m.id.clone(),
+            effort: Some(e),
+            // Effort-only push; no display change to roll back.
+            prev_model_id: None,
+        });
     }
     match pending_mode {
         DashboardDispatchMode::Normal => {
@@ -1787,13 +1817,23 @@ pub(super) fn dispatch_dashboard_begin_rename(app: &mut AppView) {
         d.set_error_toast("Subagent rows can't be renamed");
         return;
     }
-    // The draft starts EMPTY (not prefilled with the current title):
-    // renames are almost always full rewrites, so prefilling only costs
-    // the user a hold-Backspace. Esc / empty-draft Enter cancel without
-    // touching the existing name.
+    let prefill = match &sel {
+        crate::views::dashboard::DashboardRowId::TopLevel(agent_id) => app
+            .agents
+            .get(agent_id)
+            .map(rename_prefill_title)
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
     if let Some(d) = app.dashboard.as_mut() {
-        d.rename = Some(crate::views::dashboard::state::RenameDraft::new(sel, ""));
+        d.rename = Some(crate::views::dashboard::state::RenameDraft::new(
+            sel, prefill,
+        ));
     }
+}
+
+fn rename_prefill_title(agent: &AgentView) -> String {
+    crate::views::session_title::rename_source_title(agent).unwrap_or_default()
 }
 
 pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect> {
@@ -1825,6 +1865,7 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
                 session_id,
                 title,
                 cwd,
+                kind: agent.rename_kind(),
             });
         } else {
             agent.display_name = Some(title);
@@ -1846,7 +1887,7 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
 /// Without this, closing the selected agent leaves a stale cursor that
 /// `reanchor_selection` drops to `None`, and the next ↑/↓ restarts from
 /// the top of the list — a jarring jump.
-fn dashboard_neighbor_row(
+pub(super) fn dashboard_neighbor_row(
     app: &AppView,
     closed: &crate::views::dashboard::DashboardRowId,
 ) -> Option<crate::views::dashboard::DashboardRowId> {
@@ -1892,6 +1933,16 @@ fn dashboard_neighbor_row(
     })
 }
 
+/// Ctrl+X on the selected dashboard row, keyed off the row's `RowState`
+/// (the same `allows_delete` the renderer paints `[✗]` with):
+/// - Deletable row: first press arms, a second within the window deletes.
+/// - Busy top-level row: stop what keeps it busy (running turn, background
+///   tasks/monitors/`/loop`s, or queued prompts), never arm (a roster row
+///   has no local work to stop, so it just reports it must be stopped first).
+/// - Subagent row: kill the subagent.
+///
+/// Delete only ever runs on an idle row, so it is never queued alongside
+/// a `CancelTurn`.
 pub(super) fn dispatch_dashboard_stop(app: &mut AppView) -> Vec<Effect> {
     use crate::views::dashboard::DashboardRowId;
     use std::time::Instant;
@@ -1902,76 +1953,27 @@ pub(super) fn dispatch_dashboard_stop(app: &mut AppView) -> Vec<Effect> {
     match &sel {
         DashboardRowId::TopLevel(id) => {
             let id = *id;
-            let Some(agent) = app.agents.get(&id) else {
+            let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
-            let now = Instant::now();
-            // `t.elapsed()` is the idiomatic Instant API
-            // for "how long since this Instant". Behaviour identical
-            // to `now.duration_since(*t)` when `t <= now`, which is
-            // the only case the dispatcher constructs.
-            let already_confirming = app
-                .dashboard
-                .as_ref()
-                .and_then(|d| d.stop_confirm.as_ref())
-                .is_some_and(|(prev, t)| {
-                    *prev == sel
-                        && t.elapsed() < crate::views::dashboard::state::STOP_CONFIRM_WINDOW
-                });
-            if already_confirming {
-                // Pick the cursor's next home BEFORE the row vanishes, so
-                // closing moves the selection down 1 instead of letting it
-                // go stale (which `reanchor_selection` drops to `None`,
-                // bouncing the next ↑/↓ back to the top of the list).
-                let neighbor = dashboard_neighbor_row(app, &sel);
+            if !crate::views::dashboard::classify_top_level(agent).allows_delete() {
+                // Busy row: stop what keeps it out of Idle — a running turn,
+                // background work (bg tasks, monitors, scheduled `/loop`s),
+                // or queued prompts. Never arms; once the row settles to
+                // idle, Ctrl+X twice deletes it.
+                let stopped = stop_top_level_activity(agent);
                 if let Some(d) = app.dashboard.as_mut() {
-                    d.stop_confirm = None;
+                    d.delete_confirm = None;
                 }
-                // Second press: close the agent.
-                let effects = dispatch_sessions_confirm_close(app, id);
-                // Only move the cursor if the close actually happened
-                // (it's refused for the last remaining session).
-                if !app.agents.contains_key(&id)
-                    && let Some(d) = app.dashboard.as_mut()
-                {
-                    match neighbor {
-                        Some(n) => d.focus_row(n),
-                        // No neighbour left — land on the always-present
-                        // `[+ New Agent]` button via the focus helper so the
-                        // "exactly one cursor active" invariant holds (a bare
-                        // `selected = None` would leave no cursor and drop the
-                        // footer into its defensive fallback).
-                        None => d.focus_new_agent_button(),
+                return match stopped {
+                    Some(effects) => effects,
+                    None => {
+                        app.show_toast("Stop the session before deleting");
+                        vec![]
                     }
-                }
-                return effects;
+                };
             }
-            // First press: cancel turn if running, plant confirmation.
-            let mut effects = Vec::new();
-            if !agent.session.state.is_idle()
-                && let Some(sid) = agent.session.session_id.clone()
-            {
-                effects.push(Effect::CancelTurn {
-                    session_id: sid,
-                    cancel_subagents: true,
-                    trigger: None,
-                    // Dashboard first-press cancel — no local prompt rewind.
-                    rewind_if_pristine: false,
-                });
-            }
-            if let Some(d) = app.dashboard.as_mut() {
-                // The footer's `ShortcutsBar::with_pending` already
-                // paints the "press Ctrl+X again to close this
-                // session" prompt in the bottom bar. Surfacing the
-                // same line via `error_toast` would also bleed it
-                // into the dispatch input placeholder — two copies
-                // of the same hint, in two different places, with
-                // the dispatch one stealing visual weight from the
-                // user's typing area. The footer hint is the
-                // canonical surface.
-                d.stop_confirm = Some((sel, now));
-            }
-            effects
+            arm_or_delete(app, sel)
         }
         DashboardRowId::Subagent {
             parent,
@@ -1995,9 +1997,214 @@ pub(super) fn dispatch_dashboard_stop(app: &mut AppView) -> Vec<Effect> {
                 .into_iter()
                 .collect()
         }
-        // Roster-only rows are hosted elsewhere — this client can't stop
-        // them.
-        DashboardRowId::Roster { .. } => vec![],
+        DashboardRowId::Roster { session_id } => {
+            let entry = app
+                .leader_roster
+                .iter()
+                .chain(app.dashboard_local_sessions.iter())
+                .find(|e| e.session_id == session_id.as_str());
+            match entry {
+                None => {
+                    app.show_toast("Session is no longer in the list");
+                    vec![]
+                }
+                // Chat conversations can't be deleted from here yet, so
+                // don't arm a confirm that could never succeed.
+                Some(e) if e.origin.kind == "conversation" => {
+                    app.show_toast("Deleting chat conversations isn't supported yet");
+                    vec![]
+                }
+                // No local turn to cancel, so a busy roster row can't delete.
+                Some(e)
+                    if !crate::views::dashboard::roster_activity_to_state(e.activity)
+                        .allows_delete() =>
+                {
+                    app.show_toast("Stop the session before deleting");
+                    vec![]
+                }
+                Some(_) => arm_or_delete(app, sel),
+            }
+        }
+    }
+}
+
+/// Stop everything keeping a busy top-level row out of Idle: a running
+/// turn, running background tasks/monitors, scheduled `/loop`s, and queued
+/// (unsent) prompts. Marks local state optimistically (mirroring the agent
+/// view's own kill paths). Returns `Some(effects)` when it stopped
+/// something — the effects may be empty if the only thing to stop was the
+/// local prompt queue — or `None` when there was nothing stoppable (so the
+/// caller can explain why).
+fn stop_top_level_activity(agent: &mut crate::app::agent_view::AgentView) -> Option<Vec<Effect>> {
+    let session_id = agent.session.session_id.clone();
+    let mut effects = Vec::new();
+
+    // Turn / background work need a session id to reach the backend.
+    if let Some(session_id) = session_id {
+        if !agent.session.state.is_idle() || agent.wake_turn_active() {
+            // Same priority as in-pane cancel: compact, then a live wake
+            // marker (shell front is still the wake even if we locally
+            // start_turn'd a user prompt), then a local turn. Do not
+            // cancel_turn a local user turn that is only queued behind a wake.
+            if agent.session.state.is_compact_running() {
+                agent.session.cancel_compact_command();
+            } else if agent.running_wake_turn.is_some() {
+                agent.mark_wake_cancel_sent();
+            } else if agent.session.state.is_turn_running() {
+                agent.session.cancel_turn(&mut agent.scrollback);
+            }
+            agent.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::DashboardStop);
+            // Stop-everything on purpose: unlike the in-pane retry, the row
+            // stop escalates past a recorded keep-subagents choice.
+            effects.push(super::turn::emit_cancel_turn(
+                agent,
+                session_id.clone(),
+                /* cancel_subagents */ true,
+                /* rewind_if_no_output */ false,
+            ));
+        }
+        let running: Vec<String> = agent
+            .session
+            .bg_tasks
+            .values()
+            .filter(|t| t.status == crate::app::agent::BgTaskStatus::Running)
+            .map(|t| t.task_id.clone())
+            .collect();
+        for task_id in running {
+            if let Some(task) = agent.session.bg_tasks.get_mut(&task_id) {
+                task.pending_kill = true;
+                task.kill_requested_at = Some(std::time::Instant::now());
+            }
+            effects.push(Effect::KillBgTask {
+                session_id: session_id.clone(),
+                task_id,
+            });
+        }
+        let scheduled: Vec<String> = agent.session.scheduled_tasks.keys().cloned().collect();
+        for task_id in scheduled {
+            agent.session.scheduled_tasks.remove(&task_id);
+            effects.push(Effect::DeleteScheduledTask {
+                session_id: session_id.clone(),
+                task_id,
+            });
+        }
+    }
+
+    // Queued prompts are local (unsent), so dropping them needs no effect
+    // and works even before the session exists (a just-dispatched row).
+    let dropped_queue = !agent.session.pending_prompts.is_empty();
+    if dropped_queue {
+        agent.session.pending_prompts.clear();
+        agent.sync_queue_pane();
+    }
+
+    (!effects.is_empty() || dropped_queue).then_some(effects)
+}
+
+/// A live arm on `sel` confirms and deletes; otherwise (re)arm.
+fn arm_or_delete(app: &mut AppView, sel: crate::views::dashboard::DashboardRowId) -> Vec<Effect> {
+    let armed = app
+        .dashboard
+        .as_mut()
+        .and_then(|d| d.armed_delete_row())
+        .as_ref()
+        == Some(&sel);
+    if armed {
+        return delete_dashboard_row(app, sel);
+    }
+    if let Some(d) = app.dashboard.as_mut() {
+        d.arm_delete(sel);
+    }
+    vec![]
+}
+
+pub(super) fn dispatch_dashboard_delete(app: &mut AppView) -> Vec<Effect> {
+    let Some(d) = app.dashboard.as_mut() else {
+        return vec![];
+    };
+    // The `y` confirm: only fire on a row whose arm is still live AND is
+    // still the selected row. Reanchor / gc can drop `selected` without
+    // going through the focus helpers, which would otherwise let `y`
+    // delete a row the cursor has left.
+    let Some(sel) = d.armed_delete_row() else {
+        return vec![];
+    };
+    if d.selected.as_ref() != Some(&sel) {
+        d.delete_confirm = None;
+        return vec![];
+    }
+    delete_dashboard_row(app, sel)
+}
+
+/// Delete `row`, which the caller has confirmed is idle and armed. Takes
+/// `row` as a parameter (not read back off `delete_confirm`) and never
+/// cancels a turn or kills a task — delete is a settled-row operation.
+fn delete_dashboard_row(
+    app: &mut AppView,
+    row: crate::views::dashboard::DashboardRowId,
+) -> Vec<Effect> {
+    use crate::views::dashboard::DashboardRowId;
+
+    if let Some(d) = app.dashboard.as_mut() {
+        d.delete_confirm = None;
+    }
+    match row {
+        DashboardRowId::TopLevel(id) => {
+            let Some(agent) = app.agents.get(&id) else {
+                return vec![];
+            };
+            // Defensive re-check via the SAME predicate the renderer and
+            // arm path use: state can change between arming and confirming
+            // (a new turn, `/loop`, queued prompt, replay, needs-input, or
+            // bg task), and delete must never run on a non-settled row.
+            if !crate::views::dashboard::classify_top_level(agent).allows_delete() {
+                app.show_toast("Stop the session before deleting");
+                return vec![];
+            }
+            let Some(session_id) = agent.session.session_id.clone() else {
+                app.show_toast("No session history to delete");
+                return vec![];
+            };
+            let cwd = agent.session.cwd.display().to_string();
+            app.show_toast("Deleting session\u{2026}");
+            vec![Effect::DeleteSession {
+                source: "current".into(),
+                session_id: session_id.to_string(),
+                cwd,
+                after: crate::app::actions::AfterSessionDelete::Dashboard,
+            }]
+        }
+        DashboardRowId::Subagent { .. } => {
+            app.show_toast("Subagent rows can't be deleted from the dashboard");
+            vec![]
+        }
+        DashboardRowId::Roster { session_id } => {
+            let Some(entry) = app
+                .leader_roster
+                .iter()
+                .chain(app.dashboard_local_sessions.iter())
+                .find(|e| e.session_id == session_id)
+                .cloned()
+            else {
+                app.show_toast("Session is no longer in the list");
+                return vec![];
+            };
+            if entry.origin.kind == "conversation" {
+                app.show_toast("Deleting chat conversations isn't supported yet");
+                return vec![];
+            }
+            if !crate::views::dashboard::roster_activity_to_state(entry.activity).allows_delete() {
+                app.show_toast("Stop the session before deleting");
+                return vec![];
+            }
+            app.show_toast("Deleting session\u{2026}");
+            vec![Effect::DeleteSession {
+                source: "local".into(),
+                session_id,
+                cwd: entry.cwd,
+                after: crate::app::actions::AfterSessionDelete::Dashboard,
+            }]
+        }
     }
 }
 
@@ -2196,41 +2403,10 @@ pub(super) fn dispatch_dashboard_permission_select(
         return vec![];
     };
 
-    let meta = if let Some(scope) = perm
-        .mcp_scope
-        .as_ref()
-        .filter(|_| option_id.0.as_ref() == "allow-always-mcp")
-    {
-        let selection = match scope.selected {
-            crate::views::permission_view::McpScope::Tool => {
-                xai_grok_workspace::permission::McpScopeSelection::Tool {
-                    tool_name: scope.tool_name.clone(),
-                }
-            }
-            crate::views::permission_view::McpScope::Server => match &scope.server_prefix {
-                Some(prefix) => xai_grok_workspace::permission::McpScopeSelection::Server {
-                    server: prefix.clone(),
-                },
-                None => xai_grok_workspace::permission::McpScopeSelection::Tool {
-                    tool_name: scope.tool_name.clone(),
-                },
-            },
-        };
-        serde_json::to_value(selection)
-            .ok()
-            .and_then(|v| v.as_object().cloned())
-    } else if let Some(ref h) = perm.bash_highlights
-        && perm.bash_selection_count > 0
-    {
-        let parts: Vec<String> = h.highlighted_words[..perm.bash_selection_count].to_vec();
-        serde_json::to_value(xai_grok_workspace::permission::BashCommandSelectedTerms {
-            command_parts: parts,
-        })
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-    } else {
-        None
-    };
+    // Share the main dispatch's meta logic so dashboard peek honors an edited
+    // pattern (and the glob routing) identically instead of dropping it.
+    let edited_pattern = super::permissions::take_edited_pattern(agent, &perm);
+    let meta = super::permissions::build_selection_meta(&perm, &option_id, edited_pattern);
 
     perm.request
         .response_tx

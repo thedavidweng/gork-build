@@ -4,6 +4,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
 
 use super::TOOL_HEADER_RANGE;
+use crate::appearance::AppearanceConfig;
 use crate::render::line_utils::truncate_str;
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{
@@ -96,17 +97,6 @@ impl WebFetchToolCallBlock {
         }
     }
 
-    /// Format byte count as human-readable (e.g. "14.2 KB").
-    fn format_bytes(bytes: usize) -> String {
-        if bytes < 1024 {
-            format!("{bytes} B")
-        } else if bytes < 1024 * 1024 {
-            format!("{:.1} KB", bytes as f64 / 1024.0)
-        } else {
-            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-        }
-    }
-
     /// Render the header line: **Fetch** `url`
     ///
     /// When `max_width` is `Some`, the URL is truncated with ellipsis to fit.
@@ -170,7 +160,7 @@ impl WebFetchToolCallBlock {
         if let Some(bytes) = self.bytes {
             parts.push(vec![
                 Span::styled("size: ", label_style),
-                Span::styled(Self::format_bytes(bytes), value_style),
+                Span::styled(crate::util::format_bytes(bytes as u64), value_style),
             ]);
         }
 
@@ -316,7 +306,7 @@ impl BlockContent for WebFetchToolCallBlock {
         }
     }
 
-    fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
         false
     }
 

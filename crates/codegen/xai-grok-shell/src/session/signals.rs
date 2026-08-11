@@ -66,12 +66,20 @@ pub struct ToolOutcome {
 }
 
 /// Per-tool execution duration for a single invocation.
+///
+/// Written into `turn_result.json` via `SessionSignalsDelta.tool_durations_this_turn`
+/// so downstream analytics can join wall time to a specific tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDuration {
     /// Tool name (e.g. "bash", "read_file", "search_replace")
     pub tool_name: String,
-    /// Execution wall-clock time in milliseconds
+    /// Join key (`missing-call-id-{batch_idx}` if the model omitted one). Empty on legacy packages.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_call_id: String,
+    /// Dispatch wall-clock ms (start → result ready), including lock wait and
+    /// in-dispatch auth retries. A managed-MCP reauth retry adds its second
+    /// attempt here; the reauth handshake wait itself is excluded.
     pub duration_ms: u64,
 }
 
@@ -449,8 +457,12 @@ pub enum SignalEvent {
     RecordToolSuccess(String),
     /// Record a tool failure (tool returned error) with the tool name
     RecordToolFailure(String),
-    /// Record a tool execution duration
-    RecordToolDuration { tool_name: String, duration_ms: u64 },
+    /// Record a tool execution duration (dispatch wall clock).
+    RecordToolDuration {
+        tool_name: String,
+        tool_call_id: String,
+        duration_ms: u64,
+    },
 
     // === Error Events ===
     /// Record a general error (sampling, network, etc.)
@@ -645,7 +657,7 @@ impl SessionSignalsHandle {
     }
 
     /// Record a tool success.
-    pub fn record_tool_success(&self, tool_name: impl Into<String>) {
+    pub(crate) fn record_tool_success(&self, tool_name: impl Into<String>) {
         let _ = self
             .tx
             .send(SignalEvent::RecordToolSuccess(tool_name.into()));
@@ -658,10 +670,16 @@ impl SessionSignalsHandle {
             .send(SignalEvent::RecordToolFailure(tool_name.into()));
     }
 
-    /// Record a tool execution duration in milliseconds.
-    pub fn record_tool_duration(&self, tool_name: impl Into<String>, duration_ms: u64) {
+    /// Record a tool execution duration in milliseconds (dispatch wall clock).
+    pub(crate) fn record_tool_duration(
+        &self,
+        tool_name: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        duration_ms: u64,
+    ) {
         let _ = self.tx.send(SignalEvent::RecordToolDuration {
             tool_name: tool_name.into(),
+            tool_call_id: tool_call_id.into(),
             duration_ms,
         });
     }
@@ -669,24 +687,24 @@ impl SessionSignalsHandle {
     /// Record a bare echo/printf command for telemetry.
     /// Called from `execute_tool_calls` when `BashOutput.was_bare_echo` is true.
     /// Runs independently of doom loop detector config.
-    pub fn record_bare_echo(&self) {
+    pub(crate) fn record_bare_echo(&self) {
         let _ = self.tx.send(SignalEvent::RecordBareEcho);
     }
 
     // === Git/PR Metric Methods ===
 
     /// Record a successful `git commit` statement from a bash tool call.
-    pub fn record_git_commit(&self) {
+    pub(crate) fn record_git_commit(&self) {
         let _ = self.tx.send(SignalEvent::RecordGitCommit);
     }
 
     /// Record a PR created during this turn.
-    pub fn record_pr_created(&self, pr: PrCreatedSignal) {
+    pub(crate) fn record_pr_created(&self, pr: PrCreatedSignal) {
         let _ = self.tx.send(SignalEvent::RecordPrCreated(pr));
     }
 
     /// Record a successful `gh pr merge` statement from a bash tool call.
-    pub fn record_pr_merged(&self) {
+    pub(crate) fn record_pr_merged(&self) {
         let _ = self.tx.send(SignalEvent::RecordPrMerged);
     }
 
@@ -698,7 +716,7 @@ impl SessionSignalsHandle {
     }
 
     /// Record an error with a type string for analytics (e.g. "timeout", "rate_limit").
-    pub fn record_error_typed(&self, error_type: impl Into<String>) {
+    pub(crate) fn record_error_typed(&self, error_type: impl Into<String>) {
         let _ = self.tx.send(SignalEvent::RecordError {
             error_type: Some(error_type.into()),
         });
@@ -717,17 +735,17 @@ impl SessionSignalsHandle {
     }
 
     /// Record an edit-and-retry (user rewinds and submits a different prompt).
-    pub fn record_edit_and_retry(&self) {
+    pub(crate) fn record_edit_and_retry(&self) {
         let _ = self.tx.send(SignalEvent::RecordEditAndRetry);
     }
 
     /// Record an inference idle timeout event.
-    pub fn record_idle_timeout(&self) {
+    pub(crate) fn record_idle_timeout(&self) {
         let _ = self.tx.send(SignalEvent::RecordIdleTimeout);
     }
 
     /// Record a doom-loop recovery resample (poisoned attempt discarded).
-    pub fn record_doom_loop_recovery_attempt(
+    pub(crate) fn record_doom_loop_recovery_attempt(
         &self,
         triggers: Vec<String>,
         aborted_at_chunk: Option<u64>,
@@ -739,7 +757,7 @@ impl SessionSignalsHandle {
     }
 
     /// Record a budget-spent accept (final response kept confident signals).
-    pub fn record_doom_loop_accepted_after_budget(&self, triggers: Vec<String>) {
+    pub(crate) fn record_doom_loop_accepted_after_budget(&self, triggers: Vec<String>) {
         let _ = self
             .tx
             .send(SignalEvent::RecordDoomLoopAcceptedAfterBudget { triggers });
@@ -749,7 +767,7 @@ impl SessionSignalsHandle {
     ///
     /// Records the configured thresholds so dashboards can filter/group by config.
     /// Preserved on the backend when unset — subsequent syncs with None don't overwrite.
-    pub fn set_tracing_config(&self, inference_idle_timeout_secs: u64) {
+    pub(crate) fn set_tracing_config(&self, inference_idle_timeout_secs: u64) {
         let _ = self.tx.send(SignalEvent::SetTracingConfig {
             inference_idle_timeout_configured_secs: inference_idle_timeout_secs,
         });
@@ -759,7 +777,7 @@ impl SessionSignalsHandle {
     ///
     /// Reads the atomics from `UploadQueueStats` once and sends plain u64 values
     /// to the actor — the Arc is NOT retained in the signal event.
-    pub fn snapshot_gcs_queue(&self, stats: &xai_file_utils::queue::UploadQueueStats) {
+    pub(crate) fn snapshot_gcs_queue(&self, stats: &xai_file_utils::queue::UploadQueueStats) {
         use std::sync::atomic::Ordering;
         let _ = self.tx.send(SignalEvent::RecordGcsQueueSnapshot {
             enqueued: stats.enqueued.load(Ordering::Relaxed),
@@ -781,12 +799,12 @@ impl SessionSignalsHandle {
     // === Rating Methods ===
 
     /// Record a positive rating (thumbs-up / stars >= 4).
-    pub fn record_positive_rating(&self) {
+    pub(crate) fn record_positive_rating(&self) {
         let _ = self.tx.send(SignalEvent::RecordPositiveRating);
     }
 
     /// Record a negative rating (thumbs-down / stars <= 2).
-    pub fn record_negative_rating(&self) {
+    pub(crate) fn record_negative_rating(&self) {
         let _ = self.tx.send(SignalEvent::RecordNegativeRating);
     }
 
@@ -856,7 +874,7 @@ impl SessionSignalsHandle {
     /// previous session. Unlike `seed_counts` (which only restores a subset),
     /// this restores all counters faithfully, including those that survive
     /// conversation compaction (turn_count, error_count, tool_failure_count, etc.).
-    pub fn restore_signals(&self, signals: SessionSignals) {
+    pub(crate) fn restore_signals(&self, signals: SessionSignals) {
         if self.tx.send(SignalEvent::RestoreSignals(signals)).is_err() {
             tracing::warn!("Failed to restore signals: actor shut down");
         }
@@ -879,7 +897,7 @@ impl SessionSignalsHandle {
     ///
     /// Called after each streaming response completes with ITL stats
     /// computed from per-chunk timestamps.
-    pub fn record_inference_metrics(&self, stats: InferenceLatencyStats) {
+    pub(crate) fn record_inference_metrics(&self, stats: InferenceLatencyStats) {
         let _ = self.tx.send(SignalEvent::RecordInferenceMetrics(stats));
     }
 
@@ -891,7 +909,7 @@ impl SessionSignalsHandle {
     /// Response tokens = completion_tokens - reasoning_tokens.
     /// Multiple calls per turn are accumulated (e.g. multi-round tool use).
     #[tracing::instrument(skip_all, fields(completion_tokens, reasoning_tokens))]
-    pub fn record_token_usage(&self, completion_tokens: u32, reasoning_tokens: u32) {
+    pub(crate) fn record_token_usage(&self, completion_tokens: u32, reasoning_tokens: u32) {
         let span = tracing::Span::current();
         span.record("completion_tokens", i64::from(completion_tokens));
         span.record("reasoning_tokens", i64::from(reasoning_tokens));
@@ -914,7 +932,7 @@ impl SessionSignalsHandle {
     ///
     /// The actor atomically stores the current state as the new baseline
     /// for the next delta computation. Returns `None` if the actor is shut down.
-    pub async fn take_turn_end_snapshot(&self) -> Option<TurnDeltaSnapshot> {
+    pub(crate) async fn take_turn_end_snapshot(&self) -> Option<TurnDeltaSnapshot> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(SignalEvent::TakeTurnEndSnapshot(tx)).ok()?;
         rx.await.ok()
@@ -932,7 +950,7 @@ impl SessionSignalsHandle {
     }
 
     /// Tool outcomes from the last completed turn (preserved across turn resets).
-    pub async fn last_turn_tool_outcomes(&self) -> Vec<ToolOutcome> {
+    pub(crate) async fn last_turn_tool_outcomes(&self) -> Vec<ToolOutcome> {
         let (tx, rx) = oneshot::channel();
         if self
             .tx
@@ -959,7 +977,7 @@ impl SessionSignalsHandle {
     // === LOC Attribution Methods ===
 
     /// Record a LOC change from the LOC sink bridge.
-    pub fn record_loc_change(
+    pub(crate) fn record_loc_change(
         &self,
         is_agent: bool,
         lines_added: i64,
@@ -975,7 +993,7 @@ impl SessionSignalsHandle {
     }
 
     /// Record lines reverted (rejected/superseded hunk).
-    pub fn record_loc_revert(&self, lines_added_reverted: i64, lines_removed_reverted: i64) {
+    pub(crate) fn record_loc_revert(&self, lines_added_reverted: i64, lines_removed_reverted: i64) {
         let _ = self.tx.send(SignalEvent::RecordLocRevert {
             lines_added_reverted,
             lines_removed_reverted,
@@ -985,11 +1003,6 @@ impl SessionSignalsHandle {
     /// Shutdown the actor.
     pub fn shutdown(&self) {
         let _ = self.tx.send(SignalEvent::Shutdown);
-    }
-
-    /// Check if the actor is still alive.
-    pub fn is_alive(&self) -> bool {
-        !self.tx.is_closed()
     }
 }
 
@@ -1118,7 +1131,7 @@ impl SessionSignalsActor {
     }
 
     /// Create a new actor with a custom sync interval.
-    pub fn with_sync_interval(sync_interval: Duration) -> (SessionSignalsHandle, Self) {
+    pub(crate) fn with_sync_interval(sync_interval: Duration) -> (SessionSignalsHandle, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
         let handle = SessionSignalsHandle { tx };
         let actor = Self {
@@ -1248,10 +1261,12 @@ impl SessionSignalsActor {
                 }
                 SignalEvent::RecordToolDuration {
                     tool_name,
+                    tool_call_id,
                     duration_ms,
                 } => {
                     self.tool_durations_this_turn.push(ToolDuration {
                         tool_name,
+                        tool_call_id,
                         duration_ms,
                     });
                 }
@@ -3126,6 +3141,48 @@ mod tests {
             "After overflow fallback, duration should be near 0, got {}",
             snapshot.session_duration_seconds
         );
+
+        handle.shutdown();
+        actor_handle.await.unwrap();
+    }
+
+    #[test]
+    fn tool_duration_serializes_camel_case_with_call_id() {
+        let d = ToolDuration {
+            tool_name: "run_terminal_command".into(),
+            tool_call_id: "call_abc".into(),
+            duration_ms: 4_720,
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["toolName"], "run_terminal_command");
+        assert_eq!(v["toolCallId"], "call_abc");
+        assert_eq!(v["durationMs"], 4720);
+    }
+
+    #[test]
+    fn tool_duration_deserializes_legacy_without_call_id() {
+        let v = serde_json::json!({
+            "toolName": "bash",
+            "durationMs": 12
+        });
+        let d: ToolDuration = serde_json::from_value(v).unwrap();
+        assert_eq!(d.tool_name, "bash");
+        assert!(d.tool_call_id.is_empty());
+        assert_eq!(d.duration_ms, 12);
+    }
+
+    #[tokio::test]
+    async fn record_tool_duration_includes_call_id_in_turn_delta() {
+        let (handle, actor) = SessionSignalsActor::new();
+        let actor_handle = tokio::spawn(actor.run());
+
+        handle.record_tool_duration("bash", "call_1", 5_000);
+        let snap = handle.take_turn_end_snapshot().await.unwrap();
+        assert_eq!(snap.delta.tool_durations_this_turn.len(), 1);
+        let td = &snap.delta.tool_durations_this_turn[0];
+        assert_eq!(td.tool_name, "bash");
+        assert_eq!(td.tool_call_id, "call_1");
+        assert_eq!(td.duration_ms, 5_000);
 
         handle.shutdown();
         actor_handle.await.unwrap();

@@ -71,7 +71,7 @@ fn flag_takes_value(flag: &str) -> bool {
 ///
 /// Strips prior session-selection / mode flags, one-shot session-creation
 /// directives, and any bare positional prompt so a cold-start
-/// `gork "do the thing"` does not re-submit on resume. Keeps everything else
+/// `grok "do the thing"` does not re-submit on resume. Keeps everything else
 /// (e.g. `--no-leader`, `--model`, endpoint overrides) intact, including the
 /// value token that follows value-taking flags.
 ///
@@ -175,7 +175,7 @@ pub(crate) fn build_screen_mode_relaunch_args(
             continue;
         }
 
-        // Bare positional prompt (e.g. `gork "fix the bug"`). Must not re-fire
+        // Bare positional prompt (e.g. `grok "fix the bug"`). Must not re-fire
         // on resume. Clap positionals never start with `-`. Values for earlier
         // flags were already consumed above, so any remaining bare word here is
         // the prompt.
@@ -285,6 +285,7 @@ pub(crate) fn exec_screen_mode_relaunch(session_id: &str, want_minimal: bool) ->
         // reader competes with the child for console records and swallows its
         // first keystrokes.
         std::thread::sleep(std::time::Duration::from_millis(150));
+        #[allow(clippy::disallowed_methods)] // the parent waits and exits with its status
         let mut child = cmd.spawn()?;
         let status = child.wait()?;
         std::process::exit(status.code().unwrap_or(0));
@@ -624,7 +625,7 @@ mod tests {
 
     #[test]
     fn double_dash_and_following_positionals_dropped() {
-        // `gork --no-leader -- "fix the bug"`: everything after `--` is the
+        // `grok --no-leader -- "fix the bug"`: everything after `--` is the
         // prompt. The separator itself must go too, or the appended
         // `--resume <id>` would be parsed as positional prompt words.
         let out = build_screen_mode_relaunch_args(
@@ -717,7 +718,7 @@ mod tests {
 
     #[test]
     fn resume_without_value_then_flag_is_not_eaten() {
-        // `gork --resume --no-leader` (resume most-recent; next token is a flag).
+        // `grok --resume --no-leader` (resume most-recent; next token is a flag).
         let out = build_screen_mode_relaunch_args(
             args(&["grok", "--resume", "--no-leader"]),
             "sid",

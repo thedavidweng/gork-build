@@ -180,11 +180,32 @@ pub(crate) async fn create_test_actor_ex(
     SessionActor,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
 ) {
+    create_test_actor_with_terminal(
+        total_tokens,
+        context_window,
+        threshold_percent,
+        gateway_tx,
+        persistence_tx,
+        Arc::new(DummyTerminal {}),
+    )
+    .await
+}
+#[cfg(test)]
+pub(crate) async fn create_test_actor_with_terminal(
+    total_tokens: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    gateway_tx: tokio::sync::mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
+    persistence_tx: tokio::sync::mpsc::UnboundedSender<PersistenceMsg>,
+    terminal: Arc<dyn crate::terminal::AsyncTerminalRunner>,
+) -> (
+    SessionActor,
+    tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+) {
     let cwd = xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
     let fs = Arc::new(xai_grok_workspace::file_system::MockFs::new(
         cwd.to_path_buf(),
     ));
-    let terminal = Arc::new(DummyTerminal {});
     let (hunk_tx, _hunk_rx) = tokio::sync::mpsc::unbounded_channel();
     let hunk_tracker_handle = xai_hunk_tracker::HunkTrackerActor::spawn(
         "test-actor".to_string(),
@@ -206,6 +227,7 @@ pub(crate) async fn create_test_actor_ex(
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
+        front_message_committed: false,
         nudges_used_this_session: 0,
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -241,17 +263,21 @@ pub(crate) async fn create_test_actor_ex(
         model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback: None,
         auth_manager: None,
+        is_chat_kind: false,
         state,
         notifications: NotificationSender {
             gateway: GatewaySender::new(gateway_tx),
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
+            disk_full: crate::session::notifications::idle_disk_full_rx(),
         },
         permissions: xai_grok_workspace::permission::PermissionHandle::allow_all(),
         tool_context,
         deny_read_globs: Vec::new(),
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
-        mcp_strategy: McpInitStrategy::Blocking,
+        mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
+        delivery_tools: std::cell::RefCell::new(Vec::new()),
+        attach_non_interactive: std::cell::Cell::new(false),
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -282,6 +308,7 @@ pub(crate) async fn create_test_actor_ex(
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
             flush_config: crate::config::MemoryFlushConfig::default(),
@@ -366,7 +393,6 @@ pub(crate) async fn create_test_actor_ex(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-        managed_mcp_expires_at: std::sync::Mutex::new(None),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announced_servers: Mutex::new(HashMap::new()),
@@ -395,6 +421,9 @@ pub(crate) async fn create_test_actor_ex(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        turn_summary_task: std::cell::RefCell::new(None),
+        turn_summary_generation: std::cell::Cell::new(0),
+        turn_summary_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
@@ -515,6 +544,20 @@ pub(crate) fn input_with_origin_rx(
     };
     (item, rx)
 }
+/// A plain Agent-mode `queue_input` request with every optional field defaulted.
+#[cfg(test)]
+pub(crate) fn queue_input_request(
+    prompt_blocks: Vec<acp::ContentBlock>,
+    prompt_id: &str,
+    respond_to: oneshot::Sender<PromptTurnResult>,
+) -> QueueInputRequest {
+    QueueInputRequest::new(
+        prompt_blocks,
+        prompt_id.to_string(),
+        PromptMode::Agent,
+        respond_to,
+    )
+}
 /// A running-turn `AgentTask` stub: a 60s sleeper that keeps the turn "in
 /// flight" until aborted. Assign to `state.running_task`; requires a
 /// `LocalSet` (`spawn_local`).
@@ -599,17 +642,21 @@ pub(crate) fn assert_goal_discipline_in_reminder(reminder: &str, site: &str) {
         "{site} must not leave {{DISCIPLINE_BLOCK}} unsubstituted:\n{reminder}"
     );
 }
+/// An actor whose persistence channel answers the `FlushAndAck` barrier, so a
+/// turn driven with a `persist_ack` resolves (bare `build_actor` never acks).
 #[cfg(test)]
-pub(crate) fn assert_resume_recap_discipline_tracking_order(text: &str, recap_marker: &str) {
-    let recap_idx = text.find(recap_marker).unwrap_or_else(|| {
-        panic!("resume reminder must include block recap `{recap_marker}`:\n{text}");
+pub(crate) async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActor> {
+    let (gateway_tx, mut gateway_rx) =
+        tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+    tokio::task::spawn_local(async move { while gateway_rx.recv().await.is_some() {} });
+    let (persistence_tx, mut persistence_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = persistence_rx.recv().await {
+            if let PersistenceMsg::FlushAndAck { respond_to } = msg {
+                let _ = respond_to.send(Ok(()));
+            }
+        }
     });
-    assert_goal_discipline_in_reminder(text, "goal_resume");
-    let discipline_idx = text
-        .find("<task_completion_discipline>")
-        .expect("resume reminder must include discipline block");
-    assert!(
-        recap_idx < discipline_idx,
-        "resume reminder must place recap before discipline (recap={recap_idx} discipline={discipline_idx}):\n{text}"
-    );
+    std::sync::Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await)
 }

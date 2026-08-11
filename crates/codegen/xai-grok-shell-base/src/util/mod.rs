@@ -53,6 +53,15 @@ fn matches_trusted_base_url(candidate: &str, trusted_base: &str) -> bool {
         && candidate.port_or_known_default() == trusted.port_or_known_default()
         && path_matches
 }
+/// Production cli-chat-proxy base only (compiled-in constant).
+///
+/// Unlike [`is_cli_chat_proxy_url`], this rejects loopback and staging/dev hosts.
+/// Used for security-sensitive remote kill-switches that must not become env
+/// toggles via `GROK_CLI_CHAT_PROXY_BASE_URL` (or similar) pointing at an
+/// attacker-controlled origin.
+pub fn is_prod_cli_chat_proxy_url(url: &str) -> bool {
+    matches_trusted_base_url(url, crate::env::PROD_CLI_CHAT_PROXY_BASE_URL)
+}
 /// True for cli-chat-proxy URLs (production, plus local-dev hosts when the
 /// optional non-production feature is enabled). When that feature is on,
 /// runtime env overrides can extend this trust set. Loopback is always
@@ -378,6 +387,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kill_process_by_pid_terminates_live_child() {
+        #[allow(clippy::disallowed_methods)]
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -403,6 +413,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kill_process_with_signal_sigkill_terminates_live_child() {
+        #[allow(clippy::disallowed_methods)]
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()

@@ -4,7 +4,7 @@ name = "xai-file-utils"
 version = "0.1.0"
 edition.workspace = true
 description = "Local data collection: per-turn event tracking"
-authors = ["Gork Build contributors"]
+authors = ["xAI"]
 
 [dependencies]
 anyhow = { workspace = true }

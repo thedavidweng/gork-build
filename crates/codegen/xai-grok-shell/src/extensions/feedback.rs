@@ -18,7 +18,7 @@ use crate::agent::MvpAgent;
 use crate::session::persistence::{LocalFeedbackEntry, UserFeedbackEntry};
 use crate::session::{
     ClientFeedbackInput, CommentDeleteRequest, CommentDeleteResponse, CommentRequest,
-    CommentResponse, FeedbackRequestDismiss, FeedbackResponse, SessionCommand,
+    CommentResponse, FeedbackRequestDismiss, FeedbackResponse, SessionCommand, SideQuestionError,
 };
 use crate::upload::gcs::WithAuth as _;
 use xai_file_utils::gcs::upload_bytes;
@@ -54,10 +54,7 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 
     let req: BtwRequest = parse_params(args)?;
     let sid: acp::SessionId = req.session_id.clone().into();
-    let session_handle = {
-        let sessions = agent.sessions.borrow();
-        sessions.get(&sid).cloned()
-    };
+    let session_handle = agent.resident_handle(&sid);
     let Some(session) = session_handle else {
         return Err(
             acp::Error::invalid_params().data(format!("session not found: {}", req.session_id))
@@ -75,7 +72,20 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         Ok(answer) => super::to_ext_response(Ok(serde_json::json!({
             "answer": answer,
         }))),
-        Err(e) => Err(acp::Error::internal_error().data(e)),
+        // Model errors take the canonical mapping: overload gets its short
+        // display copy there, rate limits keep the typed code + upgrade
+        // copy, auth failures surface as auth_required.
+        Err(SideQuestionError::Sampling(e)) => {
+            Err(crate::sampling::error::map_sampling_err_to_acp(e))
+        }
+        // Non-model failures are already readable sentences. Set `message`
+        // and leave `data` unset — `Display` appends JSON-encoded `data`,
+        // and `internal_error().data(e)` rendered as `Internal error: "…"`,
+        // which made capacity failures look like client bugs in the TUI.
+        Err(e) => Err(acp::Error::new(
+            acp::ErrorCode::InternalError.into(),
+            e.to_string(),
+        )),
     }
 }
 
@@ -117,7 +127,7 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                 };
 
             let session_id = acp::SessionId::new(feedback_input.session_id.clone());
-            let session_handle = agent.sessions.borrow().get(&session_id).cloned();
+            let session_handle = agent.resident_handle(&session_id);
 
             let (model_id, model_metadata) = if let Some(ref session) = session_handle {
                 let (tx1, rx1) = tokio::sync::oneshot::channel();
@@ -291,7 +301,7 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             // Persist dismiss locally; flushed before storage CopyFile by the persistence actor.
             {
                 let session_id = acp::SessionId::new(dismiss_input.session_id.clone());
-                if let Some(session_handle) = agent.sessions.borrow().get(&session_id) {
+                if let Some(session_handle) = agent.resident_handle(&session_id) {
                     session_handle.persist_feedback(LocalFeedbackEntry::UserFeedback(
                         UserFeedbackEntry {
                             submitted_at: chrono::Utc::now(),

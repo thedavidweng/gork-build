@@ -19,7 +19,7 @@ use xai_grok_pager::render::Renderable;
 use xai_grok_pager::scrollback::state::ScrollbackState;
 use xai_grok_pager::scrollback::wrappers::EntryRenderer;
 use xai_grok_pager::theme::Theme;
-use xai_grok_pager::views::prompt_widget::PromptStyle;
+use xai_grok_pager::views::prompt_widget::{PromptBg, PromptStyle};
 use xai_grok_pager::views::turn_status;
 /// Left inset (columns) for every auxiliary live-region row: the status row,
 /// the info bar, the exit hint, and the todo panel — and the prompt's
@@ -81,10 +81,11 @@ pub(super) fn prompt_style(
         chrome: true,
         chrome_pad_left: live_left_inset(appearance),
         chrome_pad_right: 0,
-        bg_override: Some(Color::Reset),
+        bg: PromptBg::Canvas(Color::Reset),
         accent_color_override: input_mode.accent_color(theme),
         border_color_override: None,
         prefix_override: input_mode.prefix_override(theme),
+        placeholder_when_focused: false,
         placeholder_override: input_mode.placeholder_override(multiline),
         show_accent_line: false,
         show_borders: false,
@@ -403,12 +404,7 @@ fn live_tail_renderer<'a>(
     cwd: &'a std::path::Path,
     tick: u64,
 ) -> EntryRenderer<'a> {
-    EntryRenderer::new(entry, theme)
-        .with_appearance(appearance.clone())
-        .with_cwd(Some(cwd))
-        .with_tick(tick)
-        .with_flat_background(true)
-        .with_hide_accent(true)
+    super::commit::minimal_renderer(entry, theme, appearance.clone(), cwd, tick)
 }
 /// Render the uncommitted tail (entries past the commit frontier), bottom-anchored
 /// so the most recent output is always visible; the topmost visible entry is
@@ -511,12 +507,11 @@ fn minimal_advance_phase_timer(
 /// surfaces the same rich activity detail (`Run …` / `Thinking…` /
 /// `Waiting on subagent…` / `Retrying (attempt N)…` / `Cancelling…`), the
 /// per-phase + turn timers, and the "… still running" cue (running commands /
-/// monitors / loops / background subagents, shown while idle or parked) —
-/// instead of collapsing everything to "working…". Keyboard-only, so the
-/// mouse `[stop]` / `[↓]` buttons are suppressed (`None`), and
-/// `flat_background` keeps the row transparent like the rest of the live
-/// region. When the widget would draw nothing (plain idle or parked, no
-/// watchers) a small `minimal · /help` hint is shown instead.
+/// monitors / loops / background subagents) — instead of collapsing
+/// everything to "working…". Keyboard-only, so the mouse `[stop]` / `[↓]`
+/// buttons are suppressed (`None`), and `flat_background` keeps the row
+/// transparent like the rest of the live region. When the widget would draw
+/// nothing a small `minimal · /help` hint is shown instead.
 fn render_minimal_status(
     buf: &mut Buffer,
     area: Rect,
@@ -813,6 +808,46 @@ mod tests {
             tail_height(&agent, width, &appearance),
             painted_height.saturating_add(super::super::commit::MINIMAL_BLOCK_GAP)
         );
+    }
+    /// The tail and the committed footprint are one builder with a different
+    /// tick; this is the net for anyone tempted to fork them again.
+    #[test]
+    fn the_animation_tick_never_changes_a_blocks_height() {
+        use xai_grok_pager::scrollback::RenderBlock;
+        use xai_grok_pager::scrollback::entry::ScrollbackEntry;
+        minimal_api::set_show_thinking_blocks(true);
+        let theme = Theme::current();
+        let cwd = std::path::PathBuf::from("/tmp");
+        let appearance = super::super::commit::committed_appearance(
+            &xai_grok_pager::appearance::AppearanceConfig::default(),
+        );
+        let long = "reasoning that wraps a good few times even at a hundred and \
+                    twenty columns because it simply keeps going and going and going";
+        for block in [
+            RenderBlock::thinking(long),
+            RenderBlock::agent_message(long),
+            RenderBlock::execute("ls -la"),
+        ] {
+            let entry = ScrollbackEntry::new(block);
+            for width in [20u16, 40, 80, 120] {
+                let live =
+                    live_tail_renderer(&entry, &theme, &appearance, &cwd, 7).desired_height(width);
+                let committed = live_tail_renderer(
+                    &entry,
+                    &theme,
+                    &appearance,
+                    &cwd,
+                    super::super::commit::COMMITTED_TICK,
+                )
+                .desired_height(width);
+                assert_eq!(
+                    live, committed,
+                    "{:?} @{width}: a block's height must not depend on the tick, or the \
+                     prompt jumps on commit",
+                    entry.block
+                );
+            }
+        }
     }
     #[test]
     fn minimal_status_shows_rich_activity_and_idle_hint() {

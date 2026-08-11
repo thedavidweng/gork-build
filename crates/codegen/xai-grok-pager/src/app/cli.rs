@@ -127,6 +127,9 @@ See ~/.grok/README.md for more information.
     },
     /// Manage git worktrees
     Worktree(crate::worktree_cmd::WorktreeArgs),
+    /// Show what the grok home (~/.grok) uses on disk
+    #[command(name = "du", visible_alias = "disk-usage")]
+    DiskUsage(crate::disk_usage_cmd::DiskUsageArgs),
     /// Expose this workspace to the Computer Hub (via the leader).
     ///
     /// Disabled by default and enabled server-side per account; set
@@ -155,7 +158,7 @@ pub struct WrapArgs {
     )]
     pub command: Vec<String>,
 }
-/// Targets a running leader process by PID (used by `gork leader` / `gork workspace`).
+/// Targets a running leader process by PID (used by `grok leader` / `grok workspace`).
 #[derive(Debug, clap::Args, Clone, Default)]
 pub struct LeaderTargetArgs {
     /// Leader process ID from `grok leader list`.
@@ -398,9 +401,9 @@ pub struct LeaderArgs {
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "gork",
+    name = "grok",
     version = env!("VERSION_WITH_COMMIT"),
-    about = "Gork Build TUI",
+    about = "Grok Build TUI",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
@@ -502,6 +505,10 @@ pub struct PagerArgs {
     /// Output format for headless mode.
     #[clap(long = "output-format", value_enum, default_value = "plain")]
     pub output_format: OutputFormat,
+    /// Emit incremental `stream_event` lines (text/thinking deltas) alongside
+    /// whole messages. Only affects `--output-format streaming-messages-json`.
+    #[clap(long = "include-partial-messages")]
+    pub include_partial_messages: bool,
     /// JSON Schema for structured output. When set, the model is constrained to
     /// produce JSON matching this schema. Implies --output-format json.
     /// Example: --json-schema '{"type":"object","properties":{"name":{"type":"string"}}}'
@@ -590,18 +597,49 @@ pub struct PagerArgs {
     #[arg(long = "fork-session")]
     pub fork_session: bool,
     /// Start the session in a new git worktree, optionally named.
+    /// With `--resume` of a remote session, pass `--restore-code` to apply
+    /// the snapshot codebase (conversation is restored either way).
+    /// Headless (`-p`) does not create a worktree from this flag.
     #[arg(short = 'w', long = "worktree", num_args = 0..= 1, default_missing_value = "")]
     pub worktree: Option<String>,
     /// Branch, tag, or commit to base the worktree on (with `--worktree`).
     /// Defaults to the current HEAD of the source checkout when omitted.
     #[arg(long = "worktree-ref", visible_alias = "ref", requires = "worktree")]
     pub worktree_ref: Option<String>,
-    /// Check out the original session's commit when resuming.
+    /// Restore the original session's repository snapshot when resuming.
+    /// Remote sessions require `--worktree` (never checks out into the current
+    /// directory). Without this flag, resume restores conversation only.
     #[arg(long = "restore-code", requires = "resume_session")]
     pub restore_code: bool,
     /// Disable plan mode.
     #[arg(long = "no-plan")]
     pub no_plan: bool,
+    /// Own a local `workspace_server` (replaces remote sandbox). Requires `--chat`.
+    ///
+    /// Compiled only with `--features local-workspace` (not implied by `chat`).
+    #[cfg(feature = "local-workspace")]
+    #[arg(
+        long = "local-workspace",
+        num_args = 0..= 1,
+        value_name = "CWD",
+        conflicts_with = "local_workspace_attach",
+        requires = "chat"
+    )]
+    pub local_workspace: Option<Option<PathBuf>>,
+    /// Attach an existing local `workspace_server` by `server_id`,
+    /// replacing the chat sandbox (ExistingWorkspace only). Requires `--chat`.
+    #[cfg(feature = "local-workspace")]
+    #[arg(
+        long = "local-workspace-attach",
+        value_name = "SERVER_ID",
+        conflicts_with = "local_workspace",
+        requires = "chat"
+    )]
+    pub local_workspace_attach: Option<String>,
+    /// Cwd override for local-workspace attach/own. Requires `--chat`.
+    #[cfg(feature = "local-workspace")]
+    #[arg(long = "local-workspace-cwd", value_name = "PATH", requires = "chat")]
+    pub local_workspace_cwd: Option<PathBuf>,
     /// Disable subagent spawning.
     #[arg(long = "no-subagents")]
     pub no_subagents: bool,
@@ -647,7 +685,7 @@ pub struct PagerArgs {
     pub disable_web_search: bool,
     /// Exit as soon as the first agent turn ends, without waiting for pending
     /// background bash/monitor tasks or background subagents (headless only).
-    /// Default for all `gork -p` runs is to wait (up to `--background-wait-timeout`)
+    /// Default for all `grok -p` runs is to wait (up to `--background-wait-timeout`)
     /// so eval harnesses see full task completion. Use this for fast scripts that
     /// only need the first turn's text. Does not wait for server-side auto-wake
     /// output or persistent monitors (those hit the timeout).
@@ -734,7 +772,7 @@ pub struct PagerArgs {
     /// Run standalone even when leader mode is configured.
     #[arg(long, conflicts_with = "leader", hide = true)]
     pub no_leader: bool,
-    /// Initial prompt for the interactive session, e.g. `gork "fix the bug"` or `gork --worktree=feat "create this feature"`.
+    /// Initial prompt for the interactive session, e.g. `grok "fix the bug"` or `grok --worktree=feat "create this feature"`.
     #[arg(
         value_name = "PROMPT",
         conflicts_with_all = &["single",
@@ -784,21 +822,14 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
 impl PagerArgs {
     /// Parse CLI arguments without applying side effects.
     pub fn parse_cli() -> Self {
-        // Accept community (`gork`) and upstream (`grok` / `agent`) argv0 names.
         let bin_name = std::env::args()
             .next()
             .as_deref()
             .map(std::path::Path::new)
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .filter(|n| {
-                *n == xai_grok_version::PRODUCT_CLI
-                    || *n == "gork"
-                    || *n == "grok"
-                    || *n == "agent"
-                    || *n == "xai-grok-pager"
-            })
-            .unwrap_or(xai_grok_version::PRODUCT_CLI)
+            .filter(|n| *n == "grok" || *n == "agent")
+            .unwrap_or("grok")
             .to_owned();
         Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
     }
@@ -826,6 +857,21 @@ impl PagerArgs {
     /// feature, so call sites need no `cfg` of their own.
     pub fn chat(&self) -> bool {
         false
+    }
+    /// `--local-workspace[=cwd]` own-mode flag.
+    #[cfg(feature = "local-workspace")]
+    pub fn local_workspace(&self) -> Option<Option<&std::path::Path>> {
+        self.local_workspace.as_ref().map(|inner| inner.as_deref())
+    }
+    /// `--local-workspace-attach=<server_id>`.
+    #[cfg(feature = "local-workspace")]
+    pub fn local_workspace_attach(&self) -> Option<&str> {
+        self.local_workspace_attach.as_deref()
+    }
+    /// `--local-workspace-cwd=<path>`.
+    #[cfg(feature = "local-workspace")]
+    pub fn local_workspace_cwd(&self) -> Option<&std::path::Path> {
+        self.local_workspace_cwd.as_deref()
     }
     /// Get the session ID to resume, from either --resume or --load (hidden alias).
     ///
@@ -975,7 +1021,7 @@ impl PagerArgs {
     /// The initial interactive prompt from the positional argument, trimmed.
     ///
     /// Returns `None` when no positional prompt was given or it is only
-    /// whitespace. This is the `gork "<prompt>"` launch form; the headless
+    /// whitespace. This is the `grok "<prompt>"` launch form; the headless
     /// `-p`/`--single` path is handled separately.
     pub fn initial_prompt(&self) -> Option<&str> {
         self.prompt

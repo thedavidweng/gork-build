@@ -67,6 +67,7 @@ pub(crate) struct WorkflowManager {
     templates: HashMap<String, String>,
     active: HashMap<String, ActiveRun>,
     retiring: Vec<(String, oneshot::Receiver<()>)>,
+    max_concurrent_agents: usize,
 }
 
 impl WorkflowManager {
@@ -84,6 +85,7 @@ impl WorkflowManager {
         telemetry: TelemetryHook,
         session_cmd_tx: mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
         templates: HashMap<String, String>,
+        max_concurrent_agents: usize,
     ) -> Self {
         Self {
             session_id,
@@ -98,7 +100,15 @@ impl WorkflowManager {
             templates,
             active: HashMap::new(),
             retiring: Vec::new(),
+            max_concurrent_agents: super::host_service::workflow_max_concurrent_agents(
+                max_concurrent_agents,
+            ),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_max_concurrent_agents(&mut self, n: usize) {
+        self.max_concurrent_agents = n.max(1);
     }
 
     pub(crate) fn tracker(&self) -> Arc<parking_lot::Mutex<WorkflowTracker>> {
@@ -231,6 +241,15 @@ impl WorkflowManager {
         self.notify
             .emit(&state, self.tracker.lock().elapsed_ms(&run_id), 0);
 
+        log_run_started(
+            &run_id,
+            &self.session_id,
+            &resolved.source,
+            &state,
+            self.max_concurrent_agents,
+            spec.resume_run_id.is_some(),
+        );
+
         let (host_tx, host_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let scratch_dir = self
@@ -241,9 +260,11 @@ impl WorkflowManager {
             .join(&run_id)
             .join("scratch");
 
+        let agent_stats = Arc::new(super::host_service::WorkflowAgentStats::default());
         let (host_service, host_drained) = spawn_workflow_host_service(
             WorkflowHostParams {
                 run_id: run_id.clone(),
+                max_concurrent_agents: self.max_concurrent_agents,
                 cwd: self.cwd.clone(),
                 scratch_dir,
                 tracker: self.tracker.clone(),
@@ -254,6 +275,7 @@ impl WorkflowManager {
                 allow_fork_context,
                 templates: self.templates.clone(),
                 telemetry: self.telemetry.clone(),
+                stats: agent_stats.clone(),
                 cancel: cancel.clone(),
             },
             host_rx,
@@ -291,6 +313,8 @@ impl WorkflowManager {
         let session_cmd_tx = self.session_cmd_tx.clone();
         let watcher_run_id = run_id.clone();
         let watcher_cancel = cancel.clone();
+        let watcher_session_id = self.session_id.clone();
+        let watcher_agent_stats = agent_stats;
         let execution_epoch = self.tracker.lock().execution_epoch(&run_id).unwrap_or(0);
         tokio::spawn(async move {
             let mut outcome = exec.await.unwrap_or_else(|e| WorkflowOutcome::Failed {
@@ -314,14 +338,20 @@ impl WorkflowManager {
                             .into(),
                 };
             }
-            let state = {
+            // Epoch check and lifecycle mutation stay under one lock, or a
+            // quick resume could let this stale watcher stomp the successor.
+            let (epoch_matches, state) = {
                 let mut tracker = tracker.lock();
                 if tracker.execution_epoch(&watcher_run_id) != Some(execution_epoch) {
-                    None
+                    (false, None)
                 } else if drain_failed {
-                    tracker.interrupt(
-                        &watcher_run_id,
-                        "workflow cleanup timed out or could not be acknowledged; start a new run",
+                    (
+                        true,
+                        tracker.interrupt(
+                            &watcher_run_id,
+                            "workflow cleanup timed out or could not be acknowledged; start a \
+                             new run",
+                        ),
                     )
                 } else if pause_intent.load(Ordering::Relaxed)
                     && matches!(
@@ -329,11 +359,53 @@ impl WorkflowManager {
                         WorkflowOutcome::Cancelled | WorkflowOutcome::Paused { .. }
                     )
                 {
-                    tracker.pause_user(&watcher_run_id, None)
+                    (true, tracker.pause_user(&watcher_run_id, None))
                 } else {
-                    tracker.apply_outcome(&watcher_run_id, &outcome)
+                    (true, tracker.apply_outcome(&watcher_run_id, &outcome))
                 }
             };
+            if !epoch_matches {
+                // A quick resume took over; close this episode as superseded
+                // (cumulative fields may reflect the successor).
+                let (elapsed, agents_used, agent_budget) = {
+                    let tracker = tracker.lock();
+                    let run = tracker.get(&watcher_run_id);
+                    (
+                        tracker.elapsed_ms(&watcher_run_id),
+                        run.as_ref().map(|run| run.agents_used).unwrap_or_default(),
+                        run.as_ref().and_then(|run| run.agent_budget),
+                    )
+                };
+                log_run_ended(
+                    RunEndMetadata {
+                        run_id: &watcher_run_id,
+                        parent_session_id: &watcher_session_id,
+                        status: xai_grok_telemetry::events::WorkflowRunEndStatus::Superseded,
+                        duration_ms: elapsed,
+                        agents_used,
+                        agent_budget,
+                    },
+                    &watcher_agent_stats,
+                );
+                let _ = done_tx.send(());
+                let _ = outcome_tx.send(outcome);
+                return;
+            }
+            if state.is_none() {
+                // The run left the tracker; close the episode so its
+                // `workflow_run_started` is not orphaned.
+                log_run_ended(
+                    RunEndMetadata {
+                        run_id: &watcher_run_id,
+                        parent_session_id: &watcher_session_id,
+                        status: xai_grok_telemetry::events::WorkflowRunEndStatus::Interrupted,
+                        duration_ms: 0,
+                        agents_used: 0,
+                        agent_budget: None,
+                    },
+                    &watcher_agent_stats,
+                );
+            }
             if let Some(mut state) = state {
                 let mut persisted = true;
                 if let Err(error) = store.persist_ack(&state).await {
@@ -357,12 +429,24 @@ impl WorkflowManager {
                         tracing::error!(run_id = %watcher_run_id, %interrupt_error, "failed to persist workflow interruption marker");
                     }
                 }
+                // Emit before the persist-failure return: starts always pair.
+                let elapsed = tracker.lock().elapsed_ms(&watcher_run_id);
+                log_run_ended(
+                    RunEndMetadata {
+                        run_id: &watcher_run_id,
+                        parent_session_id: &watcher_session_id,
+                        status: run_ended_status(state.status),
+                        duration_ms: elapsed,
+                        agents_used: state.agents_used,
+                        agent_budget: state.agent_budget,
+                    },
+                    &watcher_agent_stats,
+                );
                 if !persisted {
                     let _ = done_tx.send(());
                     let _ = outcome_tx.send(outcome);
                     return;
                 }
-                let elapsed = tracker.lock().elapsed_ms(&watcher_run_id);
                 notify.broadcast(&state, elapsed, 0, true);
                 if state.status.is_completion_reportable() {
                     let _ = session_cmd_tx.send(
@@ -416,6 +500,7 @@ impl WorkflowManager {
             Arc::new(|_, _, _| {}),
             mpsc::unbounded_channel().0,
             std::collections::HashMap::new(),
+            super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
         )));
         (manager, tracker)
     }
@@ -650,6 +735,78 @@ impl WorkflowManager {
     }
 }
 
+fn log_run_started(
+    run_id: &str,
+    parent_session_id: &str,
+    source: &WorkflowSource,
+    state: &crate::session::workflow::tracker::WorkflowRunState,
+    max_concurrent_agents: usize,
+    resumed: bool,
+) {
+    use xai_grok_telemetry::events::{WorkflowRunStarted, WorkflowSourceKind};
+    xai_grok_telemetry::session_ctx::log_event(WorkflowRunStarted {
+        run_id: run_id.to_owned(),
+        parent_session_id: parent_session_id.to_owned(),
+        source: match source {
+            WorkflowSource::Builtin => WorkflowSourceKind::Builtin,
+            WorkflowSource::Inline => WorkflowSourceKind::Inline,
+            WorkflowSource::File(_) => WorkflowSourceKind::File,
+        },
+        // Only built-in workflow names leave the machine; user script names
+        // and paths stay local.
+        workflow_name: (*source == WorkflowSource::Builtin).then(|| state.name.clone()),
+        agent_budget: state.agent_budget,
+        max_concurrent_agents: u32::try_from(max_concurrent_agents).unwrap_or(u32::MAX),
+        resumed,
+    });
+}
+
+struct RunEndMetadata<'a> {
+    run_id: &'a str,
+    parent_session_id: &'a str,
+    status: xai_grok_telemetry::events::WorkflowRunEndStatus,
+    duration_ms: u64,
+    agents_used: u64,
+    agent_budget: Option<u64>,
+}
+
+fn log_run_ended(episode: RunEndMetadata<'_>, stats: &super::host_service::WorkflowAgentStats) {
+    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::WorkflowRunEnded {
+        run_id: episode.run_id.to_owned(),
+        parent_session_id: episode.parent_session_id.to_owned(),
+        status: episode.status,
+        duration_ms: episode.duration_ms,
+        agents_used: episode.agents_used,
+        agent_budget: episode.agent_budget,
+        agents_failed: stats.agents_failed.load(Ordering::Relaxed),
+        peak_concurrent_agents: stats.peak_concurrent.load(Ordering::Relaxed),
+        slot_waits: stats.slot_waits.load(Ordering::Relaxed),
+        slot_wait_ms_total: stats.slot_wait_ms_total.load(Ordering::Relaxed),
+        slot_wait_ms_max: stats.slot_wait_ms_max.load(Ordering::Relaxed),
+    });
+}
+
+/// Exhaustive so a new tracker status forces a decision here.
+fn run_ended_status(
+    status: crate::session::workflow::tracker::WorkflowRunStatus,
+) -> xai_grok_telemetry::events::WorkflowRunEndStatus {
+    use crate::session::workflow::tracker::WorkflowRunStatus as S;
+    use xai_grok_telemetry::events::WorkflowRunEndStatus as E;
+    match status {
+        S::Active => E::Active,
+        S::UserPaused => E::UserPaused,
+        S::BackOffPaused => E::BackOffPaused,
+        S::NoProgressPaused => E::NoProgressPaused,
+        S::InfraPaused => E::InfraPaused,
+        S::Blocked => E::Blocked,
+        S::BudgetLimited => E::BudgetLimited,
+        S::Interrupted => E::Interrupted,
+        S::Complete => E::Complete,
+        S::Failed => E::Failed,
+        S::Cancelled => E::Cancelled,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +882,7 @@ mod tests {
             Arc::new(|_, _, _| {}),
             mpsc::unbounded_channel().0,
             HashMap::new(),
+            crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
         );
         (manager, event_rx, cancels)
     }
@@ -736,6 +894,46 @@ mod tests {
             agent_budget: None,
             resume_run_id: None,
         }
+    }
+
+    fn parallel_n_script(n: usize) -> String {
+        format!(
+            "let meta = #{{ name: \"t\", description: \"d\" }};\n\
+             let jobs = [];\n\
+             let i = 0;\n\
+             while i < {n} {{\n\
+                 jobs.push(#{{ prompt: \"work \" + i.to_string() }});\n\
+                 i += 1;\n\
+             }}\n\
+             let results = parallel(jobs);\n\
+             complete(results.len());"
+        )
+    }
+
+    async fn recv_spawn(
+        rx: &mut SubagentEventRx,
+    ) -> xai_grok_tools::implementations::grok_build::task::types::SubagentSpawnRequest {
+        use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(SubagentEvent::Spawn(req))) => req,
+            Ok(Some(_)) => panic!("expected spawn, got a non-spawn event"),
+            Ok(None) => panic!("expected spawn, channel closed"),
+            Err(_) => panic!("expected spawn, timed out"),
+        }
+    }
+
+    fn complete_spawn(
+        req: xai_grok_tools::implementations::grok_build::task::types::SubagentSpawnRequest,
+    ) {
+        use xai_grok_tools::implementations::grok_build::task::types::SubagentResult;
+        let id = req.id.clone();
+        let _ = req.result_tx.send(SubagentResult {
+            success: true,
+            output: std::sync::Arc::from("ok"),
+            subagent_id: id.clone(),
+            child_session_id: id,
+            ..Default::default()
+        });
     }
 
     #[tokio::test]
@@ -1502,5 +1700,67 @@ mod tests {
             state.status,
             crate::session::workflow::tracker::WorkflowRunStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_panel_respects_concurrency_cap() {
+        const CAP: usize = 2;
+        const N: usize = 6;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        manager.test_set_max_concurrent_agents(CAP);
+        let (_run_id, outcome_rx) = manager
+            .launch(resolve_inline(parallel_n_script(N)).unwrap(), spec())
+            .unwrap();
+
+        let mut live = Vec::new();
+        for _ in 0..CAP {
+            live.push(recv_spawn(&mut subagent_rx).await);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), subagent_rx.recv())
+                .await
+                .is_err(),
+            "more than {CAP} children were live"
+        );
+
+        let mut completed = 0usize;
+        while completed + live.len() < N {
+            complete_spawn(live.remove(0));
+            completed += 1;
+            live.push(recv_spawn(&mut subagent_rx).await);
+        }
+        for req in live {
+            complete_spawn(req);
+        }
+
+        match outcome_rx.await.unwrap() {
+            WorkflowOutcome::Completed { result } => assert_eq!(result, serde_json::json!(N)),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_drops_queued_spawns_before_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        manager.test_set_max_concurrent_agents(1);
+        let (run_id, outcome_rx) = manager
+            .launch(resolve_inline(parallel_n_script(4)).unwrap(), spec())
+            .unwrap();
+
+        let first = recv_spawn(&mut subagent_rx).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), subagent_rx.recv())
+                .await
+                .is_err(),
+            "queued agents reached the coordinator before cancel"
+        );
+
+        assert!(manager.cancel(&run_id));
+        let _ = outcome_rx.await;
+        assert!(first.cancel_token.is_cancelled());
+        assert!(subagent_rx.try_recv().is_err());
     }
 }

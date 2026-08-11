@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use xai_grok_sampling_types::{
     ConversationResponse, EmptyResponseContext, ResponseModelMetadata, SamplingError,
+    SentCredential,
 };
 
 use crate::metrics::InferenceLatencyStats;
@@ -54,6 +55,35 @@ pub enum SamplingEvent {
         id: Option<String>,
         name: Option<String>,
         arguments_delta: Option<String>,
+    },
+
+    /// The provider opened a response (Messages `message_start`). Carries the
+    /// real message id, model, and input-side token counts exactly as they
+    /// arrive on the wire, before any content. Surfaced in order so partial-mode
+    /// consumers can emit the real `message_start` id/usage instead of a
+    /// synthesized placeholder. Emitted by the Messages L2 transform only; the
+    /// Responses/Chat transforms lack these fields at stream open and emit
+    /// nothing here.
+    ///
+    /// `input_tokens` is the uncached prompt portion; the Anthropic Messages API
+    /// reports cache hits and writes in the separate `cache_read_input_tokens`
+    /// and `cache_creation_input_tokens` buckets, both known at `message_start`.
+    ResponseStarted {
+        request_id: RequestId,
+        message_id: String,
+        model: String,
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    },
+
+    /// The reasoning (thinking) block finished and its encrypted signature is
+    /// known (Messages thinking `content_block_stop`). Surfaced in order so
+    /// partial-mode consumers can emit `signature_delta` before the thinking
+    /// block's `content_block_stop`. Emitted by the Messages L2 transform only.
+    ReasoningCompleted {
+        request_id: RequestId,
+        signature: String,
     },
 
     /// Streaming completed successfully.
@@ -124,6 +154,11 @@ pub struct SamplingErrorInfo {
     pub message: String,
     pub is_retryable: bool,
     pub retry_after_secs: Option<u64>,
+    /// Parsed `x-should-retry` response header. `Some(false)` = the server
+    /// says the failure is request-content-caused; never retry. `None` =
+    /// header absent, or payload from an older peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub should_retry: Option<bool>,
     pub model_metadata: Option<ResponseModelMetadata>,
     /// Present only when `kind == EmptyResponse`. Carries the structured
     /// context from the L2 stream so downstream consumers can distinguish
@@ -139,6 +174,11 @@ pub struct SamplingErrorInfo {
     /// Telemetry only; `None` for terminal-response detections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doom_loop_aborted_at_chunk: Option<u64>,
+    /// Meaningful only when `kind == Auth`: whether the rejected request
+    /// actually carried a credential on the wire. Defaults to `Unknown`
+    /// (charge-the-budget behavior) for payloads from older peers.
+    #[serde(default, skip_serializing_if = "SentCredential::is_unknown")]
+    pub credential: SentCredential,
 }
 
 /// Coarse-grained classification of a sampling failure.
@@ -188,7 +228,7 @@ impl From<&SamplingError> for SamplingErrorInfo {
         let message = err.to_string();
 
         let (kind, status_code, retry_after_secs, model_metadata) = match err {
-            SamplingError::Auth(_) => (SamplingErrorKind::Auth, None, None, None),
+            SamplingError::Auth { .. } => (SamplingErrorKind::Auth, None, None, None),
             SamplingError::InvalidConfiguration(_) => (SamplingErrorKind::Api, None, None, None),
             SamplingError::Http(_) => (SamplingErrorKind::Http, None, None, None),
             SamplingError::Serialization(_) => (SamplingErrorKind::Serialization, None, None, None),
@@ -235,17 +275,23 @@ impl From<&SamplingError> for SamplingErrorInfo {
             } => (Some(triggers.clone()), *aborted_at_chunk),
             _ => (None, None),
         };
+        let credential = match err {
+            SamplingError::Auth { credential, .. } => *credential,
+            _ => SentCredential::Unknown,
+        };
 
         Self {
             kind,
             status_code,
             message,
+            should_retry: err.should_retry_header(),
             is_retryable,
             retry_after_secs,
             model_metadata,
             empty_response_context,
             doom_loop_triggers,
             doom_loop_aborted_at_chunk,
+            credential,
         }
     }
 }
@@ -256,8 +302,28 @@ mod tests {
     use reqwest::StatusCode;
 
     #[test]
+    fn from_sampling_error_carries_should_retry_header() {
+        let err = SamplingError::Api {
+            status: StatusCode::from_u16(529).expect("valid status"),
+            message: "Overloaded".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: Some(false),
+        };
+        let info = SamplingErrorInfo::from(&err);
+        assert_eq!(info.should_retry, Some(false));
+
+        // Non-Api variants have no header — stays None.
+        let stream_err = SamplingError::StreamError {
+            error_type: "overloaded_error".into(),
+            message: "Overloaded".into(),
+        };
+        assert_eq!(SamplingErrorInfo::from(&stream_err).should_retry, None);
+    }
+
+    #[test]
     fn auth_variant_classified_as_auth() {
-        let err = SamplingError::Auth("bad token".into());
+        let err = SamplingError::auth_unknown("bad token");
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Auth);
         assert_eq!(info.status_code, None);
@@ -265,6 +331,18 @@ mod tests {
         assert_eq!(info.retry_after_secs, None);
         assert!(info.model_metadata.is_none());
         assert!(info.message.contains("bad token"));
+    }
+
+    /// A payload from a peer that predates `credential` must still parse,
+    /// defaulting to `Unknown` (charge-the-budget behavior).
+    #[test]
+    fn info_without_credential_field_deserializes_to_unknown() {
+        let info: SamplingErrorInfo = serde_json::from_str(
+            r#"{"kind":"Auth","status_code":401,"message":"x","is_retryable":false,
+                "retry_after_secs":null,"model_metadata":null}"#,
+        )
+        .unwrap();
+        assert_eq!(info.credential, SentCredential::Unknown);
     }
 
     #[test]

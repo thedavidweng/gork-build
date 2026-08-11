@@ -523,6 +523,7 @@ mod link_click_tests {
             },
             &bundle,
             false,
+            false,
             &mut Vec::new(),
             crate::app::agent_view::AppRenderParams::default(),
         );
@@ -606,39 +607,51 @@ mod link_click_tests {
         );
         let rect = agent
             .privacy_banner
-            .hit_accept
+            .hit_opt_in
             .rect
             .expect("accept rect armed");
         let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
         assert!(matches!(
             outcome,
-            InputOutcome::Action(Action::PrivacyBannerAccept)
+            InputOutcome::Action(Action::PrivacyBannerOptIn)
         ));
         let rect = agent
             .privacy_banner
-            .hit_customize
+            .hit_opt_out
             .rect
             .expect("customize rect armed");
         let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
         assert!(matches!(
             outcome,
-            InputOutcome::Action(Action::PrivacyBannerCustomize)
+            InputOutcome::Action(Action::PrivacyBannerOptOut)
         ));
         let rect = agent
             .privacy_banner
-            .hit_legal
+            .hit_terms
             .rect
-            .expect("legal rect armed");
+            .expect("terms rect armed");
         let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
         assert!(matches!(
             outcome,
             InputOutcome::Action(Action::OpenUrl(ref url))
-                if url == crate::views::privacy_banner::PRIVACY_BANNER_LEGAL_URL
+                if url == crate::views::privacy_banner::PRIVACY_BANNER_TERMS_URL
+        ));
+        let rect = agent
+            .privacy_banner
+            .hit_policy
+            .rect
+            .expect("privacy policy rect armed");
+        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::OpenUrl(ref url))
+                if url == crate::views::privacy_banner::PRIVACY_BANNER_POLICY_URL
         ));
         draw_frame_privacy(&mut agent, &reg, &critical, 2, 80, false);
-        assert!(agent.privacy_banner.hit_accept.rect.is_none());
-        assert!(agent.privacy_banner.hit_customize.rect.is_none());
-        assert!(agent.privacy_banner.hit_legal.rect.is_none());
+        assert!(agent.privacy_banner.hit_opt_in.rect.is_none());
+        assert!(agent.privacy_banner.hit_opt_out.rect.is_none());
+        assert!(agent.privacy_banner.hit_terms.rect.is_none());
+        assert!(agent.privacy_banner.hit_policy.rect.is_none());
         assert!(agent.hit_announcement_hide.rect.is_some());
     }
     /// Promo twin of the [hide] suppression test: the [label] CTA rect must
@@ -1993,14 +2006,14 @@ mod link_click_tests {
         let (mut agent, reg) = make_search_agent();
         agent
             .permission_queue
-            .push_back(super::paste_key_tests::make_followup_permission_state());
+            .push_back(super::test_fixtures::make_followup_permission_state());
         route_slash(&mut agent, &reg);
         assert!(agent.scrollback_search.is_none());
     }
     #[test]
     fn router_slash_blocked_while_plan_approval_pending() {
         let (mut agent, reg) = make_search_agent();
-        agent.plan_approval_view = Some(super::paste_key_tests::make_plan_approval_view_state());
+        agent.plan_approval_view = Some(super::test_fixtures::make_plan_approval_view_state());
         route_slash(&mut agent, &reg);
         assert!(agent.scrollback_search.is_none());
     }
@@ -2240,6 +2253,7 @@ mod link_click_tests {
             crate::app::agent_view::BannerSlotParams::none(),
             &bundle,
             false,
+            false,
             &mut Vec::new(),
             crate::app::agent_view::AppRenderParams::default(),
         );
@@ -2341,6 +2355,7 @@ mod link_click_tests {
             },
             &bundle,
             false,
+            false,
             &mut Vec::new(),
             crate::app::agent_view::AppRenderParams::default(),
         );
@@ -2418,6 +2433,7 @@ mod link_click_tests {
                 tip: Some(long_tip.as_str()),
             },
             &bundle,
+            false,
             false,
             &mut Vec::new(),
             crate::app::agent_view::AppRenderParams::default(),

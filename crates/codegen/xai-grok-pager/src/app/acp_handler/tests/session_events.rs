@@ -301,6 +301,31 @@
     }
 
     #[test]
+    fn apply_retry_state_disk_full_pushes_session_event() {
+        use xai_grok_shell::extensions::notification::{
+            DISK_FULL_ERROR_TYPE, DISK_FULL_USER_MESSAGE,
+        };
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: DISK_FULL_ERROR_TYPE.into(),
+                message: DISK_FULL_USER_MESSAGE.into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match scrollback.last().map(|e| &e.block) {
+            Some(RenderBlock::SessionEvent(ev)) => {
+                assert!(matches!(ev.event, SessionEvent::DiskFull));
+                assert_eq!(ev.event.message(), DISK_FULL_USER_MESSAGE);
+            }
+            other => panic!("expected DiskFull session event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_retry_state_credit_limit_exhausted_preserves_in_flight_prompt() {
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();
@@ -343,7 +368,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "proxy_error".into(),
+                error_type: "api".into(),
                 message: "status 403: run out of credits".into(),
             },
             &mut session,
@@ -372,7 +397,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "proxy_error".into(),
+                error_type: "api".into(),
                 message:
                     "API error (status 402 Payment Required): Grok Build usage balance exhausted"
                         .into(),
@@ -399,7 +424,7 @@
         });
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "server_error".into(),
+                error_type: "api".into(),
                 message: "internal server error".into(),
             },
             &mut session,
@@ -427,9 +452,16 @@
             Some("legacy_auth"),
             "Unauthorized (401) ... deprecated authentication method"
         ));
+        // auth_transient = the shell says the failure self-heals (refreshable
+        // credential, no sticky verdict — e.g. post-wake network gap). Even
+        // with a 401 in the message, the `/login` banner must not fire.
+        assert!(!is_reauthable_failure(
+            Some("auth_transient"),
+            "Unauthorized (401)\n\nAuthentication is temporarily unavailable"
+        ));
         // Unrelated failures must not be treated as re-authable.
         assert!(!is_reauthable_failure(
-            Some("server_error"),
+            Some("api"),
             "internal server error"
         ));
         assert!(!is_reauthable_failure(Some("api"), "model not found"));
@@ -507,8 +539,8 @@
         ));
     }
 
-    /// Legacy WebLogin auth keeps its verbose message (with `gork logout` /
-    /// `gork login` guidance), not the generic re-auth prompt.
+    /// Legacy WebLogin auth keeps its verbose message (with `grok logout` /
+    /// `grok login` guidance), not the generic re-auth prompt.
     #[test]
     fn apply_retry_state_legacy_auth_keeps_detailed_message() {
         let mut session = make_session(Some("s1"));
@@ -517,7 +549,7 @@
             &RetryState::Failed {
                 error_type: "legacy_auth".into(),
                 message: "Unauthorized (401) ... deprecated authentication method (WebLogin) ... \
-                          run `gork logout` then `gork login`"
+                          run `grok logout` then `grok login`"
                     .into(),
             },
             &mut session,
@@ -528,22 +560,62 @@
         ));
     }
 
-    /// Non-auth terminal failures still render the standard RetryFailed.
+    /// Non-auth terminal failures render the formatted RequestFailed banner
+    /// (same visual treatment as 401 re-auth), not a raw RetryFailed dump.
     #[test]
-    fn apply_retry_state_generic_failure_still_shows_retry_failed() {
+    fn apply_retry_state_generic_failure_shows_request_failed_banner() {
         let mut session = make_session(Some("s1"));
         let mut scrollback = ScrollbackState::new();
         apply_retry_state(
             &RetryState::Failed {
-                error_type: "server_error".into(),
-                message: "internal server error".into(),
+                error_type: "api".into(),
+                message: r#"API error (status 500 Internal Server Error): {"error":"upstream exploded"}"#.into(),
             },
             &mut session,
             &mut scrollback, false);
-        assert!(matches!(
-            last_session_event(&scrollback),
-            Some(SessionEvent::RetryFailed { .. })
-        ));
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(500));
+                assert_eq!(headline, "Server error (500)");
+                assert_eq!(
+                    detail,
+                    "Something went wrong on our side. Wait a minute and send again."
+                );
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_retry_state_403_shows_clean_denied_banner() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                message: "API error (status 403 Forbidden): Access to the chat endpoint is denied"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::RequestFailed {
+                status,
+                headline,
+                detail,
+            }) => {
+                assert_eq!(status, Some(403));
+                assert_eq!(headline, "Request denied (403)");
+                assert_eq!(detail, "Access to the chat endpoint is denied");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
     }
 
     /// A context overflow surfaces the actionable `ContextTooLarge` prompt (not the
@@ -567,6 +639,32 @@
                 Some(SessionEvent::ContextTooLarge)
             ),
             "context overflow must surface the actionable ContextTooLarge prompt"
+        );
+    }
+
+    /// Overflow-shaped copy without `error_type=context_length` must not take
+    /// the ContextTooLarge path — the shell is what tags overflow.
+    #[test]
+    fn apply_retry_state_overflow_copy_without_type_is_not_context_too_large() {
+        let mut session = make_session(Some("s1"));
+        let mut scrollback = ScrollbackState::new();
+        apply_retry_state(
+            &RetryState::Failed {
+                error_type: "api".into(),
+                message: "API error (status 500): the prompt is too long for this model's \
+                          context window"
+                    .into(),
+            },
+            &mut session,
+            &mut scrollback,
+            false,
+        );
+        assert!(
+            matches!(
+                last_session_event(&scrollback),
+                Some(SessionEvent::RequestFailed { .. })
+            ),
+            "without error_type=context_length this is a generic banner, not overflow UX"
         );
     }
 
@@ -881,6 +979,205 @@
         assert!(
             !session.model_incompatible,
             "non-encrypted_content error types must not set model_incompatible"
+        );
+    }
+
+    fn summary_generated_ext(
+        session_id: &str,
+        title: &str,
+        title_is_manual: bool,
+    ) -> acp::ExtNotification {
+        let meta = if title_is_manual {
+            Some(xai_grok_shell::extensions::notification::title_is_manual_meta())
+        } else {
+            None
+        };
+        let notif = SessionNotification {
+            session_id: acp::SessionId::new(session_id),
+            update: XaiSessionUpdate::SessionSummaryGenerated {
+                session_summary: title.into(),
+            },
+            meta,
+        };
+        let raw = serde_json::value::to_raw_value(&notif).unwrap();
+        acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw))
+    }
+
+    #[test]
+    fn manual_title_notification_sets_display_name_without_entity_decode() {
+        let mut app = make_app_with_agent("sess-1");
+        let changed = handle_session_notification(
+            &summary_generated_ext("sess-1", "a &amp; b", true),
+            &mut app,
+        );
+        assert!(changed);
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(
+            agent.display_name.as_deref(),
+            Some("a &amp; b"),
+            "manual meta must set display_name from the raw title"
+        );
+        assert_eq!(
+            agent.generated_session_title.as_deref(),
+            Some("a &amp; b"),
+            "manual meta must skip HTML-entity decode"
+        );
+    }
+
+    #[test]
+    fn auto_title_blank_after_sanitize_does_not_clear_existing() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents.get_mut(&AgentId(0)).unwrap().generated_session_title =
+            Some("Keep Me".into());
+        assert!(handle_session_notification(
+            &summary_generated_ext("sess-1", "\u{1b}\u{07}", false),
+            &mut app,
+        ));
+        assert_eq!(
+            app.agents[&AgentId(0)]
+                .generated_session_title
+                .as_deref(),
+            Some("Keep Me"),
+            "control-only auto replay must not wipe an existing title"
+        );
+    }
+
+    #[test]
+    fn auto_title_notification_does_not_set_display_name() {
+        let mut app = make_app_with_agent("sess-1");
+        let changed = handle_session_notification(
+            &summary_generated_ext("sess-1", "a &amp; b", false),
+            &mut app,
+        );
+        assert!(changed);
+        let agent = &app.agents[&AgentId(0)];
+        assert!(
+            agent.display_name.is_none(),
+            "auto titles must not promote to display_name"
+        );
+        assert_eq!(
+            agent.generated_session_title.as_deref(),
+            Some("a & b"),
+            "auto titles still HTML-entity-decode"
+        );
+    }
+
+    #[test]
+    fn auto_title_notification_does_not_clobber_existing_display_name() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents.get_mut(&AgentId(0)).unwrap().display_name = Some("Pinned".into());
+        let changed = handle_session_notification(
+            &summary_generated_ext("sess-1", "a &amp; b", false),
+            &mut app,
+        );
+        assert!(changed);
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(agent.display_name.as_deref(), Some("Pinned"));
+        assert_eq!(agent.generated_session_title.as_deref(), Some("a & b"));
+    }
+
+    #[test]
+    fn manual_meta_false_clears_display_name() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents.get_mut(&AgentId(0)).unwrap().display_name = Some("Pinned".into());
+        app.agents.get_mut(&AgentId(0)).unwrap().generated_session_title =
+            Some("Pinned".into());
+        let n = SessionNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            update: XaiSessionUpdate::SessionSummaryGenerated {
+                session_summary: String::new(),
+            },
+            meta: Some(serde_json::json!({ "x.ai/titleIsManual": false })),
+        };
+        let raw = serde_json::value::to_raw_value(&n).unwrap();
+        let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+        assert!(handle_session_notification(&notif, &mut app));
+        let agent = &app.agents[&AgentId(0)];
+        assert!(
+            agent.display_name.is_none(),
+            "explicit unpin meta must clear display_name"
+        );
+        assert!(
+            agent.generated_session_title.is_none(),
+            "empty unpin summary must drop the follower's manual generated title"
+        );
+    }
+
+    #[test]
+    fn manual_meta_false_empty_summary_keeps_leftover_auto_title() {
+        let mut app = make_app_with_agent("sess-1");
+        app.agents.get_mut(&AgentId(0)).unwrap().display_name = Some("Pinned".into());
+        app.agents.get_mut(&AgentId(0)).unwrap().generated_session_title =
+            Some("Auto".into());
+        let n = SessionNotification {
+            session_id: acp::SessionId::new("sess-1"),
+            update: XaiSessionUpdate::SessionSummaryGenerated {
+                session_summary: String::new(),
+            },
+            meta: Some(serde_json::json!({ "x.ai/titleIsManual": false })),
+        };
+        let raw = serde_json::value::to_raw_value(&n).unwrap();
+        let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
+        assert!(handle_session_notification(&notif, &mut app));
+        let agent = &app.agents[&AgentId(0)];
+        assert!(
+            agent.display_name.is_none(),
+            "explicit unpin meta must still clear display_name"
+        );
+        assert_eq!(
+            agent.generated_session_title.as_deref(),
+            Some("Auto"),
+            "empty unpin fan-out must not wipe a leftover auto title"
+        );
+    }
+
+    #[test]
+    fn auto_title_notification_strips_controls_and_caps() {
+        use xai_grok_shell::session::persistence::MAX_TITLE_SCALARS;
+        let mut app = make_app_with_agent("sess-1");
+        let dirty = format!(
+            "ok\u{1b}]0;PWNED\u{07}{}",
+            "é".repeat(MAX_TITLE_SCALARS + 5)
+        );
+        assert!(handle_session_notification(
+            &summary_generated_ext("sess-1", &dirty, false),
+            &mut app,
+        ));
+        const PREFIX: &str = "ok]0;PWNED";
+        let expected = format!(
+            "{PREFIX}{}",
+            "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+        );
+        let agent = &app.agents[&AgentId(0)];
+        assert!(
+            agent.display_name.is_none(),
+            "auto titles must not promote to display_name"
+        );
+        assert_eq!(
+            agent.generated_session_title.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn manual_title_notification_strips_controls_and_caps() {
+        use xai_grok_shell::session::persistence::MAX_TITLE_SCALARS;
+        let mut app = make_app_with_agent("sess-1");
+        let dirty = format!("ok\u{1b}]0;PWNED\u{07}{}", "é".repeat(MAX_TITLE_SCALARS + 5));
+        assert!(handle_session_notification(
+            &summary_generated_ext("sess-1", &dirty, true),
+            &mut app,
+        ));
+        const PREFIX: &str = "ok]0;PWNED";
+        let expected = format!(
+            "{PREFIX}{}",
+            "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
+        );
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(agent.display_name.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            agent.generated_session_title.as_deref(),
+            Some(expected.as_str())
         );
     }
 

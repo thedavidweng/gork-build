@@ -15,10 +15,12 @@ pub mod diag_server;
 pub mod discovery;
 pub mod envrc;
 pub mod error;
+pub mod export_github;
 pub mod file_system;
 pub mod folder_trust;
 pub mod foreign_sessions;
 pub mod fs_notify;
+pub(crate) mod git_odb;
 pub mod handle;
 pub mod hub;
 pub mod hub_auth;
@@ -30,6 +32,9 @@ pub mod permission;
 pub mod preview_supervisor;
 pub mod project_config;
 pub mod recovery;
+mod restore_fetch;
+pub use restore_fetch::{EnsureCommitsOutcome, ensure_commits_reachable};
+pub use session::git::git_object_exists;
 pub mod rpc_envelope;
 pub mod session;
 pub mod status_config;
@@ -182,7 +187,7 @@ mod init_metrics_tests {
         ));
         assert!(has(
             "grok_workspace_rpc_errors_total",
-            &[("method", "unknown"), ("error_kind", "hub_error")]
+            &[("method", "unknown"), ("error_kind", "unknown_method")]
         ));
         for stage in [
             "startup_recovery",

@@ -169,7 +169,7 @@ pub fn clear_orphan() {
 }
 
 /// Best-effort cross-process lock serializing apply/remove of the managed-config
-/// files (TUI tick vs `gork login` vs prefetch). `None` on contention — the
+/// files (TUI tick vs `grok login` vs prefetch). `None` on contention — the
 /// caller skips and retries next cycle.
 fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
     use fs2::FileExt;
@@ -187,7 +187,7 @@ fn try_lock_managed_config(home: &std::path::Path) -> Option<std::fs::File> {
 /// Retry budget for a sync, pairing the attempt count with a wall-clock cap.
 #[derive(Clone, Copy)]
 enum SyncBudget {
-    /// Background loop and explicit `gork setup`; runs retries to completion.
+    /// Background loop and explicit `grok setup`; runs retries to completion.
     Standard,
     /// Post-login sync; capped because login latency is user-visible.
     Login,
@@ -552,7 +552,7 @@ enum FetchedConfig {
 
 /// Fetches the configuration for the current principal without touching disk:
 /// the deployment key first, then a signed-in team. The installing sync and the
-/// read-only `gork setup --json` both build on this.
+/// read-only `grok setup --json` both build on this.
 async fn fetch_for_principal(
     budget: SyncBudget,
     team_override: Option<GrokAuth>,
@@ -796,7 +796,7 @@ pub enum ManagedConfigSync {
     Failed,
 }
 
-/// Post-login hook for `gork login` and the ACP/TUI authenticate flow: clear any
+/// Post-login hook for `grok login` and the ACP/TUI authenticate flow: clear any
 /// orphaned files, then fetch the new principal's config immediately rather than
 /// waiting for the background tick. `authenticated` pins the just-logged-in
 /// principal (`None` = on-disk team). Latency-bounded by [`SyncBudget::Login`];
@@ -846,7 +846,7 @@ pub async fn post_login_sync(authenticated: Option<GrokAuth>) -> ManagedConfigSy
     }
 }
 
-/// Whether a credential exists that `gork setup` could install config for.
+/// Whether a credential exists that `grok setup` could install config for.
 pub fn has_principal() -> bool {
     resolve_deployment_key().is_some() || read_active_team_auth().is_some()
 }
@@ -904,23 +904,45 @@ fn current_serving_identity_any_expiry() -> crate::config::ServingIdentity {
     serving_identity_from(active_team_id_any_expiry())
 }
 
+/// Disk-only classification for the startup `auth_mode` label.
+pub fn classify_auth_mode() -> xai_grok_telemetry::startup::AuthMode {
+    auth_mode(
+        resolve_deployment_key().is_some(),
+        &team_principal_signed_in(),
+    )
+}
+
+fn auth_mode(
+    has_deployment_key: bool,
+    signed_in_team: &std::io::Result<bool>,
+) -> xai_grok_telemetry::startup::AuthMode {
+    use xai_grok_telemetry::startup::AuthMode;
+    match (has_deployment_key, signed_in_team) {
+        (true, _) => AuthMode::Deployment,
+        (false, Ok(true)) => AuthMode::Team,
+        (false, Ok(false)) => AuthMode::Personal,
+        (false, Err(_)) => AuthMode::Unknown,
+    }
+}
+
 /// Best-effort session-start refresh: a bounded token refresh, then a bounded refetch only when the cache is
 /// hard-stale. NEVER fails the session — on failure it continues on cached / OS-protected policy.
 pub async fn ensure_managed_policy_present(
     auth_manager: &std::sync::Arc<crate::auth::AuthManager>,
 ) {
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::ManagedPolicy);
+    // Classify before the fetch gate: the label is disk-only and fetch-disabled
+    // users still deserve a real auth_mode split.
+    let has_deployment_key = resolve_deployment_key().is_some();
+    let signed_in_team = team_principal_signed_in();
+    xai_grok_telemetry::startup::set_auth_mode(auth_mode(has_deployment_key, &signed_in_team));
     // Gated on fetch-enabled, not `cfg!(test)` — that would diverge test behavior from production.
     if !is_fetch_enabled() {
         return;
     }
-    // Cheap disk-only gates before any network token refresh, so the boot path doesn't pay
-    // an `auth()` in the common cases. A personal user (no deploy key, and no team in
-    // `auth.json` even ignoring expiry) skips entirely; a usable identity whose cache isn't
-    // hard-stale also skips. Only an expired-but-refreshable team token (identity reads
-    // `None` before the refresh) or a hard-stale cache falls through to `auth()` below.
-    // `auth.json` unreadable (`Err`) is NOT treated as "no principal" — that would skip
-    // enforcement on a transient read blip.
-    if resolve_deployment_key().is_none() && matches!(team_principal_signed_in(), Ok(false)) {
+    // Disk-only gates first; `Err` reading `auth.json` is not "no principal",
+    // which would skip enforcement on a transient read blip.
+    if !has_deployment_key && matches!(&signed_in_team, Ok(false)) {
         return;
     }
     let identity = current_serving_identity();
@@ -957,7 +979,7 @@ network access: reconnect and start again. If you can't reconnect, contact your 
 /// Fail-closed session-start gate for managed principals. On a confirmed offline team
 /// switch, first purges the prior team's artifacts ([`purge_prior_tenant_on_identity_change`]).
 /// Without a signing key the user-writable marker is best-effort; root/MDM/signed cache
-/// are the non-forgeable layers. Recovery: reconnect / `gork setup`; ceasing to serve
+/// are the non-forgeable layers. Recovery: reconnect / `grok setup`; ceasing to serve
 /// `fail_closed` rolls back.
 pub fn managed_policy_gate() -> Result<(), String> {
     // Lib unit tests skip: bootstrap would hit the host's real marker/auth. Pure decision
@@ -1035,7 +1057,7 @@ fn managed_policy_gate_decision(
     Ok(())
 }
 
-/// Outcome of the `gork setup` sync. The caller renders it — CLI presentation
+/// Outcome of the `grok setup` sync. The caller renders it — CLI presentation
 /// and exit codes stay out of the library.
 #[derive(Debug)]
 pub enum SetupOutcome {
@@ -1050,9 +1072,9 @@ pub enum SetupOutcome {
     Failed(ManagedConfigError),
 }
 
-/// Result of `gork setup --json`: what the server serves for the current
+/// Result of `grok setup --json`: what the server serves for the current
 /// principal, verbatim. `managed_config` may embed the enforced deployment key,
-/// exactly as `gork setup` would write it to disk.
+/// exactly as `grok setup` would write it to disk.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupReport {
@@ -1063,13 +1085,13 @@ pub struct SetupReport {
     pub configured: bool,
     pub deployment_id: Option<String>,
     pub team_id: Option<String>,
-    /// TOML documents exactly as `gork setup` would install them.
+    /// TOML documents exactly as `grok setup` would install them.
     pub managed_config: Option<String>,
     pub requirements: Option<String>,
     pub fail_closed: bool,
 }
 
-/// Fetches the report behind `gork setup --json` without writing anything:
+/// Fetches the report behind `grok setup --json` without writing anything:
 /// no artifacts, no signature sidecar, no sync marker.
 pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
     let (source, body) = match fetch_for_principal(SyncBudget::Standard, None).await? {
@@ -1077,7 +1099,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
         FetchedConfig::Team { body, .. } => (Some("teamOauth"), body),
         FetchedConfig::NoPrincipal => (None, ManagedConfigResponse::default()),
     };
-    // Match the installer's trust decision: a payload `gork setup` would refuse
+    // Match the installer's trust decision: a payload `grok setup` would refuse
     // is reported as an error, not printed as installable config.
     if source.is_some()
         && xai_grok_config::signed_policy::verification_active()
@@ -1097,7 +1119,7 @@ pub async fn fetch_setup_report() -> Result<SetupReport, ManagedConfigError> {
     })
 }
 
-/// Run the `gork setup` sync for the current principal. The caller must check
+/// Run the `grok setup` sync for the current principal. The caller must check
 /// [`has_principal`] first and render the no-principal guidance.
 pub async fn run_setup() -> SetupOutcome {
     match sync_with_budget(SyncBudget::Standard, None).await {

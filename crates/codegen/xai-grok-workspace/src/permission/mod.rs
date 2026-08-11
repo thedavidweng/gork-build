@@ -13,10 +13,51 @@ mod shell_access;
 mod state;
 pub mod types;
 
+/// Declare a data-free "wire vocabulary" enum whose variant set, iteration
+/// inventory (`ALL`), and wire strings (`wire_str`) are all generated from ONE
+/// list, so they can never drift apart. Adding a value is a single list entry
+/// that produces the variant, its `ALL` slot, and its wire string together;
+/// removing/renaming one is a compile error at every exhaustive `match`.
+///
+/// This is the single source of truth for the owner-side permission vocabularies
+/// (`PromptOutcomeKind`, `ClassifierSourceKind`, `ClassifierVerdict`) that
+/// production event emission projects through and cross-crate telemetry drift
+/// tests iterate.
+macro_rules! wire_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $($variant:ident => $wire:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order. Generated with the enum, so it
+            /// can never omit a variant (closes the `ALL`-drift hole structurally).
+            $vis const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// Canonical wire string. Generated with the enum from the same list,
+            /// so a variant can never lack a wire value or carry a stale one.
+            $vis const fn wire_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+        }
+    };
+}
+pub(crate) use wire_enum;
+
 pub use auto_mode::{
-    AUTO_MODE_CLASSIFIER_SYSTEM_PROMPT, AutoFastPath, CLASSIFIER_TURN_MAX_LEN, ClassifierContext,
-    ClassifierFailure, ClassifierMessage, ClassifierMessageRole, ClassifierOutcome,
-    ClassifierPromptType, ClassifierSource, ClassifierTurn, ClassifierVerdict, ClassifyTextChannel,
+    AUTO_MODE_CLASSIFIER_SYSTEM_PROMPT, AutoFastPath, BashSecurityAssessment,
+    CLASSIFIER_TURN_MAX_LEN, ClassifierContext, ClassifierFailure, ClassifierMessage,
+    ClassifierMessageRole, ClassifierOutcome, ClassifierPromptType, ClassifierSecurityFinding,
+    ClassifierSource, ClassifierSourceKind, ClassifierTurn, ClassifierVerdict, ClassifyTextChannel,
     ClassifyTextFn, FixedClassifier, HeuristicPermissionClassifier, LlmPermissionClassifier,
     PermissionClassifier, SharedClassifier, access_requires_user_interaction, auto_mode_fast_path,
     build_classifier_messages, classifier_output_json_schema, default_auto_mode_classifier,
@@ -33,16 +74,20 @@ pub(crate) fn init_metrics() {
     hub_permission::init_metrics();
 }
 pub use manager::{
-    PermissionHandle, default_always_allow_scope, spawn_permission_manager,
+    AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT, PermissionHandle,
+    default_always_allow_scope, reasons, spawn_permission_manager,
     spawn_permission_manager_with_hub,
 };
-pub use policy::CompiledPolicy;
+pub use policy::{CompiledPolicy, bash_pattern_is_broad, bash_pattern_matches_command};
 pub use prompter::{
     ALLOW_EDITS_SESSION_OPTION_ID, AcpPrompter, BashCommandPermission, BashCommandSelectedTerms,
     ENABLE_ALWAYS_APPROVE_OPTION_ID, MCP_TOOL_NAME_DELIMITER, McpScopeSelection, McpToolPermission,
-    PromptOutcome, is_enable_always_approve_option, mcp_pretty_name_if_qualified,
-    mcp_titleize_segment, mcp_tool_action, mcp_tool_display_name,
+    PromptOutcome, PromptOutcomeKind, is_enable_always_approve_option,
+    mcp_pretty_name_if_qualified, mcp_titleize_segment, mcp_tool_action, mcp_tool_display_name,
 };
+pub use shell_access::{ProtectedEditPermission, ProtectedEditReason};
 pub use state::PermissionState;
 pub use state::cleanup_stale_permission_state;
-pub use types::{AccessKind, ClientType, Decision, PermissionCommand, PermissionEvent};
+pub use types::{
+    AccessKind, ClientType, Decision, PermissionCommand, PermissionEvent, PermissionResolution,
+};

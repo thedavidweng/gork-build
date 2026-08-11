@@ -976,6 +976,30 @@ pub(in crate::app::dispatch) fn set_page_flip_on_send(app: &mut AppView, new: bo
     }]
 }
 
+pub(in crate::app::dispatch) fn set_confirm_before_rewind_inner(app: &mut AppView, new: bool) {
+    app.current_ui.confirm_before_rewind = Some(new);
+}
+
+/// SHARED: `[ui].confirm_before_rewind` via `Effect::PersistSetting`.
+pub(in crate::app::dispatch) fn set_confirm_before_rewind(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = app.current_ui.confirm_before_rewind_enabled();
+    if prev == new {
+        return vec![];
+    }
+    set_confirm_before_rewind_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "confirm_before_rewind", value = new, "setting changed");
+    app.show_toast(&save_success_toast("Confirm before rewind", new));
+    vec![Effect::PersistSetting {
+        key: "confirm_before_rewind",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 pub(super) fn set_combine_queued_prompts_inner(app: &mut AppView, new: bool) {
     app.current_ui.combine_queued_prompts = Some(new);
     crate::appearance::cache::set_combine_queued_prompts(new);
@@ -1739,7 +1763,11 @@ pub(in crate::app::dispatch) fn set_default_model(
         // No session id yet — stash for
         // `EventLoop::on_session_created` to apply once the session
         // id materialises. Mirrors `Action::SwitchModel` line 586.
-        agent.session.deferred_model_switch = Some((new_id, None));
+        agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+            model_id: new_id,
+            effort: None,
+            prev_model_id: prev_id,
+        });
     }
     effects
 }

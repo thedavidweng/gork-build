@@ -5,22 +5,50 @@
 //!
 //! ## Schema
 //!
-//! - `meta`              — key-value metadata (schema version)
-//! - `session_docs`      — one row per session (title, content, content_hash)
-//! - `session_docs_fts`  — content-synced FTS5 over title + content (not cwd)
+//! - `meta`: key-value metadata (schema version, bootstrap marker/claim)
+//! - `session_docs`: one row per session (title, content, content_hash)
+//! - `session_docs_fts`: content-synced FTS5 over title + content (not cwd)
 //!
 //! FTS is kept in sync with `session_docs` via `AFTER INSERT/UPDATE/DELETE`
 //! triggers so callers never need to touch the FTS table directly.
 //! The `cwd` column is intentionally excluded from the FTS table — it is a
 //! filter dimension only, applied via JOIN on `session_docs`.
+//!
+//! The index is a rebuildable cache: an unusable file is quarantined and
+//! recreated once (see [`super::search_recovery`] and [`with_index`]).
+
+use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use xai_sqlite_journal::JournalMode;
+
+use super::search_recovery;
 
 /// Bump when making breaking schema changes that require dropping and
 /// recreating tables, or to force a rebuild of stale index content
 /// (v3 → v4: messages with JSON escapes were silently dropped at indexing).
 const SCHEMA_VERSION: &str = "4";
+
+/// Lease stamp for the in-flight bootstrap claim, stored as
+/// `"{unix_secs}:{owner_token}"`; `CAST` reads the numeric prefix, and the
+/// token fences refresh/release to the owner.
+pub(super) const META_KEY_BOOTSTRAP_CLAIM: &str = "bootstrap_claimed_at";
+
+/// Unix seconds of the last completed full reindex; its presence is the
+/// completed-bootstrap marker.
+pub(super) const META_KEY_LAST_BOOTSTRAP: &str = "last_bootstrap_at";
+
+/// On-disk schema version row; bump [`SCHEMA_VERSION`] to force a rebuild.
+pub(super) const META_KEY_SCHEMA_VERSION: &str = "session_search_schema_version";
+
+/// SQL that extracts the owner token from a claim stamp; the single source
+/// for every fenced statement, paired with [`claim_stamp`].
+const CLAIM_TOKEN_SQL: &str = "substr(value, instr(value, ':') + 1)";
+
+fn claim_stamp(now_unix: i64, token: &str) -> String {
+    format!("{now_unix}:{token}")
+}
 
 /// A document to be indexed for session search.
 #[derive(Debug, Clone)]
@@ -33,19 +61,6 @@ pub struct SessionDoc {
     pub content: String,
     /// blake3 hash of `content` — used to skip redundant upserts.
     pub content_hash: String,
-    /// Byte offset in `updates.jsonl` up to which content has been indexed.
-    /// Used for delta indexing: on subsequent updates, only bytes after this
-    /// offset are parsed and merged with existing content.
-    pub last_indexed_offset: u64,
-}
-
-/// State of a previously indexed session, returned by
-/// [`SessionSearchIndex::get_session_index_state`].
-#[derive(Debug, Clone)]
-pub struct SessionIndexState {
-    pub content: String,
-    pub content_hash: String,
-    pub last_indexed_offset: u64,
 }
 
 /// A single search result row.
@@ -73,6 +88,28 @@ pub struct SessionSearchIndex {
     db: Connection,
 }
 
+pub fn with_index<R>(
+    db_path: &Path,
+    op: impl Fn(&SessionSearchIndex) -> Result<R, rusqlite::Error>,
+) -> Result<R, rusqlite::Error> {
+    let index = SessionSearchIndex::open_or_create(db_path)?;
+    match op(&index) {
+        Ok(value) => Ok(value),
+        Err(e) if search_recovery::is_unusable_db_error(&e) => {
+            drop(index);
+            search_recovery::heal_unusable(
+                db_path,
+                &e,
+                SessionSearchIndex::probe_usable,
+                SessionSearchIndex::recreate,
+            );
+            let index = SessionSearchIndex::open_or_create(db_path)?;
+            op(&index)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl SessionSearchIndex {
     /// Open (or create) the FTS index at `db_path`.
     ///
@@ -82,29 +119,48 @@ impl SessionSearchIndex {
     /// and deletes the `last_bootstrap_at` completed-bootstrap marker so the
     /// wipe is observable to bootstrap/staleness checks.
     /// A NEWER stored version is tolerated read/write without dropping.
-    pub fn open_or_create(db_path: &std::path::Path) -> Result<Self, rusqlite::Error> {
+    ///
+    /// If the existing file is corrupt / not a database, quarantines it and
+    /// opens a fresh empty index (see [`super::search_recovery::heal_unusable`]).
+    pub fn open_or_create(db_path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        // The mode decision statfs's the parent dir created above.
-        Self::open_with_journal_mode(db_path, JournalMode::for_db_path(db_path))
+        let journal_mode = JournalMode::for_db_path(db_path);
+
+        match Self::open_with_journal_mode(db_path, journal_mode) {
+            Ok(index) => Ok(index),
+            Err(e) if search_recovery::is_unusable_db_error(&e) => {
+                search_recovery::heal_unusable(db_path, &e, Self::probe_usable, Self::recreate);
+                Self::open_with_journal_mode(db_path, journal_mode)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Open with an explicit journal mode — the seam tests use to exercise
-    /// the network-filesystem decision on a local disk.
+    fn probe_usable(db_path: &Path) -> Result<bool, rusqlite::Error> {
+        let conn = JournalMode::for_db_path(db_path).open_readonly(db_path)?;
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        let first: Option<String> = stmt.query_map([], |row| row.get(0))?.next().transpose()?;
+        Ok(first.as_deref() == Some("ok"))
+    }
+
+    fn recreate(db_path: &Path) -> Result<(), rusqlite::Error> {
+        Self::open_with_journal_mode(db_path, JournalMode::for_db_path(db_path)).map(|_| ())
+    }
+
     fn open_with_journal_mode(
-        db_path: &std::path::Path,
+        db_path: &Path,
         journal_mode: JournalMode,
     ) -> Result<Self, rusqlite::Error> {
         // busy_timeout + journal pragma live in the helper (see JournalMode::open).
-        let db = journal_mode.open(db_path)?;
+        let mut db = journal_mode.open(db_path)?;
 
-        // Check existing schema version
         let stored_version: Option<String> = db
             .query_row(
-                "SELECT value FROM meta WHERE key = 'session_search_schema_version'",
-                [],
+                "SELECT value FROM meta WHERE key = ?1",
+                params![META_KEY_SCHEMA_VERSION],
                 |row| row.get(0),
             )
             .optional()
@@ -123,30 +179,26 @@ impl SessionSearchIndex {
         let stored: Option<u64> = stored_version.as_deref().map(|v| v.parse().unwrap_or(0));
         let owned_by_newer = stored.is_some_and(|s| s > current);
         if stored.is_some_and(|s| s < current) {
-            // Discard the stale index AND its completed-bootstrap marker in
-            // one transaction. Binaries that predate the one-way ratchet
-            // (schema ≤ 3) still wipe a newer index on open, re-stamp their
-            // own version, and rewrite `last_bootstrap_at` when their
-            // bootstrap finishes. If that marker survived this upgrade drop,
-            // a "did a bootstrap complete?" check would trust it and never
-            // repopulate the now-empty tables — leaving content search
-            // permanently empty (the query path itself performs this drop).
-            // Deleting the marker makes the wipe observable: the search
-            // manager re-runs a full bootstrap and remote sync correctly
-            // treats the local index as stale. All other `meta` keys are
-            // preserved.
-            db.execute_batch(
+            // The marker and claim die with the tables: a surviving marker
+            // reads as "bootstrap complete" over an empty index, and a
+            // surviving claim blocks its rebuild until the lease expires.
+            // Other `meta` keys are preserved. Immediate: a deferred begin
+            // can fail with SQLITE_BUSY_SNAPSHOT, which skips the handler.
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch(
                 "
-                BEGIN;
                 DROP TRIGGER IF EXISTS session_docs_ai;
                 DROP TRIGGER IF EXISTS session_docs_ad;
                 DROP TRIGGER IF EXISTS session_docs_au;
                 DROP TABLE IF EXISTS session_docs_fts;
                 DROP TABLE IF EXISTS session_docs;
-                DELETE FROM meta WHERE key = 'last_bootstrap_at';
-                COMMIT;
                 ",
             )?;
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?1, ?2)",
+                params![META_KEY_LAST_BOOTSTRAP, META_KEY_BOOTSTRAP_CLAIM],
+            )?;
+            tx.commit()?;
         } else if owned_by_newer {
             tracing::debug!(
                 stored = stored.unwrap_or_default(),
@@ -155,7 +207,6 @@ impl SessionSearchIndex {
             );
         }
 
-        // Create tables + content-synced FTS5 with auto-sync triggers
         db.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -202,27 +253,12 @@ impl SessionSearchIndex {
             ",
         )?;
 
-        // Add last_indexed_offset column (idempotent migration).
-        match db.execute(
-            "ALTER TABLE session_docs ADD COLUMN last_indexed_offset INTEGER NOT NULL DEFAULT 0",
-            [],
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("duplicate column") {
-                    return Err(e);
-                }
-            }
-        }
-
         // Persist schema version — but never regress the row a newer
         // generation owns (it would re-trigger that binary's upgrade drop).
         if stored != Some(current) && !owned_by_newer {
             db.execute(
-                "INSERT OR REPLACE INTO meta(key, value) \
-                 VALUES ('session_search_schema_version', ?1)",
-                params![SCHEMA_VERSION],
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                params![META_KEY_SCHEMA_VERSION, SCHEMA_VERSION],
             )?;
         }
 
@@ -235,23 +271,21 @@ impl SessionSearchIndex {
     /// automatically.
     pub fn upsert_doc(&self, doc: &SessionDoc) -> Result<(), rusqlite::Error> {
         self.db.execute(
-            "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash, last_indexed_offset)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(session_id) DO UPDATE SET
                  cwd = excluded.cwd,
                  updated_at = excluded.updated_at,
                  title = excluded.title,
                  content = excluded.content,
-                 content_hash = excluded.content_hash,
-                 last_indexed_offset = excluded.last_indexed_offset",
+                 content_hash = excluded.content_hash",
             params![
                 doc.session_id,
                 doc.cwd,
                 doc.updated_at_unix,
                 doc.title,
                 doc.content,
-                doc.content_hash,
-                doc.last_indexed_offset as i64
+                doc.content_hash
             ],
         )?;
         Ok(())
@@ -264,8 +298,8 @@ impl SessionSearchIndex {
     /// written between the check and the insert.
     pub fn insert_doc_if_absent(&self, doc: &SessionDoc) -> Result<(), rusqlite::Error> {
         self.db.execute(
-            "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash, last_indexed_offset)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(session_id) DO NOTHING",
             params![
                 doc.session_id,
@@ -273,8 +307,7 @@ impl SessionSearchIndex {
                 doc.updated_at_unix,
                 doc.title,
                 doc.content,
-                doc.content_hash,
-                doc.last_indexed_offset as i64
+                doc.content_hash
             ],
         )?;
         Ok(())
@@ -302,44 +335,6 @@ impl SessionSearchIndex {
             .optional()
     }
 
-    /// Return the full index state for a session: content, content_hash,
-    /// and last_indexed_offset. Used by the delta indexing path.
-    pub fn get_session_index_state(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionIndexState>, rusqlite::Error> {
-        self.db
-            .query_row(
-                "SELECT content, content_hash, last_indexed_offset FROM session_docs WHERE session_id = ?1",
-                params![session_id],
-                |row| {
-                    let content: String = row.get(0)?;
-                    let content_hash: String = row.get(1)?;
-                    let offset: i64 = row.get(2)?;
-                    Ok(SessionIndexState {
-                        content,
-                        content_hash,
-                        last_indexed_offset: offset as u64,
-                    })
-                },
-            )
-            .optional()
-    }
-
-    /// Update only the `last_indexed_offset` for a session without touching
-    /// content or hash (avoids firing FTS triggers when content is unchanged).
-    pub fn update_indexed_offset(
-        &self,
-        session_id: &str,
-        offset: u64,
-    ) -> Result<(), rusqlite::Error> {
-        self.db.execute(
-            "UPDATE session_docs SET last_indexed_offset = ?2 WHERE session_id = ?1",
-            params![session_id, offset as i64],
-        )?;
-        Ok(())
-    }
-
     /// Read a value from the `meta` key-value table.
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, rusqlite::Error> {
         self.db
@@ -360,6 +355,115 @@ impl SessionSearchIndex {
         Ok(())
     }
 
+    /// Remove a value from the `meta` key-value table.
+    pub fn delete_meta(&self, key: &str) -> Result<(), rusqlite::Error> {
+        self.db
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Returns `true` when this process claimed the bootstrap under `token`.
+    /// An expired (older than `lease`), future-dated (clock rollback), or
+    /// unparsable claim is taken over; a live peer claim is not.
+    pub(super) fn try_claim_bootstrap(
+        &self,
+        now_unix: i64,
+        lease: Duration,
+        token: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let lease_secs = lease.as_secs() as i64;
+        // One upsert keeps the check-and-claim atomic across processes.
+        let changed = self.db.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(meta.value AS INTEGER) <= ?3
+                OR CAST(meta.value AS INTEGER) > ?4",
+            params![
+                META_KEY_BOOTSTRAP_CLAIM,
+                claim_stamp(now_unix, token),
+                now_unix.saturating_sub(lease_secs),
+                now_unix.saturating_add(lease_secs),
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Re-stamp the lease. Fenced on `token`: returns `false` without
+    /// writing when the claim is no longer ours (expired and taken over, or
+    /// already released), so a stale claimant can never clobber a successor.
+    pub(super) fn refresh_bootstrap_claim(
+        &self,
+        now_unix: i64,
+        token: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let changed = self.db.execute(
+            &format!("UPDATE meta SET value = ?2 WHERE key = ?1 AND {CLAIM_TOKEN_SQL} = ?3"),
+            params![
+                META_KEY_BOOTSTRAP_CLAIM,
+                claim_stamp(now_unix, token),
+                token
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Write `key = value` only while the bootstrap claim is still held
+    /// under `token`; returns `false` (no write) otherwise.
+    pub(super) fn set_meta_if_claim_owner(
+        &self,
+        key: &str,
+        value: &str,
+        token: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let changed = self.db.execute(
+            &format!(
+                "INSERT INTO meta(key, value)
+                 SELECT ?1, ?2
+                 WHERE EXISTS (
+                     SELECT 1 FROM meta WHERE key = ?3 AND {CLAIM_TOKEN_SQL} = ?4
+                 )
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            ),
+            params![key, value, META_KEY_BOOTSTRAP_CLAIM, token],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Delete the claim, fenced on `token` so only the current owner frees
+    /// it. Returns `false` when the claim was already released or taken over.
+    pub(super) fn release_bootstrap_claim(&self, token: &str) -> Result<bool, rusqlite::Error> {
+        let changed = self.db.execute(
+            &format!("DELETE FROM meta WHERE key = ?1 AND {CLAIM_TOKEN_SQL} = ?2"),
+            params![META_KEY_BOOTSTRAP_CLAIM, token],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Refresh the claim under `token` and delete indexed session ids not in
+    /// `keep`, in one Immediate transaction. Returns `false` without deleting
+    /// when this process is not the claim owner.
+    pub(super) fn prune_missing_if_claim_owner(
+        &self,
+        now_unix: i64,
+        token: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<bool, rusqlite::Error> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.refresh_bootstrap_claim(now_unix, token)? {
+            return Ok(false);
+        }
+        for id in self.all_indexed_session_ids()? {
+            if !keep.contains(&id) {
+                self.delete_doc(&id)?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Return all session IDs currently in the index.
     ///
     /// Used during reindex to detect and prune orphaned entries.
@@ -376,6 +480,12 @@ impl SessionSearchIndex {
     /// Multi-token queries require every token (AND) first; when that
     /// intersection matches nothing the query reruns as an OR so partial
     /// matches still surface. Returns `(results, next_offset, total_estimate)`.
+    ///
+    /// Session-id-shaped queries (full UUID or hyphenated hex prefix) match
+    /// `session_docs.session_id` directly. FTS only indexes title+content, and
+    /// a hyphenated UUID `MATCH` looks for tokens that were never indexed —
+    /// so `/resume` search by id returned nothing while `grok --resume <id>`
+    /// still loaded the session.
     pub fn query(
         &self,
         query: &str,
@@ -384,6 +494,13 @@ impl SessionSearchIndex {
         offset: usize,
         include_content: bool,
     ) -> Result<QueryResult, rusqlite::Error> {
+        if is_session_id_like(query) {
+            let id_hits = self.query_session_id(query, cwd, limit, offset)?;
+            if !id_hits.results.is_empty() || uuid::Uuid::try_parse(query.trim()).is_ok() {
+                return Ok(id_hits);
+            }
+        }
+
         let Some((and_query, or_query)) = Self::build_match_queries(query) else {
             return Ok(QueryResult {
                 results: Vec::new(),
@@ -399,6 +516,60 @@ impl SessionSearchIndex {
             return self.run_match_query(&or_query, cwd, limit, offset, include_content);
         }
         Ok(result)
+    }
+
+    /// Substring match on `session_docs.session_id` (not in the FTS table).
+    fn query_session_id(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<QueryResult, rusqlite::Error> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return Ok(QueryResult {
+                results: Vec::new(),
+                next_offset: None,
+                total_estimate: Some(0),
+            });
+        }
+
+        let total: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM session_docs d
+             WHERE instr(lower(d.session_id), lower(?1)) > 0
+               AND (?2 IS NULL OR d.cwd = ?2)",
+            params![needle, cwd],
+            |row| row.get(0),
+        )?;
+
+        let mut stmt = self.db.prepare(
+            "SELECT d.session_id, d.cwd, d.title, d.updated_at
+             FROM session_docs d
+             WHERE instr(lower(d.session_id), lower(?1)) > 0
+               AND (?2 IS NULL OR d.cwd = ?2)
+             ORDER BY d.updated_at DESC, d.session_id ASC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(params![needle, cwd, limit as i64, offset as i64], |row| {
+            Ok(SessionSearchRow {
+                session_id: row.get(0)?,
+                cwd: row.get(1)?,
+                title: row.get(2)?,
+                updated_at_unix: row.get(3)?,
+                score: 1.0,
+                matched_fields: vec!["session_id".to_string()],
+                snippet: None,
+            })
+        })?;
+        let results: Vec<SessionSearchRow> = rows.collect::<Result<_, _>>()?;
+        let total_usize = usize::try_from(total).unwrap_or(0);
+        let next_offset = (offset + results.len() < total_usize).then_some(offset + results.len());
+        Ok(QueryResult {
+            results,
+            next_offset,
+            total_estimate: Some(total_usize),
+        })
     }
 
     /// Execute one FTS5 MATCH string; `total_estimate` is computed with the
@@ -560,6 +731,17 @@ impl SessionSearchIndex {
     }
 }
 
+/// True when `query` is a UUID or a hyphenated hex prefix long enough to be
+/// an intentional session-id search (not a normal keyword).
+fn is_session_id_like(query: &str) -> bool {
+    let q = query.trim();
+    if uuid::Uuid::try_parse(q).is_ok() {
+        return true;
+    }
+    let stripped: String = q.chars().filter(|&c| c != '-').collect();
+    stripped.len() >= 8 && stripped.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,12 +755,106 @@ mod tests {
             title: title.to_string(),
             content: content.to_string(),
             content_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
-            last_indexed_offset: 0,
         }
     }
 
     fn open(tmp: &TempDir) -> SessionSearchIndex {
         SessionSearchIndex::open_or_create(&tmp.path().join("session_search.sqlite")).unwrap()
+    }
+
+    const LEASE: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn test_bootstrap_claim_is_single_flight_until_lease_expires() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        let peer = open(&tmp);
+        let claim = |idx: &SessionSearchIndex, now: i64, token: &str| {
+            idx.try_claim_bootstrap(now, LEASE, token).unwrap()
+        };
+
+        assert!(claim(&index, 1_000, "a"));
+        assert!(!claim(&index, 1_010, "a"), "live claim is not re-claimable");
+        assert!(
+            !claim(&peer, 1_299, "b"),
+            "live claim is not claimable by a peer"
+        );
+        assert!(claim(&peer, 1_301, "b"), "expired lease is claimable");
+    }
+
+    #[test]
+    fn test_bootstrap_claim_release_and_refresh_are_owner_fenced() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        let claim = |now: i64, token: &str| index.try_claim_bootstrap(now, LEASE, token).unwrap();
+
+        assert!(claim(1_000, "a"));
+        assert!(index.refresh_bootstrap_claim(1_200, "a").unwrap());
+        assert!(!claim(1_400, "b"), "refresh extends the lease");
+
+        // A stale claimant (expired, taken over) can neither refresh nor
+        // release the successor's claim.
+        assert!(claim(1_501, "b"), "lease from 1_200 expires at 1_500");
+        assert!(!index.refresh_bootstrap_claim(1_502, "a").unwrap());
+        assert!(!index.release_bootstrap_claim("a").unwrap());
+        assert!(!claim(1_503, "c"), "b's claim survives a's stale release");
+
+        assert!(index.release_bootstrap_claim("b").unwrap());
+        assert!(claim(1_504, "c"), "owner release frees the claim");
+    }
+
+    #[test]
+    fn test_upgrade_drop_clears_bootstrap_claim() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        assert!(index.try_claim_bootstrap(1_000, LEASE, "a").unwrap());
+        index.set_meta(META_KEY_SCHEMA_VERSION, "3").unwrap();
+        drop(index);
+
+        let reopened = open(&tmp);
+        assert!(
+            reopened.try_claim_bootstrap(1_001, LEASE, "b").unwrap(),
+            "the upgrade wipe must clear the claim so the rebuild is not blocked"
+        );
+    }
+
+    #[test]
+    fn test_set_meta_if_claim_owner_is_fenced() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+
+        assert!(!index.set_meta_if_claim_owner("k", "v", "a").unwrap());
+        assert_eq!(index.get_meta("k").unwrap(), None, "no claim: no write");
+
+        assert!(index.try_claim_bootstrap(1_000, LEASE, "a").unwrap());
+        assert!(!index.set_meta_if_claim_owner("k", "v", "b").unwrap());
+        assert_eq!(index.get_meta("k").unwrap(), None, "non-owner: no write");
+
+        assert!(index.set_meta_if_claim_owner("k", "v1", "a").unwrap());
+        assert_eq!(index.get_meta("k").unwrap().as_deref(), Some("v1"));
+        assert!(index.set_meta_if_claim_owner("k", "v2", "a").unwrap());
+        assert_eq!(
+            index.get_meta("k").unwrap().as_deref(),
+            Some("v2"),
+            "owner writes take the update arm on conflict"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_claim_takes_over_garbage_and_future_stamps() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+
+        index
+            .set_meta(META_KEY_BOOTSTRAP_CLAIM, "not-a-number")
+            .unwrap();
+        assert!(index.try_claim_bootstrap(1_000, LEASE, "a").unwrap());
+
+        // A future-dated stamp (clock rollback) must not hold forever.
+        index
+            .set_meta(META_KEY_BOOTSTRAP_CLAIM, &claim_stamp(9_999_999, "x"))
+            .unwrap();
+        assert!(index.try_claim_bootstrap(1_000, LEASE, "a").unwrap());
     }
 
     #[test]
@@ -653,12 +929,10 @@ mod tests {
                 "docs must survive a same-version reopen"
             );
             // Simulate a database written by an older schema version.
-            same_version
-                .set_meta("session_search_schema_version", "3")
-                .unwrap();
+            same_version.set_meta(META_KEY_SCHEMA_VERSION, "3").unwrap();
             assert_eq!(
                 same_version
-                    .get_meta("session_search_schema_version")
+                    .get_meta(META_KEY_SCHEMA_VERSION)
                     .unwrap()
                     .as_deref(),
                 Some("3"),
@@ -673,7 +947,7 @@ mod tests {
         );
         assert_eq!(
             reopened
-                .get_meta("session_search_schema_version")
+                .get_meta(META_KEY_SCHEMA_VERSION)
                 .unwrap()
                 .as_deref(),
             Some(SCHEMA_VERSION),
@@ -711,9 +985,7 @@ mod tests {
                 .unwrap();
             // Simulate an index owned by a newer grok generation that has
             // completed a bootstrap.
-            index
-                .set_meta("session_search_schema_version", "5")
-                .unwrap();
+            index.set_meta(META_KEY_SCHEMA_VERSION, "5").unwrap();
             index.set_meta("last_bootstrap_at", "1700000000").unwrap();
         }
 
@@ -725,7 +997,7 @@ mod tests {
         );
         assert_eq!(
             reopened
-                .get_meta("session_search_schema_version")
+                .get_meta(META_KEY_SCHEMA_VERSION)
                 .unwrap()
                 .as_deref(),
             Some("5"),
@@ -749,9 +1021,7 @@ mod tests {
             index
                 .upsert_doc(&test_doc("s1", "Rust debugging", "borrow checker"))
                 .unwrap();
-            index
-                .set_meta("session_search_schema_version", "garbage")
-                .unwrap();
+            index.set_meta(META_KEY_SCHEMA_VERSION, "garbage").unwrap();
         }
 
         let reopened = open(&tmp);
@@ -761,12 +1031,79 @@ mod tests {
         );
         assert_eq!(
             reopened
-                .get_meta("session_search_schema_version")
+                .get_meta(META_KEY_SCHEMA_VERSION)
                 .unwrap()
                 .as_deref(),
             Some(SCHEMA_VERSION),
             "rebuild rewrites the current version"
         );
+    }
+
+    #[test]
+    fn test_malformed_db_file_is_quarantined_and_recreated() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session_search.sqlite");
+        // Not a SQLite database — classic "file is not a database" / NOTADB.
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+
+        // Drive the production entrypoint: it heals on open, then the op runs.
+        with_index(&path, |index| {
+            index.upsert_doc(&test_doc("s1", "after heal", "session search works again"))
+        })
+        .expect("with_index self-heals then upserts");
+        let qr = with_index(&path, |index| index.query("works", None, 10, 0, false))
+            .expect("query after heal");
+        assert_eq!(qr.results[0].session_id, "s1");
+
+        // Original path is a real DB again; a quarantine sibling should exist.
+        assert!(path.is_file());
+        let quarantined: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "expected a quarantined corrupt sibling, got {quarantined:?}"
+        );
+    }
+
+    #[test]
+    fn test_with_index_retries_op_once_after_heal() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session_search.sqlite");
+        // A non-db file gives a real "unusable" error to inject into the op.
+        let bogus = tmp.path().join("bogus.sqlite");
+        std::fs::write(&bogus, b"not-sqlite").unwrap();
+
+        // The first op attempt reports the DB unusable, as a mid-op corruption
+        // would; with_index heals (a no-op here, the DB is healthy) and retries
+        // the op exactly once, which then succeeds.
+        let calls = std::cell::Cell::new(0u32);
+        let result = with_index(&path, |index| {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                match SessionSearchIndex::open_with_journal_mode(&bogus, JournalMode::Wal) {
+                    Ok(_) => unreachable!("a non-sqlite file cannot open as a database"),
+                    Err(e) => Err(e),
+                }
+            } else {
+                index.upsert_doc(&test_doc("s1", "t", "retried body"))
+            }
+        });
+
+        assert!(result.is_ok(), "op should succeed on the retry: {result:?}");
+        assert_eq!(
+            calls.get(),
+            2,
+            "op runs once, fails unusable, then runs once more"
+        );
+
+        let index = SessionSearchIndex::open_or_create(&path).unwrap();
+        let qr = index.query("retried", None, 10, 0, false).unwrap();
+        assert_eq!(qr.results.len(), 1, "the retried op's write is persisted");
     }
 
     /// Repro: the on-disk state left behind by a pre-ratchet binary that
@@ -783,9 +1120,7 @@ mod tests {
             index
                 .upsert_doc(&test_doc("s1", "old-binary doc", "indexed by v3"))
                 .unwrap();
-            index
-                .set_meta("session_search_schema_version", "3")
-                .unwrap();
+            index.set_meta(META_KEY_SCHEMA_VERSION, "3").unwrap();
             index.set_meta("last_bootstrap_at", "1783393389").unwrap();
         }
 
@@ -796,7 +1131,7 @@ mod tests {
         );
         assert_eq!(
             reopened
-                .get_meta("session_search_schema_version")
+                .get_meta(META_KEY_SCHEMA_VERSION)
                 .unwrap()
                 .as_deref(),
             Some(SCHEMA_VERSION),
@@ -924,6 +1259,46 @@ mod tests {
         let qr = index.query("python", None, 10, 0, false).unwrap();
         assert_eq!(qr.total_estimate, Some(1));
         assert_eq!(qr.results[0].session_id, "s2");
+    }
+
+    /// `/resume` search types a session UUID; CLI `--resume <id>` works because
+    /// it looks up by id globally. FTS only indexed title+content, so pasting
+    /// the id into search returned nothing (GB-4249).
+    #[test]
+    fn test_query_matches_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let index = open(&tmp);
+        let id = "019f870d-6976-7d73-a12a-52e9d4aebcd4";
+        index
+            .upsert_doc(&test_doc(
+                id,
+                "unrelated title",
+                "body text with no identifier",
+            ))
+            .unwrap();
+
+        let qr = index.query(id, None, 10, 0, false).unwrap();
+        assert_eq!(qr.results.len(), 1, "full session id must match");
+        assert_eq!(qr.results[0].session_id, id);
+        assert!(
+            qr.results[0]
+                .matched_fields
+                .iter()
+                .any(|f| f == "session_id")
+        );
+
+        let prefix = index.query("019f870d-6976", None, 10, 0, false).unwrap();
+        assert_eq!(prefix.results.len(), 1, "session id prefix must match");
+        assert_eq!(prefix.results[0].session_id, id);
+
+        let mut other_cwd = test_doc("019f870d-6976-7d73-a12a-ffffffffffff", "other", "unrelated");
+        other_cwd.cwd = "/other".to_string();
+        index.upsert_doc(&other_cwd).unwrap();
+        let scoped = index
+            .query(id, Some("/test/workspace"), 10, 0, false)
+            .unwrap();
+        assert_eq!(scoped.results.len(), 1);
+        assert_eq!(scoped.results[0].session_id, id);
     }
 
     #[test]

@@ -9,6 +9,8 @@
 mod common;
 #[path = "pty_e2e/scroll.rs"]
 mod scroll;
+#[path = "pty_e2e/scroll_anchor_holds_parked_marker_during_live_stream.rs"]
+mod scroll_anchor_holds_parked_marker_during_live_stream;
 
 #[path = "pty_e2e/bash_full_output_double_click_fold_pty.rs"]
 mod bash_full_output_double_click_fold_pty;
@@ -40,6 +42,8 @@ mod mouse_reporting_toggle_sticky_persists_pty;
 mod nested_quote_drag_copy_excludes_bars_pty;
 #[path = "pty_e2e/page_flip_on_send_pty.rs"]
 mod page_flip_on_send_pty;
+#[path = "pty_e2e/plan_scrollbar_grab_zone_pty.rs"]
+mod plan_scrollbar_grab_zone_pty;
 #[path = "pty_e2e/quote_block_drag_copy_excludes_bars_pty.rs"]
 mod quote_block_drag_copy_excludes_bars_pty;
 #[path = "pty_e2e/quote_block_raw_mode_copy_keeps_source_pty.rs"]
@@ -50,10 +54,14 @@ mod read_tool_header_selection_copies_path_only_pty;
 mod recap_header_not_in_selection_pty;
 #[path = "pty_e2e/resize_preserves_scroll_position.rs"]
 mod resize_preserves_scroll_position;
+#[path = "pty_e2e/response_top_indicator_pty.rs"]
+mod response_top_indicator_pty;
 #[path = "pty_e2e/scroll_debug_hud_env_toggles_overlay.rs"]
 mod scroll_debug_hud_env_toggles_overlay;
 #[path = "pty_e2e/scroll_does_not_crash.rs"]
 mod scroll_does_not_crash;
+#[path = "pty_e2e/sticky_header_drag_copy_pty.rs"]
+mod sticky_header_drag_copy_pty;
 #[path = "pty_e2e/stuck_drag_recovers_on_esc_pty.rs"]
 mod stuck_drag_recovers_on_esc_pty;
 #[path = "pty_e2e/trackpad_flood_does_not_under_travel.rs"]

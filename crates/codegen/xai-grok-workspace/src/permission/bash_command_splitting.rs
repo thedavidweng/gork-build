@@ -622,6 +622,14 @@ pub(crate) fn unwrap_wrappers(words: &[String]) -> &[String] {
     unwrap_wrappers_checked(words).words
 }
 
+/// Peel wrapper commands (`timeout`, `nice`, `env`, …) from a command's words,
+/// exposing the same normalization the permission enforcer applies before
+/// matching session grants. The pager's "Always allow" pattern editor uses this
+/// so its pre-fill and match preview agree with enforcement on wrapped commands.
+pub fn unwrap_command_wrappers(words: &[String]) -> &[String] {
+    unwrap_wrappers(words)
+}
+
 /// Result of peeling shell-transparent prefixes (`exec` / `command` / `builtin`).
 /// Not part of the canonical wrapper set — used only by security gates.
 pub(crate) enum TransparentPrefixPeel<'a> {
@@ -967,13 +975,13 @@ fn parse_plain_command_from_node(cmd: Node, src: &str) -> Option<PlainCommand> {
 
                 words.push(text);
             }
-            "string" => {
+            "string"
                 // Allow only simple double-quoted strings with plain content.
                 if child.child_count() == 3
                     && child.child(0)?.kind() == "\""
                     && child.child(1)?.kind() == "string_content"
                     && child.child(2)?.kind() == "\""
-                {
+                => {
                     let content_node = child.child(1)?;
                     let text = content_node.utf8_text(src.as_bytes()).ok()?.to_owned();
 
@@ -985,11 +993,7 @@ fn parse_plain_command_from_node(cmd: Node, src: &str) -> Option<PlainCommand> {
                     span_end = Some(child.end_byte());
 
                     words.push(text);
-                } else {
-                    // Reject complex / interpolated strings
-                    return None;
                 }
-            }
             "raw_string" => {
                 let raw_string = child.utf8_text(src.as_bytes()).ok()?;
                 let stripped = raw_string

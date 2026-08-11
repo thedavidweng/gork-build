@@ -32,7 +32,6 @@ fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     for mode in [
         PromptInputMode::Normal,
         PromptInputMode::Bash,
-        PromptInputMode::Feedback,
         PromptInputMode::Remember,
     ] {
         let mut app = test_app_with_agent();
@@ -1050,7 +1049,11 @@ fn agent_type_mismatch_with_effort_stashes_deferred_switch() {
         let agent = &app.agents[&new_aid];
         assert_eq!(
             agent.session.deferred_model_switch,
-            Some((model_id, effort)),
+            Some(crate::app::agent::DeferredModelSwitch {
+                model_id,
+                effort,
+                prev_model_id: None,
+            }),
             "effort override must be stashed for the shell via deferred_model_switch",
         );
     } else {
@@ -1066,7 +1069,11 @@ fn deferred_model_switch_still_works_for_cli_override() {
     let id = AgentId(0);
     assert_eq!(
         app.agents[&id].session.deferred_model_switch,
-        Some((cli_model, None)),
+        Some(crate::app::agent::DeferredModelSwitch {
+            model_id: cli_model,
+            effort: None,
+            prev_model_id: None,
+        }),
         "CLI -m override must still populate deferred_model_switch",
     );
 }
@@ -1482,7 +1489,7 @@ fn deferred_switch_overwritten_by_second_switch() {
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     dispatch(
         Action::SwitchModel {
-            model_id: model_a,
+            model_id: model_a.clone(),
             effort: None,
         },
         &mut app,
@@ -1496,7 +1503,93 @@ fn deferred_switch_overwritten_by_second_switch() {
     );
     assert_eq!(
         app.agents[&id].session.deferred_model_switch,
-        Some((model_b, None))
+        Some(crate::app::agent::DeferredModelSwitch {
+            model_id: model_b.clone(),
+            effort: None,
+            prev_model_id: Some(model_a),
+        })
+    );
+}
+#[test]
+fn pick_over_cli_seed_keeps_display_as_rollback_target() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let displayed = acp::ModelId::new(std::sync::Arc::from("displayed-model"));
+    let cli_model = acp::ModelId::new(std::sync::Arc::from("cli-model"));
+    let picked = acp::ModelId::new(std::sync::Arc::from("picked-model"));
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.session_id = None;
+    agent.session.models.current = Some(displayed.clone());
+    agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+        model_id: cli_model,
+        effort: None,
+        prev_model_id: None,
+    });
+    dispatch(
+        Action::SwitchModel {
+            model_id: picked.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].session.deferred_model_switch,
+        Some(crate::app::agent::DeferredModelSwitch {
+            model_id: picked,
+            effort: None,
+            prev_model_id: Some(displayed),
+        })
+    );
+}
+#[test]
+fn deferred_switch_updates_display_and_persists() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_id = acp::ModelId::new(std::sync::Arc::from("model-b"));
+    app.agents.get_mut(&id).unwrap().session.session_id = None;
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_id.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    let agent = &app.agents[&id];
+    assert_eq!(
+        agent.session.models.current,
+        Some(model_id.clone()),
+        "pre-session pick must update the displayed model immediately"
+    );
+    assert_eq!(
+        agent.session.deferred_model_switch,
+        Some(crate::app::agent::DeferredModelSwitch {
+            model_id: model_id.clone(),
+            effort: None,
+            prev_model_id: None,
+        }),
+        "switch must still round-trip once the session exists"
+    );
+    assert!(
+        !agent.session.model_switch_pending,
+        "nothing is in flight yet — the queue must not be blocked"
+    );
+    assert!(
+        matches!(
+            &effects[..],
+            [Effect::PersistPreferredModel { model_id: m, .. }] if m == &model_id
+        ),
+        "expected a single PersistPreferredModel effect, got {effects:?}"
+    );
+    let effects = dispatch(
+        Action::SwitchModel {
+            model_id: model_id.clone(),
+            effort: None,
+        },
+        &mut app,
+    );
+    assert!(
+        effects.is_empty(),
+        "unchanged pre-session pick must not re-persist, got {effects:?}"
     );
 }
 #[test]
@@ -1522,6 +1615,33 @@ fn conversation_entry_load_sets_chat_kind_bit() {
     ));
     let agent = app.agents.values().next().expect("agent");
     assert!(agent.chat_kind, "conversation entry → agent chat_kind");
+    assert!(
+        agent.conversation_entry,
+        "conversation entry must stamp conversation_entry for rename kind"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Chat
+    );
+    let rename = dispatch(
+        Action::RenameSession {
+            title: "conv title".into(),
+        },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            &rename[..],
+            [Effect::RenameSession { kind, .. }]
+                if *kind == xai_grok_shell::session::unified_list::SessionKind::Chat
+        ),
+        "conversation-entry rename must send kind=chat, got {rename:?}"
+    );
+    let reset = dispatch(Action::ResetSessionTitleToAuto, &mut app);
+    assert!(
+        reset.is_empty(),
+        "conversation-entry --auto must refuse client-side, got {reset:?}"
+    );
 }
 /// Process-wide `--chat` + non-conversation resume of a non-disk id still
 /// loads (gateway conversation) with agent chat_kind from sticky mode.
@@ -1547,8 +1667,88 @@ fn chat_mode_resume_without_local_disk_loads_as_chat() {
         "sticky --chat must set agent chat_kind even without entry bit"
     );
     assert!(
+        agent.conversation_entry,
+        "sticky --chat gateway resume (no local disk) opens as chat"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Chat
+    );
+    assert!(
         agent.app_chat_mode,
         "app.chat_mode must propagate to AgentView::app_chat_mode"
+    );
+    let rename = dispatch(
+        Action::RenameSession {
+            title: "gw title".into(),
+        },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            &rename[..],
+            [Effect::RenameSession { kind, .. }]
+                if *kind == xai_grok_shell::session::unified_list::SessionKind::Chat
+        ),
+        "sticky --chat gateway resume rename must send kind=chat, got {rename:?}"
+    );
+}
+/// Sticky `--chat` + history-bypass local-disk load stays Build for rename.
+/// Without the bypass flag this same disk row is refused (see
+/// `chat_mode_refuses_local_build_disk_load`).
+#[cfg(feature = "local-workspace")]
+#[test]
+fn load_sticky_chat_history_bypass_rename_kind_is_build() {
+    let cwd = PathBuf::from(format!("/tmp/chat-mode-hist-bypass-{}", std::process::id()));
+    let session_id = format!("local-build-disk-{}", std::process::id());
+    let sess_dir = plant_local_build_session(&cwd, &session_id);
+    let mut app = test_app();
+    app.cwd = cwd;
+    app.chat_mode = true;
+    app.welcome_history_load_as_build = true;
+    let effects = dispatch(
+        Action::LoadSession(session_id.clone(), None, false),
+        &mut app,
+    );
+    let _ = std::fs::remove_dir_all(&sess_dir);
+    assert!(
+        matches!(
+            &effects[..],
+            [Effect::LoadSession {
+                session_id: sid,
+                chat_kind: false,
+                ..
+            }] if sid == &session_id
+        ),
+        "history-bypass must load the local disk row, got {effects:?}"
+    );
+    let agent = app.agents.values().next().expect("agent");
+    assert!(
+        agent.chat_kind,
+        "sticky --chat still sets the UI chat_kind bit"
+    );
+    assert!(
+        !agent.conversation_entry,
+        "history-bypass local build must not open as chat"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Build
+    );
+    let rename = dispatch(
+        Action::RenameSession {
+            title: "local title".into(),
+        },
+        &mut app,
+    );
+    assert!(
+        matches!(
+            &rename[..],
+            [Effect::RenameSession { kind, title, .. }]
+                if *kind == xai_grok_shell::session::unified_list::SessionKind::Build
+                    && title == "local title"
+        ),
+        "history-bypass rename must send kind=build, got {rename:?}"
     );
 }
 /// Process-wide `--chat` refuses local Build disk rows (no LoadSession).
@@ -1592,6 +1792,15 @@ fn chat_mode_allows_conversation_entry_even_if_local_path() {
             ..
         }]
     ));
+    let agent = app.agents.values().next().expect("agent");
+    assert!(
+        agent.conversation_entry,
+        "conversation-entry bit must stamp conversation_entry even if a local path exists"
+    );
+    assert_eq!(
+        agent.rename_kind(),
+        xai_grok_shell::session::unified_list::SessionKind::Chat
+    );
 }
 #[test]
 fn view_catalog_entry_emits_fetch_effect() {

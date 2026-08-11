@@ -293,13 +293,13 @@ impl xai_tool_runtime::Tool for TodoWriteTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "todo_write",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
         xai_tool_protocol::ToolCapabilities {
-            is_read_only: true,
+            is_read_only: false,
             tool_scope: Some(xai_tool_protocol::ToolScope::Read),
             ..Default::default()
         }

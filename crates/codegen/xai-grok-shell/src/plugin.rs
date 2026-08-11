@@ -41,7 +41,7 @@ pub struct InstallOutcome {
 /// Classify an install source as local (filesystem) vs git (remote) without
 /// installing — used for telemetry `install_kind` on the failure path, where no
 /// [`InstallOutcome`] is available.
-pub fn install_source_is_local(source: &str, cwd: &Path) -> bool {
+pub(crate) fn install_source_is_local(source: &str, cwd: &Path) -> bool {
     matches!(
         git_install::parse_install_source(source, cwd),
         git_install::InstallSource::Local { .. }
@@ -96,7 +96,7 @@ impl std::fmt::Display for UninstallError {
                 write!(
                     f,
                     "Plugin \"{name}\" not found.\n\
-                     Run `gork plugin list` to see installed plugins."
+                     Run `grok plugin list` to see installed plugins."
                 )
             }
             Self::NeedsConfirm {
@@ -218,7 +218,7 @@ impl std::fmt::Display for UpdateError {
                 write!(
                     f,
                     "Plugin \"{name}\" not found.\n\
-                     Run `gork plugin list` to see installed plugins."
+                     Run `grok plugin list` to see installed plugins."
                 )
             }
         }
@@ -346,7 +346,7 @@ pub fn update_plugins(name: Option<&str>) -> Result<Vec<RepoUpdateOutcome>, Upda
     update_plugins_by_selector(name.map(|name| PluginUpdateSelector::PluginName(name.to_string())))
 }
 
-pub fn update_plugins_by_selector(
+pub(crate) fn update_plugins_by_selector(
     selector: Option<PluginUpdateSelector>,
 ) -> Result<Vec<RepoUpdateOutcome>, UpdateError> {
     let mut registry = InstallRegistry::load();
@@ -611,7 +611,7 @@ impl std::fmt::Display for MarketplaceInstallError {
                     write!(
                         f,
                         "Unknown marketplace \"{qualifier}\". No marketplaces are registered; \
-                         add one with `gork plugin marketplace add`."
+                         add one with `grok plugin marketplace add`."
                     )
                 } else {
                     let list = bullet_list(registered);
@@ -648,8 +648,8 @@ impl std::fmt::Display for MarketplaceInstallError {
                 write!(
                     f,
                     "No marketplace plugin named \"{name}\" in any registered marketplace.\n\
-                     Install a local directory with `gork plugin install ./{name}`, or add a \
-                     source with `gork plugin marketplace add`."
+                     Install a local directory with `grok plugin install ./{name}`, or add a \
+                     source with `grok plugin marketplace add`."
                 )?;
                 if !skipped_sources.is_empty() {
                     write!(
@@ -666,7 +666,7 @@ impl std::fmt::Display for MarketplaceInstallError {
                 write!(
                     f,
                     "Multiple marketplaces provide a plugin named \"{name}\":\n{list}\n\
-                     Pin one with `gork plugin install {name}@<qualifier>`."
+                     Pin one with `grok plugin install {name}@<qualifier>`."
                 )
             }
             Self::PartialScan {
@@ -678,7 +678,7 @@ impl std::fmt::Display for MarketplaceInstallError {
                     f,
                     "Couldn't scan every marketplace while resolving \"{name}\", so it can't be \
                      resolved safely. Unscanned source(s):\n{list}\n\
-                     Retry, or pin the source explicitly with `gork plugin install {name}@<qualifier>`."
+                     Retry, or pin the source explicitly with `grok plugin install {name}@<qualifier>`."
                 )
             }
             Self::Sync {
@@ -706,14 +706,14 @@ fn bullet_list(items: &[String]) -> String {
 /// The require-sha pin policy for remote plugin code. Disk-only config + env,
 /// both tighten-only: a remote campaign overlay must not be able to relax a
 /// local security policy, and an unreadable config falls back to the env knob.
-pub fn marketplace_require_sha() -> bool {
+pub(crate) fn marketplace_require_sha() -> bool {
     xai_grok_config::load_effective_config_disk_only()
         .map(|c| xai_grok_plugin_marketplace::load_require_sha(&c))
         .unwrap_or_else(|_| xai_grok_plugin_marketplace::env_require_sha())
 }
 
 /// Marketplace sources from config.toml + settings JSON, unfiltered.
-pub fn load_marketplace_sources() -> Vec<MarketplaceSource> {
+pub(crate) fn load_marketplace_sources() -> Vec<MarketplaceSource> {
     let config = crate::config::load_effective_config()
         .ok()
         .unwrap_or(toml::Value::Table(toml::map::Map::new()));
@@ -725,7 +725,7 @@ pub fn load_marketplace_sources() -> Vec<MarketplaceSource> {
 /// Like [`load_marketplace_sources`] but drops git sources blocked by the
 /// managed `marketplace_allowlist`. Install paths must use this so policy
 /// cannot be bypassed.
-pub fn load_filtered_marketplace_sources() -> Vec<MarketplaceSource> {
+pub(crate) fn load_filtered_marketplace_sources() -> Vec<MarketplaceSource> {
     let allowlist =
         &xai_grok_workspace::permission::resolution::managed_settings().marketplace_allowlist;
     filter_sources_by_allowlist(load_marketplace_sources(), allowlist)

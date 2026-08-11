@@ -25,6 +25,7 @@ use xai_grok_workspace_types::rpc::code_nav::{
     CodeFindDefinitionsReq, CodeFindReferencesReq, CodeGotoDefinitionReq, CodeGotoReferencesReq,
     CodeIndexStatusReq, CodeIndexStatusResponse, CodeNavResponse,
 };
+use xai_grok_workspace_types::rpc::export_github::{ExportGithubReq, ExportGithubResponse};
 use xai_grok_workspace_types::rpc::fs::{
     FsDeleteFileReq, FsExistsData, FsExistsReq, FsListData, FsListReq, FsReadFileData,
     FsReadFileReq, FsWriteFileReq, GetFilesReq, GetFilesRes, PutFilesReq, PutFilesRes,
@@ -35,7 +36,8 @@ use xai_grok_workspace_types::rpc::git::{
     GitCollectChangesResponse, GitCommitReq, GitCurrentCommitReq, GitDiffReq, GitDiffsData,
     GitDiscardReq, GitFilesReq, GitInfoData, GitInfoReq, GitMetadataReq, GitReadFilesData,
     GitResolveRootReq, GitStageContentReq, GitStageReq, GitStashReq, GitStatusExtReq,
-    GitStatusExtResponse, GitStatusReq, GitUnstageReq, StageData, VcsKind,
+    GitStatusExtResponse, GitStatusReq, GitSyncBaseReq, GitSyncBaseResult, GitUnstageReq,
+    StageData, VcsKind,
 };
 use xai_grok_workspace_types::rpc::hunks::{
     BulkHunkActionResponse, FileSummary, HunkActionResponse, HunkAllActionReq, HunkFileActionReq,
@@ -102,6 +104,14 @@ pub async fn consume_stream_terminal(
         }
     }
 }
+/// Feature-gate check over a reported workspace-server version: it parses as
+/// semver and is `>= baseline`. Absent or unparseable versions return `false`
+/// — an unproven version is older than any gated feature.
+pub fn server_version_at_least(version: Option<&str>, baseline: &semver::Version) -> bool {
+    version
+        .and_then(|v| semver::Version::parse(v).ok())
+        .is_some_and(|v| v >= *baseline)
+}
 /// Check whether a [`ToolError`](xai_tool_runtime::ToolError) indicates
 /// a fatal transport failure that should mark the hub as disconnected.
 ///
@@ -167,6 +177,14 @@ impl WorkspaceClient {
     }
     pub fn harness(&self) -> &ToolHarness {
         &self.harness
+    }
+    /// Server binary version from the hub bind report, without an RPC
+    /// round-trip. `None` before the first bind or against servers that
+    /// predate the field.
+    pub fn server_binary_version(&self) -> Option<String> {
+        self.harness
+            .last_bind_report()
+            .and_then(|report| report.binary_version.clone())
     }
     /// Whether the hub connection is believed to be alive.
     pub fn is_connected(&self) -> bool {
@@ -291,6 +309,12 @@ impl WorkspaceClient {
     ) -> Result<CommitResult, WorkspaceClientError> {
         self.rpc(req).await
     }
+    pub async fn git_sync_base(
+        &self,
+        req: &GitSyncBaseReq,
+    ) -> Result<GitSyncBaseResult, WorkspaceClientError> {
+        self.rpc(req).await
+    }
     pub async fn git_checkout(&self, req: &GitCheckoutReq) -> Result<(), WorkspaceClientError> {
         self.rpc(req).await
     }
@@ -347,6 +371,12 @@ impl WorkspaceClient {
         self.rpc(req).await
     }
     pub async fn get_files(&self, req: &GetFilesReq) -> Result<GetFilesRes, WorkspaceClientError> {
+        self.rpc(req).await
+    }
+    pub async fn export_github(
+        &self,
+        req: &ExportGithubReq,
+    ) -> Result<ExportGithubResponse, WorkspaceClientError> {
         self.rpc(req).await
     }
     pub async fn fs_list(&self, req: &FsListReq) -> Result<FsListData, WorkspaceClientError> {
@@ -557,6 +587,7 @@ mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
     use xai_computer_hub_sdk::harness::LocalRegistry;
+    use xai_grok_workspace_types::rpc::RpcActivityClass;
     use xai_grok_workspace_types::rpc::skills::SkillScope;
     use xai_tool_protocol::{SessionId, ToolId};
     use xai_tool_runtime::{Tool, ToolError};
@@ -586,6 +617,7 @@ mod tests {
             match args.method.as_str() {
                 "workspace.info" => ok(serde_json::json!({
                     "os": "linux", "shell": "bash", "cwd": "/workspace",
+                    "version": "1.2.3",
                 })),
                 "workspace.git_status" => ok(serde_json::json!("On branch main")),
                 "workspace.discover_skills" => ok(serde_json::json!([{
@@ -624,6 +656,16 @@ mod tests {
         );
         WorkspaceClient::new(harness)
     }
+    #[test]
+    fn version_gating_treats_absent_and_unparseable_as_old() {
+        let base = semver::Version::new(1, 2, 300);
+        assert!(!server_version_at_least(None, &base));
+        assert!(!server_version_at_least(Some("unknown"), &base));
+        assert!(!server_version_at_least(Some("1.2.299"), &base));
+        assert!(!server_version_at_least(Some("1.2.300-dev"), &base));
+        assert!(server_version_at_least(Some("1.2.300"), &base));
+        assert!(server_version_at_least(Some("1.3.0"), &base));
+    }
     #[tokio::test]
     async fn info_decodes_typed_response() {
         let info = client().info().await.unwrap();
@@ -633,6 +675,7 @@ mod tests {
                 os: "linux".into(),
                 shell: "bash".into(),
                 cwd: "/workspace".into(),
+                version: Some("1.2.3".into()),
             }
         );
     }
@@ -664,6 +707,7 @@ mod tests {
         }
         impl WorkspaceRpc for EchoReq {
             const METHOD: &'static str = "workspace.echo_params";
+            const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
             type Response = Value;
         }
         let echoed = client().rpc(&EchoReq { flag: true, n: 7 }).await.unwrap();
@@ -678,6 +722,7 @@ mod tests {
         struct ErrReq;
         impl WorkspaceRpc for ErrReq {
             const METHOD: &'static str = "workspace.err";
+            const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
             type Response = Value;
         }
         let err = c.rpc(&ErrReq).await.unwrap_err();
@@ -697,6 +742,7 @@ mod tests {
         struct MalformedReq;
         impl WorkspaceRpc for MalformedReq {
             const METHOD: &'static str = "workspace.malformed";
+            const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
             type Response = Value;
         }
         let err = c.rpc(&MalformedReq).await.unwrap_err();

@@ -130,19 +130,16 @@ impl MvpAgent {
         // over-exposed). Re-querying at grant time would need the `sessions` map
         // (a non-`Rc` `RefCell` field) shared into the detached task, which isn't
         // available here; the fail-safe stale-session window is accepted instead.
-        let targets: Vec<ReloadTarget> = self
-            .sessions
-            .borrow()
-            .values()
-            .filter(|h| {
-                xai_grok_workspace::trust::workspace_key(std::path::Path::new(&h.info.cwd)) == key
-            })
-            .map(|h| ReloadTarget {
-                cmd_tx: h.cmd_tx.clone(),
-                initial_client_mcp_servers: h.initial_client_mcp_servers.clone(),
-                cwd: PathBuf::from(&h.info.cwd),
-            })
-            .collect();
+        let mut targets = Vec::new();
+        self.session_registry.for_each_resident(|_, h| {
+            if xai_grok_workspace::trust::workspace_key(std::path::Path::new(&h.info.cwd)) == key {
+                targets.push(ReloadTarget {
+                    cmd_tx: h.cmd_tx.clone(),
+                    initial_client_mcp_servers: h.initial_client_mcp_servers.clone(),
+                    cwd: PathBuf::from(&h.info.cwd),
+                });
+            }
+        });
         if targets.is_empty() {
             prompted.borrow_mut().remove(&key);
             return;
@@ -150,10 +147,6 @@ impl MvpAgent {
 
         let gateway = self.gateway.clone();
         let plugin_handle = self.plugin_registry_handle.clone();
-        let managed_mcp_cache = self.managed_mcp_cache.clone();
-        let auth_manager = self.auth_manager.clone();
-        let can_fetch_managed = self.can_fetch_managed_mcps();
-        let proxy_url = self.cfg.borrow().endpoints.proxy_url();
         let compat = self.cfg.borrow().compat_resolved;
         let remote = remote.cloned();
         let cwd = cwd.to_path_buf();
@@ -258,10 +251,6 @@ impl MvpAgent {
                 gateway: &gateway,
                 targets,
                 plugin_handle: &plugin_handle,
-                managed_mcp_cache: &managed_mcp_cache,
-                auth_manager: &auth_manager,
-                can_fetch_managed,
-                proxy_url: &proxy_url,
                 compat: &compat,
                 prompt_cwd: &cwd,
             })
@@ -291,10 +280,6 @@ struct ReloadAfterGrant<'a> {
     /// Every session sharing the granted workspace, each with its own cwd.
     targets: Vec<ReloadTarget>,
     plugin_handle: &'a xai_grok_agent::plugins::SharedPluginRegistryHandle,
-    managed_mcp_cache: &'a crate::session::managed_mcp::ManagedMcpStateHandle,
-    auth_manager: &'a std::sync::Arc<AuthManager>,
-    can_fetch_managed: bool,
-    proxy_url: &'a str,
     compat: &'a xai_grok_tools::types::CompatConfig,
     /// The prompting session's cwd — used only for the client catalog push.
     prompt_cwd: &'a std::path::Path,
@@ -303,27 +288,13 @@ struct ReloadAfterGrant<'a> {
 /// Reload each granted-workspace session's now-trusted project servers in place
 /// (no restart), driving the canonical primitives the normal spawn/reload paths
 /// use — PER SESSION CWD, like `handle_reload_project_mcp_servers` /
-/// `broadcast_plugin_registry_to_sessions`: `fetch_managed_mcp_configs` +
-/// `merge_managed_mcp_servers` (`SessionCommand::UpdateMcpServers`), `build_for_cwd`
+/// `broadcast_plugin_registry_to_sessions`: `merge_managed_mcp_servers`
+/// (`SessionCommand::UpdateMcpServers`), `build_for_cwd`
 /// (`SessionCommand::ReloadPlugins`), and `reload_hooks_impl`
 /// (`SessionCommand::ReloadHooks`), then push the refreshed MCP catalog. LSP is
 /// spawn-baked and applies on the next session open (see module docs). Caller
 /// must have granted + recorded trust first.
 async fn reload_project_servers_after_grant(ctx: ReloadAfterGrant<'_>) {
-    // Managed (gateway/Toolbox) servers must survive the re-merge; fetch them once
-    // (cwd-independent) via the shared helper (single-sources the auth-key dance
-    // with `MvpAgent::get_managed_mcp_configs`). The plugin MCP snapshot is also
-    // global, so it is fine to reuse across cwds for the merge.
-    let managed = if ctx.can_fetch_managed {
-        crate::session::managed_mcp::fetch_managed_mcp_configs(
-            ctx.managed_mcp_cache,
-            ctx.proxy_url,
-            ctx.auth_manager,
-        )
-        .await
-    } else {
-        vec![]
-    };
     let plugin_snapshot = ctx.plugin_handle.snapshot();
 
     for target in ctx.targets {
@@ -337,7 +308,6 @@ async fn reload_project_servers_after_grant(ctx: ReloadAfterGrant<'_>) {
             &target.cmd_tx,
             session_cwd,
             target.initial_client_mcp_servers,
-            &managed,
             plugin_snapshot.as_deref(),
             ctx.compat,
         );
@@ -369,7 +339,7 @@ async fn reload_project_servers_after_grant(ctx: ReloadAfterGrant<'_>) {
         ctx.prompt_cwd,
         crate::util::config::load_mcp_servers(ctx.prompt_cwd, ctx.compat),
     );
-    crate::extensions::mcp::notify_servers_updated(ctx.gateway, &managed, &local).await;
+    crate::extensions::mcp::notify_servers_updated(ctx.gateway, &local).await;
 }
 
 #[cfg(test)]

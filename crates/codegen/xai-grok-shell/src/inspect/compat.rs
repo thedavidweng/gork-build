@@ -1,4 +1,4 @@
-//! Vendor-compat resolution for `gork inspect`.
+//! Vendor-compat resolution for `grok inspect`.
 //!
 //! Resolves the local env/config/default stack into a diagnostic report.
 

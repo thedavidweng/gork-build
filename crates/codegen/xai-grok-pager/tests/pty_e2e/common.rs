@@ -3,7 +3,7 @@
 //! Individual test modules import via `use super::common::*`.
 
 pub(crate) use serde_json::json;
-pub(crate) use std::path::Path;
+pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::time::{Duration, Instant};
 pub(crate) use xai_grok_pager_pty_harness::{
     AgentTurnExpectation, ContentController, EnvOp, MockModel, PtyExitPoll, PtyHarness,
@@ -28,10 +28,11 @@ pub(crate) const WELCOME_TIMEOUT: Duration = Duration::from_secs(20);
 /// session spawn) on the agent's single-threaded runtime, and the client-side
 /// `acp_send` has no timeout — so under the fully-parallel pty_e2e suite the
 /// starved agent thread can push this well past the 20s `WELCOME_TIMEOUT`
-/// (leaving the "Loading session…" placeholder up). Sized generously for the
-/// same contention reason as `WRAP_TIMEOUT`, not because resume is slow when
-/// run alone.
-pub(crate) const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
+/// (leaving the "Loading session…" placeholder up). A prior 60s budget still
+/// timed out under CI load with the same stuck-loading signature; match
+/// [`WRAP_TIMEOUT`] (120s) for the same contention reason, not because resume
+/// is slow when run alone.
+pub(crate) const RESUME_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Substring we wait for on the welcome screen. Matches the menu label `"Quit"`
 /// (`render_welcome_done` / gate menus); case-sensitive, so it does **not**
@@ -916,6 +917,63 @@ pub(crate) const MINIMAL_IDLE_SENTINEL: &str = "minimal · /help";
 pub(crate) const MINIMAL_SWITCH_BACK_IDLE_SENTINEL: &str =
     "minimal · /fullscreen to go back · /help";
 
+/// Header of minimal's parked plan-approval controls strip.
+pub(crate) const PLAN_PARKED_SENTINEL: &str = "Plan ready for review";
+
+/// A plan body the `exit_plan_mode` tool will read off disk. Every step carries
+/// a unique `{tag}{NNN}` sentinel, because a truncated plan still contains its
+/// head and would pass a plain substring check.
+pub(crate) fn plan_body(tag: &str, lines: usize) -> String {
+    let mut s = format!("# {tag} Plan\n\n");
+    for i in 0..lines {
+        s.push_str(&format!("- {tag}{i:03} step of the plan\n"));
+    }
+    s
+}
+
+/// Steps of a [`plan_body`] missing from everything the user could reach by
+/// scrolling: native scrollback plus the visible screen.
+pub(crate) fn plan_lines_missing(harness: &mut PtyHarness, tag: &str, lines: usize) -> Vec<usize> {
+    let full = harness.full_text();
+    (0..lines)
+        .filter(|i| !full.contains(&format!("{tag}{i:03}")))
+        .collect()
+}
+
+/// Steps of a [`plan_body`] that appear more than once — the print-once guard.
+pub(crate) fn plan_lines_duplicated(
+    harness: &mut PtyHarness,
+    tag: &str,
+    lines: usize,
+) -> Vec<usize> {
+    let full = harness.full_text();
+    (0..lines)
+        .filter(|i| full.matches(&format!("{tag}{i:03}")).count() > 1)
+        .collect()
+}
+
+/// Locate `<grok_home>/sessions/<encoded cwd>/<session id>/`, where the shell
+/// keeps the session's `plan.md`. Polls: the first turn creates it
+/// asynchronously.
+pub(crate) fn session_dir(content: &ContentController, harness: &mut PtyHarness) -> PathBuf {
+    let sessions = content.home().join(".grok").join("sessions");
+    for _ in 0..100 {
+        if let Ok(outer) = std::fs::read_dir(&sessions) {
+            for cwd_dir in outer.flatten() {
+                if let Ok(inner) = std::fs::read_dir(cwd_dir.path()) {
+                    for entry in inner.flatten() {
+                        if entry.path().is_dir() {
+                            return entry.path();
+                        }
+                    }
+                }
+            }
+        }
+        harness.update(Duration::from_millis(100));
+    }
+    panic!("no session dir under {}", sessions.display());
+}
+
 /// Spawn the pager in minimal mode against `content` at the default size.
 pub(crate) fn spawn_minimal(content: &ContentController) -> PtyHarness {
     spawn_minimal_sized(content, DEFAULT_ROWS, DEFAULT_COLS)
@@ -976,13 +1034,16 @@ pub(crate) fn wait_minimal_ready(harness: &mut PtyHarness) {
 
 /// Quit minimal cleanly. The prompt is always focused (a bare `q` would type
 /// into it), so quit is Ctrl+Q pressed twice (it requires confirmation). Falls
-/// back to the harness kill path if the chord doesn't take.
+/// back to the harness kill path if the chord doesn't take. Give the confirm
+/// chord and process exit enough time under suite load so a SIGKILL does not
+/// cut off the agent mid-`updates.jsonl` flush (which breaks a subsequent
+/// `--continue` resume).
 pub(crate) fn quit_minimal(harness: &mut PtyHarness) {
     let _ = harness.inject_keys(b"\x11"); // Ctrl+Q — arms the confirm
-    harness.update(Duration::from_millis(80));
+    harness.update(Duration::from_millis(200));
     let _ = harness.inject_keys(b"\x11"); // Ctrl+Q — confirms
     match harness
-        .wait_exit_code(Duration::from_secs(5))
+        .wait_exit_code(Duration::from_secs(15))
         .expect("wait for minimal pager exit")
     {
         PtyExitPoll::Running => harness.quit().expect("kill minimal pager after timeout"),
@@ -1187,6 +1248,34 @@ pub(crate) fn write_cast_if_requested(harness: &PtyHarness, file_name: &str) {
     match harness.write_cast(&path) {
         Ok(()) => eprintln!("wrote cast: {}", path.display()),
         Err(e) => eprintln!("failed to write cast {}: {e}", path.display()),
+    }
+}
+
+/// Dump the current screen (plain text and HTML) into
+/// `$GROK_PTY_CAST_DIR/<file_stem>.{txt,html}` when the env var is set.
+/// Failures are logged, never fatal — same opt-in as
+/// [`write_cast_if_requested`].
+pub(crate) fn write_screen_dump_if_requested(harness: &PtyHarness, file_stem: &str) {
+    let Ok(dir) = std::env::var("GROK_PTY_CAST_DIR") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create dump dir {}: {e}", dir.display());
+        return;
+    }
+    for (ext, body) in [
+        ("txt", harness.screen_contents()),
+        ("html", harness.screen_html()),
+    ] {
+        let path = dir.join(format!("{file_stem}.{ext}"));
+        match std::fs::write(&path, body) {
+            Ok(()) => eprintln!("wrote screen dump: {}", path.display()),
+            Err(e) => eprintln!("failed to write screen dump {}: {e}", path.display()),
+        }
     }
 }
 

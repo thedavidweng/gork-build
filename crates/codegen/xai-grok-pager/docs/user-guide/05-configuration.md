@@ -371,13 +371,12 @@ disabled = ["user/a1b2c3d4/noisy-plugin"]
 
 ### Hints
 
-`[hints]` holds small persisted UI preferences — mostly "stop asking me" opt-outs. Grok writes these for you when you pick a "don't ask again" option in the TUI, but you can edit or delete them by hand; removing a key restores the default.
+`[hints]` holds small persisted UI preferences: remembered answers and modal layout. Grok writes these for you as you use the TUI, but you can edit or delete them by hand; removing a key restores the default.
 
-`[hints]` is read from the **effective config merge**, with the usual precedence: system managed → user `managed_config.toml` → user `config.toml` → user `requirements.toml` → system `requirements.toml`, higher layers winning. The TUI only ever **writes** opt-outs to your user `~/.grok/config.toml`.
+`[hints]` is read from the **effective config merge**, with the usual precedence: system managed → user `managed_config.toml` → user `config.toml` → user `requirements.toml` → system `requirements.toml`, higher layers winning. The TUI only ever **writes** these to your user `~/.grok/config.toml`.
 
 ```toml
 [hints]
-project_picker_disabled = false        # skip the project-directory picker
 memory_modal_fullscreen = false        # remember the memory modal fullscreen state
 new_session_worktree_mode = "never"    # /new worktree prompt: "ask" | "always" | "never"
 fork_worktree_mode = "ask"             # /fork worktree prompt: "ask" | "always" | "never"
@@ -385,7 +384,6 @@ fork_worktree_mode = "ask"             # /fork worktree prompt: "ask" | "always"
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `project_picker_disabled` | bool | `false` | When `true`, skips the picker that asks you to choose a project directory on the first prompt when Grok launches from a non-project directory (home, Desktop, Downloads, `/tmp`). Set automatically when you choose **"Don't ask me again"** in that picker. Teams can pin it in `managed_config.toml` or `requirements.toml`. |
 | `memory_modal_fullscreen` | bool | `false` | Remembers whether the memory modal was last opened fullscreen. |
 | `new_session_worktree_mode` | string | `"never"` | Worktree prompt for `/new`: `ask` shows the popup, `always` creates a worktree, `never` skips it. |
 | `fork_worktree_mode` | string | `"ask"` | Worktree prompt for `/fork`: `ask`, `always`, or `never`. |
@@ -486,7 +484,7 @@ Keyboard shortcuts are **not** configurable — all bindings are built in. See [
 These are independent knobs (see [Monitoring Usage](24-monitoring-usage.md#related-settings)):
 
 - **`[features] telemetry`** / `GROK_TELEMETRY_ENABLED` — the product-analytics master switch. `/privacy` doesn't change it.
-- **`/privacy`** / Settings — coding-data sharing, separate from telemetry.
+- **Coding data, retention, and training** — the Settings row `/privacy` opens; coding-data sharing, separate from telemetry.
 - **`[telemetry] trace_upload`** / `GROK_TELEMETRY_TRACE_UPLOAD` — session traces; follows telemetry when unset.
 - **`[telemetry] otel_*`** / `GROK_EXTERNAL_OTEL` — external OTEL to your own collector (below).
 
@@ -630,7 +628,7 @@ gap_right = 0                         # gap between scrollbar and screen edge
 [scrollback.scroll]
 margin = 0                            # minimum context lines above/below selection
 min_page_fraction = 0                 # minimum scroll as % of viewport (0-100)
-follow_indicator = "center"           # follow indicator: "center" or "none"
+follow_indicator = "center"           # ▼/▲ scroll indicators: "center" or "none"
 follow_auto_select = true             # auto-select latest entry in follow mode
 follow_by_overscroll = true           # scrolling past bottom engages follow mode
 anchor_on_fold = true                 # keep block position when folding
@@ -727,6 +725,7 @@ The key ones. See the README for the complete list.
 | `GROK_WEB_FETCH_ALLOW_LOCAL` | Allow `web_fetch` to explicit loopback hosts only (`localhost` / `127.0.0.0/8` / `::1`). Same as `[toolset.web_fetch] allow_local`. Default off; private/metadata stay blocked. |
 | `GROK_AGENT` | Custom agent definition path or name |
 | `GROK_SANDBOX` | Sandbox profile (off, workspace, devbox, read-only, strict; or a custom profile name) |
+| `GROK_EXIT_TIMEOUT_SECS` | Seconds after a quit is requested before the process is force-exited if teardown hangs (default: 20, `0` disables; a hard exit follows 5s later) |
 
 ### Logging
 

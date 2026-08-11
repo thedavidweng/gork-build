@@ -1,24 +1,48 @@
-//! Auxiliary model-call concern for `SessionActor`: side questions, recap
-//! generation, and AI-suggest.
+//! Recap and `/btw` side questions on `SessionActor`.
+//!
+//! Shared cache-aligned request setup lives in [`super::side_call`].
+//! Per-turn dashboard summary lifecycle lives in [`super::turn_summary`].
 
+use super::side_call::{AuxCall, log_prompt_cache_hit};
 use super::*;
 
-use crate::remote::DEFAULT_CONTEXT_WINDOW;
+use crate::session::SideQuestionError;
+use xai_grok_sampling_types::SamplingError;
 
+/// Retry policy for the one-shot `/btw` model call: 3 attempts total
+/// (1 try + 2 retries), 500ms → 1s jittered backoff. Deliberately short —
+/// nothing like the sampler actor's budget — so a fleet-wide capacity event
+/// can't multiply side-question traffic into a retry storm.
+fn side_question_retry_policy() -> backon::ExponentialBuilder {
+    backon::ExponentialBuilder::default()
+        .with_max_times(2)
+        .with_min_delay(std::time::Duration::from_millis(500))
+        .with_max_delay(std::time::Duration::from_secs(1))
+        .with_jitter()
+}
+
+/// Retry transient failures per the canonical [`SamplingError::is_retryable`]
+/// rule (5xx incl. Cloudflare 52x, stream/connect glitches), minus the shared
+/// vetoes (`x-should-retry: false`, context length) and rate limits — a 429
+/// needs `Retry-After`-scale waits, not this sub-second budget.
+fn should_retry_side_question(e: &SamplingError) -> bool {
+    e.is_retryable() && !e.is_rate_limited() && !e.is_retry_vetoed()
+}
+
+/// Clone the base `/btw` request and stamp a fresh `req_id`, so retried
+/// attempts never collide in logs. Everything else is byte-identical.
+fn build_side_question_attempt(base: &ConversationRequest) -> ConversationRequest {
+    let mut request = base.clone();
+    request.x_grok_req_id = Some(format!("xai-btw-{}", uuid::Uuid::new_v4()));
+    request
+}
 impl SessionActor {
-    /// Handle a /btw side question — single-turn model call using the
-    /// parent session's full context.
-    ///
-    /// Approach:
-    /// - Keeps the parent's system prompt (conversation[0]) intact
-    /// - Passes the full conversation history (including tool calls/results)
-    /// - Includes tool definitions so the model knows capabilities
-    /// - Wraps the question in a `<system-reminder>` block in a user message
-    /// - Single turn, no tool execution
-    ///
-    /// Generates a unique btw session ID and persists the result to
-    /// `btw_history.jsonl` in the session folder.
-    pub(super) async fn handle_side_question(&self, question: &str) -> Result<String, String> {
+    /// Answers a `/btw` side question with one model call over the parent session's context, and saves it to `btw_history.jsonl` under a new
+    /// btw session ID. Client tool calls are dropped rather than run, hosted search still runs, and transient failures retry on a short budget.
+    pub(super) async fn handle_side_question(
+        &self,
+        question: &str,
+    ) -> Result<String, SideQuestionError> {
         let btw_session_id = format!("btw-{}", uuid::Uuid::new_v4());
         let parent_session_id = self.session_info.id.to_string();
         let asked_at = chrono::Utc::now();
@@ -26,67 +50,29 @@ impl SessionActor {
         let sampling_client = self
             .prepare_chat_completion(false)
             .await
-            .map_err(|e| format!("failed to prepare client: {e}"))?;
+            .map_err(|e| SideQuestionError::PrepareClient(e.to_string()))?;
 
         // Full conversation snapshot including system prompt, tool calls, and results.
-        // Strip reasoning/thinking blocks from assistant items so we don't send
-        // `ContentBlock::Thinking` without a top-level `thinking` config. The
-        // Anthropic Messages API rejects requests that include thinking blocks in
-        // messages but omit the `thinking` parameter.
+        let conversation = self.chat_state_handle.get_conversation().await;
         let mut items: Vec<ConversationItem> =
-            xai_chat_state::compaction_utils::strip_reasoning_blocks(
-                self.chat_state_handle.get_conversation().await,
-            );
+            if sampling_client.api_backend().requires_reasoning_strip() {
+                xai_chat_state::compaction_utils::strip_reasoning_blocks(conversation)
+            } else {
+                conversation
+            };
 
-        // /btw fires mid-turn, so the snapshot may end with an assistant
-        // message whose tool_calls have no matching ToolResult yet. The
-        // Anthropic Messages API rejects this with "tool_use ids were found
-        // without tool_result blocks". Truncate the trailing incomplete
-        // assistant+tool_result run.
-        while let Some(last) = items.last() {
-            match last {
-                ConversationItem::Assistant(a) if !a.tool_calls.is_empty() => {
-                    items.pop();
-                }
-                ConversationItem::ToolResult(_) => {
-                    items.pop();
-                }
-                _ => break,
-            }
-        }
+        // /btw fires mid-turn, so the snapshot may end with an assistant message whose tool_calls have no matching ToolResult yet.
+        crate::session::helpers::session_recap::pop_trailing_tool_run(&mut items);
 
-        // Wrap the question in a <system-reminder> user message.
-        let tag = self.reminder_wrapper_tag();
-        let wrapped_question = format!(
-            "<{tag}>This is a side question from the user. \
-             You must answer this question directly in a single response.\n\n\
-             IMPORTANT CONTEXT:\n\
-             - You are a separate, lightweight agent spawned to answer this one question\n\
-             - The main agent is NOT interrupted - it continues working independently in the background\n\
-             - You share the conversation context but are a completely separate instance\n\
-             - Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\n\n\
-             CRITICAL CONSTRAINTS:\n\
-             - You have NO tools available - you cannot read files, run commands, search, or take any actions\n\
-             - This is a one-off response - there will be no follow-up turns\n\
-             - You can ONLY provide information based on what you already know from the conversation context\n\
-             - NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n\
-             - If you don't know the answer, say so - do not offer to look it up or investigate\n\n\
-             Simply answer the question with the information you have.</{tag}>\n\n\
-             {question}"
-        );
-        items.push(ConversationItem::user(wrapped_question));
+        let (instruction, tool_specs, hosted_tools) =
+            self.side_question_prompt_and_tools(question).await;
+        items.push(instruction);
 
-        let tool_definitions = self.prepare_tool_definitions().await;
-        let tool_specs: Vec<ToolSpec> = tool_definitions.into_iter().map(ToolSpec::from).collect();
+        let sampling_config = self.chat_state_handle.get_sampling_config().await;
+        let reasoning_effort = sampling_config.as_ref().and_then(|c| c.reasoning_effort);
+        let model = sampling_config.map(|c| c.model).unwrap_or_default();
 
-        let model = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .unwrap_or_default();
-
-        let persist = |answer: String, success: bool, error: Option<String>| {
+        let persist = |answer: String, success: bool, error: Option<String>, attempts: u32| {
             let _ = self.notifications.persistence_tx.send(PersistenceMsg::Btw(
                 crate::session::persistence::BtwEntry {
                     btw_session_id: btw_session_id.clone(),
@@ -97,42 +83,92 @@ impl SessionActor {
                     model: model.clone(),
                     success,
                     error,
+                    attempts,
                 },
             ));
         };
 
-        // Don't set temperature explicitly — cli-chat-proxy may inject
-        // `thinking` config via request_defaults for thinking-enabled models,
-        // Anthropic requires temperature == 1 when thinking is enabled.
-        // Leaving it None lets the provider defaults apply correctly.
-        let request = ConversationRequest {
+        // Built once; each attempt clones it and stamps a fresh req_id, and retries are rare so the success path pays one clone.
+        let base_request = self.parent_cached_request(AuxCall {
             items,
             tools: tool_specs,
-            model: Some(model.clone()),
-            temperature: None,
-            x_grok_conv_id: Some(btw_session_id.clone()),
-            x_grok_req_id: Some(format!("xai-btw-{}", uuid::Uuid::new_v4())),
-            x_grok_session_id: Some(parent_session_id.clone()),
-            x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            ..Default::default()
-        };
+            hosted_tools,
+            model: model.clone(),
+            reasoning_effort,
+            backend: sampling_client.api_backend(),
+            conv_id: btw_session_id.clone(),
+            req_id: format!("xai-btw-{}", uuid::Uuid::new_v4()),
+        });
 
-        let response = sampling_client
-            .conversation_collect(request)
-            .await
-            .map_err(|e| {
-                let msg = format!("side question model call failed: {e}");
-                persist(String::new(), false, Some(msg.clone()));
-                msg
-            })?;
-        let content = response.assistant_text();
+        // conversation_collect is one-shot (no sampler-actor retry); /btw adds
+        // its own bounded transient-failure retry (policy + predicate above).
+        use backon::Retryable as _;
+        let attempts = std::cell::Cell::new(1u32);
+        let result =
+            (|| sampling_client.conversation_collect(build_side_question_attempt(&base_request)))
+                .retry(side_question_retry_policy())
+                .when(should_retry_side_question)
+                .notify(|e: &SamplingError, backoff: std::time::Duration| {
+                    attempts.set(attempts.get() + 1);
+                    tracing::warn!(
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "side question transient failure; retrying"
+                    );
+                })
+                .await;
 
-        if content.is_empty() {
-            persist(String::new(), false, Some("No response from model".into()));
-            return Err("No response from model".to_string());
+        match result {
+            Ok(response) => {
+                log_prompt_cache_hit("btw", sampling_client.api_backend(), &response);
+                let content = response.assistant_text();
+                if content.is_empty() {
+                    let err = SideQuestionError::EmptyResponse;
+                    persist(String::new(), false, Some(err.to_string()), attempts.get());
+                    return Err(err);
+                }
+                persist(content.clone(), true, None, attempts.get());
+                Ok(content)
+            }
+            Err(e) => {
+                let err = SideQuestionError::from(e);
+                persist(String::new(), false, Some(err.to_string()), attempts.get());
+                Err(err)
+            }
         }
-        persist(content.clone(), true, None);
-        Ok(content)
+    }
+
+    /// The `/btw` instruction and tools. Tools ship unchanged so the cached prefix matches, so only the prompt keeps the model from calling them.
+    async fn side_question_prompt_and_tools(
+        &self,
+        question: &str,
+    ) -> (
+        ConversationItem,
+        Vec<ToolSpec>,
+        Vec<xai_grok_sampling_types::HostedTool>,
+    ) {
+        let tag = self.reminder_wrapper_tag();
+        let instruction = ConversationItem::user(format!(
+            "<{tag}>This is a side question from the user. \
+             You must answer this question directly in a single response.\n\n\
+             IMPORTANT CONTEXT:\n\
+             - You are a separate, lightweight agent spawned to answer this one question\n\
+             - The main agent is NOT interrupted - it continues working independently in the background\n\
+             - You share the conversation context but are a completely separate instance\n\
+             - Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\n\n\
+             CRITICAL CONSTRAINTS:\n\
+             - Do NOT call any tools, respond with plain text only\n\
+             - A tool call cannot help you: nothing runs on the user's machine and you get no turn in which to read a result\n\
+             - This is a one-off response - there will be no follow-up turns\n\
+             - You can ONLY provide information based on what you already know from the conversation context\n\
+             - NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n\
+             - If you don't know the answer, say so - do not offer to look it up or investigate\n\n\
+             Simply answer the question with the information you have.</{tag}>\n\n\
+             {question}"
+        ));
+        // Same tools as the main turn: they serialize into the cached prefix, and a side question must not search past the active cutoff.
+        let tool_specs = self.turn_base_tool_specs(&self.prepare_tool_definitions().await);
+        (instruction, tool_specs, self.hosted_tools_for_turn())
     }
 
     /// Generate a session recap and broadcast it via
@@ -143,9 +179,8 @@ impl SessionActor {
     /// makes one tool-free model call, and emits the cleaned one-line summary
     /// for display only. It never mutates the conversation.
     ///
-    /// Best-effort: a failed or empty generation is logged and dropped — a
-    ///
-    /// missing recap must never disrupt the session.
+    /// Best-effort: a failed or empty generation is logged and dropped.
+    /// A missing recap must never disrupt the session.
     pub(super) async fn handle_recap(&self, auto: bool) {
         use crate::session::helpers::session_recap;
 
@@ -160,6 +195,12 @@ impl SessionActor {
         let last = if stored > main_turns {
             let healed = main_turns.saturating_sub(1);
             self.last_recap_main_turn.set(healed);
+            // Keep disk aligned after compaction/rewind so resume does not
+            // re-load a watermark above current main turns.
+            session_recap::save_recap_watermark(
+                &crate::session::persistence::session_dir(&self.session_info),
+                healed,
+            );
             healed
         } else {
             stored
@@ -183,7 +224,9 @@ impl SessionActor {
         }
 
         // Serialize recap work: watermark alone cannot exclude concurrent manual
-        // re-recaps once last == main_turns (in-flight or finished).
+        // re-recaps once last == main_turns (in-flight or finished). Claim after
+        // the gate with no await between check and set — LocalSet + Cell makes
+        // that atomic for concurrent spawn_local Recap cmds.
         if self.recap_in_flight.get() {
             tracing::debug!(auto, main_turns, "skipping recap: another recap in flight");
             if !auto {
@@ -196,8 +239,8 @@ impl SessionActor {
         // (not on failure/empty/cancel) so auto can retry later for this turn if needed.
         let clear_in_flight = || self.recap_in_flight.set(false);
 
-        let sampling_client = match self.prepare_chat_completion(false).await {
-            Ok(c) => c,
+        let setup = match self.prepare_side_call().await {
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "recap: failed to prepare sampling client");
                 clear_in_flight();
@@ -208,61 +251,26 @@ impl SessionActor {
                 return;
             }
         };
-
         let tag = self.reminder_wrapper_tag();
-        // Strip reasoning ONLY on the Anthropic Messages backend (it rejects
-        // thinking blocks without a `thinking` config). Every other backend
-        // keeps reasoning verbatim so the prefix matches the last turn and the
-        // provider's prefix KV cache stays warm. Mirrors compaction's
-        // `summary_strips_reasoning`.
-        let strip_reasoning =
-            sampling_client.api_backend() == crate::sampling::ApiBackend::Messages;
-
-        // Budget off the recap model's context window (today the session model).
-        // One read serves both the window and the model.
-        let sampling_config = self.chat_state_handle.get_sampling_config().await;
-        let context_window = sampling_config
-            .as_ref()
-            .map(|c| c.context_window.get())
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        let items =
-            session_recap::budget_recap_items(conversation, tag, strip_reasoning, context_window);
-
-        let model = sampling_config.map(|c| c.model).unwrap_or_default();
-
-        // Leave BOTH temperature and max_output_tokens unset: the cli-chat-proxy
-        // layer may inject a `thinking` budget for thinking-enabled models
-        // (which also forces temperature == 1), and a small max_output_tokens
-        // below that budget makes the call error or return empty — silently
-        // dropping the recap. The recap instruction keeps the body to
-        // ~25–40 words, and `clean_recap_text` caps it at a generous
-        // RECAP_MAX_CHARS safety net, so an explicit token cap isn't needed.
+        let items = session_recap::budget_recap_items(
+            conversation,
+            tag,
+            setup.strip_reasoning,
+            setup.context_window,
+        );
+        let strip_reasoning = setup.strip_reasoning;
+        let model = setup.model.clone();
         let started_at = chrono::Utc::now().to_rfc3339();
         let x_grok_conv_id = format!("recap-{}", uuid::Uuid::new_v4());
         let x_grok_req_id = format!("xai-recap-{}", uuid::Uuid::new_v4());
         // Clone the exact request items for the on-disk artifact (recap never
         // mutates conversation state, so this file is the only durable record).
         let chat_history_for_artifact = items.clone();
-        // Main-turn tool specs: tools serialize into the cached token prefix.
-        let tool_defs = self.prepare_tool_definitions().await;
-        let tools = self.turn_base_tool_specs(&tool_defs);
-        // Mirror the main turn's hosted tools so a recap can't search past the active cutoff.
-        let hosted_tools = self.hosted_tools_for_turn();
-        let request = ConversationRequest {
-            items,
-            tools,
-            hosted_tools,
-            model: Some(model.clone()),
-            temperature: None,
-            x_grok_conv_id: Some(x_grok_conv_id.clone()),
-            x_grok_req_id: Some(x_grok_req_id.clone()),
-            x_grok_session_id: Some(self.session_info.id.to_string()),
-            x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            prompt_cache_key: Some(self.session_info.id.to_string()),
-            ..Default::default()
-        };
+        let request = self
+            .side_call_request(&setup, items, x_grok_conv_id.clone(), x_grok_req_id.clone())
+            .await;
 
-        let response = match sampling_client.conversation_collect(request).await {
+        let response = match setup.client.conversation_collect(request).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "recap: model call failed");
@@ -288,6 +296,7 @@ impl SessionActor {
             }
         };
 
+        log_prompt_cache_hit("recap", setup.client.api_backend(), &response);
         let raw_response = response.assistant_text();
         let summary = session_recap::clean_recap_text(&raw_response);
         if summary.is_empty() {
@@ -392,12 +401,6 @@ impl SessionActor {
         .await;
     }
 
-    /// Invalidate in-flight recap (real user prompt at queue time / turn start).
-    pub(crate) fn cancel_pending_recap_for_new_prompt(&self) {
-        self.recap_epoch.set(self.recap_epoch.get().wrapping_add(1));
-    }
-
-    /// Whether `epoch` is stale because a newer prompt started.
     pub(crate) fn recap_was_cancelled(&self, epoch: u64) -> bool {
         self.recap_epoch.get() != epoch
     }
@@ -411,6 +414,10 @@ impl SessionActor {
         } else {
             self.last_recap_main_turn.set(main_turns);
             self.recap_in_flight.set(false);
+            crate::session::helpers::session_recap::save_recap_watermark(
+                &crate::session::persistence::session_dir(&self.session_info),
+                main_turns,
+            );
             true
         }
     }
@@ -687,5 +694,111 @@ impl SessionActor {
             "prompt suggest: response"
         );
         suggestion
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api(status: u16, message: &str, should_retry: Option<bool>) -> SamplingError {
+        SamplingError::Api {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            message: message.into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry,
+        }
+    }
+
+    #[test]
+    fn side_question_retries_transient_failures_only() {
+        // Transient: overload (stream + proxy-wrapped 500 + 529), generic
+        // 5xx, and Cloudflare edge 52x (SEV-576: /btw died on a 522).
+        assert!(should_retry_side_question(&SamplingError::StreamError {
+            error_type: "overloaded_error".into(),
+            message: "Overloaded".into(),
+        }));
+        assert!(should_retry_side_question(&api(
+            500,
+            "stream error (overloaded_error): Overloaded",
+            None
+        )));
+        for code in [503u16, 522, 529] {
+            assert!(
+                should_retry_side_question(&api(code, "transient", None)),
+                "{code} must retry"
+            );
+        }
+
+        // Server veto (`x-should-retry: false`) wins over any retryable status.
+        assert!(!should_retry_side_question(&api(
+            522,
+            "timed out",
+            Some(false)
+        )));
+        // Deterministic context-length failures never retry, even on 529.
+        assert!(!should_retry_side_question(&api(
+            529,
+            "invalid_request_error: prompt is too long: 300000 tokens > 200000 maximum",
+            None
+        )));
+        // Rate limits need Retry-After-scale waits, not this sub-second
+        // budget; origin TLS and client errors never clear on retry.
+        for code in [429u16, 525, 526, 400] {
+            assert!(
+                !should_retry_side_question(&api(code, "not transient", None)),
+                "{code} must NOT retry"
+            );
+        }
+    }
+
+    /// The wired policy: 3 attempts total, backoff within the configured
+    /// bounds (500ms + 1s base, jitter adds up to the current delay), and a
+    /// fresh request id stamped per attempt.
+    #[tokio::test(start_paused = true)]
+    async fn side_question_retry_wiring_caps_attempts_and_bounds_backoff() {
+        use backon::Retryable as _;
+
+        let calls = std::cell::Cell::new(0u32);
+        let start = tokio::time::Instant::now();
+        let result: Result<(), SamplingError> = (|| async {
+            calls.set(calls.get() + 1);
+            Err(SamplingError::StreamError {
+                error_type: "overloaded_error".into(),
+                message: "Overloaded".into(),
+            })
+        })
+        .retry(side_question_retry_policy())
+        .when(should_retry_side_question)
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 3, "1 try + 2 retries");
+        // Base delays 500ms + 1s; jitter adds (0, delay) per sleep.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_500),
+            "elapsed {elapsed:?} below minimum backoff"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_millis(3_100),
+            "elapsed {elapsed:?} above maximum backoff"
+        );
+    }
+
+    #[test]
+    fn side_question_attempts_get_fresh_request_ids() {
+        let base = ConversationRequest {
+            x_grok_conv_id: Some("btw-test".into()),
+            ..Default::default()
+        };
+        let a = build_side_question_attempt(&base);
+        let b = build_side_question_attempt(&base);
+        let (a_id, b_id) = (a.x_grok_req_id.unwrap(), b.x_grok_req_id.unwrap());
+        assert!(a_id.starts_with("xai-btw-"));
+        assert_ne!(a_id, b_id, "each attempt must get a fresh req_id");
+        // Everything except the request id is byte-identical to the base.
+        assert_eq!(a.x_grok_conv_id, base.x_grok_conv_id);
     }
 }

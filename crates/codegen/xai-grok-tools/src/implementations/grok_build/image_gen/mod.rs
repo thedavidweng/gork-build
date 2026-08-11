@@ -129,16 +129,18 @@ impl ImageGenClient {
             Ok::<(), xai_tool_runtime::ToolError>(())
         })?;
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(IMAGE_GEN_TIMEOUT_SECS))
-            .read_timeout(std::time::Duration::from_secs(IMAGE_GEN_READ_TIMEOUT_SECS))
-            .default_headers(headers)
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "Failed to build HTTP client: {e}"
-                ))
-            })?;
+        let http = xai_grok_extra_ca::with_extra_root_certificates(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(IMAGE_GEN_TIMEOUT_SECS))
+                .read_timeout(std::time::Duration::from_secs(IMAGE_GEN_READ_TIMEOUT_SECS))
+                .default_headers(headers),
+        )
+        .build()
+        .map_err(|e| {
+            xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "Failed to build HTTP client: {e}"
+            ))
+        })?;
 
         Ok(Self {
             http,
@@ -419,7 +421,7 @@ impl xai_tool_runtime::Tool for ImageGenTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "image_gen",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 

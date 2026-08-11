@@ -19,8 +19,9 @@ use super::app_view::AppView;
 /// (right-justified) on the marker line instead of as a standalone block.
 ///
 /// All three marker rails route through here: the driver's `PromptResponse`,
-/// the lost-RPC reconcile, and the viewer finalize. (Wake turns close
-/// markerless — see `finish_wake_turn` in acp_handler.) `event == None`
+/// the lost-RPC reconcile, and the viewer finalize. (Wake turns route through
+/// `finish_wake_turn` in acp_handler, which maps their stop reason and calls
+/// here only when a marker is due.) `event == None`
 /// (bash turns, rate-limit / re-auth UX that replaces the marker) flushes the
 /// held hooks as the legacy standalone lifecycle block so failures stay
 /// visible.
@@ -173,6 +174,24 @@ fn arm_driver_turn_end_reconcile(
     true
 }
 
+/// Formatted `TurnFailed` marker for an errored turn, or `None` when a
+/// dedicated banner (re-auth, overflow, disk-full, request-failed) already
+/// covers the failure.
+pub(in crate::app) fn turn_failed_event(
+    scrollback: &crate::scrollback::state::ScrollbackState,
+    agent_result: Option<&str>,
+    elapsed: std::time::Duration,
+) -> Option<SessionEvent> {
+    if super::dispatch::scrollback_has_recent_error_banner(scrollback) {
+        return None;
+    }
+    let raw = agent_result.unwrap_or("unknown error");
+    Some(SessionEvent::TurnFailed {
+        error: crate::app::error_display::format_request_failure(None, None, raw).message(),
+        elapsed: Some(elapsed),
+    })
+}
+
 fn driver_mid_active_work(agent: &AgentView) -> bool {
     matches!(
         agent.session.tracker.activity(),
@@ -272,12 +291,7 @@ pub(super) fn finalize_turn_from_terminal(
         // Rate limits drive a dedicated UX on the driver and are not actionable
         // from a viewer — don't surface a stray "Turn failed" line.
         Some("rate_limit") => None,
-        Some("error") => Some(SessionEvent::TurnFailed {
-            error: agent_result
-                .map(str::to_string)
-                .unwrap_or_else(|| "unknown error".to_string()),
-            elapsed: Some(elapsed),
-        }),
+        Some("error") => turn_failed_event(&agent.scrollback, agent_result, elapsed),
         // end_turn / max_tokens / max_turn_requests / refusal / unknown → done.
         _ => Some(SessionEvent::TurnCompleted {
             elapsed: Some(elapsed),

@@ -36,8 +36,9 @@ pub struct CampaignOverride {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DoomLoopRecoverySettings {
-    /// Send the `x-grok-doom-loop-check` header and parse the reported
-    /// triggers. `Some(false)` is a kill-switch; absent ⇒ client default (off).
+    /// Send the `x-grok-doom-loop-check` header, parse the reported
+    /// triggers, and resample confident loops. `Some(false)` is a
+    /// kill-switch; absent ⇒ client default (ON).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Highest `tail_repetition` threshold considered confident (clamped to
@@ -150,7 +151,7 @@ pub struct WorktreeAutoGcSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_age_by_kind: Option<std::collections::BTreeMap<String, WorktreeKindMaxAge>>,
-    /// Optional discovery rebuild + stale `.git/worktrees/` prune (default off).
+    /// Optional discovery rebuild + grok-scoped stale `.git/worktrees/` scrub (default off).
     #[serde(
         default,
         deserialize_with = "de_opt_bool_tolerant",
@@ -697,8 +698,9 @@ pub struct RemoteSettings {
     pub managed_mcps_enabled: Option<bool>,
     #[serde(default)]
     pub managed_mcp_gateway_tools_enabled: Option<bool>,
-    /// Fleet kill switch for the **external OTEL** stream (customer
-    /// collectors). Restrictive-only by construction: there is deliberately
+    /// Remote-policy disable lever for the **external OTEL** stream (customer
+    /// collectors); feeds `ExternalOtelRemotePolicy.force_disable`.
+    /// Restrictive-only by construction: there is deliberately
     /// no `external_otel_enabled` remote field — remote settings are fetched
     /// per-run and never persisted, so a remote "enable" could never reach
     /// init; org-wide enable ships via managed config instead. Applied
@@ -711,6 +713,9 @@ pub struct RemoteSettings {
     /// Tighten-only, like `external_otel_disabled`.
     #[serde(default)]
     pub external_otel_content_gates_locked: Option<bool>,
+    /// `Some(false)` disarms managed-config signature verification (remote kill-switch).
+    #[serde(default)]
+    pub managed_config_signature_verification: Option<bool>,
     #[serde(default)]
     pub telemetry_enabled: Option<bool>,
     /// Telemetry mode override (string): `"session-metrics"`, `"full"`, `"off"`.
@@ -845,7 +850,7 @@ pub struct RemoteSettings {
     #[serde(default)]
     pub worktree_type: Option<String>,
     /// Server-recommended default for `restore_code` in worktree resume.
-    /// Fallback when no local `[cli] restore_code` is set in config.toml.
+    /// Applied only when the client omits `restoreCode`.
     #[serde(default)]
     pub restore_code: Option<bool>,
     /// When `Some(true)`, Ctrl+C before the first server activity rewinds
@@ -856,6 +861,11 @@ pub struct RemoteSettings {
     /// Optional remote kill-switch; shell defaults ON when unset (set `false` to disable).
     #[serde(default)]
     pub session_recap: Option<bool>,
+    /// Enables the per-turn dashboard summary (one-line "what happened last
+    /// turn" generated at turn end). Optional remote kill-switch; shell
+    /// defaults ON when unset (set `false` to disable).
+    #[serde(default)]
+    pub turn_summary: Option<bool>,
     /// Enables the `ask_user_question` tool. Optional remote kill-switch:
     /// `Some(false)` strips the tool; `Some(true)` or absent → the shell
     /// default (ON). Feature-flagged via remote settings.
@@ -999,6 +1009,16 @@ pub struct RemoteSettings {
     /// further override per the resolver chain.
     #[serde(default)]
     pub auto_compact_threshold_percent: Option<u8>,
+    /// Max subagent nesting depth (`grok_build_settings.subagents_max_depth`).
+    #[serde(default)]
+    pub subagents_max_depth: Option<u32>,
+    #[serde(default)]
+    pub subagents_max_concurrent: Option<u32>,
+    /// `"queue"` or `"fail"`.
+    #[serde(default)]
+    pub subagents_limit_behavior: Option<String>,
+    #[serde(default)]
+    pub workflow_max_concurrent_agents: Option<u32>,
     /// Global system-prompt identity label. Per-model override wins; see
     /// `resolve_system_prompt_label`.
     #[serde(default)]

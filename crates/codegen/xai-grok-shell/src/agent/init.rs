@@ -23,12 +23,30 @@ pub fn bootstrap(
     auth_manager: &Arc<AuthManager>,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> Result<(AgentConfig, ModelsManager), String> {
-    // Fail closed before any policy is read: a tampered managed policy must not run unmanaged.
+    // Remote kill-switch before the gate (settings-only prefetch — no managed-config
+    // sync, so a live server cannot heal a tampered policy before fail-closed).
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::Bootstrap);
+    let mut cfg = cfg.clone();
+    {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.remote_settings");
+        ensure_remote_settings_side_effects(&mut cfg, false);
+    }
     crate::managed_config::managed_policy_gate()?;
-    let cfg = resolve_config(cfg, auth_manager);
-    cfg.validate_model_filters()?;
-    init_process(&cfg, auth_manager);
-    let models_manager = ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?;
+    let cfg = {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.resolve_config");
+        let cfg = resolve_config(&cfg, auth_manager);
+        cfg.validate_model_filters()?;
+        cfg
+    };
+    {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.init_process");
+        init_process(&cfg, auth_manager);
+    }
+    xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::ModelCatalog);
+    let models_manager = {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.models_manager");
+        ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?
+    };
 
     // Refresh on every auth refresh — the FSEvents watcher can silently die after
     // macOS sleep, stranding the catalog on bundled defaults.
@@ -46,6 +64,42 @@ pub(crate) fn exit_on_config_error<T>(e: String) -> T {
     xai_tty_utils::restore_native_stderr();
     eprintln!("\nConfiguration error:\n\n    {e}\n");
     std::process::exit(1);
+}
+
+/// Fill `remote_settings` if absent and apply process-global remote side effects
+/// (signature kill-switch and caches). Safe to call more than once.
+///
+/// `sync_managed`: when true, missing-settings fallback may also refresh
+/// managed-config. Must be false before the managed-policy gate.
+fn ensure_remote_settings_side_effects(cfg: &mut AgentConfig, sync_managed: bool) {
+    // Fallback: if the client didn't pre-supply remote settings, fetch them
+    // now so remote-settings-gated features work regardless of which client
+    // spawned us. Clients that already call `start_early_prefetch()` and
+    // thread the result into `cfg.remote_settings` skip this entirely.
+    if cfg.remote_settings.is_none() {
+        let handle = if sync_managed {
+            crate::agent::models::start_early_prefetch(Some(cfg.grok_com_config.clone()))
+        } else {
+            crate::agent::models::start_early_prefetch_settings_only(Some(
+                cfg.grok_com_config.clone(),
+            ))
+        };
+        if let Some(handle) = handle {
+            match handle.join() {
+                Ok(result) => {
+                    cfg.remote_settings = result.settings;
+                    crate::util::config::set_remote_campaigns_from_settings(
+                        cfg.remote_settings.as_ref(),
+                    );
+                    tracing::info!("remote_settings fetched as shell-level fallback");
+                }
+                Err(_) => {
+                    tracing::warn!("remote_settings fallback prefetch thread panicked");
+                }
+            }
+        }
+    }
+    crate::agent::config::apply_remote_settings_side_effects(cfg.remote_settings.as_ref());
 }
 
 /// Config transform: apply managed settings, fetch remote settings,
@@ -74,40 +128,21 @@ fn resolve_config(cfg: &AgentConfig, auth_manager: &AuthManager) -> AgentConfig 
         tracing::info!(field = %e.path, value = %e.value, source = %e.source, "policy override");
     }
 
-    // Fallback: if the client didn't pre-supply remote settings, fetch them
-    // now so remote-settings-gated features work regardless of which client
-    // spawned us.  Clients that already call `start_early_prefetch()` and
-    // thread the result into `cfg.remote_settings` skip this entirely.
-    if cfg.remote_settings.is_none()
-        && let Some(handle) =
-            crate::agent::models::start_early_prefetch(Some(cfg.grok_com_config.clone()))
-    {
-        match handle.join() {
-            Ok(result) => {
-                cfg.remote_settings = result.settings;
-                crate::util::config::set_remote_campaigns_from_settings(
-                    cfg.remote_settings.as_ref(),
-                );
-                tracing::info!("remote_settings fetched as shell-level fallback");
-            }
-            Err(_) => {
-                tracing::warn!("remote_settings fallback prefetch thread panicked");
-            }
-        }
-    }
+    // Idempotent: bootstrap may already have fetched + applied side effects for the gate.
+    // Full prefetch (with managed-config sync when stale) is allowed after the gate.
+    ensure_remote_settings_side_effects(&mut cfg, true);
     crate::util::config::sync_campaign_fields(&mut cfg);
-    crate::agent::config::apply_remote_settings_side_effects(cfg.remote_settings.as_ref());
 
     // env var > remote settings > Local. Skip remote settings for Generic (grok -p, subagents).
+    let has_xai_auth = auth_manager.current().is_some_and(|a| a.is_xai_auth());
     if cfg.storage_mode == StorageMode::Local
         && cfg.mode != crate::agent::config::AgentMode::Generic
     {
-        cfg.storage_mode = StorageMode::resolve(None, cfg.remote_settings.as_ref());
+        cfg.storage_mode =
+            StorageMode::from_remote_gated(cfg.remote_settings.as_ref(), has_xai_auth);
     }
-    // Writeback talks to the code backend; requires grok.com auth.
-    if cfg.storage_mode == StorageMode::Writeback
-        && !auth_manager.current().is_some_and(|a| a.is_xai_auth())
-    {
+    // A CLI/env-set Writeback still requires grok.com auth.
+    if cfg.storage_mode == StorageMode::Writeback && !has_xai_auth {
         tracing::info!("Writeback is disabled: requires auth with grok.com");
         cfg.storage_mode = StorageMode::Local;
     }
@@ -128,6 +163,13 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        // Every agent mode (stdio/headless/leader and the in-process TUI
+        // agent) passes through here, so diagnostic uploads always carry
+        // the version stamp and the resource ceilings in effect.
+        xai_grok_telemetry::unified_log::set_version(xai_grok_version::VERSION);
+        let limits = crate::util::limits::ProcessLimits::read();
+        limits.log();
+
         if !cfg!(test) {
             // Clear a logged-out team's files before the background sync runs.
             crate::managed_config::clear_orphan();
@@ -136,12 +178,16 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
 
         let grok_home = crate::util::grok_home::grok_home();
         crate::builtin::extract_builtin_files(&grok_home);
+        if !cfg!(test) {
+            // Deletes dirs; must never touch a unit-test process's real home.
+            crate::builtin::purge_stale_extracted_skills(&grok_home);
+        }
 
         crate::extensions::marketplace::purge_default_skills_installs(&grok_home);
 
-        // Auto-register is gated (default off; env/remote settings enables). Kept out
-        // of built-in extraction so the gate can read the resolved
-        // remote_settings, which resolve_config has populated by now.
+        // At boot remote_settings may still be None (fetches are backgrounded),
+        // so only an env opt-in fires here; the gate is re-evaluated once
+        // settings arrive (see `MvpAgent::reapply_official_marketplace`).
         if cfg.resolve_official_marketplace_auto_register().value {
             crate::extensions::marketplace::ensure_official_marketplace_source(&grok_home);
         }
@@ -170,6 +216,8 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
             );
         }
         update_telemetry_config(cfg, auth_manager);
+        // Emitted here: the event needs the client update_telemetry_config installs.
+        xai_grok_telemetry::session_ctx::log_event(limits.into_event());
     });
 }
 

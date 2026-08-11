@@ -68,6 +68,17 @@ mod inner {
         .expect("computer_hub_client_reconnects_by_cause_total must register once")
     });
 
+    static DISCONNECT_DETAIL_CLASS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "computer_hub_client_disconnect_detail_class_total",
+            "Disconnects with a transport error detail, by cause (transport_read_error |\
+             transport_write_error) and bounded detail_class (connection_reset | \
+             broken_pipe | unexpected_eof | timeout | connection_aborted | other).",
+            &["cause", "detail_class"]
+        )
+        .expect("computer_hub_client_disconnect_detail_class_total must register once")
+    });
+
     static RECONNECT_GAP_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
         register_histogram!(
             "computer_hub_client_reconnect_gap_seconds",
@@ -340,6 +351,12 @@ mod inner {
         RECONNECTS_BY_CAUSE_TOTAL.with_label_values(&[cause]).inc();
     }
 
+    pub(crate) fn disconnect_detail_class(cause: &str, detail_class: &str) {
+        DISCONNECT_DETAIL_CLASS_TOTAL
+            .with_label_values(&[cause, detail_class])
+            .inc();
+    }
+
     pub(crate) fn reconnect_gap_observe(secs: f64) {
         RECONNECT_GAP_SECONDS.observe(secs);
     }
@@ -414,6 +431,11 @@ mod inner {
 
     pub(crate) fn heartbeat_pong_dropped() {
         HEARTBEAT_PONG_DROPPED_TOTAL.inc();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn heartbeat_pong_dropped_count() -> u64 {
+        HEARTBEAT_PONG_DROPPED_TOTAL.get()
     }
 
     pub(crate) fn cancel_applied() {
@@ -544,6 +566,10 @@ mod inner {
 
 #[cfg(not(feature = "metrics"))]
 mod inner {
+    #[cfg(test)]
+    static TEST_HEARTBEAT_PONG_DROPPED: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     pub(crate) fn pool_connections_inc() {}
     pub(crate) fn pool_connections_dec() {}
     pub(crate) fn pool_evictions_inc() {}
@@ -551,6 +577,7 @@ mod inner {
     pub(crate) fn reconnect_failed(_reason: &str) {}
     pub(crate) fn reconnect_duration_observe(_secs: f64) {}
     pub(crate) fn reconnect_cause(_cause: &str) {}
+    pub(crate) fn disconnect_detail_class(_cause: &str, _detail_class: &str) {}
     pub(crate) fn reconnect_gap_observe(_secs: f64) {}
     pub(crate) fn call_dispatch_observe(_secs: f64) {}
     pub(crate) fn demux_inbox_depth_set(_depth: i64) {}
@@ -566,7 +593,15 @@ mod inner {
     pub(crate) fn writer_sink_send_error() {}
     pub(crate) fn reconnect_writer_resume() {}
     pub(crate) fn liveness_deadline_expired() {}
-    pub(crate) fn heartbeat_pong_dropped() {}
+    pub(crate) fn heartbeat_pong_dropped() {
+        #[cfg(test)]
+        TEST_HEARTBEAT_PONG_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn heartbeat_pong_dropped_count() -> u64 {
+        TEST_HEARTBEAT_PONG_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub(crate) fn cancel_applied() {}
     pub(crate) fn cancel_pending_tombstoned() {}
     pub(crate) fn cancel_no_target() {}
@@ -598,8 +633,11 @@ pub(crate) use inner::cancel_hook_received;
 pub(crate) use inner::cancel_no_target;
 pub(crate) use inner::cancel_pending_tombstoned;
 pub(crate) use inner::demux_inbox_depth_set;
+pub(crate) use inner::disconnect_detail_class;
 pub(crate) use inner::early_notif_buffered;
 pub(crate) use inner::heartbeat_pong_dropped;
+#[cfg(test)]
+pub(crate) use inner::heartbeat_pong_dropped_count;
 pub(crate) use inner::hook_send;
 pub(crate) use inner::inbox_full_notification_dropped;
 pub(crate) use inner::inbox_full_reject_send_failed;

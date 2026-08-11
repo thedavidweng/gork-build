@@ -2,20 +2,124 @@
 //! Co-located `#[path]`-style child of `mvp_agent` (`use super::*`) so the `impl`
 //! block keeps access to `MvpAgent`'s private fields.
 use super::*;
+/// Bound on close's wait for a prompt still in intake.
+pub(super) const CLOSE_INTAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound on close's wait for an in-flight attach.
+const CLOSE_ATTACH_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap on the sum of every close wait.
+pub(super) const CLOSE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// Bound on delete's wait for the subagent coordinator to drain a session's
+/// children. Separate from [`DRAIN_OLD_THREAD_WAIT`] (which bounds waiting out
+/// a flushing actor thread) so the two budgets can move independently.
+const DRAIN_SUBAGENTS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap on the sum of every delete wait (subagent drain + old-thread drain),
+/// mirroring [`CLOSE_TOTAL_BUDGET`] so the delete toast cannot outlast it.
+const DELETE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// `cap`, shrunk to what remains under `deadline`.
+fn stage_budget(deadline: tokio::time::Instant, cap: std::time::Duration) -> std::time::Duration {
+    cap.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+}
+/// What a close did. `Superseded`: a live session replaced the target and
+/// survived.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseOutcome {
+    Closed,
+    NotResident,
+    Superseded,
+}
+impl CloseOutcome {
+    /// The spelling clients see in the close response.
+    pub(crate) fn wire_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::NotResident => "notResident",
+            Self::Superseded => "superseded",
+        }
+    }
+}
 impl MvpAgent {
     /// Ask a live session actor to shut down.
     pub(crate) fn request_session_shutdown(&self, id: &acp::SessionId) {
-        if let Some(handle) = self.sessions.borrow().get(id) {
-            let _ = handle.cmd_tx.send(SessionCommand::Shutdown);
+        if let Some(handle) = self.resident_handle(id) {
+            let _ = handle
+                .cmd_tx
+                .send(SessionCommand::Shutdown(ShutdownKind::Graceful));
         }
     }
-    /// Finalize the cloud session replica (fire-and-forget, "Hook 4").
+    /// ACP `session/close` and its pre-ACP spelling. Orders behind prompt
+    /// intake; every wait spends from [`CLOSE_TOTAL_BUDGET`].
+    pub(crate) async fn close_active_session(&self, id: &acp::SessionId) -> CloseOutcome {
+        let deadline = tokio::time::Instant::now() + CLOSE_TOTAL_BUDGET;
+        self.wait_for_load_to_settle(id, stage_budget(deadline, CLOSE_ATTACH_SETTLE_WAIT))
+            .await;
+        let Some(target) = self.resident_handle(id).map(|h| h.cmd_tx.clone()) else {
+            return CloseOutcome::NotResident;
+        };
+        let intake = self.dispatch_lock(id);
+        let intake_guard =
+            tokio::time::timeout(stage_budget(deadline, CLOSE_INTAKE_WAIT), intake.lock())
+                .await
+                .ok();
+        match self.resident_handle(id).map(|h| h.cmd_tx.clone()) {
+            None => return CloseOutcome::NotResident,
+            Some(current) if !current.same_channel(&target) => {
+                return CloseOutcome::Superseded;
+            }
+            Some(_) => {}
+        }
+        if !self.hard_stop_resident(id, CancelTrigger::SessionClose) {
+            return CloseOutcome::NotResident;
+        }
+        drop(intake_guard);
+        self.remove_session_terminal(id, SessionLiveState::Completed);
+        self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+            .await;
+        self.finalize_session_replica(id);
+        CloseOutcome::Closed
+    }
+    /// Cancel the running turn and shut the actor down; `false` when not
+    /// resident. Close finalizes the replica afterward, delete must not.
+    fn hard_stop_resident(&self, id: &acp::SessionId, trigger: CancelTrigger) -> bool {
+        let Some(handle) = self.resident_handle(id) else {
+            return false;
+        };
+        let _ = handle.cmd_tx.send(SessionCommand::Cancel(CancelOptions {
+            cancel_subagents: true,
+            kill_background_tasks: true,
+            trigger: Some(trigger),
+            ..Default::default()
+        }));
+        let _ = handle
+            .cmd_tx
+            .send(SessionCommand::Shutdown(ShutdownKind::CancelRunningTurn));
+        true
+    }
+    /// Hard-stop before wiping history so delete cannot race live writers.
     ///
-    /// Marks the session **done** upstream, so this MUST only run on a genuine
-    /// session end — a terminal/explicit close (`x.ai/session/close`). It must
-    /// NOT run on a mere client disconnect or a dead-actor reap: those leave the
-    /// conversation resumable on disk, and finalizing would wrongly mark a still
-    /// running/resumable session "done".
+    /// Order matches [`Self::close_active_session`]: drop residency *before*
+    /// any await (the supervisor treats a finished still-resident actor as a
+    /// crash; awaiting subagent drain while resident races that sweep), and
+    /// every wait spends from a shared [`DELETE_TOTAL_BUDGET`] so the two
+    /// drains cannot stack into a toast twice as long as close's.
+    pub(crate) async fn teardown_live_session_before_delete(&self, id: &acp::SessionId) {
+        let deadline = tokio::time::Instant::now() + DELETE_TOTAL_BUDGET;
+        let resident = self.hard_stop_resident(id, CancelTrigger::SessionDelete);
+        if resident {
+            self.remove_session_terminal(id, SessionLiveState::Completed);
+        }
+        xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
+            self.subagent_event_tx.clone(),
+        )
+        .teardown_session_and_drain(&id.0, stage_budget(deadline, DRAIN_SUBAGENTS_WAIT))
+        .await;
+        if resident {
+            self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
+                .await;
+        }
+    }
+    /// Move the replica `active` -> `completed`. A hosting signal, not a
+    /// conversation ending: only an explicit close sends it.
     pub(super) fn finalize_session_replica(&self, id: &acp::SessionId) {
         #[cfg(test)]
         self.finalize_spy.borrow_mut().push(id.0.to_string());
@@ -28,60 +132,89 @@ impl MvpAgent {
             });
         }
     }
+    /// Clone of the hosted handle, if any. Callers must not hold a registry
+    /// borrow across an await: clone the handle out first.
+    pub(crate) fn resident_handle(&self, id: &acp::SessionId) -> Option<SessionHandle> {
+        self.session_registry.resident_handle(id)
+    }
+    pub(crate) fn is_resident(&self, id: &acp::SessionId) -> bool {
+        self.session_registry.is_resident(id)
+    }
+    /// Register or replace the hosted handle. Returns the displaced handle.
+    pub(crate) fn insert_resident(
+        &self,
+        id: &acp::SessionId,
+        handle: SessionHandle,
+    ) -> Option<SessionHandle> {
+        self.session_registry.put_resident(id, handle)
+    }
+    pub(crate) fn resident_count(&self) -> usize {
+        self.session_registry.resident_count()
+    }
+    pub(crate) fn resident_ids(&self) -> Vec<acp::SessionId> {
+        self.session_registry.resident_ids()
+    }
+    pub(crate) fn with_resident_mut<R>(
+        &self,
+        id: &acp::SessionId,
+        f: impl FnOnce(&mut SessionHandle) -> R,
+    ) -> Option<R> {
+        self.session_registry.with_resident_mut(id, f)
+    }
+    pub(crate) fn resident_cmd_txs(
+        &self,
+    ) -> Vec<tokio::sync::mpsc::UnboundedSender<SessionCommand>> {
+        let mut txs = Vec::new();
+        self.session_registry
+            .for_each_resident(|_, handle| txs.push(handle.cmd_tx.clone()));
+        txs
+    }
+    pub(crate) fn for_each_resident(&self, f: impl FnMut(&acp::SessionId, &SessionHandle)) {
+        self.session_registry.for_each_resident(f)
+    }
+    /// The funnel for a handle leaving residency: SIGKILLs the child-process
+    /// tree before the actor drains `Shutdown`, even on idle-unload, so a
+    /// wedged session's tree is still reclaimed.
+    pub(super) fn take_session(&self, id: &acp::SessionId) -> Option<SessionHandle> {
+        let handle = self.session_registry.take_resident(id);
+        if let Some(handle) = &handle
+            && let Some(scope) = &handle.tool_context.process_scope
+        {
+            scope.kill_all();
+        }
+        handle
+    }
     /// Remove a session without finalizing; it stays resumable on disk.
     pub(crate) fn remove_session(&self, id: &acp::SessionId) {
-        self.sessions.borrow_mut().remove(id);
-        self.dispatch_locks.borrow_mut().remove(id);
-        self.session_threads.borrow_mut().remove(id);
-        self.session_index_claims.borrow_mut().remove(id);
-        self.require_gateway_sessions.borrow_mut().remove(id);
-        self.model_unavailable_sessions
-            .borrow_mut()
-            .remove(id.0.as_ref());
-        self.permission_event_receivers.borrow_mut().remove(id);
-        self.session_turn_numbers.borrow_mut().remove(id);
-        self.session_live_state.borrow_mut().remove(id);
+        let _ = self
+            .subagent_event_tx
+            .send(xai_grok_tools::implementations::grok_build::task::types::SubagentEvent::TeardownSession {
+                parent_session_id: id.0.to_string(),
+                respond_to: None,
+            });
+        self.take_session(id);
+        self.session_registry.release(id);
         if let Some(ops) = self.workspace_ops.borrow().as_ref() {
             ops.end_local_session(id.0.as_ref());
         }
-        let _ = self
-            .subagent_event_tx
-            .send(xai_grok_tools::implementations::grok_build::task::types::SubagentEvent::DiscardSessionCompletions {
-                parent_session_id: id.0.to_string(),
-            });
+        self.log_resource_usage(xai_grok_telemetry::events::ResourceReportTrigger::SessionClose);
     }
-    /// Get-or-create the per-session dispatch lock (see
-    /// [`Self::dispatch_locks`]). Cheap clone of the shared `Rc`.
+    /// Per-session prompt-intake lock: prompts land in submission order and a
+    /// cancel cannot overtake the prompt it targets. Keep preambles lean.
     pub(super) fn dispatch_lock(&self, id: &acp::SessionId) -> std::rc::Rc<tokio::sync::Mutex<()>> {
-        self.dispatch_locks
-            .borrow_mut()
-            .entry(id.clone())
-            .or_default()
-            .clone()
-    }
-    /// Close a session in response to an **explicit** terminal close
-    /// (`x.ai/session/close`). Finalizes the cloud replica (genuine session
-    /// end), then removes the session terminally as `Completed`.
-    pub(crate) fn close_session_explicit(&self, id: &acp::SessionId) {
-        self.finalize_session_replica(id);
-        self.remove_session_terminal(id, SessionLiveState::Completed);
+        self.session_registry.dispatch_lock(id)
     }
     /// Record the coarse lifecycle state for a session.
     pub(super) fn set_session_live_state(&self, id: &acp::SessionId, state: SessionLiveState) {
-        self.session_live_state
-            .borrow_mut()
-            .insert(id.clone(), state);
+        self.session_registry.set_live(id, state);
     }
     /// Read the recorded lifecycle state for a session (test observability).
     #[cfg(test)]
     pub(super) fn session_live_state_for(&self, id: &acp::SessionId) -> Option<SessionLiveState> {
-        self.session_live_state.borrow().get(id).copied()
+        self.session_registry.live(id)
     }
-    /// Roster-delta hook for a terminally removed session. Broadcasts an
-    /// `x.ai/sessions/changed` notification with the session in `removed` so
-    /// every attached dashboard drops the row promptly. Also
-    /// records the call site (and the terminal state) for test observability,
-    /// since the `session_live_state` entry is dropped on removal.
+    /// Broadcast the removal delta; the spy records it because the live-state
+    /// entry is dropped with the session.
     pub(super) fn record_roster_delta(&self, id: &acp::SessionId, final_state: SessionLiveState) {
         #[cfg(test)]
         self.roster_delta_spy
@@ -94,30 +227,14 @@ impl MvpAgent {
         );
         self.emit_roster_changed(Vec::new(), vec![id.0.to_string()]);
     }
-    /// Roster-delta hook for a newly-resident / changed session. Broadcasts an
-    /// `x.ai/sessions/changed` notification with the current entry in
-    /// `upserted` so dashboards add/refresh the row.
+    /// Broadcast the upsert delta for a resident session.
     pub(crate) fn push_roster_delta_upserted(&self, id: &acp::SessionId) {
         if let Some(entry) = self.resident_roster_entry(id) {
             self.emit_roster_changed(vec![entry], Vec::new());
         }
     }
-    /// Emit an `x.ai/sessions/changed` upsert for a resident session with an
-    /// explicit `activity`, so every attached dashboard reflects a
-    /// turn-boundary transition (Working / Idle / NeedsInput) *immediately*
-    /// rather than waiting for the ≤1s roster poll (deltas are emitted
-    /// at turn-start/turn-end). Without this, a viewer client that holds no
-    /// local `AgentView` for the session only learns its activity from the
-    /// poll, so a turn driven by another client shows as `Idle` for up to a
-    /// poll interval — and not at all while that viewer's poll is dormant.
-    ///
-    /// The `activity` is supplied by the caller rather than read from
-    /// `resident_activity` because at turn-start the actor may not have
-    /// published `current_prompt_id` yet (it is set asynchronously once the
-    /// actor dequeues the `SessionCommand::Prompt`), so a natural read would
-    /// still observe `Idle`. The authoritative entry (cwd / worktree / model /
-    /// yolo) is built by `resident_roster_entry`, so it never diverges from
-    /// the polled entry; only the `activity` field is overridden.
+    /// Upsert with a caller-supplied activity: at turn-start the actor has not
+    /// published `current_prompt_id` yet, so a natural read would say Idle.
     pub(super) fn push_roster_activity_delta(
         &self,
         id: &acp::SessionId,
@@ -128,11 +245,8 @@ impl MvpAgent {
             self.emit_roster_changed(vec![entry], Vec::new());
         }
     }
-    /// Fan an `x.ai/sessions/changed` delta out to every attached client.
-    ///
-    /// This is a roster-wide notification (no `sessionId`), so the leader IPC
-    /// server broadcasts it to all clients rather than routing by session (see
-    /// the `x.ai/sessions/changed` special-case in `leader/server.rs`).
+    /// Roster-wide notification (no `sessionId`): the leader broadcasts it to
+    /// every client instead of routing by session.
     pub(super) fn emit_roster_changed(
         &self,
         upserted: Vec<crate::agent::roster::RosterEntry>,
@@ -150,21 +264,15 @@ impl MvpAgent {
                 ));
         }
     }
-    /// Coarse activity of a resident session for the dashboard status column.
-    ///
-    /// Precedence: a non-empty pending-interaction map →
-    /// `NeedsInput` (wins even over a running turn — a session awaiting a
-    /// permission *mid-turn* is "needs input"); else a running turn →
-    /// `Working`; else map the coarse `SessionLiveState`.
+    /// Dashboard activity. Precedence: NeedsInput (even mid-turn), then
+    /// Working, then the coarse `SessionLiveState`.
     pub(super) fn resident_activity(
         &self,
         id: &acp::SessionId,
     ) -> crate::agent::roster::RosterActivity {
         use crate::agent::roster::RosterActivity;
         let (needs_input, turn_running) = self
-            .sessions
-            .borrow()
-            .get(id)
+            .resident_handle(id)
             .map(|h| {
                 let needs_input = h
                     .pending_interactions
@@ -185,23 +293,22 @@ impl MvpAgent {
         if turn_running {
             return RosterActivity::Working;
         }
-        match self.session_live_state.borrow().get(id).copied() {
+        match self.session_registry.live(id) {
             Some(SessionLiveState::Completed) => RosterActivity::Completed,
             Some(SessionLiveState::DeadFailed) => RosterActivity::Dead,
             Some(SessionLiveState::Dormant) => RosterActivity::Dormant,
-            _ => RosterActivity::Idle,
+            Some(SessionLiveState::Attaching | SessionLiveState::Working) => RosterActivity::Idle,
+            Some(SessionLiveState::IdleResident) | None => RosterActivity::Idle,
         }
     }
-    /// Build a single roster entry for a resident session, or `None` if it is
-    /// not currently resident.
+    /// Roster entry for a resident session; `None` when not resident.
     pub(super) fn resident_roster_entry(
         &self,
         id: &acp::SessionId,
     ) -> Option<crate::agent::roster::RosterEntry> {
         let session_id = id.0.to_string();
         let (cwd, is_worktree, model_id, reasoning_effort, yolo) = {
-            let sessions = self.sessions.borrow();
-            let h = sessions.get(id)?;
+            let h = self.resident_handle(id)?;
             (
                 h.display_cwd.clone().unwrap_or_else(|| h.info.cwd.clone()),
                 h.display_cwd.is_some(),
@@ -210,12 +317,15 @@ impl MvpAgent {
                 h.yolo_mode,
             )
         };
+        let (title, last_turn_summary) = self
+            .resident_roster_titles
+            .borrow()
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
         Some(crate::agent::roster::RosterEntry {
-            title: self
-                .resident_roster_titles
-                .borrow()
-                .get(&session_id)
-                .cloned(),
+            title,
+            last_turn_summary,
             session_id,
             cwd,
             is_worktree,
@@ -230,14 +340,13 @@ impl MvpAgent {
     }
     /// Snapshot all resident sessions as roster entries (synchronous; no disk).
     pub(super) fn resident_roster_entries(&self) -> Vec<crate::agent::roster::RosterEntry> {
-        let ids: Vec<acp::SessionId> = self.sessions.borrow().keys().cloned().collect();
+        let ids: Vec<acp::SessionId> = self.resident_ids();
         ids.iter()
             .filter_map(|id| self.resident_roster_entry(id))
             .collect()
     }
-    /// Build the full roster: resident actors plus recently-touched on-disk
-    /// (`Dormant`) sessions. Resident wins on an id collision; hidden sessions
-    /// are excluded.
+    /// Full roster: resident actors plus recent on-disk sessions; resident
+    /// wins an id collision.
     pub(crate) async fn build_roster(&self) -> Vec<crate::agent::roster::RosterEntry> {
         let resident = self.resident_roster_entries();
         let summaries = crate::session::persistence::list_recent_summaries(200)
@@ -252,12 +361,15 @@ impl MvpAgent {
         *self.resident_roster_titles.borrow_mut() = entries
             .iter()
             .filter(|e| e.resident)
-            .filter_map(|e| Some((e.session_id.clone(), e.title.clone()?)))
+            .map(|e| {
+                (
+                    e.session_id.clone(),
+                    (e.title.clone(), e.last_turn_summary.clone()),
+                )
+            })
             .collect();
     }
-    /// Terminally remove a session: emit the roster delta with its final state,
-    /// then drop it from all maps (no finalize — callers that need finalize do
-    /// it first, see `close_session_explicit`).
+    /// Emit the final roster delta, then drop the session from all maps.
     pub(super) fn remove_session_terminal(
         &self,
         id: &acp::SessionId,
@@ -266,50 +378,31 @@ impl MvpAgent {
         self.record_roster_delta(id, final_state);
         self.remove_session(id);
     }
-    /// Reap a session whose **resident** actor thread exited unexpectedly
-    /// (panic / load failure). Demotes it to `DeadFailed`, emits the roster
-    /// delta, and removes it WITHOUT finalize — the conversation persists on
-    /// disk and stays resumable (reaping a dead actor is harmless;
-    /// it demotes to Dormant).
+    /// Reap a resident actor that exited unexpectedly; the conversation stays
+    /// resumable on disk.
     pub(super) fn reap_dead_session(&self, id: &acp::SessionId) {
         self.remove_session_terminal(id, SessionLiveState::DeadFailed);
     }
-    /// Sweep `session_threads` for finished threads and clean them up.
-    ///
-    /// A finished thread has two distinct meanings, and conflating them
-    /// corrupts the `SessionLiveState` roster source:
-    ///
-    /// - **Still resident in `sessions`** → the actor exited unexpectedly while
-    ///   the session was hosted (panic / load failure). Reap as `DeadFailed`.
-    /// - **Not resident** (already idle-unloaded → `Dormant`, or explicitly
-    ///   closed) → this is the *expected* clean exit. The `SessionThread` was
-    ///   kept only so `drain_old_session_thread` could wait on it; now that it
-    ///   has finished there is nothing left to drain, so just drop the leftover
-    ///   `SessionThread`/state entries. Do **not** demote to `DeadFailed` and do
-    ///   **not** emit a second roster delta.
-    ///
-    /// `JoinHandle::is_finished()` is non-blocking and cannot distinguish a
-    /// clean exit from a panic on its own, which is exactly why the residency
-    /// check is required. Runs both opportunistically and from the join-handle
-    /// supervisor (`ensure_session_supervisor`).
+    /// Reap finished actor threads. Resident and finished is a crash
+    /// (`DeadFailed`); non-resident and finished is the expected clean exit,
+    /// dropped without demotion. `is_finished()` alone cannot tell them apart,
+    /// which is why residency decides.
     pub(super) fn sweep_dead_sessions(&self) {
-        let dead: Vec<acp::SessionId> = self
-            .session_threads
-            .borrow()
-            .iter()
-            .filter(|(_, t)| t.is_finished())
-            .map(|(id, _)| id.clone())
-            .collect();
+        let dead = self.session_registry.finished_threads();
         for id in dead {
-            if self.sessions.borrow().contains_key(&id) {
+            if self.session_registry.live(&id) == Some(SessionLiveState::Attaching)
+                && !self.is_resident(&id)
+            {
+                continue;
+            }
+            if self.is_resident(&id) {
                 tracing::warn!(
                     session_id = %id.0,
                     "Resident session actor exited unexpectedly; reaping as DeadFailed"
                 );
                 self.reap_dead_session(&id);
             } else {
-                self.session_threads.borrow_mut().remove(&id);
-                self.session_live_state.borrow_mut().remove(&id);
+                self.session_registry.clear_exited_thread(&id);
                 tracing::debug!(
                     session_id = %id.0,
                     "Reaped finished thread for non-resident session (clean exit)"
@@ -317,21 +410,10 @@ impl MvpAgent {
             }
         }
     }
-    /// Start the join-handle supervisor. **Idempotent.**
-    ///
-    /// A single `spawn_local` task periodically reaps actor threads that have
-    /// exited (panicked or finished) so a dead actor never lingers as a roster
-    /// zombie. `std::thread::JoinHandle` is not awaitable, so we poll
-    /// `is_finished()` on a tick — the same mechanism `drain_old_session_thread`
-    /// and `sweep_dead_sessions` already use. A panicked actor is therefore
-    /// reaped within one [`SESSION_SUPERVISOR_TICK`].
-    ///
-    /// The sweep body is wrapped in `catch_unwind` so a single panicking sweep
-    /// can never terminate the loop (which would silently disable reaping for
-    /// the rest of the process). The task holds a `LocalRef` (raw pointer) to
-    /// `self` for the lifetime of the `LocalSet`; this is sound because the
-    /// agent owns the `LocalSet` and outlives it (same contract as
-    /// `start_subagent_coordinator`), and `LocalRef` is `!Send`.
+    /// Idempotent join-handle supervisor: polls `is_finished()` each tick
+    /// (JoinHandle is not awaitable) and sweeps under `catch_unwind` so one
+    /// bad sweep cannot end supervision. The `LocalRef` to `self` is sound
+    /// because the agent owns and outlives the `LocalSet`.
     pub(super) fn ensure_session_supervisor(&self) {
         if self.supervisor_started.replace(true) {
             return;
@@ -352,42 +434,13 @@ impl MvpAgent {
             }
         });
     }
-    /// Coarse "any work pending" check for the idle-unload stub.
-    /// Returns `true` while the session has work in flight.
+    /// Any work in flight? Sync running-turn and parked-plan-approval checks,
+    /// then an async queue probe; conservative (busy) on poison or timeout.
     ///
-    /// Three layers:
-    /// 1. **Fast path (sync):** the shared `current_prompt_id` slot, which the
-    ///    actor sets while a turn is running (`maybe_start_running_task`) and
-    ///    clears via its RAII guard. A poisoned lock is treated as busy → never
-    ///    unload.
-    /// 1b. **Parked plan-approval (sync):** the shared `pending_interactions`
-    ///    slot. The parked plan-approval resume re-park is the one outstanding work with no
-    ///    running turn, so it needs its own sync check (the same shared-`Arc`
-    ///    idiom as `current_prompt_id`) rather than the async round-trip below.
-    /// 2. **Queue check (async):** when no turn is running, the actor is between
-    ///    turns and responsive, so we ask it whether `pending_inputs` is
-    ///    non-empty (a prompt queued at the turn boundary). This closes the
-    ///    sub-tick window where `current_prompt_id` is momentarily `None` but a
-    ///    queued input is about to be drained. On timeout we keep the session
-    ///    resident (conservative).
-    ///
-    /// TODO(PR-4): once the aggregate `SessionActivity` signal exists, also
-    /// consult the autonomous background sources so a detached session is never
-    /// idle-unloaded (→ `Shutdown` → `KillOnDrop`) while they are live:
-    /// `monitor_event_buffer`, pending scheduler fires,
-    /// `ToolContext.background_tasks`, and background subagent sessions. Until
-    /// then those background-only sessions rely on the keep-resident default and
-    /// the `current_prompt_id` auto-wake turn being active.
-    ///
-    /// TODO(PR-4): this is also inherently a *check-then-act* across the
-    /// actor-thread boundary — work can arrive (a new `Prompt`/auto-wake) in the
-    /// gap between this `IsBusy` answer and the caller's subsequent `Shutdown`,
-    /// so an idle-unload can still race a just-arrived turn. The actor processes
-    /// its mailbox in order, so the lost work is bounded and recoverable on
-    /// reload; PR-4 closes the gap properly by gating the unload inside the
-    /// actor (a single `Unload`-if-idle command) rather than check-then-send.
+    /// TODO: once the session actor can report its own aggregate activity,
+    /// including background work, move this gate inside the actor.
     pub(super) async fn session_has_live_work(&self, id: &acp::SessionId) -> bool {
-        let Some(handle) = self.sessions.borrow().get(id).cloned() else {
+        let Some(handle) = self.resident_handle(id) else {
             return false;
         };
         let turn_running = handle
@@ -407,8 +460,7 @@ impl MvpAgent {
             .await
             .unwrap_or(true)
     }
-    /// Entry counts for every collection [`Self::remove_session`] drains,
-    /// plus workspace bindings and shared coordinator state.
+    /// Counts for `x.ai/debug/agent`, including maps outside the registry.
     pub(crate) async fn registry_snapshot(&self) -> RegistrySnapshot {
         let subagents =
             xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend::new(
@@ -416,33 +468,46 @@ impl MvpAgent {
             )
             .registry_counts()
             .await;
+        let workspace_ops = self.workspace_ops.borrow();
+        let workspace = workspace_ops
+            .as_ref()
+            .and_then(|ops| ops.workspace_handle());
+        let counts = self.session_registry.counts();
         RegistrySnapshot {
-            sessions: self.sessions.borrow().len(),
-            session_threads: self.session_threads.borrow().len(),
-            dispatch_locks: self.dispatch_locks.borrow().len(),
-            session_turn_numbers: self.session_turn_numbers.borrow().len(),
-            permission_event_receivers: self.permission_event_receivers.borrow().len(),
-            model_unavailable_sessions: self.model_unavailable_sessions.borrow().len(),
-            session_live_state: self.session_live_state.borrow().len(),
-            session_index_claims: self.session_index_claims.borrow().len(),
-            require_gateway_sessions: self.require_gateway_sessions.borrow().len(),
+            sessions: self.resident_count(),
+            loading_sessions: self.session_registry.attaching_count(),
+            session_registry_entries: counts.entries,
+            session_threads: counts.session_threads,
+            resident_resources: counts.resident_resources,
+            retained_resources: counts.retained_resources,
+            dispatch_locks: counts.dispatch_locks,
+            session_turn_numbers: counts.session_turn_numbers,
+            permission_event_receivers: counts.permission_event_receivers,
+            model_unavailable_sessions: counts.model_unavailable_sessions,
+            session_live_state: counts.session_live_state,
+            session_index_claims: counts.session_index_claims,
+            require_gateway_sessions: counts.require_gateway_sessions,
             subagent_pending: subagents.pending,
             subagent_active: subagents.active,
             subagent_completed: subagents.completed,
-            workspace_bindings: self
-                .workspace_ops
-                .borrow()
-                .as_ref()
-                .and_then(|ops| ops.workspace_handle().map(|h| h.session_count())),
+            subagent_queued: subagents.queued,
+            workspace_bindings: workspace.map(|h| h.session_count()),
+            workspace_activity_sessions: workspace.map(|h| h.activity_tracker().session_count()),
         }
     }
 }
 /// Field names are the wire contract of `x.ai/debug/agent`'s `registries`
 /// object; each maps to the same-named registry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RegistrySnapshot {
+pub(crate) struct RegistrySnapshot {
     pub sessions: usize,
+    pub loading_sessions: usize,
+    /// Ids the session registry still tracks. Non-zero when every count below
+    /// is zero means an entry survived with a field none of them name.
+    pub session_registry_entries: usize,
     pub session_threads: usize,
+    pub resident_resources: usize,
+    pub retained_resources: usize,
     pub dispatch_locks: usize,
     pub session_turn_numbers: usize,
     pub permission_event_receivers: usize,
@@ -453,5 +518,8 @@ pub struct RegistrySnapshot {
     pub subagent_pending: usize,
     pub subagent_active: usize,
     pub subagent_completed: usize,
+    /// Spawns parked at the session concurrent limit.
+    pub subagent_queued: usize,
     pub workspace_bindings: Option<usize>,
+    pub workspace_activity_sessions: Option<usize>,
 }

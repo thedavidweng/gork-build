@@ -11,11 +11,14 @@ arc-swap = { workspace = true }
 dirs = { workspace = true }
 derive_more = { workspace = true, features = ["from", "try_into"] }
 dunce = { workspace = true }
+encoding_rs = { workspace = true, optional = true }
 fs2 = { workspace = true }
 educe = { workspace = true, features = ["Debug"] }
 async-openai = { workspace = true }
 xai-tty-utils = { workspace = true }
+xai-grok-auth = { workspace = true }
 xai-grok-config = { path = "../xai-grok-config" }
+xai-grok-extra-ca = { workspace = true }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-grok-version = { workspace = true }
@@ -30,6 +33,7 @@ ignore = { workspace = true }
 infer = { workspace = true }
 globset = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
+kamadak-exif = { workspace = true, optional = true }
 pdf_oxide = { workspace = true }
 # PPTX text extraction (implementations/read_file/pptx.rs). Deliberately NOT
 # `workspace = true`: the workspace `zip` pin has default features on, which
@@ -72,6 +76,7 @@ tokio = { workspace = true, features = [
 tokio-util = { workspace = true, features = ["compat"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true, optional = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wildmatch = { workspace = true }
@@ -85,6 +90,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 xai-file-utils = { path = "../xai-file-utils" }
+dhat = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 command-fds = { version = "0.3", features = ["tokio"] }
@@ -101,14 +107,17 @@ windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 dirs = { workspace = true }
+pretty_assertions = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 wiremock = { workspace = true }
+xai-grok-test-support = { workspace = true }
 xai-test-utils = { workspace = true }
 
 [build-dependencies]
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 flate2 = { workspace = true }
+sha2 = { workspace = true }
 tar = { workspace = true }
 
 [lints]
@@ -118,3 +127,4 @@ workspace = true
 default-bazel = ["serde"]
 default = ["serde"]
 serde = []
+dhat-heap = ["dep:dhat"]

@@ -3,7 +3,9 @@
 //! Inherent [`MvpAgent`] helpers (MCP/clients/gateway, settings/models, session ops, spawn).
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
+use crate::auth::PreferredAuthMethod;
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
+use xai_tty_utils::ProcessScope;
 /// `preferred` model, else catalog `current`, else first with own credentials.
 fn byok_from_models(
     models: &indexmap::IndexMap<String, ModelEntry>,
@@ -16,30 +18,56 @@ fn byok_from_models(
         .or_else(|| models.get(current).and_then(|m| m.own_credential()))
         .or_else(|| models.values().find_map(|m| m.own_credential()))
 }
+struct MissingSessionCtx {
+    has_session_key: bool,
+    has_own_credentials: bool,
+    is_session_based_auth: bool,
+    preferred: Option<PreferredAuthMethod>,
+}
+/// Warn only when a missing session is a real failure, not on API-key hosts.
+fn should_warn_missing_session(ctx: MissingSessionCtx) -> bool {
+    if ctx.has_session_key || ctx.has_own_credentials {
+        return false;
+    }
+    match ctx.preferred {
+        Some(PreferredAuthMethod::Oidc) => true,
+        Some(PreferredAuthMethod::ApiKey) => false,
+        None => ctx.is_session_based_auth,
+    }
+}
 impl MvpAgent {
+    /// Announce a session's new title over ACP. ACP scopes `session/update` to
+    /// sessions the client established, and a rename can name a history row it
+    /// never loaded, so the liveness check belongs here rather than at each
+    /// call site.
+    pub(crate) fn notify_session_info_update(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        title: &str,
+    ) {
+        if self.is_resident(session_id) {
+            self.gateway
+                .forward_fire_and_forget(
+                    crate::session::summary::session_info_update_manual(
+                        session_id.clone(),
+                        title,
+                    ),
+                );
+        }
+    }
     pub fn reload_skills_all_sessions(&self) -> usize {
-        let session_ids: Vec<agent_client_protocol::SessionId> = self
-            .sessions
-            .borrow()
-            .keys()
-            .cloned()
-            .collect();
+        let session_ids = self.resident_ids();
         for sid in &session_ids {
-            if let Some(handle) = self.sessions.borrow().get(sid).cloned() {
+            if let Some(handle) = self.resident_handle(sid) {
                 let _ = handle.cmd_tx.send(SessionCommand::ReloadSkills);
             }
         }
         session_ids.len()
     }
     pub fn advertise_commands_all_sessions(&self) -> usize {
-        let session_ids: Vec<agent_client_protocol::SessionId> = self
-            .sessions
-            .borrow()
-            .keys()
-            .cloned()
-            .collect();
+        let session_ids = self.resident_ids();
         for session_id in &session_ids {
-            if let Some(handle) = self.sessions.borrow().get(session_id).cloned() {
+            if let Some(handle) = self.resident_handle(session_id) {
                 let _ = handle.cmd_tx.send(SessionCommand::AdvertiseCommands);
             }
         }
@@ -160,31 +188,11 @@ impl MvpAgent {
             .current_or_expired()
             .is_some_and(|a| a.is_managed_mcp_eligible())
     }
-    /// Requires feature flag AND xAI authentication (OIDC or legacy WebLogin).
-    pub(super) fn can_fetch_managed_mcps(&self) -> bool {
-        let cfg = self.cfg.borrow();
-        cfg.managed_mcps_enabled && !cfg.managed_mcp_gateway_tools_enabled
-            && self.has_managed_mcp_auth()
-    }
     fn can_fetch_managed_mcp_gateway_tools(&self) -> bool {
         self.cfg.borrow().managed_mcp_gateway_tools_enabled
             && self.has_managed_mcp_auth()
     }
-    pub async fn get_managed_mcp_configs(
-        &self,
-    ) -> Vec<crate::session::managed_mcp::ManagedMcpConfig> {
-        if !self.can_fetch_managed_mcps() {
-            return vec![];
-        }
-        let proxy_url = self.cfg.borrow().endpoints.proxy_url();
-        crate::session::managed_mcp::fetch_managed_mcp_configs(
-                &self.managed_mcp_cache,
-                &proxy_url,
-                &self.auth_manager,
-            )
-            .await
-    }
-    pub async fn get_managed_mcp_gateway_tool_catalog(
+    pub(crate) async fn get_managed_mcp_gateway_tool_catalog(
         &self,
     ) -> Option<crate::session::managed_mcp::GatewayToolCatalog> {
         if !self.can_fetch_managed_mcp_gateway_tools() {
@@ -206,15 +214,20 @@ impl MvpAgent {
             )
             .await
     }
-    pub fn managed_mcp_cache(
+    pub(crate) fn managed_mcp_cache(
         &self,
     ) -> &crate::session::managed_mcp::ManagedMcpStateHandle {
         &self.managed_mcp_cache
     }
     pub(crate) fn disable_managed_gateway_tools_and_refresh_sessions(&self) {
-        self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
-            self.sessions.borrow().values().map(|handle| handle.cmd_tx.clone()).collect(),
-        );
+        self.disable_managed_gateway_tools_and_refresh_sessions_with_txs({
+            let mut txs = Vec::new();
+            self.session_registry
+                .for_each_resident(|_, handle| {
+                    txs.push(handle.cmd_tx.clone());
+                });
+            txs
+        });
     }
     fn disable_managed_gateway_tools_and_refresh_sessions_with_txs(
         &self,
@@ -229,12 +242,7 @@ impl MvpAgent {
         });
     }
     pub(crate) fn spawn_managed_gateway_tool_catalog_fetch(&self) {
-        let session_txs: Vec<_> = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|handle| handle.cmd_tx.clone())
-            .collect();
+        let session_txs = self.resident_cmd_txs();
         if !self.can_fetch_managed_mcp_gateway_tools() {
             self.disable_managed_gateway_tools_and_refresh_sessions_with_txs(
                 session_txs,
@@ -272,80 +280,39 @@ impl MvpAgent {
             }
         });
     }
-    /// Push a fresh legacy managed-MCP catalog into live sessions' per-session
-    /// `McpServers` (called after `mcp/list` with `cache=false`).
-    ///
-    /// The per-session `merge_managed_mcp_servers` re-reads disk, so the whole
-    /// broadcast is deferred off the `mcp/list` response-latency path via
-    /// `spawn_local`. This ONLY re-merges/pushes connectors; rebuilding the
-    /// agent-level gateway catalog's `search_tool` index is a separate,
-    /// independently-gated broadcast (see `refresh_mcp_search_index_in_sessions`),
-    /// because the two run in mutually-exclusive modes (legacy fetch only when
-    /// gateway tools are OFF, gateway fetch only when ON).
-    /// Caller must confirm the managed fetch succeeded (cache `Ready`) first: a
-    /// failed fetch returns an empty vec and syncing it tears down live servers.
-    pub(crate) fn sync_fresh_managed_mcp_to_sessions(
-        &self,
-        managed: &[crate::session::managed_mcp::ManagedMcpConfig],
-    ) {
-        let sessions: Vec<_> = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|handle| (
-                handle.cmd_tx.clone(),
-                handle.info.cwd.clone(),
-                handle.initial_client_mcp_servers.clone(),
-            ))
-            .collect();
-        if sessions.is_empty() {
-            return;
-        }
-        let compat = self.cfg.borrow().compat_resolved;
-        let plugin_snapshot = self.plugin_registry_handle.snapshot();
-        let managed = managed.to_vec();
-        tokio::task::spawn_local(async move {
-            let mut updated = 0u32;
-            for (cmd_tx, cwd, initial_client_mcp_servers) in sessions {
-                let cwd = std::path::PathBuf::from(cwd);
-                if crate::session::managed_mcp::merge_and_send_managed_mcp_update(
-                    &cmd_tx,
-                    &cwd,
-                    initial_client_mcp_servers,
-                    &managed,
-                    plugin_snapshot.as_deref(),
-                    &compat,
-                ) {
-                    updated += 1;
-                }
-            }
-            if updated > 0 {
-                tracing::info!(
-                    updated,
-                    managed_count = managed.len(),
-                    "synced fresh managed MCP catalog into live sessions"
-                );
-            }
-        });
-    }
     /// Rebuild `search_tool` in every live session after a fresh gateway tool
     /// catalog committed.
     ///
-    /// Gateway tools live in the agent-level catalog (not per-session
-    /// `McpServers`), so a fresh gateway catalog needs a session-side
-    /// `search_tool` rebuild even though the legacy managed cache stays
-    /// `NotFetched` in gateway mode. Callers gate on a successful refetch and
-    /// skip on failure to keep the last-good index.
+    /// Gateway tools live in the agent-level catalog, not per-session
+    /// `McpServers`. Callers skip on a failed refetch so the last-good index
+    /// stays.
     pub(crate) fn refresh_mcp_search_index_in_sessions(&self) {
-        let session_txs: Vec<_> = self
-            .sessions
-            .borrow()
-            .values()
-            .map(|handle| handle.cmd_tx.clone())
-            .collect();
+        let session_txs = self.resident_cmd_txs();
         for tx in session_txs {
             let _ = tx.send(SessionCommand::RefreshMcpSearchIndex);
         }
+    }
+    /// `mcp/list` catalog fetch: optional cache bust, then gateway list, then
+    /// fan `RefreshMcpSearchIndex` only when a fresh catalog commits.
+    ///
+    /// Gateway off (or no eligible auth) goes through
+    /// [`Self::get_managed_mcp_gateway_tool_catalog`], which disables the cache
+    /// the same way initialize does.
+    pub(crate) async fn fetch_gateway_catalog_for_mcp_list(
+        &self,
+        cache: bool,
+    ) -> Option<crate::session::managed_mcp::GatewayToolCatalog> {
+        if !cache {
+            crate::session::managed_mcp::invalidate_gateway_tool_cache(
+                    self.managed_mcp_cache(),
+                )
+                .await;
+        }
+        let catalog = self.get_managed_mcp_gateway_tool_catalog().await;
+        if !cache && catalog.is_some() {
+            self.refresh_mcp_search_index_in_sessions();
+        }
+        catalog
     }
     /// Resolve the launch dir's project-scope trust verdict ONCE and return it
     /// with its path.
@@ -372,15 +339,12 @@ impl MvpAgent {
     /// Resolve folder trust and load launch-dir MCP configs after `initialize`
     /// returns. The walks are synchronous and expensive in large monorepos; they
     /// must not block the ACP response (grok-desktop sends `initialize` immediately).
-    pub(super) fn spawn_initialize_launch_mcp_setup(&self, fetch_managed_mcps: bool) {
+    pub(super) fn spawn_initialize_launch_mcp_setup(&self) {
         let cwd = self.launch_cwd.clone();
         let compat = self.cfg.borrow().compat_resolved;
         let remote_settings = self.cfg.borrow().remote_settings.clone();
         let gateway = self.gateway.clone();
         let agent_mcp_state = self.agent_mcp_state.clone();
-        let managed_mcp_cache = self.managed_mcp_cache.clone();
-        let proxy_url = self.cfg.borrow().endpoints.proxy_url();
-        let auth_manager = self.auth_manager.clone();
         tokio::task::spawn_local(async move {
             let local_mcp_servers = match tokio::task::spawn_blocking(move || {
                     let local = crate::util::config::load_mcp_servers(&cwd, &compat);
@@ -402,32 +366,11 @@ impl MvpAgent {
             if !local_mcp_servers.is_empty() {
                 agent_mcp_state.lock().await.update_configs(local_mcp_servers.clone());
             }
-            crate::extensions::mcp::notify_servers_updated(
-                    &gateway,
-                    &[],
-                    &local_mcp_servers,
-                )
+            crate::extensions::mcp::notify_servers_updated(&gateway, &local_mcp_servers)
                 .await;
-            if !fetch_managed_mcps {
-                return;
-            }
-            let managed = crate::session::managed_mcp::fetch_managed_mcp_configs(
-                    &managed_mcp_cache,
-                    &proxy_url,
-                    &auth_manager,
-                )
-                .await;
-            if !managed.is_empty() {
-                crate::extensions::mcp::notify_servers_updated(
-                        &gateway,
-                        &managed,
-                        &local_mcp_servers,
-                    )
-                    .await;
-            }
         });
     }
-    pub fn agent_mcp_state(
+    pub(crate) fn agent_mcp_state(
         &self,
     ) -> std::sync::Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>> {
         self.agent_mcp_state.clone()
@@ -458,23 +401,29 @@ impl MvpAgent {
             "lazily populated plugin registry snapshot"
         );
     }
-    /// Fetch managed configs, merge with client servers, return merged list + earliest expiry.
+    /// Admit client servers and merge local / plugin / client sources.
+    ///
+    /// Plugin registry is ensured first; admit + merge then share one compat
+    /// snapshot.
     pub(super) async fn resolve_mcp_servers(
         &self,
         client_servers: Vec<acp::McpServer>,
         cwd: &std::path::Path,
-    ) -> (Vec<acp::McpServer>, Option<chrono::DateTime<chrono::Utc>>) {
+    ) -> (Vec<acp::McpServer>, Vec<acp::McpServer>) {
         self.ensure_plugin_registry();
-        let managed = self.get_managed_mcp_configs().await;
-        let expires_at = managed.iter().filter_map(|c| c.token_expires_at).min();
-        let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
+        let compat = self.cfg.borrow().compat_resolved;
+        let admitted = crate::session::managed_mcp::admit_client_mcp_servers(
             client_servers,
             cwd,
-            &managed,
-            self.plugin_registry_handle.snapshot().as_deref(),
-            &self.cfg.borrow().compat_resolved,
+            &compat,
         );
-        (merged, expires_at)
+        let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
+            admitted.clone(),
+            cwd,
+            self.plugin_registry_handle.snapshot().as_deref(),
+            &compat,
+        );
+        (admitted, merged)
     }
     /// Set the memory configuration (called from TUI after config resolution).
     pub fn set_memory_config(&mut self, config: crate::config::MemoryConfig) {
@@ -486,15 +435,28 @@ impl MvpAgent {
     ///
     /// Must be called right after construction: entries registered on the
     /// constructor-created default instance are NOT migrated.
-    pub fn set_activity(&mut self, activity: crate::agent::activity::AgentActivity) {
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: crate::agent::activity::AgentActivity,
+    ) {
         self.activity = activity;
+    }
+    /// Send [`SessionCommand::Shutdown`] to every live session actor and wait
+    /// up to `grace` for them to exit (SessionEnd hooks, memory save, etc.).
+    ///
+    /// Call on non-leader process quit **after** the cancel token fires but
+    /// **before** dropping the agent / exiting the process, so session actors
+    /// are not killed mid-hook. Mirrors the leader auto-update / relaunch
+    /// flush path ([`crate::agent::activity::AgentActivity::flush_all_sessions`]).
+    pub async fn flush_all_sessions(&self, grace: std::time::Duration) {
+        self.activity.flush_all_sessions(grace).await;
     }
     /// Install the channel that fans new session cwds into the leader's
     /// `ConfigFileWatcher::watch_path`. Called once after
     /// the watcher is constructed in `agent/app.rs`. In simple /
     /// non-leader mode the channel is never wired and
     /// `notify_session_cwd_for_watch` is a no-op.
-    pub fn set_config_watcher_path_tx(
+    pub(crate) fn set_config_watcher_path_tx(
         &mut self,
         tx: tokio::sync::mpsc::UnboundedSender<std::path::PathBuf>,
     ) {
@@ -691,7 +653,7 @@ impl MvpAgent {
     /// Most recently allocated turn number for `sid`, or `None` if the
     /// session has not started a turn yet.
     pub(crate) fn session_turn_number(&self, sid: &acp::SessionId) -> Option<u64> {
-        self.session_turn_numbers.borrow().get(sid).copied()
+        self.session_registry.turn_number(sid)
     }
     /// Return the current GrokAuth credentials, if authenticated and not expired.
     pub(crate) fn current_auth(&self) -> Option<crate::auth::GrokAuth> {
@@ -705,7 +667,7 @@ impl MvpAgent {
     }
     /// `true` when the agent runs in writeback storage mode.
     pub(crate) fn is_writeback_storage(&self) -> bool {
-        matches!(self.storage_mode, StorageMode::Writeback)
+        matches!(self.storage_mode.get(), StorageMode::Writeback)
     }
     /// Resolved cli-chat-proxy base for session features (via
     /// `proxy_url`). Not for the deployment-config fetch.
@@ -714,6 +676,596 @@ impl MvpAgent {
     }
     pub(crate) fn alpha_test_key(&self) -> Option<String> {
         self.cfg.borrow().endpoints.alpha_test_key.clone()
+    }
+    #[cfg(all(feature = "local-workspace", unix))]
+    /// Spawn owned `workspace_server` for chat+local `own` intent.
+    /// Mints `server_id` into `_meta` before handshake parse.
+    pub(crate) async fn start_own_local_workspace_if_needed(
+        &self,
+        meta: &mut Option<acp::Meta>,
+        session_cwd: &std::path::Path,
+    ) -> Result<
+        Option<crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle>,
+        acp::Error,
+    > {
+        use crate::gateway_bridge::local_workspace_supervisor::{
+            parse_local_workspace_intent, stamp_server_id_into_meta, start_own,
+            StartOwnConfig, LocalWorkspaceIntent,
+        };
+        let Some(LocalWorkspaceIntent::Own { cwd }) = parse_local_workspace_intent(
+            meta.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let cwd = if cwd.as_os_str().is_empty() {
+            session_cwd.to_path_buf()
+        } else {
+            cwd
+        };
+        crate::gateway_bridge::local_workspace_supervisor::validate_cwd(&cwd)
+            .map_err(|e| e.into_acp_error())?;
+        let hub_url = {
+            let cfg = self.cfg.borrow();
+            crate::gateway_bridge::local_workspace_supervisor::resolve_hub_url(
+                cfg.hub.url.as_deref(),
+            )
+        };
+        let handle = start_own(StartOwnConfig {
+                cwd,
+                hub_url,
+                auth_config: None,
+                binary: None,
+                ready_timeout: crate::gateway_bridge::local_workspace_supervisor::READY_TIMEOUT,
+                allow_missing_auth: false,
+            })
+            .await
+            .map_err(|e| e.into_acp_error())?;
+        let meta_map = meta.get_or_insert_with(acp::Meta::new);
+        stamp_server_id_into_meta(meta_map, &handle.server_id);
+        Ok(Some(handle))
+    }
+    #[cfg(all(feature = "local-workspace", unix))]
+    pub(crate) fn register_local_workspace_supervisor(
+        &self,
+        session_id: acp::SessionId,
+        handle: crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle,
+    ) {
+        let server_id = handle.server_id.clone();
+        self.arm_local_workspace_watcher(session_id.clone(), handle);
+        tracing::info!(
+            session_id = %session_id.0,
+            server_id = %server_id,
+            "local_workspace_supervisor: registered own workspace_server"
+        );
+    }
+    #[cfg(all(feature = "local-workspace", unix))]
+    pub(crate) fn new_local_workspace_reap_guard(
+        &self,
+        session_id: acp::SessionId,
+        armed: bool,
+    ) -> LocalWorkspaceReapGuard {
+        LocalWorkspaceReapGuard {
+            supervisors: self.local_workspace_supervisors.clone(),
+            generations: self.local_workspace_generations.clone(),
+            session_id,
+            armed,
+        }
+    }
+    /// Prefer live supervisor `server_id` over the parse-time stamp (pre-bridge crash).
+    #[cfg(all(feature = "local-workspace", unix))]
+    pub(crate) fn refresh_sessions_from_supervisor(
+        &self,
+        session_id: &acp::SessionId,
+        sessions: Option<Vec<crate::gateway_bridge::ComputerSession>>,
+    ) -> Option<Vec<crate::gateway_bridge::ComputerSession>> {
+        use crate::gateway_bridge::ComputerSession;
+        let supervisors = self.local_workspace_supervisors.borrow();
+        let Some(handle) = supervisors.get(session_id) else {
+            return sessions;
+        };
+        let server_id = handle.server_id.clone();
+        let cwd = Some(handle.cwd.to_string_lossy().into_owned());
+        match sessions {
+            None => Some(vec![ComputerSession::ExistingWorkspace { server_id, cwd }]),
+            Some(mut list) => {
+                for session in &mut list {
+                    if let ComputerSession::ExistingWorkspace {
+                        server_id: sid,
+                        cwd: existing_cwd,
+                    } = session {
+                        *sid = server_id.clone();
+                        if existing_cwd.is_none() {
+                            *existing_cwd = cwd.clone();
+                        }
+                    }
+                }
+                Some(list)
+            }
+        }
+    }
+    /// Wait out an in-flight crash restart before refreshing handshake sessions.
+    #[cfg(all(feature = "local-workspace", unix))]
+    pub(crate) async fn await_refresh_sessions_from_supervisor(
+        &self,
+        session_id: &acp::SessionId,
+        sessions: Option<Vec<crate::gateway_bridge::ComputerSession>>,
+    ) -> Option<Vec<crate::gateway_bridge::ComputerSession>> {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let pending = self
+                .local_workspace_restart_pending
+                .borrow()
+                .contains(session_id);
+            let live = self
+                .local_workspace_supervisors
+                .borrow()
+                .contains_key(session_id);
+            if live || !pending {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    "timed out waiting for local-workspace crash restart before handshake refresh"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        self.refresh_sessions_from_supervisor(session_id, sessions)
+    }
+    #[cfg(all(feature = "local-workspace", unix))]
+    fn arm_local_workspace_watcher(
+        &self,
+        session_id: acp::SessionId,
+        handle: crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle,
+    ) {
+        let cwd = handle.cwd.clone();
+        let sessions = self.session_registry.clone();
+        let supervisors = self.local_workspace_supervisors.clone();
+        let generations = self.local_workspace_generations.clone();
+        let sid = session_id.clone();
+        let hub_url = {
+            let cfg = self.cfg.borrow();
+            crate::gateway_bridge::local_workspace_supervisor::resolve_hub_url(
+                cfg.hub.url.as_deref(),
+            )
+        };
+        let auth_path = xai_grok_workspace::hub_auth::default_auth_path().ok();
+        let binary = crate::gateway_bridge::local_workspace_supervisor::resolve_workspace_server_bin()
+            .ok();
+        let agent_ref = LocalRef::new(self);
+        let generation = {
+            let mut gens = generations.borrow_mut();
+            let e = gens.entry(session_id.clone()).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        self.local_workspace_supervisors.borrow_mut().insert(session_id.clone(), handle);
+        let mut supervisors_mut = self.local_workspace_supervisors.borrow_mut();
+        let Some(handle_mut) = supervisors_mut.get_mut(&session_id) else {
+            return;
+        };
+        let _ = handle_mut
+            .spawn_exit_watcher(move || {
+                let sessions = sessions.clone();
+                let supervisors = supervisors.clone();
+                let generations = generations.clone();
+                let sid = sid.clone();
+                let hub_url = hub_url.clone();
+                let auth_path = auth_path.clone();
+                let binary = binary.clone();
+                let cwd = cwd.clone();
+                let agent_ref = agent_ref.clone();
+                tokio::task::spawn_local(async move {
+                    if generations.borrow().get(&sid) != Some(&generation) {
+                        return;
+                    }
+                    agent_ref
+                        .get()
+                        .local_workspace_restart_pending
+                        .borrow_mut()
+                        .insert(sid.clone());
+                    let prev = supervisors.borrow_mut().remove(&sid);
+                    let Some(prev) = prev else {
+                        agent_ref
+                            .get()
+                            .local_workspace_restart_pending
+                            .borrow_mut()
+                            .remove(&sid);
+                        return;
+                    };
+                    let Some(binary) = binary else {
+                        tracing::warn!(
+                        session_id = %sid.0,
+                        "local workspace crash restart skipped: binary missing"
+                    );
+                        prev.shutdown().await;
+                        agent_ref
+                            .get()
+                            .local_workspace_restart_pending
+                            .borrow_mut()
+                            .remove(&sid);
+                        return;
+                    };
+                    let auth = auth_path
+                        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
+                    let restart_count = prev.restart_count;
+                    let prev_cwd = prev.cwd.clone();
+                    prev.shutdown().await;
+                    match crate::gateway_bridge::local_workspace_supervisor::restart_own_from(
+                            restart_count,
+                            prev_cwd,
+                            &binary,
+                            &hub_url,
+                            &auth,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(new_handle) => {
+                            if generations.borrow().get(&sid) != Some(&generation) {
+                                new_handle.shutdown().await;
+                                agent_ref
+                                    .get()
+                                    .local_workspace_restart_pending
+                                    .borrow_mut()
+                                    .remove(&sid);
+                                return;
+                            }
+                            let new_id = new_handle.server_id.clone();
+                            let cwd_str = cwd.to_string_lossy().into_owned();
+                            agent_ref
+                                .get()
+                                .arm_local_workspace_watcher(sid.clone(), new_handle);
+                            agent_ref
+                                .get()
+                                .local_workspace_restart_pending
+                                .borrow_mut()
+                                .remove(&sid);
+                            let armed_generation = generations
+                                .borrow()
+                                .get(&sid)
+                                .copied();
+                            let bridge = sessions.bridge(&sid);
+                            if let Some(bridge) = bridge {
+                                let _ = crate::gateway_bridge::local_workspace_supervisor::push_computer_sessions_update(
+                                        &bridge,
+                                        new_id.clone(),
+                                        Some(cwd_str.clone()),
+                                        false,
+                                    )
+                                    .await;
+                                let _ = bridge.wait_until_ready().await;
+                                if generations.borrow().get(&sid)
+                                    != armed_generation.as_ref()
+                                {
+                                    tracing::debug!(
+                                    session_id = %sid.0,
+                                    "skip stale local-workspace session.update after superseded restart"
+                                );
+                                    return;
+                                }
+                                let _ = crate::gateway_bridge::local_workspace_supervisor::push_computer_sessions_update(
+                                        &bridge,
+                                        new_id,
+                                        Some(cwd_str),
+                                        false,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                            session_id = %sid.0,
+                            error = %err,
+                            "local workspace crash restart failed"
+                        );
+                            agent_ref
+                                .get()
+                                .local_workspace_restart_pending
+                                .borrow_mut()
+                                .remove(&sid);
+                        }
+                    }
+                });
+            });
+    }
+    /// add-only mid-session local workspace via ACP extension / session.update.
+    ///
+    /// Refuses if a local existing workspace is already bound (no remove until session end).
+    /// Own mode requires unix (supervisor spawn). Attach is platform-agnostic.
+    #[cfg(feature = "local-workspace")]
+    pub(crate) async fn add_local_workspace_mid_session(
+        &self,
+        session_id: &acp::SessionId,
+        mut meta: Option<acp::Meta>,
+        session_cwd: &std::path::Path,
+    ) -> Result<serde_json::Value, acp::Error> {
+        use crate::gateway_bridge::ComputerSession;
+        use crate::gateway_bridge::local_workspace_supervisor::{
+            parse_local_workspace_intent, LocalWorkspaceIntent, SupervisorError,
+        };
+        if self.local_workspace_already_bound(session_id) {
+            return Err(
+                acp::Error::invalid_params()
+                    .data(
+                        serde_json::json!({
+                "code": "local_workspace_already_bound",
+                "message": "local workspace already bound; remove is not supported until session end",
+            }),
+                    ),
+            );
+        }
+        self.mark_local_workspace_bound(session_id.clone());
+        let mut bind_guard = LocalWorkspaceBindGuard {
+            bound: self.local_workspace_bound.clone(),
+            session_id: session_id.clone(),
+            keep: false,
+        };
+        let Some(intent) = parse_local_workspace_intent(meta.as_ref()) else {
+            return Err(
+                acp::Error::invalid_params()
+                    .data(
+                        serde_json::json!({
+                "code": "local_workspace_intent_missing",
+                "message": "x.ai/local_workspace intent required for mid-session add",
+            }),
+                    ),
+            );
+        };
+        let mode = match &intent {
+            LocalWorkspaceIntent::Own { .. } => "own",
+            LocalWorkspaceIntent::Attach { .. } => "attach",
+        };
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let pending: Option<
+            crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle,
+        > = match intent {
+            LocalWorkspaceIntent::Own { .. } => {
+                #[cfg(unix)]
+                {
+                    self.start_own_local_workspace_if_needed(&mut meta, session_cwd)
+                        .await?
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = session_cwd;
+                    return Err(SupervisorError::UnsupportedPlatform.into_acp_error());
+                }
+            }
+            LocalWorkspaceIntent::Attach { cwd, .. } => {
+                if let Some(ref cwd) = cwd {
+                    crate::gateway_bridge::local_workspace_supervisor::validate_cwd(cwd)
+                        .map_err(|e| e.into_acp_error())?;
+                }
+                Self::ensure_attach_fs_only_advertised_tools()
+                    .map_err(|msg| {
+                        acp::Error::invalid_params()
+                            .data(
+                                serde_json::json!({
+                        "code": "local_workspace_fs_only_required",
+                        "message": msg,
+                    }),
+                            )
+                    })?;
+                None
+            }
+        };
+        let sessions = resolve_session_computer_sessions(meta.as_ref())?;
+        let Some(sessions) = sessions.filter(|s| !s.is_empty()) else {
+            return Err(
+                acp::Error::invalid_params()
+                    .data(
+                        serde_json::json!({
+                "code": "local_workspace_stamp_failed",
+                "message": "failed to resolve existing_workspace stamp for mid-session add",
+            }),
+                    ),
+            );
+        };
+        if !sessions
+            .iter()
+            .any(|s| matches!(s, ComputerSession::ExistingWorkspace { .. }))
+        {
+            return Err(
+                acp::Error::invalid_params()
+                    .data(
+                        serde_json::json!({
+                "code": "local_workspace_stamp_failed",
+                "message": "mid-session add did not produce existing_workspace",
+            }),
+                    ),
+            );
+        }
+        #[cfg(unix)]
+        let mut reap_guard = self
+            .new_local_workspace_reap_guard(session_id.clone(), false);
+        #[cfg(unix)]
+        if let Some(handle) = pending {
+            self.register_local_workspace_supervisor(session_id.clone(), handle);
+            reap_guard = self.new_local_workspace_reap_guard(session_id.clone(), true);
+        }
+        let Some(bridge) = self.gateway_bridge_for(session_id) else {
+            return Err(
+                acp::Error::invalid_params()
+                    .data(
+                        serde_json::json!({
+                "code": "gateway_bridge_missing",
+                "message": "session has no gateway bridge for session.update computer_sessions",
+            }),
+                    ),
+            );
+        };
+        match tokio::time::timeout(BRIDGE_READY_TIMEOUT, bridge.wait_until_ready()).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return Err(err.into_acp_error());
+            }
+            Err(_) => {
+                return Err(
+                    acp::Error::internal_error()
+                        .data(
+                            "gateway bridge not ready for mid-session add_local_workspace",
+                        ),
+                );
+            }
+        }
+        let sessions = sessions;
+        let server_id = match sessions.first() {
+            Some(ComputerSession::ExistingWorkspace { server_id, .. }) => {
+                server_id.clone()
+            }
+            _ => {
+                return Err(
+                    acp::Error::internal_error()
+                        .data("expected existing_workspace as first computer session"),
+                );
+            }
+        };
+        let cwd = match sessions.first() {
+            Some(ComputerSession::ExistingWorkspace { cwd, .. }) => cwd.clone(),
+            _ => None,
+        };
+        if let Some(ref stamped_cwd) = cwd {
+            crate::gateway_bridge::local_workspace_supervisor::validate_cwd(
+                    std::path::Path::new(stamped_cwd),
+                )
+                .map_err(|e| e.into_acp_error())?;
+        }
+        if let Err(err) = crate::gateway_bridge::local_workspace_supervisor::push_computer_sessions_update(
+                &bridge,
+                server_id.clone(),
+                cwd,
+                true,
+            )
+            .await
+        {
+            return Err(err.into_acp_error());
+        }
+        #[cfg(unix)] reap_guard.disarm();
+        bind_guard.keep = true;
+        Ok(serde_json::json!({
+            "ok": true,
+            "server_id": server_id,
+            "mode": mode,
+        }))
+    }
+    #[cfg(feature = "local-workspace")]
+    pub(crate) fn local_workspace_already_bound(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> bool {
+        if self.local_workspace_bound.borrow().contains(session_id) {
+            return true;
+        }
+        #[cfg(unix)]
+        if self.local_workspace_supervisors.borrow().contains_key(session_id) {
+            return true;
+        }
+        false
+    }
+    #[cfg(feature = "local-workspace")]
+    pub(crate) fn mark_local_workspace_bound(&self, session_id: acp::SessionId) {
+        self.local_workspace_bound.borrow_mut().insert(session_id);
+    }
+    /// Operator-attested FS-only toolset for mid-session attach.
+    #[cfg(feature = "local-workspace")]
+    fn ensure_attach_fs_only_advertised_tools() -> Result<(), String> {
+        const ENV: &str = "GROK_CHAT_LOCAL_WORKSPACE_ADVERTISED_TOOLS";
+        const ALLOW: &[&str] = &[
+            "workspace.fs_list",
+            "workspace.fs_exists",
+            "workspace.fs_read_file",
+            "workspace.fs_write_file",
+            "workspace.fs_delete_file",
+            "workspace.put_files",
+            "workspace.get_files",
+        ];
+        let Some(raw) = std::env::var(ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()) else {
+            return Err(
+                "attached workspace_server advertised toolset is uncheckable; refuse attach \
+                 (set GROK_CHAT_LOCAL_WORKSPACE_ADVERTISED_TOOLS to a comma-separated FS-only catalog)"
+                    .into(),
+            );
+        };
+        let ids: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Err(
+                "attached workspace_server advertised an empty toolset; refuse attach"
+                    .into(),
+            );
+        }
+        let forbidden: Vec<&str> = ids
+            .into_iter()
+            .filter(|id| !ALLOW.contains(id))
+            .collect();
+        if forbidden.is_empty() {
+            Ok(())
+        } else {
+            Err(
+                    format!(
+                "attached workspace_server advertises tools outside the FS-only allowlist: {}",
+                forbidden.join(", ")
+            ),
+                )
+        }
+    }
+    #[cfg(feature = "local-workspace")]
+    /// After chat+local stamp, wait for handshake success.
+    ///
+    /// Only fail-closed for `x.ai/local_workspace` intent (not generic
+    /// GatewayAttach). Handshake errors propagate; session + bridge are reaped
+    /// on failure / timeout.
+    pub(crate) async fn await_existing_workspace_handshake(
+        &self,
+        session_id: &acp::SessionId,
+        local_workspace_intent: bool,
+    ) -> Result<(), acp::Error> {
+        if !local_workspace_intent {
+            return Ok(());
+        }
+        #[cfg(feature = "local-workspace")]
+        self.mark_local_workspace_bound(session_id.clone());
+        let Some(bridge) = self.gateway_bridge_for(session_id) else {
+            return Ok(());
+        };
+        match tokio::time::timeout(BRIDGE_READY_TIMEOUT, bridge.wait_until_ready()).await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    error = %err,
+                    kind = "existing_workspace_handshake_failed",
+                    "chat+local handshake failed; reaping session"
+                );
+                self.request_session_shutdown(session_id);
+                self.remove_session(session_id);
+                Err(err.into_acp_error())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    kind = "existing_workspace_handshake_timeout",
+                    "chat+local handshake timed out; reaping session"
+                );
+                self.request_session_shutdown(session_id);
+                self.remove_session(session_id);
+                Err(
+                    acp::Error::internal_error().data("gateway bridge connect timed out"),
+                )
+            }
+        }
     }
     /// Build the process-lifetime local `WorkspaceOps` on first use.
     ///
@@ -812,17 +1364,17 @@ impl MvpAgent {
             xai_chat_state::AuthType::ApiKey
         }
     }
-    /// When `cached_token` cannot proceed, prefer non-interactive `xai.api_key`
-    /// iff `should_advertise_xai_api_key`; otherwise `grok.com`. Returns `None`
-    /// when `preferred_method` is pinned (fail-closed — no cross-method fallthrough).
+    /// Fall through to `xai.api_key` if the startup probe still allows it,
+    /// else `grok.com`. `None` when `preferred_method` is pinned.
     pub(super) fn cached_token_fallthrough_method_id(
         &self,
     ) -> Option<acp::AuthMethodId> {
         let preferred = self.cfg.borrow().grok_com_config.preferred_method;
         let id = auth_method::method_id_after_cached_token_unavailable(
-            auth_method::should_advertise_xai_api_key(
+            auth_method::should_advertise_xai_api_key_with_env_ok(
                 self.cfg.borrow().grok_com_config.api_key_auth_disabled(),
                 self.models_manager.models().values(),
+                self.auth_manager.first_party_env_api_key_ok(),
             ),
             preferred,
         )?;
@@ -875,19 +1427,183 @@ impl MvpAgent {
     pub(crate) fn deployment_key(&self) -> Option<String> {
         self.cfg.borrow().endpoints.deployment_key.clone()
     }
-    /// Re-fetch remote settings and re-init the telemetry client.
+    /// Apply settings side effects + push `x.ai/settings/update` to clients.
+    /// Shared tail for every settings-arrival site.
+    pub(super) fn on_remote_settings_changed(&self) {
+        crate::agent::config::apply_remote_settings_side_effects(
+            self.cfg.borrow().remote_settings.as_ref(),
+        );
+        if let Some(identity) = self
+            .auth_manager
+            .current_or_expired()
+            .filter(|a| a.is_xai_auth())
+            .map(|a| a.user_id)
+        {
+            self.tier_allowed
+                .set(
+                    super::settings_allow_access(
+                        self.cfg.borrow().remote_settings.as_ref(),
+                    ),
+                );
+            *self.allow_access_resolved_for.borrow_mut() = Some(identity);
+        }
+        self.reapply_storage_mode();
+        self.reapply_official_marketplace();
+        {
+            let cfg_snapshot = self.cfg.borrow().clone();
+            if self.session_registry.resident_count() == 0 {
+                self.models_manager.apply_config_reselecting_default(cfg_snapshot);
+            } else {
+                self.models_manager.apply_config(cfg_snapshot);
+            }
+        }
+        self.sync_collection_config_gate();
+        self.emit_settings_update_notification();
+        self.emit_announcements(AnnouncementsPushMode::IfChanged);
+        self.reconfigure_heap_profile_monitor();
+    }
+    /// Re-evaluates the official-marketplace auto-register gate now that
+    /// remote settings exist. `init_process` ran the same gate at boot without
+    /// them, so a settings-targeted (not env-set) team would otherwise never
+    /// register. Idempotent: a no-op once installed.
+    fn reapply_official_marketplace(&self) {
+        if self.cfg.borrow().resolve_official_marketplace_auto_register().value {
+            crate::extensions::marketplace::ensure_official_marketplace_source(
+                &crate::util::grok_home::grok_home(),
+            );
+        }
+    }
+    /// Upgrade storage mode from newly-arrived remote settings. Mirrors the
+    /// `resolve_config` gate: only upgrades from `Local`, writeback needs xai auth.
+    fn reapply_storage_mode(&self) {
+        if self.storage_mode.get() != StorageMode::Local {
+            return;
+        }
+        let resolved_mode = {
+            let cfg = self.cfg.borrow();
+            if cfg.mode == crate::agent::config::AgentMode::Generic {
+                return;
+            }
+            let has_xai_auth = self
+                .auth_manager
+                .current_or_expired()
+                .is_some_and(|a| a.is_xai_auth());
+            StorageMode::from_remote_gated(cfg.remote_settings.as_ref(), has_xai_auth)
+        };
+        if resolved_mode == self.storage_mode.get() {
+            return;
+        }
+        tracing::info!(?resolved_mode, "storage mode upgraded from remote settings");
+        self.storage_mode.set(resolved_mode);
+        if resolved_mode == StorageMode::Writeback {
+            self.session_registry
+                .for_each_resident(|_, handle| {
+                    let _ = handle
+                        .persistence_tx
+                        .send(crate::session::persistence::PersistenceMsg::UpgradeToWriteback {
+                            auth_manager: self.auth_manager.clone(),
+                        });
+                });
+        }
+    }
+    /// Run the blocking `/settings` fetch for `auth` off the runtime thread.
+    async fn fetch_settings(
+        &self,
+        auth: &crate::auth::GrokAuth,
+    ) -> crate::remote::SettingsFetch {
+        let (base_url, alpha) = {
+            let cfg = self.cfg.borrow();
+            (cfg.endpoints.proxy_url(), cfg.endpoints.alpha_test_key.clone())
+        };
+        let auth = auth.clone();
+        match tokio::task::spawn_blocking(move || crate::remote::fetch_settings_blocking(
+                &base_url,
+                &auth,
+                alpha.as_deref(),
+            ))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::warn!(error = %e, "settings fetch task panicked");
+                crate::remote::SettingsFetch::Retry
+            }
+        }
+    }
+    /// Fetch remote settings for `auth` and drive the external-OTEL gate from
+    /// the outcome. Re-closes the gate first only on an account switch, then
+    /// hands the outcome to [`OtelGate::resolve`], which returns the settings
+    /// only on a successful fetch for the still-live identity. Single seam for
+    /// both post-auth callers.
     ///
-    /// Called unconditionally from both auth handlers so that:
-    /// - First install / expired OIDC token: settings are fetched for
-    ///   the first time (the early prefetch had no auth to use).
-    /// - Reauth / account switch: settings are refreshed to reflect
-    ///   the new user's remote settings targeting attributes.
+    /// [`OtelGate::resolve`]: crate::agent::otel_gate::OtelGate::resolve
+    pub(super) async fn fetch_settings_resolving_gate(
+        &self,
+        auth: &crate::auth::GrokAuth,
+    ) -> Option<crate::util::config::RemoteSettings> {
+        let identity = auth.user_id.clone();
+        let channel = {
+            let proxy_url = self.cfg.borrow().endpoints.proxy_url();
+            crate::agent::otel_gate::policy_channel_for(&proxy_url)
+        };
+        self.otel_gate.rearm_on_switch(&identity, channel);
+        let outcome = self.fetch_settings_self_healing_401(auth).await;
+        let live = self.auth_manager.current_or_expired().map(|a| a.user_id);
+        self.otel_gate.resolve(&identity, outcome, live.as_deref())
+    }
+    /// Fetch settings; on a `401` try one self-healing [`AuthManager::auth`]
+    /// refresh and re-fetch if it yields a *different* token (recovers a 401
+    /// from a token that expired mid-fetch). The refresh is bounded by
+    /// `STARTUP_AUTH_REFRESH_TIMEOUT` so a wedged IdP can't hang the caller; on
+    /// timeout or error the original `Rejected` stands.
+    async fn fetch_settings_self_healing_401(
+        &self,
+        auth: &crate::auth::GrokAuth,
+    ) -> crate::remote::SettingsFetch {
+        let outcome = self.fetch_settings(auth).await;
+        if matches!(outcome, crate::remote::SettingsFetch::Rejected)
+            && let Ok(Ok(fresh)) = tokio::time::timeout(
+                    crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+                    self.auth_manager.auth(),
+                )
+                .await && fresh.key != auth.key
+        {
+            return self.fetch_settings(&fresh).await;
+        }
+        outcome
+    }
+    /// Writes remote settings into `cfg` along with the fields derived from
+    /// them, so no derived field drifts between post-fetch callers.
+    pub(super) fn store_remote_settings(
+        &self,
+        settings: crate::util::config::RemoteSettings,
+    ) {
+        let mut cfg = self.cfg.borrow_mut();
+        cfg.remote_settings = Some(settings);
+        crate::util::config::sync_campaign_fields(&mut cfg);
+        if let Some(v) = cfg
+            .remote_settings
+            .as_ref()
+            .and_then(|s| s.path_not_found_hints)
+        {
+            cfg.path_not_found_hints = v;
+        }
+    }
+    /// Stores settings and fans out side effects via
+    /// [`Self::on_remote_settings_changed`]. Shared tail for callers that do
+    /// not also re-init the telemetry client (those use
+    /// [`Self::refresh_remote_settings`]).
+    pub(super) fn install_remote_settings(
+        &self,
+        settings: crate::util::config::RemoteSettings,
+    ) {
+        self.store_remote_settings(settings);
+        self.on_remote_settings_changed();
+    }
+    /// Re-fetch remote settings, re-init the telemetry client, apply side
+    /// effects, and push `x.ai/settings/update` to clients. Called from both
+    /// auth handlers (first install + reauth/account switch).
     ///
-    /// This only refreshes `cfg.remote_settings` and re-inits the
-    /// telemetry client (the only global static). Other settings
-    /// derived from `remote_settings` (`is_trace_upload_enabled`,
-    /// `web_fetch_enabled`, etc.) are resolved lazily per-turn from
-    /// `cfg` and pick up the new values automatically.
     /// Agent-level fields materialised at startup (`worktree_type`,
     /// `restore_code`) are NOT re-resolved here; that requires a
     /// broader refactor of the init path.
@@ -900,11 +1616,11 @@ impl MvpAgent {
         let user_id = auth.user_id.clone();
         let team_id = auth.team_id.clone();
         let remote_was_absent = self.cfg.borrow().remote_settings.is_none();
-        let Some(settings) = self.fetch_remote_settings(auth.clone()).await else {
-            tracing::warn!("post-auth settings refresh failed (HTTP or parse error)");
+        let Some(settings) = self.fetch_settings_resolving_gate(auth).await else {
             return;
         };
         tracing::info!("post-auth settings refreshed");
+        self.store_remote_settings(settings);
         let (
             telemetry_config,
             telemetry_mode,
@@ -913,11 +1629,9 @@ impl MvpAgent {
             deployment_key,
             subscription_tier,
         ) = {
-            let mut cfg = self.cfg.borrow_mut();
-            cfg.remote_settings = Some(settings);
-            crate::util::config::sync_campaign_fields(&mut cfg);
-            crate::agent::config::apply_remote_settings_side_effects(
-                cfg.remote_settings.as_ref(),
+            let cfg = self.cfg.borrow();
+            crate::util::config::cache_remote_mcp_startup_timeout_secs(
+                cfg.remote_settings.as_ref().and_then(|s| s.mcp_startup_timeout_secs),
             );
             let telemetry_mode = cfg.resolve_telemetry_mode();
             let trace_upload = cfg.resolve_trace_upload();
@@ -943,7 +1657,6 @@ impl MvpAgent {
                 subscription_tier_display,
             )
         };
-        self.sync_collection_config_gate();
         let subscription_tier = resolve_subscription_tier_for_telemetry(
             subscription_tier,
             self.auth_manager.current_or_expired().as_ref(),
@@ -960,8 +1673,7 @@ impl MvpAgent {
             crate::http::shared_client(),
         );
         crate::auth::credential_provider::sync_external_otel_identity();
-        self.emit_announcements(AnnouncementsPushMode::IfChanged);
-        self.reconfigure_heap_profile_monitor();
+        self.on_remote_settings_changed();
         if remote_was_absent {
             self.spawn_auto_worktree_gc();
         }
@@ -993,6 +1705,82 @@ impl MvpAgent {
         self.emit_settings_update_notification();
         self.emit_announcements(AnnouncementsPushMode::Force);
         self.reconfigure_heap_profile_monitor();
+    }
+    /// Spawns a background task coalesced on `in_flight`: a request while one
+    /// is in flight is dropped. The task is bounded by
+    /// `SETTINGS_REAPPLY_TIMEOUT`. Returns whether a task was spawned.
+    fn spawn_coalesced_settings_task(
+        &self,
+        in_flight: &std::rc::Rc<std::cell::Cell<bool>>,
+        task: impl std::future::Future<Output = ()> + 'static,
+    ) -> bool {
+        if in_flight.replace(true) {
+            return false;
+        }
+        let in_flight = in_flight.clone();
+        tokio::task::spawn_local(async move {
+            struct ClearOnDrop(std::rc::Rc<std::cell::Cell<bool>>);
+            impl Drop for ClearOnDrop {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _clear = ClearOnDrop(in_flight);
+            let _ = tokio::time::timeout(crate::http::SETTINGS_REAPPLY_TIMEOUT, task)
+                .await;
+        });
+        true
+    }
+    /// Fire-and-forget remote settings refresh for new sessions (at most one
+    /// in flight).
+    pub(super) fn spawn_settings_reapply(&self) {
+        let agent_ref = LocalRef::new(self);
+        let auth_manager = self.auth_manager.clone();
+        let _spawned = self
+            .spawn_coalesced_settings_task(
+                &self.settings_reapply_in_flight,
+                async move {
+                    let auth_result = tokio::time::timeout(
+                            crate::http::STARTUP_FETCH_TIMEOUT,
+                            auth_manager.auth(),
+                        )
+                        .await;
+                    if let Ok(Ok(auth)) = auth_result {
+                        let agent = agent_ref.get();
+                        if agent.post_auth_settings_in_flight.get() {
+                            return;
+                        }
+                        agent.refresh_settings_and_reapply(&auth).await;
+                    }
+                },
+            );
+        #[cfg(test)]
+        if _spawned {
+            self.settings_reapply_spawn_count
+                .set(self.settings_reapply_spawn_count.get() + 1);
+        }
+    }
+    /// Resolve post-auth remote settings in the background so a slow or hung
+    /// `/settings` can't gate `authenticate` (and thus the client's first draw).
+    /// The external-OTEL gate stays fail-closed until this resolves; the result
+    /// reaches clients via `x.ai/settings/update`. Its own guard keeps an
+    /// in-flight reapply from coalescing away the authenticated identity.
+    pub(super) fn spawn_post_auth_settings(&self, auth: crate::auth::GrokAuth) {
+        let agent_ref = LocalRef::new(self);
+        let _spawned = self
+            .spawn_coalesced_settings_task(
+                &self.post_auth_settings_in_flight,
+                async move {
+                    let agent = agent_ref.get();
+                    agent.refresh_remote_settings(&auth).await;
+                    agent.maybe_fetch_post_auth_settings().await;
+                },
+            );
+        #[cfg(test)]
+        if _spawned {
+            self.post_auth_settings_spawn_count
+                .set(self.post_auth_settings_spawn_count.get() + 1);
+        }
     }
     /// Spawn the periodic remote-settings poll that pushes mid-session
     /// announcement changes to connected clients. Idempotent; plain loop (no
@@ -1155,7 +1943,7 @@ impl MvpAgent {
             ))
             .await
         {
-            Ok(settings) => settings,
+            Ok(outcome) => outcome.into_option(),
             Err(e) => {
                 tracing::warn!(error = %e, "settings fetch task panicked");
                 None
@@ -1224,9 +2012,11 @@ impl MvpAgent {
         origin_client: Option<crate::http::OriginClientInfo>,
     ) -> SamplingConfig {
         let preferred = self.cfg.borrow().grok_com_config.preferred_method;
+        let prefers_oidc = preferred == Some(PreferredAuthMethod::Oidc);
+        let is_session_based_auth = self.is_session_based_auth();
         let session = match preferred {
-            Some(crate::auth::PreferredAuthMethod::ApiKey) => None,
-            _ if self.is_session_based_auth() => self.auth_manager.current_or_expired(),
+            Some(PreferredAuthMethod::ApiKey) => None,
+            _ if is_session_based_auth => self.auth_manager.current_or_expired(),
             _ => None,
         };
         let has_session_key = session.is_some();
@@ -1234,8 +2024,7 @@ impl MvpAgent {
             model,
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if matches!(preferred, Some(crate::auth::PreferredAuthMethod::Oidc))
-            && !model.has_own_credentials()
+        if prefers_oidc && !model.has_own_credentials()
             && credentials.auth_type == xai_chat_state::AuthType::ApiKey
         {
             credentials.api_key = None;
@@ -1247,7 +2036,7 @@ impl MvpAgent {
             session.as_ref().map(|a| a.key.as_str()),
         );
         if !has_session_key && credentials.auth_type == xai_chat_state::AuthType::ApiKey
-            && !model.has_own_credentials() && self.is_session_based_auth()
+            && !model.has_own_credentials() && is_session_based_auth
         {
             tracing::info!(
                 model = model.info().model.as_str(),
@@ -1260,7 +2049,12 @@ impl MvpAgent {
             );
             credentials.auth_type = xai_chat_state::AuthType::SessionToken;
         }
-        if !has_session_key && !model.has_own_credentials() {
+        if should_warn_missing_session(MissingSessionCtx {
+            has_session_key,
+            has_own_credentials: model.has_own_credentials(),
+            is_session_based_auth,
+            preferred,
+        }) {
             tracing::warn!(
                 model = model.info().model.as_str(),
                 is_expired = self.auth_manager.is_expired(),
@@ -1609,11 +2403,8 @@ impl MvpAgent {
         let (subagent_event_tx, subagent_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let activity = crate::agent::activity::AgentActivity::default();
         let instance = Self {
-            sessions: RefCell::new(HashMap::new()),
             activity,
-            loading_sessions: RefCell::new(HashMap::new()),
-            dispatch_locks: RefCell::new(HashMap::new()),
-            session_threads: RefCell::new(HashMap::new()),
+            session_registry: SessionRegistry::default(),
             resident_roster_titles: RefCell::new(HashMap::new()),
             initialize_request: OnceLock::new(),
             gateway,
@@ -1647,7 +2438,9 @@ impl MvpAgent {
                 RefCell::new(std::collections::HashSet::new()),
             ),
             tier_allowed: std::cell::Cell::new(true),
-            storage_mode,
+            allow_access_resolved_for: std::cell::RefCell::new(None),
+            storage_mode: std::cell::Cell::new(storage_mode),
+            otel_gate: crate::agent::otel_gate::OtelGate::default(),
             default_yolo_mode,
             default_auto_mode,
             trace_upload_live: Arc::new(
@@ -1658,12 +2451,9 @@ impl MvpAgent {
             relay_sync_enabled,
             buffering_settings: RefCell::new(None),
             background_copy_context: BackgroundCopyContext::new(),
-            session_turn_numbers: RefCell::new(HashMap::new()),
-            permission_event_receivers: RefCell::new(HashMap::new()),
             codebase_indexes: Arc::new(
                 parking_lot::Mutex::new(CodebaseIndexManager::new()),
             ),
-            session_index_claims: RefCell::new(HashMap::new()),
             worktree_type,
             restore_code,
             session_registry_local,
@@ -1673,23 +2463,32 @@ impl MvpAgent {
                     crate::session::mcp_servers::McpState::new(vec![]),
                 ),
             ),
-            model_unavailable_sessions: RefCell::new(std::collections::HashMap::new()),
             subagent_event_tx,
             subagent_event_rx: RefCell::new(Some(subagent_event_rx)),
             subagent_presentation: RefCell::new(
                 crate::agent::subagent::SubagentPresentation::new(),
             ),
-            monitor_event_buffer: xai_grok_tools::implementations::grok_build::task::types::MonitorEventBuffer::default(),
+            monitor_event_buffer: xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer::default(),
             bundle_sync_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             post_unblock_jwt_retry_in_flight: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
             workspace_ops: RefCell::new(None),
-            require_gateway_sessions: Rc::new(
+            #[cfg(all(feature = "local-workspace", unix))]
+            local_workspace_supervisors: Rc::new(RefCell::new(HashMap::new())),
+            #[cfg(all(feature = "local-workspace", unix))]
+            local_workspace_generations: Rc::new(RefCell::new(HashMap::new())),
+            #[cfg(all(feature = "local-workspace", unix))]
+            local_workspace_restart_pending: Rc::new(
                 RefCell::new(std::collections::HashSet::new()),
             ),
-            session_live_state: RefCell::new(HashMap::new()),
+            #[cfg(feature = "local-workspace")]
+            local_workspace_bound: Rc::new(
+                RefCell::new(std::collections::HashSet::new()),
+            ),
             supervisor_started: std::cell::Cell::new(false),
+            settings_reapply_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
+            post_auth_settings_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             announcements_gen: std::cell::Cell::new(0),
             last_emitted_announcements: RefCell::new(Vec::new()),
             announcements_refresh_started: std::cell::Cell::new(false),
@@ -1703,6 +2502,10 @@ impl MvpAgent {
             roster_delta_spy: RefCell::new(Vec::new()),
             #[cfg(test)]
             supervisor_spawn_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            settings_reapply_spawn_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            post_auth_settings_spawn_count: std::cell::Cell::new(0),
         };
         instance
             .auth_manager
@@ -1761,20 +2564,50 @@ impl MvpAgent {
             sessions = ?p.session_ids,
             "Client disconnected; detaching sessions (no-evict keystone)"
         );
-        let checks = p
+        let (attaching, to_check): (Vec<_>, Vec<_>) = p
             .session_ids
             .iter()
-            .map(|sid| {
-                let id = acp::SessionId::new(sid.clone());
-                async move {
-                    let busy = self.session_has_live_work(&id).await;
-                    (id, busy)
-                }
+            .map(|sid| acp::SessionId::new(sid.clone()))
+            .partition(|id| self.session_registry.is_attaching(id));
+        for id in &attaching {
+            tracing::info!(
+                session_id = %id.0,
+                "kept session resident across client disconnect (attach in flight)"
+            );
+        }
+        let checks = to_check
+            .into_iter()
+            .map(|id| async move {
+                let measured = self.resident_handle(&id).map(|h| h.cmd_tx);
+                let busy = self.session_has_live_work(&id).await;
+                (id, busy, measured)
             });
         let resolved = futures::future::join_all(checks).await;
-        let mut kept_resident: usize = 0;
+        let mut kept_resident: usize = attaching.len();
         let mut unloaded: usize = 0;
-        for (id, busy) in resolved {
+        for (id, busy, measured) in resolved {
+            if self.session_registry.is_attaching(&id) {
+                kept_resident += 1;
+                tracing::info!(
+                    session_id = %id.0,
+                    "kept session resident across client disconnect (attach in flight)"
+                );
+                continue;
+            }
+            let same_actor = self
+                .resident_handle(&id)
+                .zip(measured)
+                .is_some_and(|(current, measured)| {
+                    current.cmd_tx.same_channel(&measured)
+                });
+            if !same_actor {
+                kept_resident += 1;
+                tracing::info!(
+                    session_id = %id.0,
+                    "kept session resident across client disconnect (actor replaced mid-check)"
+                );
+                continue;
+            }
             if busy {
                 self.set_session_live_state(&id, SessionLiveState::Working);
                 kept_resident += 1;
@@ -1785,9 +2618,8 @@ impl MvpAgent {
                 continue;
             }
             self.request_session_shutdown(&id);
-            if self.sessions.borrow_mut().remove(&id).is_some() {
-                self.session_index_claims.borrow_mut().remove(&id);
-                self.require_gateway_sessions.borrow_mut().remove(&id);
+            if self.take_session(&id).is_some() {
+                self.session_registry.clear_resident(&id);
                 self.set_session_live_state(&id, SessionLiveState::Dormant);
                 unloaded += 1;
                 tracing::debug!(session_id = %id.0, "idle session unloaded to disk on disconnect");
@@ -1808,28 +2640,45 @@ impl MvpAgent {
     /// Uses async polling (never blocks the `LocalSet` runtime) with a 5s deadline
     /// to handle slow shutdowns (e.g., embedding API timeouts).
     pub(super) async fn drain_old_session_thread(&self, session_id: &acp::SessionId) {
-        let thread = self.session_threads.borrow_mut().remove(session_id);
-        let Some(thread) = thread else { return };
-        if thread.is_finished() {
-            return;
+        self.drain_old_session_thread_within(session_id, DRAIN_OLD_THREAD_WAIT).await;
+    }
+    /// [`Self::drain_old_session_thread`] under a caller-supplied budget.
+    pub(super) async fn drain_old_session_thread_within(
+        &self,
+        session_id: &acp::SessionId,
+        budget: std::time::Duration,
+    ) {
+        match self.session_registry.thread_is_finished(session_id) {
+            None => return,
+            Some(true) => {
+                self.session_registry.clear_thread(session_id);
+                return;
+            }
+            Some(false) => {}
         }
         tracing::info!(
             session_id = %session_id.0,
             "Waiting for old session thread to finish before reload"
         );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + budget;
         loop {
-            if thread.is_finished() {
-                tracing::debug!(
-                    session_id = %session_id.0,
-                    "Old session thread finished cleanly"
-                );
-                return;
+            match self.session_registry.thread_is_finished(session_id) {
+                None => return,
+                Some(true) => {
+                    self.session_registry.clear_thread(session_id);
+                    tracing::debug!(
+                        session_id = %session_id.0,
+                        "Old session thread finished cleanly"
+                    );
+                    return;
+                }
+                Some(false) => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(
                     session_id = %session_id.0,
-                    "Old session thread still running after 5s — proceeding with replay. \
+                    budget_ms = budget.as_millis() as u64,
+                    "Old session thread still running at the drain budget; proceeding. \
                      Session data may be incomplete if the old actor is still writing."
                 );
                 return;
@@ -1848,8 +2697,7 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> SessionLoadGuard<'_> {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        self.loading_sessions.borrow_mut().insert(session_id.clone(), rx.clone());
+        let (tx, rx) = self.session_registry.begin_attach(session_id);
         SessionLoadGuard {
             agent: self,
             session_id: session_id.clone(),
@@ -1873,12 +2721,12 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
-        let existing = self.sessions.borrow().get(session_id).cloned();
+        let existing = self.resident_handle(session_id);
         if existing.is_some() {
             return existing;
         }
         self.wait_for_in_flight_session_load(session_id).await;
-        self.sessions.borrow().get(session_id).cloned()
+        self.resident_handle(session_id)
     }
     /// If a `session/load` for `session_id` is in flight, wait (bounded) for
     /// it to finish. Returns immediately when no load is in flight.
@@ -1898,10 +2746,10 @@ impl MvpAgent {
         );
         let deadline = tokio::time::Instant::now() + LOAD_WAIT_TIMEOUT;
         loop {
-            if self.sessions.borrow().contains_key(session_id) {
+            if self.is_resident(session_id) {
                 return;
             }
-            let rx = self.loading_sessions.borrow().get(session_id).cloned();
+            let rx = self.session_registry.attach_waiter(session_id);
             let Some(mut rx) = rx else { return };
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -1911,7 +2759,53 @@ impl MvpAgent {
                 );
                 return;
             }
-            let _ = tokio::time::timeout(deadline - now, rx.changed()).await;
+            if let Ok(Err(_)) = tokio::time::timeout(deadline - now, rx.changed()).await
+                && self
+                    .session_registry
+                    .attach_waiter(session_id)
+                    .is_some_and(|w| w.same_channel(&rx))
+            {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    "attach waiter closed without settling; abandoning the wait"
+                );
+                return;
+            }
+        }
+    }
+    /// Wait until no attach is in flight for this id, up to `budget`. An
+    /// attach registers its actor and keeps going, so handle presence is not
+    /// enough.
+    pub(crate) async fn wait_for_load_to_settle(
+        &self,
+        session_id: &acp::SessionId,
+        budget: std::time::Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let Some(mut rx) = self.session_registry.attach_waiter(session_id) else {
+                return;
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    "timed out waiting for session/load to settle"
+                );
+                return;
+            }
+            if let Ok(Err(_)) = tokio::time::timeout(deadline - now, rx.changed()).await
+                && self
+                    .session_registry
+                    .attach_waiter(session_id)
+                    .is_some_and(|w| w.same_channel(&rx))
+            {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    "attach waiter closed without settling; abandoning the wait"
+                );
+                return;
+            }
         }
     }
     /// Returns the default YOLO mode setting for new sessions
@@ -1920,15 +2814,15 @@ impl MvpAgent {
     }
     /// Returns the storage mode configured for this agent
     pub fn storage_mode(&self) -> StorageMode {
-        self.storage_mode
+        self.storage_mode.get()
     }
     /// Returns the background copy context for managing background file copy tasks.
-    pub fn background_copy_context(&self) -> BackgroundCopyContext {
+    pub(crate) fn background_copy_context(&self) -> BackgroundCopyContext {
         self.background_copy_context.clone()
     }
     /// Move a foreground bash command to background.
     /// Routes through the session's tool bridge to unblock the agent loop.
-    pub async fn background_foreground_command(
+    pub(crate) async fn background_foreground_command(
         &self,
         session_id: &str,
         tool_call_id: &str,
@@ -1942,7 +2836,7 @@ impl MvpAgent {
     }
     /// Kill a background task by task_id.
     /// Routes through the session's tool bridge to the TerminalBackend.
-    pub async fn kill_background_task(
+    pub(crate) async fn kill_background_task(
         &self,
         session_id: &str,
         task_id: &str,
@@ -1954,7 +2848,7 @@ impl MvpAgent {
             Err("session not found".to_string())
         }
     }
-    pub async fn delete_scheduled_task(
+    pub(crate) async fn delete_scheduled_task(
         &self,
         session_id: &str,
         task_id: &str,
@@ -1969,7 +2863,7 @@ impl MvpAgent {
     /// Cancel a subagent by id, returning a typed outcome that backs the pager's
     /// `x.ai/subagent/cancel`. Active/pending → cancelled (a finish follows);
     /// already-finished → its terminal status; unknown id → `NotFound`.
-    pub async fn cancel_subagent(
+    pub(crate) async fn cancel_subagent(
         &self,
         subagent_id: &str,
     ) -> xai_grok_tools::implementations::grok_build::task::types::SubagentCancelOutcome {
@@ -2062,7 +2956,7 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Result<(), &'static str> {
-        let cmd_tx = self.sessions.borrow().get(session_id).map(|h| h.cmd_tx.clone());
+        let cmd_tx = self.resident_handle(session_id).map(|h| h.cmd_tx.clone());
         let Some(cmd_tx) = cmd_tx else {
             return Err("session not found");
         };
@@ -2076,7 +2970,8 @@ impl MvpAgent {
             return Err("send failed");
         }
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(_))) => Err("flush failed"),
             Ok(Err(_)) => Err("channel closed"),
             Err(_) => Err("timeout"),
         }
@@ -2170,21 +3065,22 @@ impl MvpAgent {
     }
     /// Get a session's cwd by session_id.
     /// Returns None if the session is not found.
-    pub fn get_session_cwd(&self, session_id: &acp::SessionId) -> Option<PathBuf> {
-        let sessions = self.sessions.borrow();
-        sessions.get(session_id).map(|handle| PathBuf::from(&handle.info.cwd))
+    pub(crate) fn get_session_cwd(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<PathBuf> {
+        self.resident_handle(session_id).map(|handle| PathBuf::from(&handle.info.cwd))
     }
     /// Get a session handle by session_id.
     /// Returns None if the session is not found.
-    pub fn get_session_handle(
+    pub(crate) fn get_session_handle(
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
-        let sessions = self.sessions.borrow();
-        sessions.get(session_id).cloned()
+        self.resident_handle(session_id)
     }
     /// Get hooks list for a session (for `x.ai/hooks/list` extension).
-    pub async fn list_hooks(
+    pub(crate) async fn list_hooks(
         &self,
         session_id: &acp::SessionId,
     ) -> Option<xai_hooks_plugins_types::HooksListResponse> {
@@ -2192,7 +3088,7 @@ impl MvpAgent {
         handle.get_hooks_list().await
     }
     /// Execute a hooks management action (for `x.ai/hooks/action`).
-    pub async fn execute_hooks_action(
+    pub(crate) async fn execute_hooks_action(
         &self,
         session_id: &acp::SessionId,
         action: xai_hooks_plugins_types::HooksAction,
@@ -2208,7 +3104,7 @@ impl MvpAgent {
         handle.execute_hooks_action(action).await
     }
     /// Execute a plugins management action (for `x.ai/plugins/action`).
-    pub async fn execute_plugins_action(
+    pub(crate) async fn execute_plugins_action(
         &self,
         session_id: &acp::SessionId,
         action: xai_hooks_plugins_types::PluginsAction,
@@ -2226,7 +3122,7 @@ impl MvpAgent {
         outcome
     }
     /// Get a snapshot of the shared plugin registry (for `x.ai/plugins/list`).
-    pub fn plugin_registry_snapshot(
+    pub(crate) fn plugin_registry_snapshot(
         &self,
     ) -> Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>> {
         self.plugin_registry_handle.snapshot()
@@ -2234,7 +3130,7 @@ impl MvpAgent {
     /// Run content search at agent level.
     /// This allows content search to work with just a cwd, without requiring a session.
     /// Returns an upload method, or `None` when trace uploads are disabled.
-    pub async fn trace_upload_config(
+    pub(crate) async fn trace_upload_config(
         &self,
     ) -> Option<crate::session::repo_changes::UploadMethod> {
         let (method, _reason) = self.trace_upload_config_with_reason().await;
@@ -2413,8 +3309,8 @@ impl MvpAgent {
         session_id: Option<&acp::SessionId>,
     ) -> acp::SessionModelState {
         let model_id = lookup_session_model(
-            &self.sessions.borrow(),
-            session_id,
+            session_id
+                .and_then(|sid| self.resident_handle(sid).map(|h| h.model_id.clone())),
             &self.models_manager.current_model_id(),
         );
         let mut available_models: Vec<acp::ModelInfo> = self
@@ -2424,7 +3320,7 @@ impl MvpAgent {
             .cloned()
             .collect();
         let override_effort = session_id
-            .and_then(|sid| self.sessions.borrow().get(sid).map(|h| h.reasoning_effort))
+            .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
             .flatten()
             .or_else(|| self.models_manager.current_reasoning_effort());
         if let Some(override_effort) = override_effort
@@ -2469,9 +3365,7 @@ impl MvpAgent {
         };
         let current_effort = if supports_effort {
             session_id
-                .and_then(|sid| {
-                    self.sessions.borrow().get(sid).map(|h| h.reasoning_effort)
-                })
+                .and_then(|sid| self.resident_handle(sid).map(|h| h.reasoning_effort))
                 .flatten()
                 .or_else(|| self.models_manager.current_reasoning_effort())
                 .or_else(|| {
@@ -2489,17 +3383,18 @@ impl MvpAgent {
             current_effort,
         )
     }
-    /// Build the `x.ai/sessionConfig` and `x.ai/sessionDetail` `_meta` values
-    /// shared by `new_session` and `load_session`, returned as
-    /// `(sessionConfig, sessionDetail)`. Keeping both response paths on this one
+    /// Insert the per-session `_meta` keys (`x.ai/sessionConfig`,
+    /// `x.ai/sessionDetail`, `x.ai/schedulerBackgroundLoops`) shared by
+    /// `new_session` and `load_session`. Keeping both response paths on this one
     /// builder stops them drifting.
-    pub(super) fn session_config_meta(
+    pub(super) fn insert_session_config_meta(
         &self,
+        meta: &mut serde_json::Map<String, serde_json::Value>,
         session_id: &acp::SessionId,
         cwd: String,
         title: Option<String>,
         model_state: &acp::SessionModelState,
-    ) -> (serde_json::Value, serde_json::Value) {
+    ) {
         let config_options = self.session_config_options(Some(session_id), model_state);
         let detail = session_config::GrokSessionDetail::build(
             session_id.0.to_string(),
@@ -2507,7 +3402,20 @@ impl MvpAgent {
             model_state.current_model_id.0.to_string(),
             title,
         );
-        (serde_json::json!({ "options": config_options }), serde_json::json!(detail))
+        meta.insert(
+            "x.ai/sessionConfig".to_string(),
+            serde_json::json!({ "options": config_options }),
+        );
+        meta.insert("x.ai/sessionDetail".to_string(), serde_json::json!(detail));
+        if let Some(background_loops) = self
+            .resident_handle(session_id)
+            .map(|handle| handle.scheduler_background_loops)
+        {
+            meta.insert(
+                SCHEDULER_BACKGROUND_LOOPS_META_KEY.to_string(),
+                serde_json::json!(background_loops),
+            );
+        }
     }
     /// Seed the global sampling config with login auth when available.
     ///
@@ -2597,27 +3505,15 @@ impl MvpAgent {
     }
     /// Read a session's next trace turn number without advancing the counter.
     fn peek_turn_number(&self, session_id: &acp::SessionId) -> u64 {
-        self.session_turn_numbers.borrow().get(session_id).copied().unwrap_or(0u64)
+        self.session_turn_number(session_id).unwrap_or(0u64)
     }
-    /// Set a session's next trace turn number. The sole writer of the
-    /// `session_turn_numbers` counter, shared by `allocate_turn_number` and the
-    /// batched harness-sibling allocation so both honor the same storage.
-    fn set_turn_number(&self, session_id: &acp::SessionId, next: u64) {
-        self.session_turn_numbers.borrow_mut().insert(session_id.clone(), next);
+    /// Set a session's next trace turn number.
+    pub(super) fn set_turn_number(&self, session_id: &acp::SessionId, next: u64) {
+        self.session_registry.set_turn_number(session_id, next);
     }
-    /// Upload each drained harness trace turn (the goal planner at setup, and
-    /// each verifier skeptic panel) as its OWN sibling `turn_{N}` artifact.
-    ///
-    /// These phases run inside the single user-facing goal turn but are
-    /// recorded out-of-band (synthetic `task` pairs in a side buffer), so the
-    /// normal per-round `turn_messages.json` never references them. Giving each
-    /// phase its own monotonic turn number — from the SAME `session_turn_numbers`
-    /// counter the model turns use (see [`Self::allocate_turn_number`]), via
-    /// [`Self::get_trace_context`] + [`upload_turn_messages`] — makes the
-    /// subagents discoverable in remote/web clients
-    /// via the `<subagent_result>` footer each synthetic `task` result carries.
-    /// The advanced counter is persisted via `SetNextTraceTurn` so the siblings
-    /// survive a restart. Best-effort and non-blocking.
+    /// Upload each drained harness trace turn as its own `turn_{N}` artifact,
+    /// numbered from the same counter as model turns so subagents interleave
+    /// correctly in remote clients. Best-effort and non-blocking.
     pub(super) async fn upload_harness_trace_turns(
         &self,
         session_id: &acp::SessionId,
@@ -2804,12 +3700,7 @@ impl MvpAgent {
             archive_name_override: None,
             upload_method,
         };
-        let session_handle = match self.sessions.borrow().get(&session_info.id) {
-            Some(h) => h.clone(),
-            None => {
-                return None;
-            }
-        };
+        let session_handle = self.resident_handle(&session_info.id)?;
         let queue = session_handle
             .upload_queue
             .get_or_init(|| {
@@ -3033,19 +3924,19 @@ impl MvpAgent {
             client_terminal,
             client_fs_read,
             client_fs_write,
-            preloaded_envrc,
+            envrc,
             persisted_signals,
             persisted_plan_mode,
             persisted_goal_mode,
             persisted_workflow_runs,
             persisted_announcement_state,
             session_meta,
-            managed_mcp_expires_at,
             model_agent_type,
             session_model_id,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
+            is_chat_kind,
         } = spec;
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
@@ -3055,6 +3946,13 @@ impl MvpAgent {
             spawn_remote_settings.as_ref(),
             false,
         );
+        let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
+        let project_env_trusted = folder_trust::project_scope_allowed(cwd.as_path());
+        let envrc = envrc
+            .unwrap_or_else(|| xai_grok_workspace::envrc::spawn_envrc_load(
+                cwd.as_path().to_path_buf(),
+                load_envrc && project_env_trusted,
+            ));
         let use_acp_fs = client_fs_read && client_fs_write;
         let fs_notify_config = init
             .client_capabilities
@@ -3120,15 +4018,7 @@ impl MvpAgent {
             );
             std::sync::Arc::new(TerminalRunner::new(notifier, session_info.id.clone()))
         };
-        let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
-        let startup_hints = init
-            .meta
-            .as_ref()
-            .and_then(|m| m.get("startupHints"))
-            .and_then(|v| {
-                serde_json::from_value::<crate::session::StartupHints>(v.clone()).ok()
-            })
-            .unwrap_or_default();
+        let startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
         let hunk_plan = plan_hunk_tracking(
             init
                 .client_capabilities
@@ -3214,21 +4104,11 @@ impl MvpAgent {
             }
             _ => None,
         };
-        let project_env_trusted = folder_trust::project_scope_allowed(cwd.as_path());
         let mut session_env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
             cwd.as_path(),
             project_env_trusted,
         );
-        let envrc = match preloaded_envrc {
-            Some(env) => env,
-            None => {
-                xai_grok_workspace::envrc::load_envrc_or_empty_when_trusted(
-                    cwd.as_path(),
-                    load_envrc && project_env_trusted,
-                )
-            }
-        };
-        session_env.extend(envrc);
+        session_env.extend(envrc.join().await);
         if no_color {
             session_env.extend(crate::terminal::no_color_env());
         } else {
@@ -3244,6 +4124,7 @@ impl MvpAgent {
                 session_env,
             )
             .with_hunk_tracking_enabled(hunk_tracking_enabled);
+        tool_ctx.process_scope = Some(ProcessScope::new());
         let workspace_ops = self
             .resolve_workspace_ops()
             .map_err(|_| {
@@ -3459,7 +4340,7 @@ impl MvpAgent {
                 let user_path = xai_grok_tools::util::grok_home::grok_home()
                     .join("lsp.json");
                 let project_path = tool_ctx.cwd.as_path().join(".grok").join("lsp.json");
-                tracing::warn!(
+                tracing::debug!(
                     cwd = %tool_ctx.cwd,
                     user_lsp_path = %user_path.display(),
                     project_lsp_path = %project_path.display(),
@@ -3472,11 +4353,12 @@ impl MvpAgent {
                 let mgr = std::sync::Arc::new(
                     tokio::sync::Mutex::new(
                         LspManager::new(
-                            servers,
-                            tool_ctx.cwd.as_path().to_path_buf(),
-                            true,
-                            xai_grok_tools::notification::ToolNotificationHandle::noop(),
-                        ),
+                                servers,
+                                tool_ctx.cwd.as_path().to_path_buf(),
+                                true,
+                                xai_grok_tools::notification::ToolNotificationHandle::noop(),
+                            )
+                            .with_process_scope(tool_ctx.process_scope.clone()),
                     ),
                 );
                 let adapter = std::sync::Arc::new(LspBackendAdapter::new(mgr));
@@ -3509,6 +4391,11 @@ impl MvpAgent {
         let goal_enabled = self.cfg.borrow().resolve_goal().value;
         let background_workflows_enabled = self.cfg.borrow().resolve_workflows().value;
         let subagents_enabled = self.cfg.borrow().subagents_enabled;
+        let subagents_max_depth = self.cfg.borrow().subagents_max_depth;
+        let workflow_max_concurrent_agents = self
+            .cfg
+            .borrow()
+            .workflow_max_concurrent_agents;
         let ask_user_question_enabled = crate::upload::turn::parse_ask_user_question_from_meta(
                 session_meta,
             )
@@ -3610,7 +4497,11 @@ impl MvpAgent {
                     let hooks_val = hooks_config.as_value();
                     let (specs, errors) = xai_grok_hooks::config::parse_hooks_from_value_with_dir(
                         &hooks_val,
-                        &format!("agent:{}", agent_definition.name),
+                        &format!(
+                        "{}{}",
+                        xai_grok_hooks::config::AGENT_HOOK_PREFIX,
+                        agent_definition.name
+                    ),
                         std::path::Path::new(&session_info.cwd),
                     );
                     for e in &errors {
@@ -3725,7 +4616,6 @@ impl MvpAgent {
                     loc_tracking_enabled,
                     feedback_flags,
                     self.managed_mcp_cache.clone(),
-                    managed_mcp_expires_at,
                     managed_mcp_proxy_url,
                     session_model_id,
                     session_yolo_mode,
@@ -3742,6 +4632,8 @@ impl MvpAgent {
                     goal_enabled,
                     background_workflows_enabled,
                     subagents_enabled,
+                    subagents_max_depth,
+                    workflow_max_concurrent_agents,
                     ask_user_question_enabled,
                     client_hooks,
                     prompt_display_cwd,
@@ -3793,12 +4685,11 @@ impl MvpAgent {
                     None,
                     max_turns,
                     None,
+                    is_chat_kind,
                 )
                 .await?
         };
-        self.session_threads
-            .borrow_mut()
-            .insert(session_info.id.clone(), session_thread);
+        self.session_registry.set_thread(&session_info.id, session_thread);
         tracing::debug!(session_id = %session_info.id.0, "spawn_session_on_thread complete");
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);
         self.ensure_session_supervisor();
@@ -3858,9 +4749,8 @@ impl MvpAgent {
                 }
             });
         }
-        self.permission_event_receivers
-            .borrow_mut()
-            .insert(session_info.id.clone(), permission_events_rx);
+        self.session_registry
+            .set_permission_receiver(&session_info.id, permission_events_rx);
         if handle_display_cwd.is_some() {
             handle.display_cwd = handle_display_cwd;
         }
@@ -3872,7 +4762,11 @@ impl MvpAgent {
             });
         self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
         self.activity.register_session(&session_info.id.0, &handle);
-        self.sessions.borrow_mut().insert(session_info.id.clone(), handle);
+        if let Some(old) = self.insert_resident(&session_info.id, handle)
+            && let Some(scope) = &old.tool_context.process_scope
+        {
+            scope.kill_all();
+        }
         self.spawn_managed_gateway_tool_catalog_fetch();
         let cwd_for_maintenance = session_info.cwd.clone();
         tokio::spawn(async move {
@@ -3887,16 +4781,56 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Vec<PermissionEvent> {
-        let mut events = Vec::new();
-        if let Some(rx) = self
-            .permission_event_receivers
-            .borrow_mut()
-            .get_mut(session_id)
-        {
-            while let Ok(event) = rx.try_recv() {
-                events.push(event);
-            }
+        self.session_registry.drain_permission_events(session_id)
+    }
+}
+/// Rollback guard for mid-session bind reservation.
+#[cfg(feature = "local-workspace")]
+struct LocalWorkspaceBindGuard {
+    bound: Rc<RefCell<std::collections::HashSet<acp::SessionId>>>,
+    session_id: acp::SessionId,
+    keep: bool,
+}
+#[cfg(feature = "local-workspace")]
+impl Drop for LocalWorkspaceBindGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.bound.borrow_mut().remove(&self.session_id);
         }
-        events
+    }
+}
+/// Reap guard: if session/new fails after register, Drop kills the supervisor.
+#[cfg(all(feature = "local-workspace", unix))]
+pub(crate) struct LocalWorkspaceReapGuard {
+    supervisors: Rc<
+        RefCell<
+            HashMap<
+                acp::SessionId,
+                crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceHandle,
+            >,
+        >,
+    >,
+    generations: Rc<RefCell<HashMap<acp::SessionId, u64>>>,
+    session_id: acp::SessionId,
+    armed: bool,
+}
+#[cfg(all(feature = "local-workspace", unix))]
+impl LocalWorkspaceReapGuard {
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+#[cfg(all(feature = "local-workspace", unix))]
+impl Drop for LocalWorkspaceReapGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.generations.borrow_mut().remove(&self.session_id);
+        if let Some(handle) = self.supervisors.borrow_mut().remove(&self.session_id) {
+            tokio::spawn(async move {
+                handle.shutdown().await;
+            });
+        }
     }
 }

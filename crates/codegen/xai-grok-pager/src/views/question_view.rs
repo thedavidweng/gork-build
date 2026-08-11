@@ -24,12 +24,13 @@ pub use xai_grok_tools::implementations::grok_build::ask_user_question::{
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::input::key::RowWalk;
 use crate::render::line_utils::{byte_offset_at_width, truncate_line, truncate_str};
 use crate::render::wrapping::word_wrap_lines_with_joiners;
 use crate::syntax::get_syntect;
 use crate::theme::Theme;
 use crate::theme::md_style;
-use crate::views::prompt_widget::StashedPrompt;
+use crate::views::prompt_widget::{PromptBg, PromptStyle, StashedPrompt};
 
 /// Maximum description lines shown in the question chrome before truncation.
 const DEFAULT_MAX_CHROME_DESC_LINES: u16 = 5;
@@ -54,6 +55,19 @@ pub enum QuestionSelection {
     Single(Option<usize>),
     /// Multi-choice: zero or more options toggled on.
     Multi(HashSet<usize>),
+}
+
+/// A cursor move within one question's answer rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMotion {
+    Next,
+    Prev,
+    HalfPageDown,
+    HalfPageUp,
+    PageDown,
+    PageUp,
+    First,
+    Last,
 }
 
 /// Focus mode within the question view.
@@ -88,19 +102,6 @@ pub enum LocalQuestionKind {
         /// path back to `dispatch_fork_resolved` without a global mailbox.
         directive: Option<String>,
     },
-    /// Shown on first prompt from a non-project directory.
-    ProjectSelect {
-        /// Index-aligned with the leading question options. Direct lookup by
-        /// selection index.
-        resolved_paths: Vec<std::path::PathBuf>,
-        /// The original cwd (fallback on cancel/skip).
-        original_cwd: std::path::PathBuf,
-        /// The prompt text the user typed (stashed to re-send after selection).
-        stashed_prompt: String,
-        /// Option index of the "Don't ask me again" entry. Selecting it
-        /// continues in `original_cwd` and persists the opt-out.
-        dont_ask_index: usize,
-    },
     /// Modal opened by `/new` to resolve the worktree question.
     /// On submit, the selected option index is translated into an
     /// [`crate::app::actions::Action::NewSessionAnswered`].
@@ -131,6 +132,9 @@ pub enum LocalQuestionKind {
         target: crate::app::actions::DoctorFixTarget,
         plan: Box<crate::diagnostics::FixPlan>,
     },
+    DeleteCurrentSession,
+    /// Modal opened by bare `/feedback` (no inline text). Freeform-only; submit sends [`crate::app::actions::Action::SendFeedback`].
+    Feedback,
 }
 
 // ── State ──────────────────────────────────────────────────────────────
@@ -200,6 +204,11 @@ pub struct QuestionViewState {
     /// while the user is answering questions — the time spent in the
     /// question view is subtracted from the turn elapsed display.
     pub opened_at: Instant,
+    /// Wall-clock twin of `opened_at` (UTC ms). `Instant` is suspend-blind,
+    /// so a pause netted against the wall-anchored turn span must itself be
+    /// measured on the wall clock, or a suspend during an open question
+    /// would read as worked time.
+    pub opened_at_wall_ms: i64,
     /// When `true`, the freeform "Other" input row is hidden. Used by
     /// locally-driven questions (e.g. credit-limit upsell) that only
     /// offer fixed options with no free-text fallback.
@@ -271,6 +280,7 @@ impl QuestionViewState {
             bottom_panel_index: None,
             local_kind: None,
             opened_at: Instant::now(),
+            opened_at_wall_ms: chrono::Utc::now().timestamp_millis(),
             no_freeform: false,
         }
     }
@@ -323,6 +333,40 @@ impl QuestionViewState {
             .get(self.active_tab)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Move the cursor within the active question, clamped at both ends.
+    pub fn move_cursor(&mut self, motion: CursorMotion) {
+        let last = self.total_items(self.active_tab).saturating_sub(1);
+        let cursor = self.cursor();
+        let target = match motion {
+            CursorMotion::Next => cursor + 1,
+            CursorMotion::Prev => cursor.saturating_sub(1),
+            CursorMotion::HalfPageDown => cursor + (last / 2).max(1),
+            CursorMotion::HalfPageUp => cursor.saturating_sub((last.max(1) / 2).max(1)),
+            CursorMotion::PageDown => cursor + last.max(1),
+            CursorMotion::PageUp => cursor.saturating_sub(last.max(1)),
+            CursorMotion::First => 0,
+            CursorMotion::Last => last,
+        };
+        self.set_cursor(target.min(last));
+    }
+
+    /// Walk one answer row of the active question, wrapping at both ends.
+    pub fn walk_cursor(&mut self, walk: RowWalk) {
+        let target = walk.step(self.cursor(), self.total_items(self.active_tab));
+        self.set_cursor(target);
+    }
+
+    pub fn clear_selection(&mut self, q_idx: usize) {
+        match self.selections.get_mut(q_idx) {
+            Some(QuestionSelection::Multi(selected)) => selected.clear(),
+            Some(QuestionSelection::Single(selected)) => *selected = None,
+            None => {}
+        }
+        if let Some(freeform_selected) = self.per_question_freeform_selected.get_mut(q_idx) {
+            *freeform_selected = false;
+        }
     }
 
     /// Set cursor position for the active question, clamped to valid range.
@@ -646,10 +690,18 @@ fn chrome_height_with_dynamic_caps(
     let preview_lines = preview_lines.min(preview_cap);
 
     let preview_gap = if preview_lines > 0 { 1 } else { 0 };
+    let label_gap = if label_gap_suppressed(question) { 0 } else { 1 };
 
     // vpad(1) + label + label_gap(1) + description (if any)
     //   + [preview_gap(1) + preview_lines if preview exists] + gap(1)
-    1 + label_lines + 1 + desc_lines + preview_gap + preview_lines + 1
+    1 + label_lines + label_gap + desc_lines + preview_gap + preview_lines + 1
+}
+
+/// A card with no description and no options has nothing under its label, so the blank line meant to separate them would leave it unevenly padded.
+/// [`chrome_height_with_dynamic_caps`] and [`render_question_chrome`] must agree on it.
+fn label_gap_suppressed(question: &Question) -> bool {
+    let (_, desc) = split_question_label_desc(&question.question);
+    desc.is_empty() && question.options.is_empty()
 }
 
 /// Chrome height for a question: vpad + label lines + gap + [description lines] + gap.
@@ -775,6 +827,18 @@ impl QuestionViewState {
         option.preview.as_deref()
     }
 
+    /// The bare `/feedback` report pane. Having no options to navigate, it keeps input focus for its whole life and answers Esc by dismissing.
+    pub fn is_feedback(&self) -> bool {
+        matches!(self.local_kind, Some(LocalQuestionKind::Feedback))
+    }
+
+    pub fn feedback_report(&self) -> String {
+        self.per_question_freeform
+            .first()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// Labels of the selected options for a given question.
     pub fn selected_labels(&self, question_idx: usize) -> Vec<String> {
         let Some(sel) = self.selections.get(question_idx) else {
@@ -802,15 +866,13 @@ impl QuestionViewState {
     }
 
     /// True when the active tab has any option selected, or its free-form
-    /// answer marked selected. Drives the graduated `Esc` back-out: when
-    /// nothing is selected, `Esc` (which only clears the selection) has
-    /// nothing to do, so it can fall through to the dashboard back-out.
+    /// answer marked selected.
     pub fn active_tab_has_selection(&self) -> bool {
-        let idx = self.active_tab;
-        let option_selected = !self.selected_labels(idx).is_empty();
+        let q_idx = self.active_tab;
+        let option_selected = !self.selected_labels(q_idx).is_empty();
         let freeform_selected = self
             .per_question_freeform_selected
-            .get(idx)
+            .get(q_idx)
             .copied()
             .unwrap_or(false);
         option_selected || freeform_selected
@@ -1109,6 +1171,50 @@ pub const QUESTION_VIEW_HPAD: u16 = 5;
 ///   Single: `X (●) ` = 1 + 1 + 3 + 1 = 6
 pub fn option_prefix_w(_question: &Question) -> usize {
     6 // both multi and single use 3-char markers now
+}
+
+/// Report area of the bare `/feedback` card: a multi-line box standing in for the option rows, shared by the full TUI and minimal renderers.
+/// `draw` needs a blank [`crate::views::prompt_widget::PromptInfo`] to put the bottom rule in place.
+pub mod feedback_input {
+    use super::{PromptBg, PromptStyle, QUESTION_VIEW_HPAD, Theme};
+
+    /// Rows at rest: top rule, five text rows, bottom rule. The box grows with the report up to the caller's cap.
+    pub const HEIGHT: u16 = 7;
+
+    /// Rows of that height spent on the outline rather than text.
+    pub const CHROME_H: u16 = 2;
+
+    /// Smallest box that can still carry its outline: the two rules plus one row of text. Below this the renderers drop to [`flat_style`].
+    pub const MIN_HEIGHT: u16 = CHROME_H + 1;
+
+    /// Shown while the box is empty, including while it has focus.
+    pub const PLACEHOLDER: &str = "Please provide as much detail as possible.";
+
+    /// The card's content column, so the box lines up under the label.
+    pub fn width(area_width: u16) -> u16 {
+        area_width.saturating_sub(QUESTION_VIEW_HPAD)
+    }
+
+    pub fn style(theme: &Theme) -> PromptStyle {
+        PromptStyle {
+            // Sits on the card, so it takes the card's surface rather than the composer's, and pads symmetrically inside its own rules.
+            bg: PromptBg::Panel(theme.bg_light),
+            chrome_pad_right: 2,
+            placeholder_when_focused: true,
+            placeholder_override: Some(PLACEHOLDER),
+            ..PromptStyle::default()
+        }
+    }
+
+    /// Unoutlined variant for a panel too short to spare the two rows the rules cost.
+    pub fn flat_style(theme: &Theme) -> PromptStyle {
+        PromptStyle {
+            vpad_top: 0,
+            chrome: false,
+            show_borders: false,
+            ..style(theme)
+        }
+    }
 }
 
 /// Width available for inline prompt text given the full area width.
@@ -1863,8 +1969,10 @@ fn render_question_chrome(
         cur_y += 1;
     }
 
-    // Blank line after label.
-    cur_y += 1;
+    // Blank line separating the label from what follows it.
+    if !label_gap_suppressed(question) {
+        cur_y += 1;
+    }
 
     // ── Description (dimmed, markdown-rendered) ──
     if !desc_text.is_empty() {
@@ -2672,6 +2780,23 @@ mod tests {
                 DEFAULT_MAX_CHROME_PREVIEW_LINES
             ),
             4
+        );
+    }
+
+    #[test]
+    fn chrome_height_option_less_question_drops_the_label_gap() {
+        // Nothing under the label to separate it from, so the gap goes: vpad(1) + label(1) + gap(1) = 3. This is the bare `/feedback` card.
+        let q = make_question("How can we improve Grok Build?", &[], false);
+        assert_eq!(
+            chrome_height(
+                &q,
+                80,
+                None,
+                false,
+                DEFAULT_MAX_CHROME_DESC_LINES,
+                DEFAULT_MAX_CHROME_PREVIEW_LINES
+            ),
+            3
         );
     }
 

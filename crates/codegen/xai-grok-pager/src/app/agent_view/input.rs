@@ -7,9 +7,9 @@ use super::paste::paste_key_tests;
 #[cfg(test)]
 use super::test_fixtures;
 use super::{
-    AgentPane, AgentView, CtaPhase, InputMode, MULTI_CLICK_TIMEOUT_MS, PromptInputMode,
-    active_contexts_for_pane, format_key_for_log, is_link_modifier_for_key,
-    is_mouse_reporting_toggle_chord, resolve_action,
+    AgentPane, AgentView, BlockingCard, CtaPhase, EscStep, InputMode, KeyOwner,
+    MULTI_CLICK_TIMEOUT_MS, PromptInputMode, active_contexts_for_pane, format_key_for_log,
+    is_link_modifier_for_key, is_mouse_reporting_toggle_chord, resolve_action,
 };
 use crate::actions::{ActionId, ActionRegistry, When};
 use crate::app::actions::Action;
@@ -89,13 +89,10 @@ impl AgentView {
             && self.btw_state.is_none()
             && self.scrollback_search.is_none()
     }
-    /// Whether no input-demanding overlay (permission / plan / cancel-turn /
-    /// question) is awaiting a response.
+    /// Whether no input-demanding overlay — a [`BlockingCard`] or the plan
+    /// approval — is awaiting a response.
     pub(crate) fn no_input_overlay_pending(&self) -> bool {
-        self.permission_queue.is_empty()
-            && self.plan_approval_view.is_none()
-            && self.cancel_turn_view.is_none()
-            && self.question_view.is_none()
+        self.blocking_card().is_none() && self.plan_approval_view.is_none()
     }
     /// Whether FocusGained should move focus from Scrollback → Prompt.
     ///
@@ -118,7 +115,7 @@ impl AgentView {
     /// That cascade runs before `handle_input`, so without this guard Left/Esc
     /// on an empty prompt would exit the overlay instead of reaching `/gboom`
     /// (turn/close), video (seek/close), or image (close).
-    fn modal_owns_input(&self) -> bool {
+    pub(super) fn modal_owns_input(&self) -> bool {
         self.extensions_modal.is_some()
             || self.active_modal.is_some()
             || self.gboom.is_some()
@@ -218,20 +215,15 @@ impl AgentView {
             && self.no_esc_consumer_pending()
             && self.no_input_overlay_pending()
     }
-    /// Esc on the prompt pane in a dashboard overlay backs out to the dashboard
-    /// list (the prompt-focus mirror of the Left-arrow back-out), but only for an
-    /// empty, Normal-mode composer with no per-pane Esc consumer pending. Beyond
-    /// [`Self::is_empty_focused_prompt`] it also requires `PromptInputMode::Normal`
-    /// (so a Bash/Remember/Feedback empty prompt keeps Esc as its mode-exit,
-    /// matching the full-screen view) and [`Self::no_esc_consumer_pending`] (so
-    /// Esc still clears or dismisses a pending text selection / link highlight /
-    /// goal detail / rewind first — Esc, unlike Left, is their consumer). A
-    /// non-empty draft fails the guard so Esc still arms "press again to clear".
-    /// Used only in the overlay cascade; the full-screen Esc policy (clear /
-    /// rewind while idle; mid-turn cancel or swallow) is untouched.
+    /// Esc on the prompt pane in a dashboard overlay backs out to the dashboard list (the prompt-focus mirror of the Left-arrow back-out), but only
+    /// for an empty, Normal-mode composer with no per-pane Esc consumer pending. Beyond [`Self::is_empty_focused_prompt`] it also requires
+    /// `PromptInputMode::Normal` (so a Bash/Remember empty prompt keeps Esc as its mode-exit, matching the full-screen view) and
+    /// [`Self::no_esc_consumer_pending`] (so Esc still clears or dismisses a pending text selection / link highlight / goal detail / rewind first;
+    /// Esc, unlike Left, is their consumer). A non-empty draft fails the guard so Esc still arms "press again to clear".
+    /// Used only in the overlay cascade; the full-screen Esc policy (clear / rewind while idle; mid-turn cancel or swallow) is untouched.
     ///
-    /// Also gated to an idle agent (`!is_turn_running() && !is_cancelling()`):
-    /// while a turn is running or cancelling, Esc must fall through to
+    /// Also gated to an idle agent (no running, cancelling, or wake turn):
+    /// while one is in flight, Esc must fall through to
     /// [`Self::try_handle_esc_policy`] (running → cancel in minimal / non-vim
     /// mode, swallow in vim mode; cancelling → retry CancelTurn), not detach
     /// to the dashboard. Detach mid-turn stays on
@@ -242,6 +234,7 @@ impl AgentView {
             && self.no_esc_consumer_pending()
             && !self.session.state.is_turn_running()
             && !self.session.state.is_cancelling()
+            && !self.wake_turn_active()
     }
     /// True when a pending plan / Q&A overlay is at its top navigation state
     /// (nothing left for `Esc` to clear), so the next `Esc` backs out of the
@@ -249,24 +242,22 @@ impl AgentView {
     /// keep their in-overlay meaning. Dashboard-overlay only; the overlay
     /// stays pending (no answer sent).
     pub(crate) fn overlay_esc_backs_out(&self) -> bool {
-        use crate::views::question_view::{LocalQuestionKind, QuestionFocus};
         if !self.in_dashboard_overlay {
             return false;
         }
         if self.modal_owns_input() {
             return false;
         }
+        if !self.no_input_overlay_pending()
+            && self.is_bare_scrollback()
+            && self.no_esc_consumer_pending()
+        {
+            return true;
+        }
         if self.plan_approval_view.is_some() {
             return self.plan_overlay_at_back_out_top();
         }
-        if let Some(qv) = self.question_view.as_ref() {
-            return self.active_pane != AgentPane::Scrollback
-                && qv.focus == QuestionFocus::Navigation
-                && qv.active_tab == 0
-                && !matches!(qv.local_kind, Some(LocalQuestionKind::ProjectSelect { .. }))
-                && !qv.active_tab_has_selection();
-        }
-        false
+        self.card_esc() == Some(EscStep::BackOutOverlay)
     }
     /// Whether the pending plan-approval overlay is at a state where `Esc` /
     /// `Left` have nothing else to do, so they back out to the dashboard:
@@ -671,6 +662,19 @@ impl AgentView {
                 _ => {}
             }
         }
+        if self.active_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if registry.lookup(key, When::Always) == Some(ActionId::Quit) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_modal_key_with_registry(key, registry)
+                }
+                Event::Mouse(mouse) => self.handle_modal_mouse_with_registry(mouse, registry),
+                Event::Paste(text) => self.handle_modal_paste(text, registry),
+                _ => InputOutcome::Changed,
+            };
+        }
         if self.line_viewer.is_some() {
             if let Event::Mouse(mouse) = ev
                 && mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -686,8 +690,10 @@ impl AgentView {
             if !plan_prompt_focused && !casual_commenting {
                 return match ev {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if key!('q', CONTROL).matches(key) {
-                            return InputOutcome::Unchanged;
+                        if let Some(outcome) =
+                            self.try_plan_overlay_agent_action(key, registry, false)
+                        {
+                            return outcome;
                         }
                         self.handle_line_viewer_key(key)
                     }
@@ -708,8 +714,8 @@ impl AgentView {
             }
             return match ev {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
+                    if let Some(outcome) = self.try_plan_overlay_agent_action(key, registry, true) {
+                        return outcome;
                     }
                     if casual_commenting {
                         self.handle_casual_plan_feedback_key(key)
@@ -808,7 +814,7 @@ impl AgentView {
                 _ => InputOutcome::Changed,
             };
         }
-        if !self.permission_queue.is_empty() && self.active_pane != AgentPane::Scrollback {
+        if self.focused_card() == Some(BlockingCard::Permission) {
             return match ev {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if key!('q', CONTROL).matches(key) {
@@ -844,6 +850,7 @@ impl AgentView {
                                     perm.active_idx = idx;
                                     perm.focus =
                                         crate::views::permission_view::PermissionFocus::Options;
+                                    self.permission_pattern_edit = None;
                                     if is_double_click {
                                         self.last_permission_click = None;
                                         if let Some(opt) = perm.options.get(idx) {
@@ -871,26 +878,30 @@ impl AgentView {
                     }
                 }
                 Event::Paste(text) => {
-                    let in_followup = self.permission_queue.front().is_some_and(|p| {
-                        p.focus == crate::views::permission_view::PermissionFocus::FollowupInput
-                    });
-                    if in_followup {
-                        self.route_popup_paste(text)
-                    } else {
-                        InputOutcome::Changed
+                    let front_focus = self.permission_queue.front().map(|p| p.focus);
+                    match front_focus {
+                        Some(crate::views::permission_view::PermissionFocus::FollowupInput) => {
+                            self.route_popup_paste(text)
+                        }
+                        Some(crate::views::permission_view::PermissionFocus::PatternEdit) => {
+                            if let Some(edit) = self.permission_pattern_edit.as_mut() {
+                                for ch in text.chars().filter(|c| *c != '\n' && *c != '\r') {
+                                    edit.insert_char(ch);
+                                }
+                            }
+                            InputOutcome::Changed
+                        }
+                        _ => InputOutcome::Changed,
                     }
                 }
                 _ => InputOutcome::Changed,
             };
         }
-        if self.plan_approval_view.is_some()
-            && self.line_viewer.is_none()
-            && self.active_pane != AgentPane::Scrollback
-        {
+        if self.key_owner() == KeyOwner::PlanApproval {
             return match ev {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
+                    if let Some(outcome) = self.try_plan_overlay_agent_action(key, registry, true) {
+                        return outcome;
                     }
                     self.handle_plan_feedback_key(key)
                 }
@@ -988,8 +999,7 @@ impl AgentView {
                         return InputOutcome::Unchanged;
                     }
                     if registry.matches_id(ActionId::CancelTurn, key)
-                        && (self.session.state.is_turn_running()
-                            || self.session.state.is_cancelling())
+                        && (self.stoppable_activity_running() || self.any_cancel_pending())
                     {
                         self.dismiss_jump_picker();
                         return self
@@ -1001,7 +1011,7 @@ impl AgentView {
                 _ => InputOutcome::Unchanged,
             };
         }
-        if self.cancel_turn_view.is_some() && self.active_pane != AgentPane::Scrollback {
+        if self.focused_card() == Some(BlockingCard::CancelTurn) {
             return match ev {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if key!('q', CONTROL).matches(key) {
@@ -1013,7 +1023,7 @@ impl AgentView {
                 _ => InputOutcome::Unchanged,
             };
         }
-        if self.question_view.is_some() && self.active_pane != AgentPane::Scrollback {
+        if self.focused_card() == Some(BlockingCard::Question) {
             return match ev {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if key!('q', CONTROL).matches(key) {
@@ -1175,6 +1185,11 @@ impl AgentView {
             && key.kind != KeyEventKind::Release
             && registry.lookup(key, When::AgentScreen) == Some(ActionId::OpenExtensions)
         {
+            crate::actions::log_shortcut_used(
+                key,
+                ActionId::OpenExtensions,
+                When::AgentScreen.telemetry_name(),
+            );
             return InputOutcome::Action(Action::OpenExtensionsModal {
                 tab: crate::views::extensions_modal::ExtensionsTab::Plugins,
                 trigger: xai_grok_telemetry::events::ExtensionsModalTrigger::KeyboardShortcut,
@@ -1201,7 +1216,7 @@ impl AgentView {
             self.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
                 entries: crate::views::modal::default_palette_entries(
                     self.sharing_enabled,
-                    self.prompt.slash_controller.screen_mode(),
+                    &self.prompt.slash_controller,
                 ),
                 state: crate::views::picker::PickerState::input_active(),
                 window: crate::views::modal_window::ModalWindowState::new(),
@@ -1265,6 +1280,32 @@ impl AgentView {
         let registry = ActionRegistry::defaults();
         self.handle_agent_action_with_registry(action_id, &registry)
     }
+    /// Model/palette while plan approval owns the keyboard. `typing`: bare
+    /// keys (e.g. `?`) go to the prompt; only Ctrl/Super/Alt chords pass.
+    fn try_plan_overlay_agent_action(
+        &mut self,
+        key: &crossterm::event::KeyEvent,
+        registry: &ActionRegistry,
+        typing: bool,
+    ) -> Option<InputOutcome> {
+        if registry.lookup(key, When::Always) == Some(ActionId::Quit) {
+            return Some(InputOutcome::Unchanged);
+        }
+        let action_id = registry.lookup(key, When::AgentScreen)?;
+        match action_id {
+            ActionId::ModelPicker | ActionId::CommandPalette => {
+                if typing
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT)
+                {
+                    return None;
+                }
+                Some(self.handle_agent_action_with_registry(action_id, registry))
+            }
+            _ => None,
+        }
+    }
     /// Handle an agent-level action (from registry lookup with `When::AgentScreen`).
     pub(super) fn handle_agent_action_with_registry(
         &mut self,
@@ -1273,11 +1314,11 @@ impl AgentView {
     ) -> InputOutcome {
         match action_id {
             ActionId::CancelTurn => {
-                if self.session.state.is_turn_running() {
+                if self.stoppable_activity_running() {
                     self.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::CtrlC);
                     return InputOutcome::Action(Action::CancelTurn);
                 }
-                if self.session.state.is_cancelling() {
+                if self.any_cancel_pending() {
                     return InputOutcome::Action(Action::Quit);
                 }
                 if crate::app::minimal_mode_active()
@@ -1323,7 +1364,7 @@ impl AgentView {
                 self.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
                     entries: crate::views::modal::default_palette_entries(
                         self.sharing_enabled,
-                        self.prompt.slash_controller.screen_mode(),
+                        &self.prompt.slash_controller,
                     ),
                     state: crate::views::picker::PickerState::input_active(),
                     window: crate::views::modal_window::ModalWindowState::new(),
@@ -1538,6 +1579,40 @@ mod background_and_tasks_shortcut_tests {
             assert_eq!(agent.prompt.history_search.selected, selected);
             assert_eq!(agent.prompt.text(), text);
             assert_eq!(agent.prompt.cursor(), cursor);
+        }
+    }
+    #[test]
+    fn shortcuts_key_tears_down_history_and_opens_cheatsheet() {
+        use crate::views::modal::ActiveModal;
+        let registry = ActionRegistry::defaults();
+        let history = [HistoryEntry {
+            text: "earlier prompt".into(),
+        }];
+        for key in [
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        ] {
+            for browse in [true, false] {
+                let mut agent = make_agent();
+                agent.set_active_pane(AgentPane::Prompt, true);
+                if browse {
+                    agent.prompt.history_search.activate_browse(&history, "");
+                    agent.prompt.set_text("earlier prompt");
+                } else {
+                    agent.prompt.history_search.activate(&history, "query");
+                    agent.prompt.set_text("query");
+                }
+                let out = agent.handle_prompt_key_with_registry_for_test(&key, &registry);
+                assert!(matches!(out, InputOutcome::Changed));
+                assert!(
+                    matches!(agent.active_modal, Some(ActiveModal::ShortcutsHelp { .. })),
+                    "shortcuts key must open the cheatsheet"
+                );
+                assert!(
+                    !agent.prompt.history_search.is_active(),
+                    "history overlay must be torn down first"
+                );
+            }
         }
     }
     #[test]
@@ -1884,7 +1959,7 @@ mod btw_focus_tests {
         let reg = ActionRegistry::defaults();
         agent
             .permission_queue
-            .push_back(super::paste_key_tests::make_followup_permission_state());
+            .push_back(super::test_fixtures::make_followup_permission_state());
         agent.handle_minimal_input(&key(KeyCode::Esc), &reg);
         assert_minimal_btw_active(&agent, "permission");
         assert_eq!(
@@ -1960,7 +2035,7 @@ mod btw_focus_tests {
         agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
         agent
             .permission_queue
-            .push_back(super::paste_key_tests::make_followup_permission_state());
+            .push_back(super::test_fixtures::make_followup_permission_state());
         agent.handle_input(&key(KeyCode::Esc), &reg);
         assert!(agent.btw_state.is_none());
         assert!(!agent.permission_queue.is_empty());
@@ -2038,11 +2113,10 @@ mod btw_focus_tests {
 }
 #[cfg(test)]
 mod focus_gained_restore_tests {
-    use super::paste_key_tests::{
-        make_followup_permission_state, make_plan_approval_view_state,
-        make_question_view_state_in_input_mode,
+    use super::paste_key_tests::make_question_view_state_in_input_mode;
+    use super::test_fixtures::{
+        make_agent, make_followup_permission_state, make_plan_approval_view_state,
     };
-    use super::test_fixtures::make_agent;
     use super::{AgentPane, AgentView};
     use crate::app::agent::AgentState;
     use crate::views::modal::{ActiveModal, CancelTurnViewState};
@@ -2111,7 +2185,7 @@ mod focus_gained_restore_tests {
         agent.active_modal = Some(ActiveModal::CommandPalette {
             entries: crate::views::modal::default_palette_entries(
                 false,
-                agent.prompt.slash_controller.screen_mode(),
+                &agent.prompt.slash_controller,
             ),
             state: crate::views::picker::PickerState::input_active(),
             window: crate::views::modal_window::ModalWindowState::new(),
@@ -2278,7 +2352,12 @@ mod esc_would_cancel_turn_tests {
 mod jump_backout_key_tests {
     use super::test_fixtures::make_agent;
     use super::{AgentPane, AgentView};
+    use crate::actions::ActionRegistry;
+    use crate::app::actions::Action;
+    use crate::app::agent::{AgentCommand, AgentState};
+    use crate::app::app_view::InputOutcome;
     use crate::views::jump::{JumpRestore, JumpState};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     fn open_jump(agent: &mut AgentView) {
         agent.jump_state = Some(JumpState {
             entries: Vec::new(),
@@ -2289,6 +2368,9 @@ mod jump_backout_key_tests {
                 follow_mode: false,
             },
         });
+    }
+    fn ctrl_c() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
     }
     /// In the dashboard overlay, a bare Esc backs out via
     /// `no_esc_consumer_pending`; the open `/jump` picker must count as a
@@ -2323,11 +2405,81 @@ mod jump_backout_key_tests {
             "an open /jump picker owns Esc/Left in the overlay back-out"
         );
     }
+    /// `/jump` must not swallow Ctrl+C while `/compact` is running — same
+    /// hatch as a running turn.
+    #[test]
+    fn jump_picker_ctrl_c_cancels_compact() {
+        let mut agent = make_agent();
+        agent.session.state = AgentState::CommandRunning {
+            command: AgentCommand::Compact,
+            started_at: std::time::Instant::now(),
+        };
+        open_jump(&mut agent);
+        let outcome = agent.handle_input(&ctrl_c(), &ActionRegistry::defaults());
+        assert!(
+            agent.jump_state.is_none(),
+            "Ctrl+C during /compact must dismiss the jump picker"
+        );
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
+            "Ctrl+C during /compact with /jump open must cancel, got {outcome:?}"
+        );
+    }
+    /// Once a wake cancel is in flight, Ctrl+C must reach the same quit
+    /// escalation as a stuck normal cancel instead of re-sending forever.
+    #[test]
+    fn ctrl_c_escalates_to_quit_while_wake_cancel_is_stuck() {
+        let mut agent = make_agent();
+        agent.running_wake_turn = Some(crate::app::agent_view::RunningWakeTurn {
+            prompt_id: "task-completed-bg1".into(),
+            cancel_sent: false,
+        });
+        let outcome = agent.handle_input(&ctrl_c(), &ActionRegistry::defaults());
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
+            "the first Ctrl+C cancels the wake turn, got {outcome:?}"
+        );
+        agent.running_wake_turn.as_mut().unwrap().cancel_sent = true;
+        let outcome = agent.handle_input(&ctrl_c(), &ActionRegistry::defaults());
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::Quit)),
+            "Ctrl+C during a stuck wake cancel must escalate to quit, got {outcome:?}"
+        );
+    }
+}
+#[cfg(test)]
+mod plan_approval_model_handoff_tests {
+    use super::test_fixtures::{make_agent, make_plan_approval_view_state};
+    use crate::actions::ActionRegistry;
+    use crate::key;
+    use crate::views::modal::ActiveModal;
+    use agent_client_protocol as acp;
+    use crossterm::event::Event;
+    use std::sync::Arc;
+    #[test]
+    fn model_picker_during_plan_approval() {
+        let mut agent = make_agent();
+        let id = acp::ModelId::new(Arc::from("test-model"));
+        agent.session.models.available.insert(
+            id.clone(),
+            acp::ModelInfo::new(id, "Test Model".to_string()),
+        );
+        agent.plan_approval_view = Some(make_plan_approval_view_state());
+        agent.reopen_plan_approval();
+        let reg = ActionRegistry::defaults();
+        agent.handle_input(&Event::Key(key!('m', CONTROL).to_key_event()), &reg);
+        assert!(matches!(
+            agent.active_modal,
+            Some(ActiveModal::ArgPicker { ref command, .. }) if command == "model"
+        ));
+        agent.handle_input(&Event::Key(key!(Esc).to_key_event()), &reg);
+        assert!(agent.active_modal.is_none());
+        assert!(agent.plan_approval_view.is_some());
+    }
 }
 #[cfg(test)]
 mod voice_stop_click_during_plan_review_tests {
-    use super::paste_key_tests::make_plan_approval_view_state;
-    use super::test_fixtures::make_agent;
+    use super::test_fixtures::{make_agent, make_plan_approval_view_state};
     use crate::actions::ActionRegistry;
     use crate::app::actions::Action;
     use crate::app::app_view::InputOutcome;

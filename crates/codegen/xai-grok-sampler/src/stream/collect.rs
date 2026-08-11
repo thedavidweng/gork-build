@@ -49,10 +49,12 @@ pub async fn collect_response(
         message: "stream ended without Completed or Failed".to_string(),
         is_retryable: false,
         retry_after_secs: None,
+        should_retry: None,
         model_metadata: None,
         empty_response_context: None,
         doom_loop_triggers: None,
         doom_loop_aborted_at_chunk: None,
+        credential: xai_grok_sampling_types::SentCredential::Unknown,
     })
 }
 
@@ -171,6 +173,9 @@ mod tests {
                 message_chunks_emitted: 1,
                 doom_loop_signals: Vec::new(),
                 stop_message: None,
+                message_id: None,
+                raw_stop_reason: None,
+                stop_sequence: None,
             }),
             metrics: InferenceLatencyStats::default(),
         };
