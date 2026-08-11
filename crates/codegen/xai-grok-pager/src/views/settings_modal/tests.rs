@@ -7972,6 +7972,7 @@ fn locked_coding_data_sharing_row_does_not_open_picker() {
     for lock in [
         CodingDataSharingLock::Zdr,
         CodingDataSharingLock::TeamManaged,
+        CodingDataSharingLock::PrivacyBuild,
     ] {
         let mut s = make_locked_state(lock);
         s.selected = coding_data_sharing_row_idx(&s);
@@ -8007,6 +8008,7 @@ fn locked_coding_data_sharing_row_refuses_reset() {
     for lock in [
         CodingDataSharingLock::Zdr,
         CodingDataSharingLock::TeamManaged,
+        CodingDataSharingLock::PrivacyBuild,
     ] {
         let mut s = make_locked_state(lock);
         s.selected = coding_data_sharing_row_idx(&s);
