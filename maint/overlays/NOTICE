@@ -1,0 +1,29 @@
+Gork Build
+Copyright 2026 The Gork Build contributors
+
+This product is an independent, community-maintained distribution of
+Grok Build, with vendor telemetry and branding removed.
+
+================================================================================
+Apache License 2.0 attribution
+================================================================================
+
+This distribution includes software originally published by SpaceXAI as
+"Grok Build" under the Apache License, Version 2.0:
+
+  Repository: https://github.com/xai-org/grok-build
+  Copyright 2023-2026 SpaceXAI
+
+See the accompanying LICENSE file for the full text of the Apache License,
+Version 2.0.
+
+Grok, Grok Build, xAI, and SpaceXAI are trademarks of their respective
+owners. This project is not affiliated with, endorsed by, or sponsored by
+SpaceXAI or xAI.
+
+================================================================================
+Third-party software
+================================================================================
+
+Bundled third-party components and their licenses are listed in
+THIRD-PARTY-NOTICES (and per-crate notices under third_party/).
