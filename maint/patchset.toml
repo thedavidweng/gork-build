@@ -76,8 +76,3 @@ file = "0081-package-publishing.patch"
 critical = false
 contracts = []
 
-[[patch]]
-id = "branding-docs"
-file = "0082-branding-docs.patch"
-critical = false
-contracts = []
