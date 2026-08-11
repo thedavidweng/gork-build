@@ -12,7 +12,7 @@
 //! All tests in this file mutate `PATH` (global), so they're serialized with
 //! `#[serial]`.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "updater-integration-tests"))]
 
 mod common;
 

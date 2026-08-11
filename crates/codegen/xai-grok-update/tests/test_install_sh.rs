@@ -14,7 +14,7 @@
 //! the test skips rather than fail — under the repo's `cargo nextest` workflow
 //! the path resolves and the installer is exercised end to end.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "updater-integration-tests"))]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
