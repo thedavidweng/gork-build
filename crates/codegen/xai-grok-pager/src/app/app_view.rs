@@ -1100,7 +1100,7 @@ pub struct AppView {
     pub privacy_banner_reshow_days: Option<u64>,
     /// Local `[privacy].privacy_banner_acked` (RFC 3339 UTC).
     pub privacy_banner_acked: Option<String>,
-    /// Accept awaits ACP success before ack.
+    /// In-flight opt-in write whose ack waits on ACP success.
     pub privacy_banner_opt_in_inflight: bool,
     /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed
     /// on the `TaskResult`, so an older write's late reply — whose
@@ -6482,7 +6482,7 @@ pub(crate) mod tests {
             let agent = app.agents.get_mut(&id).unwrap();
             agent.session.prompt_history = vec!["first prompt".into(), "second prompt".into()];
             let history = agent.combined_prompt_history();
-            agent.prompt.history_search.activate(&history, "");
+            assert!(agent.prompt.history_search.activate(&history, ""));
         }
         assert!(
             app.needs_animation(),
@@ -9454,10 +9454,12 @@ pub(crate) mod tests {
         assert!(agent.prompt.textarea.text().is_empty());
         let history = agent.combined_prompt_history();
         let current_text = agent.prompt.text().to_string();
-        agent
-            .prompt
-            .history_search
-            .activate(&history, &current_text);
+        assert!(
+            agent
+                .prompt
+                .history_search
+                .activate(&history, &current_text)
+        );
         agent.active_pane = crate::views::agent::ActivePane::Scrollback;
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
@@ -10008,8 +10010,10 @@ pub(crate) mod tests {
             other => panic!("expected SubmitAuthCode, got {:?}", other),
         }
     }
+    /// A bare `Moved` after a press means the release was lost: the press
+    /// must end, never promote into a selection.
     #[test]
-    fn moved_with_button_held_promotes_pending_scrollback_drag() {
+    fn moved_after_press_ends_gesture_instead_of_promoting() {
         let mut app = test_app_with_agent();
         let id = super::super::agent::AgentId(0);
         let agent = app.agents.get_mut(&id).unwrap();
@@ -10052,8 +10056,9 @@ pub(crate) mod tests {
         assert!(agent.drag_selection.is_none());
         assert!(matches!(app.handle_input(&moved), InputOutcome::Changed));
         let agent = app.agents.get(&id).unwrap();
-        assert!(agent.pending_text_drag.is_some());
-        assert!(agent.drag_selection.is_some());
+        assert!(!agent.left_mouse_down, "lost release ended the press");
+        assert!(agent.pending_text_drag.is_none());
+        assert!(agent.drag_selection.is_none(), "hover must not select");
     }
     #[test]
     fn moved_without_button_does_not_promote_pending_scrollback_drag() {
@@ -11222,7 +11227,7 @@ pub(crate) mod tests {
         {
             let agent = app.agents.get_mut(&id).unwrap();
             agent.active_pane = crate::app::agent_view::AgentPane::Prompt;
-            agent.prompt.history_search.activate(&[], "");
+            assert!(agent.prompt.history_search.activate(&[], ""));
             assert!(
                 agent.prompt.text().is_empty(),
                 "fixture draft must be empty"

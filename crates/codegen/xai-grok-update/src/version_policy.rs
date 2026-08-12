@@ -16,9 +16,8 @@ enum RequiredRangeDecision {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VersionPolicyError {
     #[error(
-        "Cannot install Gork Build {target}: the minimum allowed version is {minimum}. \
-         Rebuild from source or install a community release at or above that version \
-         (vendor auto-update is disabled in this fork)."
+        "Cannot install Grok {target}: the minimum allowed version is {minimum}. \
+         Run `grok update` to install the latest allowed version."
     )]
     TargetBelowFloor { target: String, minimum: String },
 }
@@ -80,16 +79,16 @@ fn required_range_message(decision: &RequiredRangeDecision) -> Option<String> {
     match decision {
         RequiredRangeDecision::InRange => None,
         RequiredRangeDecision::Below { current, minimum } => Some(format!(
-            "This version of Gork Build ({current}) is older than the minimum required \
+            "This version of Grok ({current}) is older than the minimum required \
              by your organization ({minimum}).\n\n\
-             Rebuild from source or install a community release at or above that \
-             version (vendor auto-update is disabled in this fork)."
+             Update to an approved version through your organization's approved \
+             method (for example, run `grok update`)."
         )),
         RequiredRangeDecision::Above { current, maximum } => Some(format!(
-            "This version of Gork Build ({current}) is newer than the maximum allowed \
+            "This version of Grok ({current}) is newer than the maximum allowed \
              by your organization ({maximum}).\n\n\
-             Rebuild from source or install a community release at version {maximum} \
-             (vendor auto-update is disabled in this fork)."
+             Install an approved version through your organization's approved \
+             method (for example, run `grok update --version {maximum}`)."
         )),
     }
 }

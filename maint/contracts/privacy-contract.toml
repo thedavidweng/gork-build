@@ -35,7 +35,10 @@ command = [
 [[contract]]
 id = "updater-product-build"
 group = "privacy"
-command = ["cargo", "test", "-p", "xai-grok-update"]
+# Product binary has no updater-integration-tests feature: lib/unit tests only.
+# Installer-path integration suites run under updater-installer-integration
+# (feature + GORK_TEST_ALLOW_UPDATE).
+command = ["cargo", "test", "-p", "xai-grok-update", "--lib"]
 
 [[contract]]
 id = "updater-privacy-filters"

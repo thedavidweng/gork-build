@@ -30,7 +30,7 @@ index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..180372c12b9635f4f787baf538a9ec8b
  [features]
  default = []
 diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
-index e84bc51acc937045941677c8b418010524f9bc51..49f3f639b2800afd710ce894da6cea53957d4e4d 100644
+index 49eb1691081af33ddacc67ff106c7c3c8572c547..319ba906b0c47ddb5e6563bbd7c8e4f776a9852a 100644
 --- a/crates/codegen/xai-grok-telemetry/src/client.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/client.rs
 @@ -85,14 +85,10 @@ impl TelemetryClient {
@@ -53,10 +53,10 @@ index e84bc51acc937045941677c8b418010524f9bc51..49f3f639b2800afd710ce894da6cea53
              .filter(|s| !s.is_empty())
              .map(|k| deployment_id_from_key(&k));
 diff --git a/crates/codegen/xai-grok-telemetry/src/config.rs b/crates/codegen/xai-grok-telemetry/src/config.rs
-index 6594fb2fc88f47f4b62efc6bedc57244a8409d75..bddd060baf2a32a94fbc129e916ceaa353f5a2c5 100644
+index 04ee011e27289ff70ac00a4e85b0b9c921ae3e18..dd5ded3f29120830e7bb44ec46b1f8ff9b9fb8e0 100644
 --- a/crates/codegen/xai-grok-telemetry/src/config.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/config.rs
-@@ -127,23 +127,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
+@@ -148,23 +148,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
  }
  impl Default for TelemetryConfig {
      fn default() -> Self {
@@ -92,7 +92,7 @@ index 6594fb2fc88f47f4b62efc6bedc57244a8409d75..bddd060baf2a32a94fbc129e916ceaa3
              otel_enabled: None,
              otel_metrics_exporter: None,
              otel_logs_exporter: None,
-@@ -224,14 +220,14 @@ mod tests {
+@@ -245,14 +241,14 @@ mod tests {
          assert_eq!(build_env_default(Some(" key ")), Some("key".to_owned()));
      }
      #[test]
@@ -236,8 +236,8 @@ index 94a1a836706b674827af4fcde1c61bfab17505d1..437e3634849f2e8ec7b473111b2e36c5
      }
  }
 
-base-commit: b13fa526f5112c0b20dad5f1f2300d3d3b127895
-prerequisite-patch-id: e91e5a7076a517f7a2ce2b292e6c4c2fd9c2b7af
+base-commit: be713136d2a69080743a3f6b3c72077057e5948f
+prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
 -- 
 2.50.1 (Apple Git-155)
 
