@@ -1,4 +1,4 @@
-From ebf0da10daeeecfc4c45f700076ab9a6e20a8f2b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Gork <gork-ci@users.noreply.github.com>
 Date: Tue, 11 Aug 2026 16:54:02 -0700
 Subject: [PATCH] vendor-updater-hard-off: install chokepoint and
@@ -9,13 +9,20 @@ Gork-Invariant: vendor-install-unreachable
 Gork-Risk: critical
 ---
  crates/codegen/xai-grok-update/Cargo.toml     |   7 +
- .../xai-grok-update/src/auto_update.rs        | 235 ++++++++++++++----
+ .../xai-grok-update/src/auto_update.rs        | 338 +++++++++++++-----
  crates/codegen/xai-grok-update/src/version.rs |   4 +-
  .../xai-grok-update/tests/common/mod.rs       |   3 +
- 4 files changed, 203 insertions(+), 46 deletions(-)
+ .../tests/test_blitz_cancel.rs                |   2 +-
+ .../tests/test_check_status_regression.rs     |   2 +-
+ .../tests/test_concurrent_convergence.rs      |   2 +-
+ .../tests/test_downgrade_matrix.rs            |   2 +-
+ .../tests/test_install_internal.rs            |   2 +-
+ .../xai-grok-update/tests/test_install_sh.rs  |   2 +-
+ .../xai-grok-update/tests/test_subprocess.rs  |   2 +-
+ 11 files changed, 264 insertions(+), 102 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-update/Cargo.toml b/crates/codegen/xai-grok-update/Cargo.toml
-index 045ee6c..0a45287 100644
+index 045ee6c2fd5a4cbfbf1e541577f659ddfb417a16..0a45287068d84bbfdf9fa024ea7b1f5ac3ada965 100644
 --- a/crates/codegen/xai-grok-update/Cargo.toml
 +++ b/crates/codegen/xai-grok-update/Cargo.toml
 @@ -4,6 +4,13 @@ name = "xai-grok-update"
@@ -33,7 +40,7 @@ index 045ee6c..0a45287 100644
  anyhow = { workspace = true }
  futures = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/auto_update.rs b/crates/codegen/xai-grok-update/src/auto_update.rs
-index 2ae404b..540d70f 100644
+index 2ae404b5ca2280654382e2b5afe34c379aa15649..9ea1e9eca647f55645daade4135193dd6c437418 100644
 --- a/crates/codegen/xai-grok-update/src/auto_update.rs
 +++ b/crates/codegen/xai-grok-update/src/auto_update.rs
 @@ -29,55 +29,62 @@ pub enum UpdateRunMode {
@@ -304,7 +311,164 @@ index 2ae404b..540d70f 100644
      apply_channel_switch(channel_switch, update_config).await;
      let installer = match get_installer().await {
          Some(i) => i,
-@@ -5415,4 +5471,95 @@ mod tests {
+@@ -3842,94 +3898,99 @@ mod tests {
+ 
+     #[test]
+     fn test_reinstall_hint_npm_mentions_npm_command() {
++        // Gork Build points at the community package, never @xai-official/grok.
+         let hint = reinstall_hint("npm", "stable");
+         assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
+         assert!(
+-            hint.contains("@xai-official/grok"),
+-            "should name the package: {hint}"
++            hint.contains("@gork-build/gork"),
++            "should name the gork package: {hint}"
++        );
++        assert!(
++            !hint.contains("@xai-official/grok"),
++            "must not recommend vendor npm package: {hint}"
+         );
+     }
+ 
+     #[test]
+     fn test_reinstall_hint_gh_release_mentions_gh_command() {
++        // Gork Build points at this fork's releases, not xai-org installers.
+         let hint = reinstall_hint("gh-release", "stable");
+         assert!(
+-            hint.contains("gh release download"),
+-            "should suggest gh release download: {hint}"
++            hint.contains("thedavidweng/gork-build"),
++            "should name the fork releases: {hint}"
+         );
+         assert!(
+-            hint.contains("xai-org-shared/grok-build"),
+-            "should name the repo: {hint}"
++            !hint.contains("xai-org") && !hint.contains("gh release download"),
++            "must not recommend vendor gh release path: {hint}"
+         );
+     }
+ 
+     #[test]
+     fn test_reinstall_hint_internal_mentions_platform_installer() {
++        // Privacy: internal installer reinstall is source rebuild, never x.ai scripts.
++        // (Hint prose may mention "x.ai/cli" as a warning — reject only actionable installers.)
+         let hint = reinstall_hint("internal", "stable");
+-        if cfg!(windows) {
+-            assert!(hint.contains("irm"), "should suggest irm install: {hint}");
+-            assert!(
+-                hint.contains("install.ps1"),
+-                "should reference install.ps1: {hint}"
+-            );
+-            assert!(
+-                !hint.contains("GROK_CHANNEL"),
+-                "stable must not set channel: {hint}"
+-            );
+-        } else {
+-            assert!(hint.contains("curl"), "should suggest curl install: {hint}");
+-            assert!(
+-                hint.contains("install.sh"),
+-                "should reference install.sh: {hint}"
+-            );
+-            assert!(
+-                !hint.contains("GROK_CHANNEL"),
+-                "stable must not set channel: {hint}"
+-            );
+-        }
++        assert!(
++            hint.contains("cargo build") && hint.contains("gork"),
++            "should point at gork source rebuild: {hint}"
++        );
++        assert!(
++            !hint.contains("curl -")
++                && !hint.contains("irm ")
++                && !hint.contains("install.sh")
++                && !hint.contains("install.ps1")
++                && !hint.contains("https://x.ai/cli"),
++            "must not recommend vendor installers: {hint}"
++        );
++        assert!(
++            !hint.contains("GROK_CHANNEL"),
++            "stable source rebuild must not set channel: {hint}"
++        );
+     }
+ 
+     #[test]
+     fn test_reinstall_hint_internal_alpha_sets_channel() {
++        // Privacy: channel is ignored; every internal path is the same source rebuild.
+         let hint = reinstall_hint("internal", "alpha");
+-        if cfg!(windows) {
+-            assert!(
+-                hint.contains("$env:GROK_CHANNEL='alpha'"),
+-                "alpha should set GROK_CHANNEL: {hint}"
+-            );
+-        } else {
+-            assert!(
+-                hint.contains("| GROK_CHANNEL='alpha' bash"),
+-                "alpha must set GROK_CHANNEL on bash (the process running \
+-                 install.sh), not curl: {hint}"
+-            );
+-        }
++        assert!(
++            hint.contains("cargo build") && hint.contains("gork"),
++            "alpha still points at source rebuild: {hint}"
++        );
++        assert!(
++            !hint.contains("GROK_CHANNEL") && !hint.contains("https://x.ai/cli"),
++            "must not set vendor channel env or installer URL: {hint}"
++        );
+     }
+ 
+     #[test]
+     fn test_reinstall_hint_enterprise_uses_enterprise_script() {
+-        // Enterprise ships via its own bootstrap script (channel hardcoded
+-        // there), never install.sh + GROK_CHANNEL.
++        // Privacy: enterprise channel also refuses vendor bootstrap scripts.
+         let hint = reinstall_hint("internal", "enterprise");
+         assert!(
+-            hint.contains("/enterprise-install."),
+-            "enterprise must use the published enterprise-install script: {hint}"
++            hint.contains("cargo build") && hint.contains("gork"),
++            "enterprise must also point at source rebuild: {hint}"
+         );
+         assert!(
+-            !hint.contains("GROK_CHANNEL"),
+-            "enterprise script needs no channel env: {hint}"
++            !hint.contains("/enterprise-install.")
++                && !hint.contains("GROK_CHANNEL")
++                && !hint.contains("https://x.ai/cli"),
++            "must not recommend vendor enterprise install: {hint}"
+         );
+     }
+ 
+     #[test]
+     fn test_reinstall_hint_malformed_channel_falls_back_to_stable() {
+-        // Free-text config channels never reach the shell one-liner unless
+-        // they are plain [A-Za-z0-9._-] tokens.
++        // Free-text config channels never reach a shell one-liner under privacy —
++        // all map to the same source-build hint (no GROK_CHANNEL interpolation).
+         for bad in ["al pha", "x'; rm -rf ~;'", "a\"b", ""] {
+             let hint = reinstall_hint("internal", bad);
+             assert!(
+                 !hint.contains("GROK_CHANNEL"),
+-                "malformed channel {bad:?} must fall back to stable: {hint}"
++                "malformed channel {bad:?} must not reach shell: {hint}"
++            );
++            assert!(
++                hint.contains("cargo build"),
++                "malformed channel {bad:?} still source rebuild: {hint}"
+             );
+         }
+     }
+@@ -4733,7 +4794,7 @@ mod tests {
+         );
+         assert_eq!(
+             MSG_RUN_UPDATE_MANUAL,
+-            "Run `grok update` to get the latest version."
++            "Run `gork update` to get the latest version."
+         );
+     }
+ 
+@@ -5415,4 +5476,95 @@ mod tests {
              "other executables' leftovers must be untouched"
          );
      }
@@ -401,7 +565,7 @@ index 2ae404b..540d70f 100644
 +    }
  }
 diff --git a/crates/codegen/xai-grok-update/src/version.rs b/crates/codegen/xai-grok-update/src/version.rs
-index 721d859..de55f63 100644
+index 721d859bfac7b955665634e63b53c949935d2a85..de55f63382533d0e50018f3d9f24e0d7c07058a9 100644
 --- a/crates/codegen/xai-grok-update/src/version.rs
 +++ b/crates/codegen/xai-grok-update/src/version.rs
 @@ -10,8 +10,8 @@ use xai_grok_shell::env::GrokBuildEnvironment;
@@ -416,7 +580,7 @@ index 721d859..de55f63 100644
  /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
  /// for binaries and origin-respecting no-cache for channel pointers.
 diff --git a/crates/codegen/xai-grok-update/tests/common/mod.rs b/crates/codegen/xai-grok-update/tests/common/mod.rs
-index 9845e49..1524e3d 100644
+index 9845e49f8c839f88525d460d3e13b178c9f61ce8..1524e3dce464acc4406d37c58aa4d1c0fc169bf2 100644
 --- a/crates/codegen/xai-grok-update/tests/common/mod.rs
 +++ b/crates/codegen/xai-grok-update/tests/common/mod.rs
 @@ -56,6 +56,9 @@ pub fn test_home() -> &'static PathBuf {
@@ -429,6 +593,103 @@ index 9845e49..1524e3d 100644
          }
          path
      })
+diff --git a/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs b/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs
+index 7db620f1b9699bbf472a70e0abb48273318b7fe5..1de0d0b4c496bcc26f8905a53f605355ba3db411 100644
+--- a/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs
++++ b/crates/codegen/xai-grok-update/tests/test_blitz_cancel.rs
+@@ -14,7 +14,7 @@
+ //! right-length-but-garbage body, or hang mid-transfer — for both the parallel
+ //! byte-range path and the single-connection path.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ mod common;
+ 
+diff --git a/crates/codegen/xai-grok-update/tests/test_check_status_regression.rs b/crates/codegen/xai-grok-update/tests/test_check_status_regression.rs
+index 230fdbf0f537aa70737209ceb5aed1107d2097e9..241bafa9fd49c28883906453d8b96978c0678e03 100644
+--- a/crates/codegen/xai-grok-update/tests/test_check_status_regression.rs
++++ b/crates/codegen/xai-grok-update/tests/test_check_status_regression.rs
+@@ -26,7 +26,7 @@
+ //! These tests verify the JSON contract so any refactor to `UpdateStatus`,
+ //! `check_update_status`, or the npm dispatch path will surface a diff.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ mod common;
+ 
+diff --git a/crates/codegen/xai-grok-update/tests/test_concurrent_convergence.rs b/crates/codegen/xai-grok-update/tests/test_concurrent_convergence.rs
+index c53bc2bb81ab937513d71d5d2b1360b11395b185..9b39130a992942e7f46bf8714521c1088a78bdfd 100644
+--- a/crates/codegen/xai-grok-update/tests/test_concurrent_convergence.rs
++++ b/crates/codegen/xai-grok-update/tests/test_concurrent_convergence.rs
+@@ -28,7 +28,7 @@
+ //!   (`with_extension("tmp")` eats everything after the last dot), so racer
+ //!   A could atomically rename racer B's half-written file into place.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ mod common;
+ 
+diff --git a/crates/codegen/xai-grok-update/tests/test_downgrade_matrix.rs b/crates/codegen/xai-grok-update/tests/test_downgrade_matrix.rs
+index db207ccd7c8a2aaf1cc910bbe5dd49851818f1eb..f9c4282f89c2f32a8e30aa33f2d3a2d18828e6ce 100644
+--- a/crates/codegen/xai-grok-update/tests/test_downgrade_matrix.rs
++++ b/crates/codegen/xai-grok-update/tests/test_downgrade_matrix.rs
+@@ -11,7 +11,7 @@
+ //! internal installer actually downloads and symlinks an older binary
+ //! when the stable pointer is rolled back.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ mod common;
+ 
+diff --git a/crates/codegen/xai-grok-update/tests/test_install_internal.rs b/crates/codegen/xai-grok-update/tests/test_install_internal.rs
+index 734948a0163b88d504d1b30363ab24c1887b5743..8185ba2acbcd47be8b97468bb425bbc39fdca083 100644
+--- a/crates/codegen/xai-grok-update/tests/test_install_internal.rs
++++ b/crates/codegen/xai-grok-update/tests/test_install_internal.rs
+@@ -10,7 +10,7 @@
+ //! tests in this binary share a single `GROK_HOME` and run serially via
+ //! `#[serial]`.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ mod common;
+ 
+diff --git a/crates/codegen/xai-grok-update/tests/test_install_sh.rs b/crates/codegen/xai-grok-update/tests/test_install_sh.rs
+index e14b992e216e3f6374936dfe627925e2a75ae531..cc81f647ca75c21bf49c6b127c02a1153cd18841 100644
+--- a/crates/codegen/xai-grok-update/tests/test_install_sh.rs
++++ b/crates/codegen/xai-grok-update/tests/test_install_sh.rs
+@@ -14,7 +14,7 @@
+ //! the test skips rather than fail — under the repo's `cargo nextest` workflow
+ //! the path resolves and the installer is exercised end to end.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ use std::os::unix::fs::PermissionsExt;
+ use std::path::{Path, PathBuf};
+diff --git a/crates/codegen/xai-grok-update/tests/test_subprocess.rs b/crates/codegen/xai-grok-update/tests/test_subprocess.rs
+index b031ee7b03995634ff473163fe48fe7a05abdb57..f69e2974e651a9c9b12011483cd6c8f027996ef5 100644
+--- a/crates/codegen/xai-grok-update/tests/test_subprocess.rs
++++ b/crates/codegen/xai-grok-update/tests/test_subprocess.rs
+@@ -12,7 +12,7 @@
+ //! All tests in this file mutate `PATH` (global), so they're serialized with
+ //! `#[serial]`.
+ 
+-#![cfg(unix)]
++#![cfg(all(unix, feature = "updater-integration-tests"))]
+ 
+ mod common;
+ 
+
+base-commit: be713136d2a69080743a3f6b3c72077057e5948f
+prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
+prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
+prerequisite-patch-id: 34ca1becedc5edfe22fb9108fc3a4215e49bb0d1
 -- 
 2.50.1 (Apple Git-155)
 
