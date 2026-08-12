@@ -1,7 +1,3 @@
-#![cfg(feature = "updater-integration-tests")]
-// Requires: cargo test -p xai-grok-update --features updater-integration-tests
-// + GORK_TEST_ALLOW_UPDATE=1 (set by tests/common).
-
 //! Invariant matrix tests for the rollback/downgrade feature.
 //!
 //! Covers every combination of:
@@ -15,7 +11,7 @@
 //! internal installer actually downloads and symlinks an older binary
 //! when the stable pointer is rolled back.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "updater-integration-tests"))]
 
 mod common;
 

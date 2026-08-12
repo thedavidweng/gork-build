@@ -12,7 +12,7 @@ Gork-Risk: critical
  1 file changed, 134 insertions(+), 10 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index efa8a8e4808c7621eb6bf738e7ba52d1d2567aae..38e4288cb3ea084feefa890f3ec504a1dc069446 100644
+index fec0659ebc8c3bc2769346ae30d4f08034cecd18..389331ca565a1e940612d70d13371147b3deff28 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
 @@ -317,7 +317,7 @@ impl EndpointsConfig {
@@ -247,8 +247,8 @@ index efa8a8e4808c7621eb6bf738e7ba52d1d2567aae..38e4288cb3ea084feefa890f3ec504a1
      #[serial]
      fn resolve_goal_defaults_to_true_when_unset() {
 
-base-commit: b13fa526f5112c0b20dad5f1f2300d3d3b127895
-prerequisite-patch-id: e91e5a7076a517f7a2ce2b292e6c4c2fd9c2b7af
+base-commit: be713136d2a69080743a3f6b3c72077057e5948f
+prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
 prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
 -- 
 2.50.1 (Apple Git-155)

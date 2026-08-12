@@ -1,7 +1,3 @@
-#![cfg(feature = "updater-integration-tests")]
-// Requires: cargo test -p xai-grok-update --features updater-integration-tests
-// + GORK_TEST_ALLOW_UPDATE=1 (set by tests/common).
-
 //! Blitz harness: hammer the download + install lifecycle while injecting a
 //! truncation / corruption / cancel at every point, and after every iteration
 //! assert the single invariant that makes the brick impossible:
@@ -18,7 +14,7 @@
 //! right-length-but-garbage body, or hang mid-transfer — for both the parallel
 //! byte-range path and the single-connection path.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "updater-integration-tests"))]
 
 mod common;
 
