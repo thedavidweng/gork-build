@@ -22,7 +22,8 @@ contents the agent reads) still goes to the model API — that is how cloud
 coding works. Research uploads and product analytics are hard-off separately;
 they are not the same channel.
 
-[Building from source](#build-from-source) ·
+[Install](#install) ·
+[Build from source](#build-from-source) ·
 [Privacy](#privacy-guarantees-client) ·
 [Documentation](#documentation) ·
 [Contributing](#contributing) ·
@@ -31,12 +32,17 @@ they are not the same channel.
 ![Gork Build TUI](docs/assets/gork-build-tui-screenshot.jpg)
 
 **Gork Build is to [Grok Build](https://github.com/xai-org/grok-build) what
-[VSCodium](https://github.com/VSCodium/vscodium) is to VS Code.**
+[VSCodium](https://github.com/VSCodium/vscodium) is to VS Code**, and what
+[ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium)
+is to Chromium.
 
-This repository contains the Rust source for the `gork` CLI/TUI and agent
-runtime, forked from [`xai-org/grok-build`](https://github.com/xai-org/grok-build)
-with research telemetry hard-off and a community rebrand (paths, env prefixes,
-and API hosts kept for compatibility).
+This GitHub repository is **not** a full Rust checkout. Like
+[VSCodium](https://github.com/VSCodium/vscodium) and
+[ungoogled-chromium](https://github.com/ungoogled-software/ungoogled-chromium),
+it holds a patch queue, overlays, and CI that fetch a pinned
+[`xai-org/grok-build`](https://github.com/xai-org/grok-build) revision and
+apply privacy hard-offs. Compatibility identifiers (`~/.grok`, `GROK_*`, API
+hosts) are kept.
 
 </div>
 
@@ -80,26 +86,61 @@ That is required for a cloud coding agent and is separate from the research /
 product-analytics hard-offs. Gork Build does not add extra research packaging
 on top.
 
-## Build from source
+## Install
 
-Requirements: Rust (see `rust-toolchain.toml`), `protoc` (see `bin/protoc`).
+Prefer a [GitHub Release](https://github.com/thedavidweng/gork-build/releases)
+binary (`gork-<tag>-<platform>.tar.gz` / `.zip`). Those are the patched
+product builds. Vendor `x.ai/cli` installers are hard-disabled — they would
+overwrite this fork with official Grok Build.
 
-This repository is a recipe repo (patches + control plane). Materialize the
-product tree, then build:
+macOS binaries are unsigned:
 
 ```sh
-python3 maint/scripts/patchctl.py checkout   # or ./scripts/dev.sh
-cd .work/src
-cargo run -p xai-grok-pager-bin              # build + launch TUI (binary: gork)
-cargo build -p xai-grok-pager-bin --release  # target/release/gork
-cargo check -p xai-grok-pager-bin
+xattr -d com.apple.quarantine gork
 ```
 
-Install the release binary somewhere on your `PATH` as `gork` (and optionally
-`grok` if you want the upstream command name).
+Put `gork` on your `PATH`. An optional `grok` alias is fine if you want the
+upstream command name.
+
+## Build from source
+
+This repo is a **recipe** (patches + scripts), like VSCodium or
+ungoogled-chromium. Clone it, materialize upstream + patches, then compile:
+
+```sh
+git clone https://github.com/thedavidweng/gork-build.git
+cd gork-build
+python3 maint/scripts/patchctl.py checkout   # or ./scripts/dev.sh
+# → .work/src  (gitignored product tree)
+
+cd .work/src
+# Rust toolchain: rust-toolchain.toml in this tree
+# protoc: bin/protoc, a system protoc, or $PROTOC
+cargo run -p xai-grok-pager-bin              # TUI binary: gork
+cargo build -p xai-grok-pager-bin --release  # target/release/gork
+```
 
 On first launch, authenticate with your Grok / xAI account the same way
 upstream does — model access still goes through the Grok API.
+
+### What's in this repository
+
+| Path | Role |
+|------|------|
+| `maint/patches/` | Privacy / identity patch series (the delta vs upstream) |
+| `maint/overlays/` | Community README, PRIVACY, assets applied on checkout |
+| `maint/upstream.lock.toml` | Pinned `xai-org/grok-build` SHA + version |
+| `maint/scripts/patchctl.py` | `checkout`, `apply`, `export`, `lint`, sync |
+| `.github/workflows/` | Privacy contracts, replay, community releases |
+| `.work/src/` | **Not committed.** Created by `checkout`. |
+
+Edit behavior in `.work/src`, then from the repo root:
+
+```sh
+python3 maint/scripts/patchctl.py export --tip HEAD
+```
+
+That rewrites `maint/patches/`. Do not expect a `crates/` tree on `main`.
 
 ## Privacy guarantees (client)
 
@@ -132,9 +173,12 @@ community releases.
 
 ## Documentation
 
-User guide (upstream docs tree, still accurate for features):
+Feature docs ship with upstream and appear after checkout:
 
-[`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
+`.work/src/crates/codegen/xai-grok-pager/docs/user-guide/`
+
+Or read the same tree on
+[`xai-org/grok-build`](https://github.com/xai-org/grok-build/tree/main/crates/codegen/xai-grok-pager/docs/user-guide).
 
 ## Contributing
 
@@ -151,9 +195,10 @@ for setup, commit style, and PR expectations. Security reports: [`SECURITY.md`](
 
 ## Relationship to upstream
 
-This repository is a fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build).
-We intend to pull upstream fixes periodically while keeping the privacy
-hard-offs.
+Gork Build **tracks** [`xai-org/grok-build`](https://github.com/xai-org/grok-build).
+CI fetches a locked upstream SHA, applies `maint/patches/`, and publishes
+community binaries. When the series applies cleanly, a draft PR updates only
+the lock and patches — not a wholesale copy of the upstream tree.
 
 **Credit:** original Grok Build is developed and published by SpaceXAI under
 Apache-2.0. Gork Build is an independent community distribution and is **not**

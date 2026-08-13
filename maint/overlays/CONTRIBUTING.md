@@ -19,15 +19,14 @@ and [`NOTICE`](NOTICE)).
 
 ## Development setup
 
-Requirements:
+Requirements (after checkout; they live in the materialized tree):
 
-- Rust toolchain from [`rust-toolchain.toml`](rust-toolchain.toml) (`rustup`
-  installs it automatically)
-- `protoc` — see [`bin/protoc`](bin/protoc) or install a system `protoc` /
-  set `$PROTOC`
+- Rust from `.work/src/rust-toolchain.toml` (`rustup` picks it up)
+- `protoc` — `.work/src/bin/protoc`, a system `protoc`, or `$PROTOC`
 
-This repository is a **recipe repo**: it stores patches and the control plane,
-not the full upstream tree. Materialize a buildable tree first:
+This repository is a **recipe repo** (VSCodium / ungoogled-chromium shape):
+it stores patches and the control plane, not the full upstream tree.
+Materialize a buildable tree first:
 
 ```sh
 git clone https://github.com/thedavidweng/gork-build.git
