@@ -84,7 +84,12 @@ on top.
 
 Requirements: Rust (see `rust-toolchain.toml`), `protoc` (see `bin/protoc`).
 
+This repository is a recipe repo (patches + control plane). Materialize the
+product tree, then build:
+
 ```sh
+python3 maint/scripts/patchctl.py checkout   # or ./scripts/dev.sh
+cd .work/src
 cargo run -p xai-grok-pager-bin              # build + launch TUI (binary: gork)
 cargo build -p xai-grok-pager-bin --release  # target/release/gork
 cargo check -p xai-grok-pager-bin
