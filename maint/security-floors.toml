@@ -19,3 +19,8 @@ advisory = "RUSTSEC-2026-0204"
 package = "quinn-proto"
 precise = "0.11.15"
 advisory = "RUSTSEC-2026-0185"
+
+[[floor]]
+package = "webbrowser"
+precise = "1.2.2"
+advisory = "RUSTSEC-2026-0257"

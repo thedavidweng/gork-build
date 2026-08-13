@@ -8,12 +8,12 @@ Gork-Invariant: product-telemetry-disabled
 Gork-Risk: critical
 ---
  crates/codegen/xai-grok-telemetry/Cargo.toml  |   5 +-
- .../codegen/xai-grok-telemetry/src/client.rs  | 117 ++++++++++++++++--
+ .../codegen/xai-grok-telemetry/src/client.rs  | 115 ++++++++++++++++--
  .../codegen/xai-grok-telemetry/src/config.rs  |  44 +++----
  .../xai-grok-telemetry/src/otel_layer/mod.rs  |   5 +
  .../codegen/xai-grok-telemetry/src/sentry.rs  |  11 +-
  crates/codegen/xai-mixpanel/src/lib.rs        |  57 +++------
- 6 files changed, 156 insertions(+), 83 deletions(-)
+ 6 files changed, 154 insertions(+), 83 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-telemetry/Cargo.toml b/crates/codegen/xai-grok-telemetry/Cargo.toml
 index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..efa5fbd3d246a51a0d2c56a8357367078cbde7ee 100644
@@ -39,7 +39,7 @@ index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..efa5fbd3d246a51a0d2c56a835736707
  xai-mixpanel = { workspace = true }
  xai-grok-config = { workspace = true }
 diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
-index 49eb1691081af33ddacc67ff106c7c3c8572c547..7fc249cefa63e97da6e33a73b51244eab0efcb76 100644
+index 49eb1691081af33ddacc67ff106c7c3c8572c547..cb0c6ba1a1d0abd2c403c2ff23b6179436ebed15 100644
 --- a/crates/codegen/xai-grok-telemetry/src/client.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/client.rs
 @@ -85,13 +85,16 @@ impl TelemetryClient {
@@ -87,18 +87,16 @@ index 49eb1691081af33ddacc67ff106c7c3c8572c547..7fc249cefa63e97da6e33a73b51244ea
      let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
      let client = {
          let guard = lock.lock().unwrap_or_else(|err| err.into_inner());
-@@ -349,7 +356,9 @@ pub fn init(
+@@ -349,7 +356,7 @@ pub fn init(
  ) {
      let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
      let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
 -    *guard = if mode.is_disabled() {
-+    *guard = if mode.is_disabled()
-+        || xai_grok_version::research_data_collection_forbidden()
-+    {
++    *guard = if mode.is_disabled() || xai_grok_version::research_data_collection_forbidden() {
          None
      } else {
          Some(TelemetryClient::from_config(
-@@ -382,7 +391,7 @@ pub fn init_if_needed(
+@@ -382,7 +389,7 @@ pub fn init_if_needed(
      subscription_tier: Option<String>,
      http_client: reqwest::Client,
  ) {
@@ -107,7 +105,7 @@ index 49eb1691081af33ddacc67ff106c7c3c8572c547..7fc249cefa63e97da6e33a73b51244ea
          return;
      }
      let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
-@@ -427,6 +436,9 @@ mod tests {
+@@ -427,6 +434,9 @@ mod tests {
  
      /// SessionMetrics must not attempt Mixpanel profile engage — sync_profile
      /// is a no-op unless mode is fully Enabled.
@@ -117,7 +115,7 @@ index 49eb1691081af33ddacc67ff106c7c3c8572c547..7fc249cefa63e97da6e33a73b51244ea
      #[test]
      fn sync_profile_is_noop_in_session_metrics_mode() {
          // No tokio runtime here BY DESIGN: if the gate wrongly falls through,
-@@ -469,12 +481,93 @@ mod tests {
+@@ -469,12 +479,93 @@ mod tests {
          // Explicit call must no-op too (init already invoked it once).
          sync_profile();
          assert!(
