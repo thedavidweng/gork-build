@@ -20,11 +20,11 @@ Gork-Risk: medium
  10 files changed, 100 insertions(+), 162 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
-index be8ea025fc402eb3ae818daef6a5477822a54948..24f67dd61f25af422ae5b7c8ef81e3c1c27db98a 100644
+index 59ac5e13e16cac6e21bd2de5c15392b84fb64e52..969f381c4476c7a4d01bcc8cd66f20126bd6d115 100644
 --- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
 @@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
- version = "1.0.1"
+ version = "1.0.3"
  edition.workspace = true
  license = "Apache-2.0"
 -authors = ["xAI"]
@@ -59,7 +59,7 @@ index be8ea025fc402eb3ae818daef6a5477822a54948..24f67dd61f25af422ae5b7c8ef81e3c1
  xai-grok-workspace = { workspace = true }
  xai-crash-handler = { path = "../xai-crash-handler" }
 diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
-index f8e31f74dfe79edb4c50c335795121b5b0fe49c7..a2fc26216e8a8e9540f3649a1112c704ecd7015e 100644
+index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a2dbbbf9e 100644
 --- a/crates/codegen/xai-grok-pager-bin/src/main.rs
 +++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
 @@ -3,7 +3,8 @@
@@ -117,7 +117,7 @@ index f8e31f74dfe79edb4c50c335795121b5b0fe49c7..a2fc26216e8a8e9540f3649a1112c704
               try again."
              )
          }
-@@ -1106,7 +1107,7 @@ async fn run_agent_command(
+@@ -1104,7 +1105,7 @@ async fn run_agent_command(
      let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
      if !is_stdio && !is_leader {
          eprintln!(
@@ -126,7 +126,7 @@ index f8e31f74dfe79edb4c50c335795121b5b0fe49c7..a2fc26216e8a8e9540f3649a1112c704
              xai_grok_version::display_version_with_commit(
                  env!("VERSION_WITH_COMMIT"),
                  xai_grok_update::channel_label(),
-@@ -1790,7 +1791,8 @@ fn install_heap_profile_hooks() {
+@@ -1788,7 +1789,8 @@ fn install_heap_profile_hooks() {
  }
  fn version_text(channel_label: &str) -> String {
      format!(
@@ -136,7 +136,7 @@ index f8e31f74dfe79edb4c50c335795121b5b0fe49c7..a2fc26216e8a8e9540f3649a1112c704
          xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
      )
  }
-@@ -2635,7 +2637,7 @@ mod tests {
+@@ -2612,7 +2614,7 @@ mod tests {
              let mut output = Vec::new();
              write_version(&mut output, label).unwrap();
              let output = String::from_utf8(output).unwrap();
@@ -146,10 +146,10 @@ index f8e31f74dfe79edb4c50c335795121b5b0fe49c7..a2fc26216e8a8e9540f3649a1112c704
              assert!(output.ends_with(expected_suffix), "{output:?}");
          }
 diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-index d340f35cb11d1da9c7f1c16b227b3e4cd0b3e8f4..5169a7cb9ce9983d614564e2685c7c8ebbe46dfe 100644
+index 5a960e588c81ecc9d642217455fa28a87fc84b28..f377a2992984d7920a2e2bdf19e3cbb0398d4af1 100644
 --- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-@@ -1269,6 +1269,10 @@ impl AppView {
+@@ -1268,6 +1268,10 @@ impl AppView {
      /// Why `coding_data_sharing` is locked for this user (`None` = editable).
      /// Mirrors the dispatch guards in `set_coding_data_sharing`.
      pub fn coding_data_sharing_lock(&self) -> Option<crate::settings::CodingDataSharingLock> {
@@ -160,7 +160,7 @@ index d340f35cb11d1da9c7f1c16b227b3e4cd0b3e8f4..5169a7cb9ce9983d614564e2685c7c8e
          if self.is_zdr {
              Some(crate::settings::CodingDataSharingLock::Zdr)
          } else if self.is_team_non_admin() {
-@@ -1278,7 +1282,14 @@ impl AppView {
+@@ -1277,7 +1281,14 @@ impl AppView {
          }
      }
      /// Welcome privacy banner visibility gates.
@@ -229,7 +229,7 @@ index f9a88aaa8da4d7a735f39a301e7c8bc5ac8dc77d..bbc17ce21edcae47217a80cb916b19bd
      if app.is_zdr {
          app.show_toast("\u{2717} Cannot change: Zero Data Retention enabled");
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
-index ab1584766fffb9fd85ebf54185c373836d9f963f..4b474bd14926cdc31fdf75eb8096f09c9480105a 100644
+index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515cfe29ca7 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
 @@ -613,20 +613,20 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
@@ -487,7 +487,7 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
      }
  }
 diff --git a/crates/codegen/xai-grok-pager/src/lib.rs b/crates/codegen/xai-grok-pager/src/lib.rs
-index 949379f9de82e61fdcd0c8f7b75355ef31de52c1..000b558c746ad3d3146bf8ba894ddcb958029f29 100644
+index 2747f2a7a35f6c4fa444cc830cb06e5049e4e594..c900c13bf631ff8dc7ad69daafba2e8dd76917a6 100644
 --- a/crates/codegen/xai-grok-pager/src/lib.rs
 +++ b/crates/codegen/xai-grok-pager/src/lib.rs
 @@ -1,4 +1,4 @@
@@ -497,10 +497,10 @@ index 949379f9de82e61fdcd0c8f7b75355ef31de52c1..000b558c746ad3d3146bf8ba894ddcb9
  //! A clean-room implementation built on the v3 pager rendering engine.
  
 diff --git a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
-index 747eab5c2a109c3d21f6ee76a857286b0f83212f..5ec9d1a7dc6349d43aacff6641bbc4e8641a7a18 100644
+index 2b64e239d2028a1847584abd312fec2e604fe73c..58b789a94804eb34dd2861ca3fea1c6f3beefc54 100644
 --- a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
 +++ b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
-@@ -7972,6 +7972,7 @@ fn locked_coding_data_sharing_row_does_not_open_picker() {
+@@ -7973,6 +7973,7 @@ fn locked_coding_data_sharing_row_does_not_open_picker() {
      for lock in [
          CodingDataSharingLock::Zdr,
          CodingDataSharingLock::TeamManaged,
@@ -508,7 +508,7 @@ index 747eab5c2a109c3d21f6ee76a857286b0f83212f..5ec9d1a7dc6349d43aacff6641bbc4e8
      ] {
          let mut s = make_locked_state(lock);
          s.selected = coding_data_sharing_row_idx(&s);
-@@ -8007,6 +8008,7 @@ fn locked_coding_data_sharing_row_refuses_reset() {
+@@ -8008,6 +8009,7 @@ fn locked_coding_data_sharing_row_refuses_reset() {
      for lock in [
          CodingDataSharingLock::Zdr,
          CodingDataSharingLock::TeamManaged,
@@ -533,12 +533,12 @@ index 03749b2927ac24b22a4abd1902818e59a12eaff5..75d192bf96d8582541f4ce74c825e835
      }
      if let Some(ref email) = user_info.email
 
-base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: ecf5704845e72317f02add5cb7a3bdea33898ddf
+base-commit: eb267feff13129e568df38fb6fdf0ceb65f735d6
+prerequisite-patch-id: 461d9a629c55db377161aa870929fbbc6cb08b71
 prerequisite-patch-id: 8a4d87ffeadd239c0b5c504db10b4cf492fa89fa
-prerequisite-patch-id: e9ad14073269e96e5ee49d6b6970cedaf0f59f48
+prerequisite-patch-id: 0fc38c6c0c974617e675e3c1061fd32df8f759d3
 prerequisite-patch-id: 561132f565e3d3e04c045251cbe0b2d3d98ecacb
-prerequisite-patch-id: 2730d2e122b55111a3375ce84c07b0c78d628277
+prerequisite-patch-id: b6702a9eb9a1c961a89eb827a84555ab6934cc72
 prerequisite-patch-id: af0edcd4d732f947ad389b939b5e9ea11cd00fa3
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c

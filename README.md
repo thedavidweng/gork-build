@@ -90,7 +90,10 @@ on top.
 
 Prefer a [GitHub Release](https://github.com/thedavidweng/gork-build/releases)
 binary (`gork-<tag>-<platform>.tar.gz` / `.zip`). Those are the patched
-product builds. Vendor `x.ai/cli` installers are hard-disabled — they would
+product builds. CI extracts every shipped archive and runs the binary
+(`--version`, `--help`, and `update` must refuse vendor installers) before
+the release is published, then re-downloads the published assets and smokes
+them again. Vendor `x.ai/cli` installers are hard-disabled — they would
 overwrite this fork with official Grok Build.
 
 macOS binaries are unsigned:

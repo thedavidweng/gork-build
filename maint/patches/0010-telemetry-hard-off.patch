@@ -16,7 +16,7 @@ Gork-Risk: critical
  6 files changed, 154 insertions(+), 83 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-telemetry/Cargo.toml b/crates/codegen/xai-grok-telemetry/Cargo.toml
-index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..efa5fbd3d246a51a0d2c56a8357367078cbde7ee 100644
+index 08d06668f0482d1291e340d3c335980884fb4c01..e77042069ac3ab71e5b774ad664ffd51a2de8b69 100644
 --- a/crates/codegen/xai-grok-telemetry/Cargo.toml
 +++ b/crates/codegen/xai-grok-telemetry/Cargo.toml
 @@ -3,8 +3,8 @@ license = "Apache-2.0"
@@ -411,8 +411,8 @@ index 94a1a836706b674827af4fcde1c61bfab17505d1..437e3634849f2e8ec7b473111b2e36c5
      }
  }
 
-base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: ecf5704845e72317f02add5cb7a3bdea33898ddf
+base-commit: eb267feff13129e568df38fb6fdf0ceb65f735d6
+prerequisite-patch-id: 461d9a629c55db377161aa870929fbbc6cb08b71
 -- 
 2.50.1 (Apple Git-155)
 
