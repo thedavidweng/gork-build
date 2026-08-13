@@ -331,11 +331,10 @@ def write_series(root: Path, files: list[str]) -> None:
 
 
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    # Windows checkouts may rewrite LF → CRLF; hash the LF form so SHA256SUMS
+    # is host-independent and release builders do not fail closed on autocrlf.
+    data = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def write_sha256sums(root: Path, files: list[str]) -> None:
@@ -1011,9 +1010,12 @@ def cmd_report(args: argparse.Namespace) -> int:
     if args.fail_on_sensitive:
         cmd.append("--fail-on-sensitive")
     proc = subprocess.run(cmd, cwd=root)
-    print("--- series ---")
+    # Keep --json stdout machine-readable. Replay CI tees it into a file and
+    # json.load()s it; series listing on stdout made that fail-closed.
+    dest = sys.stderr if args.json else sys.stdout
+    print("--- series ---", file=dest)
     for p in read_series(root):
-        print(p)
+        print(p, file=dest)
     return proc.returncode
 
 

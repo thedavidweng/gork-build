@@ -75,9 +75,11 @@ jobs:
           set -euo pipefail
           python3 maint/scripts/patchctl.py report --json \
             --new "${{ steps.meta.outputs.sha }}" \
-            | tee upstream-sensitive.json
+            > upstream-sensitive.json
+          python3 -c "import json; json.load(open('upstream-sensitive.json'))"
           COUNT=$(python3 -c "import json; print(json.load(open('upstream-sensitive.json'))['sensitive_count'])")
           echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "sensitive_count=${COUNT}"
 
       - name: Apply patch series into .work/src
         id: apply

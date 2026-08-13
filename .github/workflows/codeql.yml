@@ -40,8 +40,9 @@ jobs:
         include:
           - language: rust
             build-mode: none
-          - language: javascript-typescript
-            build-mode: none
+          # No committed JS/TS in the recipe repo (npm bits live in patches
+          # and materialize into .work/src). Scanning javascript-typescript
+          # fails CodeQL finalize with "no source code seen".
           - language: python
             build-mode: none
           - language: actions
