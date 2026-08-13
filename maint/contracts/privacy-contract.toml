@@ -35,11 +35,9 @@ command = [
 [[contract]]
 id = "telemetry-chokepoints"
 group = "privacy"
+# One cargo filter: all three tests are named *_under_privacy.
 command = [
-  "cargo", "test", "-p", "xai-grok-telemetry", "--lib",
-  "init_enabled_still_installs_no_client_under_privacy",
-  "from_config_drops_events_sink_under_privacy",
-  "track_is_hard_return_under_privacy",
+  "cargo", "test", "-p", "xai-grok-telemetry", "--lib", "under_privacy",
 ]
 
 [[contract]]

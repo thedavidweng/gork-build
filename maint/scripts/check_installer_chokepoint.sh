@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Static inventory: vendor install chokepoints must remain gated.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$ROOT"
+CONTROL="$(cd "$(dirname "$0")/../.." && pwd)"
+TREE="${GORK_WORK_SRC:-$CONTROL}"
+cd "$TREE"
 
 # minimum_version.rs was folded into version_policy.rs upstream (0.2.111);
 # the policy path no longer installs, so only auto_update.rs carries the gate.

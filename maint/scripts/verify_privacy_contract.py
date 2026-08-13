@@ -34,13 +34,23 @@ def load_contracts(path: Path) -> list[dict]:
     return list(data.get("contract") or [])
 
 
-def run_contract(tree: Path, contract: dict, *, skip_expensive: bool) -> int:
+def resolve_cmd(control: Path, cmd: list[str]) -> list[str]:
+    out = list(cmd)
+    for i, part in enumerate(out):
+        if part.startswith("maint/") or part.startswith("./maint/"):
+            out[i] = str(control / part.lstrip("./"))
+    return out
+
+
+def run_contract(tree: Path, control: Path, contract: dict, *, skip_expensive: bool) -> int:
     cid = contract["id"]
     if contract.get("expensive") and skip_expensive:
         print(f"[skip] {cid} (expensive)")
         return 0
-    cmd = contract["command"]
+    cmd = resolve_cmd(control, list(contract["command"]))
     env = os.environ.copy()
+    env.setdefault("GORK_CONTROL_ROOT", str(control))
+    env.setdefault("GORK_WORK_SRC", str(tree))
     for key, val in (contract.get("env") or {}).items():
         env[str(key)] = str(val)
     print(f"[run]  {cid}: {' '.join(cmd)}  (cwd={tree})")
@@ -118,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
 
     failed = 0
     for c in contracts:
-        rc = run_contract(tree, c, skip_expensive=args.skip_expensive)
+        rc = run_contract(tree, root, c, skip_expensive=args.skip_expensive)
         if rc != 0:
             failed += 1
     if failed:
