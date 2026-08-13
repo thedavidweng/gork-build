@@ -1,9 +1,10 @@
 {
-    "name": "@xai-official/grok",
+    "name": "@gork-build/gork",
     "version": "0.1.220-alpha.4",
-    "description": "Bring Grok into your terminal",
+    "description": "Gork Build \u2014 community VSCodium-style Grok Build (no vendor telemetry)",
     "license": "Apache-2.0",
     "bin": {
+        "gork": "bin/grok",
         "grok": "bin/grok"
     },
     "files": [
@@ -31,11 +32,11 @@
         "@iarna/toml": "^3.0.0"
     },
     "optionalDependencies": {
-        "@xai-official/grok-darwin-arm64": "0.1.220-alpha.4",
-        "@xai-official/grok-darwin-x64": "0.1.220-alpha.4",
-        "@xai-official/grok-linux-arm64": "0.1.220-alpha.4",
-        "@xai-official/grok-linux-x64": "0.1.220-alpha.4",
-        "@xai-official/grok-win32-arm64": "0.1.220-alpha.4",
-        "@xai-official/grok-win32-x64": "0.1.220-alpha.4"
+        "@gork-build/gork-darwin-arm64": "0.1.220-alpha.4",
+        "@gork-build/gork-darwin-x64": "0.1.220-alpha.4",
+        "@gork-build/gork-linux-arm64": "0.1.220-alpha.4",
+        "@gork-build/gork-linux-x64": "0.1.220-alpha.4",
+        "@gork-build/gork-win32-arm64": "0.1.220-alpha.4",
+        "@gork-build/gork-win32-x64": "0.1.220-alpha.4"
     }
 }

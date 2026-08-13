@@ -6,7 +6,7 @@
 //   2. Stamps the sub-package's version to match the meta package
 //
 // Each per-platform package is its own npm publish target. The meta package
-// (`@xai-official/grok`) lists all six as `optionalDependencies` pinned to
+// (`@gork-build/gork`) lists all six as `optionalDependencies` pinned to
 // the same version; npm installs only the one matching the host's
 // `os` + `cpu` filters.
 //
