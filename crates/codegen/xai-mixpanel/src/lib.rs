@@ -5,7 +5,6 @@
 //!
 //! Only the `track` API is implemented since that's all we use.
 
-use base64::Engine;
 use std::collections::HashMap;
 
 /// Mixpanel client for sending track events.
@@ -44,6 +43,10 @@ impl Mixpanel {
     /// Scrub property string values in place, then inject the project
     /// token. Split out from [`Self::track`] so the scrub-then-inject
     /// ordering is testable.
+    ///
+    /// Not called by [`Self::track`] in Gork Build (track is a hard no-op),
+    /// but kept + unit-tested so a future re-enable cannot drop scrub order.
+    #[allow(dead_code)] // intentionally unused by privacy no-op track path
     fn prepare_properties(
         &self,
         mut properties: HashMap<String, serde_json::Value>,
@@ -57,58 +60,30 @@ impl Mixpanel {
 
     /// Track an event. Properties should include `distinct_id`. The
     /// project `token` is injected after scrubbing, so it isn't redacted.
+    ///
+    /// **Gork Build:** always a no-op — product analytics never leave the host.
     pub async fn track(
         &self,
-        event: &str,
-        properties: Option<HashMap<String, serde_json::Value>>,
+        _event: &str,
+        _properties: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<(), Error> {
-        let props = self.prepare_properties(properties.unwrap_or_default());
-
-        let payload = serde_json::json!([{
-            "event": event,
-            "properties": props,
-        }]);
-
-        let json_bytes = serde_json::to_vec(&payload)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&json_bytes);
-
-        self.client
-            .post("https://api.mixpanel.com/track")
-            .form(&[("data", &encoded)])
-            .send()
-            .await?;
-
+        // Privacy fork: drop all Mixpanel track calls. Token/client remain so
+        // construction sites compile, but nothing is transmitted.
+        let _ = (&self.token, &self.client);
         Ok(())
     }
 
     /// Create or update a user profile via Mixpanel's Engage API.
     /// String values in `set` are scrubbed for secrets before sending.
     /// The project `token` is injected automatically.
+    ///
+    /// **Gork Build:** always a no-op.
     pub async fn engage(
         &self,
-        distinct_id: &str,
-        set: HashMap<String, serde_json::Value>,
+        _distinct_id: &str,
+        _set: HashMap<String, serde_json::Value>,
     ) -> Result<(), Error> {
-        let mut scrubbed = set;
-        for v in scrubbed.values_mut() {
-            xai_grok_secrets::redact_json_string_values(v);
-        }
-
-        let payload = serde_json::json!([{
-            "$token": self.token,
-            "$distinct_id": distinct_id,
-            "$set": scrubbed,
-        }]);
-
-        let json_bytes = serde_json::to_vec(&payload)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&json_bytes);
-
-        self.client
-            .post("https://api.mixpanel.com/engage")
-            .form(&[("data", &encoded)])
-            .send()
-            .await?;
-
+        let _ = (&self.token, &self.client);
         Ok(())
     }
 }
