@@ -85,13 +85,16 @@ impl TelemetryClient {
         subscription_tier: Option<String>,
         http_client: reqwest::Client,
     ) -> Self {
-        let mixpanel = if config.mixpanel_enabled {
-            config
-                .mixpanel_token
-                .as_ref()
-                .map(|token| Arc::new(Mixpanel::new(token.as_str())))
+        // Gork Build: never construct a Mixpanel client or keep a first-party
+        // events sink. `Mixpanel::{track,engage}` and [`track`] are also
+        // no-ops as a second line of defense.
+        let _ = (config.mixpanel_enabled, config.mixpanel_token.as_ref());
+        let privacy = xai_grok_version::research_data_collection_forbidden();
+        let mixpanel: Option<Arc<Mixpanel>> = None;
+        let (events_url, events_api_key) = if privacy {
+            (None, None)
         } else {
-            None
+            (config.events_url, config.events_api_key)
         };
         let deployment_id = deployment_key
             .filter(|s| !s.is_empty())
@@ -103,8 +106,8 @@ impl TelemetryClient {
 
         Self {
             mode,
-            events_url: config.events_url,
-            events_api_key: config.events_api_key,
+            events_url,
+            events_api_key,
             mixpanel,
             user_id,
             team_id,
@@ -181,6 +184,10 @@ impl UserContext {
 
 /// Core telemetry emitter. Routes to product events + Mixpanel.
 pub async fn track(event_name: &str, request_id: &str, ctx: &UserContext, mut metadata: Metadata) {
+    // Entry-point hard-off: even a mis-initialized client cannot POST.
+    if xai_grok_version::research_data_collection_forbidden() {
+        return;
+    }
     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
     let client = {
         let guard = lock.lock().unwrap_or_else(|err| err.into_inner());
@@ -349,7 +356,7 @@ pub fn init(
 ) {
     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
-    *guard = if mode.is_disabled() {
+    *guard = if mode.is_disabled() || xai_grok_version::research_data_collection_forbidden() {
         None
     } else {
         Some(TelemetryClient::from_config(
@@ -382,7 +389,7 @@ pub fn init_if_needed(
     subscription_tier: Option<String>,
     http_client: reqwest::Client,
 ) {
-    if mode.is_disabled() {
+    if mode.is_disabled() || xai_grok_version::research_data_collection_forbidden() {
         return;
     }
     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
@@ -427,6 +434,9 @@ mod tests {
 
     /// SessionMetrics must not attempt Mixpanel profile engage — sync_profile
     /// is a no-op unless mode is fully Enabled.
+    ///
+    /// Gork Build: `init` itself refuses to install a client, so this is a
+    /// stronger no-op than upstream (no live SessionMetrics funnel).
     #[test]
     fn sync_profile_is_noop_in_session_metrics_mode() {
         // No tokio runtime here BY DESIGN: if the gate wrongly falls through,
@@ -469,10 +479,91 @@ mod tests {
         // Explicit call must no-op too (init already invoked it once).
         sync_profile();
         assert!(
-            is_session_metrics_enabled(),
-            "client must be live for session metrics"
+            !is_session_metrics_enabled(),
+            "privacy build must not install a telemetry client"
         );
         assert!(!is_enabled(), "product analytics must stay off");
+    }
+
+    #[test]
+    fn init_enabled_still_installs_no_client_under_privacy() {
+        struct ClearClient;
+        impl Drop for ClearClient {
+            fn drop(&mut self) {
+                let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
+                *lock.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            }
+        }
+        let _clear = ClearClient;
+        let cfg = TelemetryConfig {
+            mixpanel_enabled: true,
+            mixpanel_token: Some("test-token".into()),
+            events_url: Some("https://events.example.invalid/v1".into()),
+            events_api_key: Some("k".into()),
+            ..TelemetryConfig::default()
+        };
+        init(
+            cfg,
+            TelemetryMode::Enabled,
+            Some("user-1".into()),
+            None,
+            None,
+            None,
+            "0.0.0-test".into(),
+            None,
+            reqwest::Client::new(),
+        );
+        assert!(!is_enabled());
+        assert!(!is_session_metrics_enabled());
+    }
+
+    #[test]
+    fn from_config_drops_events_sink_under_privacy() {
+        let cfg = TelemetryConfig {
+            mixpanel_enabled: true,
+            mixpanel_token: Some("test-token".into()),
+            events_url: Some("https://events.example.invalid/v1".into()),
+            events_api_key: Some("k".into()),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::from_config(
+            cfg,
+            TelemetryMode::Enabled,
+            Some("user-1".into()),
+            None,
+            None,
+            None,
+            "0.0.0-test".into(),
+            None,
+            reqwest::Client::new(),
+        );
+        assert!(client.events_url.is_none());
+        assert!(client.events_api_key.is_none());
+        assert!(client.mixpanel.is_none());
+    }
+
+    #[tokio::test]
+    async fn track_is_hard_return_under_privacy() {
+        struct ClearClient;
+        impl Drop for ClearClient {
+            fn drop(&mut self) {
+                let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
+                *lock.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            }
+        }
+        let _clear = ClearClient;
+        // Even if a client were somehow installed, track must return before POST.
+        track(
+            "grok-shell-turn",
+            "req-1",
+            &UserContext {
+                country: "US".into(),
+                language: "en".into(),
+                timestamp: "0".into(),
+            },
+            Metadata::new(),
+        )
+        .await;
     }
 
     /// Names without a known emitter prefix pass through unchanged (preserves

@@ -106,6 +106,11 @@ where
         .with_filter(otel_filter)
 }
 fn build_tracer_provider(client: OtelClientInfo, config: OtelLayerConfig) -> SdkTracerProvider {
+    // Privacy build: never construct the vendor OTLP exporter (cli-chat-proxy
+    // traces), including workspace Server mode.
+    if xai_grok_version::research_data_collection_forbidden() {
+        return SdkTracerProvider::builder().build();
+    }
     match instrumentation::current_mode() {
         instrumentation::InstrumentationMode::Server => build_server_provider(client, config),
         _ => SdkTracerProvider::builder().build(),
