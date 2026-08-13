@@ -112,19 +112,15 @@ echo "==> gork --help (smoke)"
 "$BIN" --help >/dev/null
 
 echo "==> gork update (must refuse vendor install without dialing x.ai)"
-set +e
-UPDATE_OUT="$("$BIN" update 2>&1)"
-UPDATE_EC=$?
-set -e
+UPDATE_EC=0
+UPDATE_OUT="$("$BIN" update 2>&1)" || UPDATE_EC=$?
 echo "$UPDATE_OUT" | head -40
-if echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available'; then
-  echo "update path reported privacy/manual messaging (ok)"
-elif [[ "$UPDATE_EC" -ne 0 ]]; then
-  echo "update exited non-zero (ok for privacy build)"
-else
-  echo "FAIL: gork update exited 0 without privacy refusal message"
+if ! echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available|privacy build never'; then
+  echo "FAIL: gork update did not print a vendor/privacy refusal (exit ${UPDATE_EC})"
+  echo "$UPDATE_OUT"
   exit 1
 fi
+echo "update path reported privacy/manual messaging (ok, exit ${UPDATE_EC})"
 
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then
   echo "FAIL: proxy died during gork smoke"

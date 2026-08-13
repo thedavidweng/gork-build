@@ -7,9 +7,9 @@ Gork-Patch-Id: egress-guard
 Gork-Invariant: egress-denylist-enforced
 Gork-Risk: critical
 ---
- scripts/privacy_egress_check.sh | 151 +++++++++++++++++++++++++++++++
+ scripts/privacy_egress_check.sh | 147 ++++++++++++++++++++++++++++++++
  scripts/privacy_egress_proxy.py | 156 ++++++++++++++++++++++++++++++++
- 2 files changed, 307 insertions(+)
+ 2 files changed, 303 insertions(+)
  create mode 100755 scripts/privacy_egress_check.sh
  create mode 100755 scripts/privacy_egress_proxy.py
 
@@ -18,7 +18,7 @@ new file mode 100755
 index 0000000000000000000000000000000000000000..820af1d02138ae86879a66008ba4471443827d58
 --- /dev/null
 +++ b/scripts/privacy_egress_check.sh
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,147 @@
 +#!/usr/bin/env bash
 +# Privacy egress check: run release `gork` through a local CONNECT proxy and
 +# fail if denylisted destinations appear in the host log.
@@ -133,19 +133,15 @@ index 0000000000000000000000000000000000000000..820af1d02138ae86879a66008ba44714
 +"$BIN" --help >/dev/null
 +
 +echo "==> gork update (must refuse vendor install without dialing x.ai)"
-+set +e
-+UPDATE_OUT="$("$BIN" update 2>&1)"
-+UPDATE_EC=$?
-+set -e
++UPDATE_EC=0
++UPDATE_OUT="$("$BIN" update 2>&1)" || UPDATE_EC=$?
 +echo "$UPDATE_OUT" | head -40
-+if echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available'; then
-+  echo "update path reported privacy/manual messaging (ok)"
-+elif [[ "$UPDATE_EC" -ne 0 ]]; then
-+  echo "update exited non-zero (ok for privacy build)"
-+else
-+  echo "FAIL: gork update exited 0 without privacy refusal message"
++if ! echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available|privacy build never'; then
++  echo "FAIL: gork update did not print a vendor/privacy refusal (exit ${UPDATE_EC})"
++  echo "$UPDATE_OUT"
 +  exit 1
 +fi
++echo "update path reported privacy/manual messaging (ok, exit ${UPDATE_EC})"
 +
 +if ! kill -0 "$PROXY_PID" 2>/dev/null; then
 +  echo "FAIL: proxy died during gork smoke"

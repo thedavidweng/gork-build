@@ -215,19 +215,16 @@ if ! echo "$HELP_OUT" | grep -q 'Usage: gork'; then
 fi
 
 echo "==> $GOT_NAME update (must refuse vendor install)"
-set +e
-UPDATE_OUT="$("$BIN" update 2>&1)"
-UPDATE_EC=$?
-set -e
+UPDATE_EC=0
+UPDATE_OUT="$("$BIN" update 2>&1)" || UPDATE_EC=$?
 echo "$UPDATE_OUT" | head -40
-if echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available|privacy build never'; then
-  echo "update refused vendor install (ok)"
-elif [[ "$UPDATE_EC" -ne 0 ]]; then
-  echo "update exited $UPDATE_EC (ok for privacy build)"
-else
-  echo "FAIL: gork update exited 0 without a privacy/vendor refusal" >&2
+# A crash or network error is not a privacy refusal. Require the hard-off text.
+if ! echo "$UPDATE_OUT" | grep -qiE 'never installs from vendor|rebuild from source|Auto-update is not available|privacy build never'; then
+  echo "FAIL: gork update did not print a vendor/privacy refusal (exit ${UPDATE_EC})" >&2
+  echo "$UPDATE_OUT" >&2
   exit 1
 fi
+echo "update refused vendor install (ok, exit ${UPDATE_EC})"
 if echo "$UPDATE_OUT" | grep -qE 'curl -fsSL https://x\.ai/cli|irm https://x\.ai/cli'; then
   echo "FAIL: update output recommends a vendor installer" >&2
   exit 1

@@ -85,7 +85,7 @@ index 4c5a8f7849ec49e79ec2df4110bf610cc3101098..9479fc86a03a9d9944c2f0a67bb1f118
              label: "Auto-update",
 -            description: "Automatically download and install pager updates on startup. \
 -                          Restart required.",
-+            description: "Unused in Gork Build. Vendor (x.ai) auto-update is hard-disabled so                           this fork is never overwritten by official Grok Build installers.                           Update by rebuilding from the gork-build repository.",
++            description: "Unused in Gork Build. Vendor (x.ai) auto-update is hard-disabled so this fork is never overwritten by official Grok Build installers. Update by rebuilding from the gork-build repository.",
              keywords: &[
                  "auto", "update", "updates", "upgrade", "version", "install", "channel",
              ],
