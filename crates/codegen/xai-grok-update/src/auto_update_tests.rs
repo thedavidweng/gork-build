@@ -986,94 +986,99 @@ async fn test_cleanup_old_downloads_mixed_stable_and_alpha() {
 
 #[test]
 fn test_reinstall_hint_npm_mentions_npm_command() {
+    // Gork Build points at the community package, never @xai-official/grok.
     let hint = reinstall_hint("npm", "stable");
     assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
     assert!(
-        hint.contains("@xai-official/grok"),
-        "should name the package: {hint}"
+        hint.contains("@gork-build/gork"),
+        "should name the gork package: {hint}"
+    );
+    assert!(
+        !hint.contains("@xai-official/grok"),
+        "must not recommend vendor npm package: {hint}"
     );
 }
 
 #[test]
 fn test_reinstall_hint_gh_release_mentions_gh_command() {
+    // Gork Build points at this fork's releases, not xai-org installers.
     let hint = reinstall_hint("gh-release", "stable");
     assert!(
-        hint.contains("gh release download"),
-        "should suggest gh release download: {hint}"
+        hint.contains("thedavidweng/gork-build"),
+        "should name the fork releases: {hint}"
     );
     assert!(
-        hint.contains("xai-org-shared/grok-build"),
-        "should name the repo: {hint}"
+        !hint.contains("xai-org") && !hint.contains("gh release download"),
+        "must not recommend vendor gh release path: {hint}"
     );
 }
 
 #[test]
 fn test_reinstall_hint_internal_mentions_platform_installer() {
+    // Privacy: internal installer reinstall is source rebuild, never x.ai scripts.
+    // (Hint prose may mention "x.ai/cli" as a warning — reject only actionable installers.)
     let hint = reinstall_hint("internal", "stable");
-    if cfg!(windows) {
-        assert!(hint.contains("irm"), "should suggest irm install: {hint}");
-        assert!(
-            hint.contains("install.ps1"),
-            "should reference install.ps1: {hint}"
-        );
-        assert!(
-            !hint.contains("GROK_CHANNEL"),
-            "stable must not set channel: {hint}"
-        );
-    } else {
-        assert!(hint.contains("curl"), "should suggest curl install: {hint}");
-        assert!(
-            hint.contains("install.sh"),
-            "should reference install.sh: {hint}"
-        );
-        assert!(
-            !hint.contains("GROK_CHANNEL"),
-            "stable must not set channel: {hint}"
-        );
-    }
+    assert!(
+        hint.contains("cargo build") && hint.contains("gork"),
+        "should point at gork source rebuild: {hint}"
+    );
+    assert!(
+        !hint.contains("curl -")
+            && !hint.contains("irm ")
+            && !hint.contains("install.sh")
+            && !hint.contains("install.ps1")
+            && !hint.contains("https://x.ai/cli"),
+        "must not recommend vendor installers: {hint}"
+    );
+    assert!(
+        !hint.contains("GROK_CHANNEL"),
+        "stable source rebuild must not set channel: {hint}"
+    );
 }
 
 #[test]
 fn test_reinstall_hint_internal_alpha_sets_channel() {
+    // Privacy: channel is ignored; every internal path is the same source rebuild.
     let hint = reinstall_hint("internal", "alpha");
-    if cfg!(windows) {
-        assert!(
-            hint.contains("$env:GROK_CHANNEL='alpha'"),
-            "alpha should set GROK_CHANNEL: {hint}"
-        );
-    } else {
-        assert!(
-            hint.contains("| GROK_CHANNEL='alpha' bash"),
-            "alpha must set GROK_CHANNEL on bash (the process running \
-             install.sh), not curl: {hint}"
-        );
-    }
+    assert!(
+        hint.contains("cargo build") && hint.contains("gork"),
+        "alpha still points at source rebuild: {hint}"
+    );
+    assert!(
+        !hint.contains("GROK_CHANNEL") && !hint.contains("https://x.ai/cli"),
+        "must not set vendor channel env or installer URL: {hint}"
+    );
 }
 
 #[test]
 fn test_reinstall_hint_enterprise_uses_enterprise_script() {
-    // Enterprise ships via its own bootstrap script (channel hardcoded
-    // there), never install.sh + GROK_CHANNEL.
+    // Privacy: enterprise channel also refuses vendor bootstrap scripts.
     let hint = reinstall_hint("internal", "enterprise");
     assert!(
-        hint.contains("/enterprise-install."),
-        "enterprise must use the published enterprise-install script: {hint}"
+        hint.contains("cargo build") && hint.contains("gork"),
+        "enterprise must also point at source rebuild: {hint}"
     );
     assert!(
-        !hint.contains("GROK_CHANNEL"),
-        "enterprise script needs no channel env: {hint}"
+        !hint.contains("/enterprise-install.")
+            && !hint.contains("GROK_CHANNEL")
+            && !hint.contains("https://x.ai/cli"),
+        "must not recommend vendor enterprise install: {hint}"
     );
 }
 
 #[test]
 fn test_reinstall_hint_malformed_channel_falls_back_to_stable() {
-    // Free-text config channels never reach the shell one-liner unless
-    // they are plain [A-Za-z0-9._-] tokens.
+    // Free-text config channels never reach a shell one-liner under privacy —
+    // all map to the same source-build hint (no GROK_CHANNEL interpolation).
     for bad in ["al pha", "x'; rm -rf ~;'", "a\"b", ""] {
         let hint = reinstall_hint("internal", bad);
         assert!(
             !hint.contains("GROK_CHANNEL"),
-            "malformed channel {bad:?} must fall back to stable: {hint}"
+            "malformed channel {bad:?} must not reach shell: {hint}"
+        );
+        assert!(
+            hint.contains("cargo build"),
+            "malformed channel {bad:?} still source rebuild: {hint}"
         );
     }
 }
@@ -1876,7 +1881,7 @@ fn test_user_facing_constants_are_stable() {
     );
     assert_eq!(
         MSG_RUN_UPDATE_MANUAL,
-        "Run `grok update` to get the latest version."
+        "Run `gork update` to get the latest version."
     );
 }
 
@@ -2556,5 +2561,93 @@ async fn test_windows_replace_exe_sweeps_accumulated_asides() {
     assert!(
         agent_old.exists(),
         "other executables' leftovers must be untouched"
+    );
+}
+
+#[test]
+fn privacy_build_forbids_vendor_auto_update() {
+    assert!(
+        vendor_auto_update_forbidden(),
+        "PRIVACY_BUILD must forbid vendor auto-update"
+    );
+    let msg = vendor_update_blocked_message();
+    assert!(
+        msg.contains("Gork Build") || msg.contains("vendor") || msg.contains("never"),
+        "{msg}"
+    );
+    assert!(!msg.contains("curl -fsSL https://x.ai/cli"), "{msg}");
+}
+
+#[tokio::test]
+async fn run_install_script_fail_closed_under_privacy() {
+    let cfg = UpdateConfig {
+        proxy_base_url: "http://test.invalid/v1".to_string(),
+        auth_scope: "test".to_string(),
+        deployment_key: None,
+        alpha_test_key: None,
+        channel: "stable".to_string(),
+        npm_registry: None,
+    };
+    let err = run_install_script(
+        "internal",
+        Some("1.0.0"),
+        &cfg,
+        CliUpdateTrigger::UserCommand,
+    )
+    .await
+    .expect_err("run_install_script must refuse under privacy");
+    let s = format!("{err:#}");
+    assert!(
+        s.contains("vendor") || s.contains("Gork") || s.contains("privacy") || s.contains("never"),
+        "{s}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_latest_on_disk_no_install_under_privacy() {
+    let cfg = UpdateConfig {
+        proxy_base_url: "http://test.invalid/v1".to_string(),
+        auth_scope: "test".to_string(),
+        deployment_key: None,
+        alpha_test_key: None,
+        channel: "stable".to_string(),
+        npm_registry: None,
+    };
+    let out = ensure_latest_on_disk(&cfg)
+        .await
+        .expect("privacy path is Ok(no-op), not network error");
+    assert!(
+        out.installed.is_none(),
+        "leader hourly path must not install under privacy"
+    );
+    assert!(
+        !out.relaunch_needed,
+        "must not claim relaunch after a privacy no-op"
+    );
+}
+
+#[tokio::test]
+async fn auto_update_target_none_under_privacy() {
+    let cfg = UpdateConfig {
+        proxy_base_url: "http://test.invalid/v1".to_string(),
+        auth_scope: "test".to_string(),
+        deployment_key: None,
+        alpha_test_key: None,
+        channel: "stable".to_string(),
+        npm_registry: None,
+    };
+    assert!(auto_update_target(&cfg).await.is_none());
+}
+
+#[test]
+fn test_reinstall_hint_internal_points_at_gork_source_build() {
+    let hint = reinstall_hint("internal", "stable");
+    assert!(
+        hint.contains("cargo build") && hint.contains("gork"),
+        "Gork Build reinstall must point at source rebuild, not x.ai installers: {hint}"
+    );
+    assert!(
+        !hint.contains("curl -fsSL https://x.ai/cli") && !hint.contains("irm https://x.ai/cli"),
+        "must not recommend vendor installers: {hint}"
     );
 }
