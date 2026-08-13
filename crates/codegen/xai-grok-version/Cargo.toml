@@ -3,7 +3,13 @@ license = "Apache-2.0"
 name = "xai-grok-version"
 version = "1.0.3"
 edition.workspace = true
-description = "Lockstepped grok CLI version."
+description = "Lockstepped Gork Build CLI version and privacy-build constants."
+
+[features]
+# Default-on in this fork. Product crates request `features = ["privacy"]`
+# so `--no-default-features` on an unrelated crate cannot turn the switch off.
+default = ["privacy"]
+privacy = []
 
 [dependencies]
 semver = { workspace = true }
