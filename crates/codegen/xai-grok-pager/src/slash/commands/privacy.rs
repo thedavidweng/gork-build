@@ -14,8 +14,8 @@ impl SlashCommand for PrivacyCommand {
     }
 
     fn description(&self) -> &str {
-        // Reads as the row it opens: "Coding data, retention, and training".
-        "Open coding data, retention, and training settings"
+        // Gork Build: retention is locked; still opens the (locked) settings row.
+        "Show coding data retention status (locked to opt-out)"
     }
 
     fn usage(&self) -> &str {
