@@ -1,0 +1,93 @@
+# Download the latest published GitHub Release the way a user would and
+# prove the archive still extracts and runs. Catches a bad upload, a
+# truncated asset, or a tag that shipped without a working binary.
+name: Published release smoke
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to smoke (empty = latest)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: published-release-smoke-${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-downloaded-asset:
+    name: Download and smoke ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-latest
+          - platform: win32-x64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            maint/scripts/smoke_release_archive.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Download published asset
+        id: dl
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_INPUT: ${{ github.event.release.tag_name || inputs.tag }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$TAG_INPUT" ]]; then
+            TAG="$TAG_INPUT"
+          else
+            TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
+              --json tagName --jq '.[0].tagName')
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "no published release to smoke" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "$PLATFORM" == win32-* ]]; then
+            ASSET="gork-${TAG}-${PLATFORM}.zip"
+          else
+            ASSET="gork-${TAG}-${PLATFORM}.tar.gz"
+          fi
+          mkdir -p "$RUNNER_TEMP/dl"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET" --dir "$RUNNER_TEMP/dl"
+          test -s "$RUNNER_TEMP/dl/$ASSET"
+          echo "asset=${RUNNER_TEMP}/dl/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "downloaded $TAG / $ASSET"
+
+      - name: Smoke as a user would
+        shell: bash
+        env:
+          TAG: ${{ steps.dl.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          VER="${VER%%-gork.*}"
+          bash maint/scripts/smoke_release_archive.sh "${{ steps.dl.outputs.asset }}" \
+            --platform "${{ matrix.platform }}" \
+            --expect-version "$VER"

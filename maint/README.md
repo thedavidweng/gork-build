@@ -27,7 +27,11 @@ Daily, when the patch series applies cleanly:
    hit adds `security-review-required`.
 3. **`release.yml`** (cron) — materializes `.work/src` and publishes
    `v<upstream>-gork.N` (N increments so a patch-only fix can ship) for the
-   six-target matrix.
+   six-target matrix. Each archive is extracted and the binary is executed
+   (`--version` / `--help` / `update` must refuse vendor installers) before
+   publish. The same packaging path is smoked on every PR (`Build gork`).
+   `published-release-smoke.yml` re-downloads the GitHub Release assets the
+   way a user would and smokes them again.
 
 Fail-closed exits from the loop (human/agent needed):
 

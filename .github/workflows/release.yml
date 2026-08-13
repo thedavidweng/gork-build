@@ -58,6 +58,7 @@ jobs:
             exit 1
           fi
           MAIN_SHA=$(git rev-parse HEAD)
+          LOCK=$(sed -n 's/^commit = "\(.*\)"/\1/p' maint/upstream.lock.toml | head -1)
           # Increment v<upstream>-gork.N so a patch-only fix can ship.
           EXISTING=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName --jq '.[].tagName' | grep -E "^v${VER}-gork\\.[0-9]+$" || true)
@@ -67,11 +68,29 @@ jobs:
             N=$((MAX + 1))
           fi
           TAG="v${VER}-gork.${N}"
+          # Do not republish the same control-repo commit (daily cron).
+          ALREADY=""
+          if [[ -n "$EXISTING" ]]; then
+            while IFS= read -r prev; do
+              [[ -z "$prev" ]] && continue
+              TARGET=$(gh release view "$prev" --repo "$GITHUB_REPOSITORY" \
+                --json targetCommitish --jq .targetCommitish)
+              if [[ "$TARGET" == "$MAIN_SHA" ]]; then
+                ALREADY="$prev"
+                break
+              fi
+            done <<< "$EXISTING"
+          fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
-          echo "will release ${TAG} from ${MAIN_SHA}"
-          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          if [[ -n "$ALREADY" ]]; then
+            echo "skip: ${MAIN_SHA} already released as ${ALREADY}"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "will release ${TAG} from ${MAIN_SHA} (lock ${LOCK})"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     name: Build ${{ matrix.platform }}
@@ -196,18 +215,26 @@ jobs:
           if [[ -n "${{ matrix.target }}" ]]; then
             OUTDIR=".work/src/target/${{ matrix.target }}/release"
           fi
-          STAGE=$(mktemp -d)
           if [[ "$PLATFORM" == win32-* ]]; then
-            cp "${OUTDIR}/gork.exe" "${STAGE}/gork.exe"
-            ASSET="gork-${TAG}-${PLATFORM}.zip"
-            (cd "$STAGE" && 7z a -tzip "${GITHUB_WORKSPACE}/${ASSET}" gork.exe >/dev/null)
+            BIN="${OUTDIR}/gork.exe"
           else
-            cp "${OUTDIR}/gork" "${STAGE}/gork"
-            "${STAGE}/gork" --version || true
-            ASSET="gork-${TAG}-${PLATFORM}.tar.gz"
-            tar -C "$STAGE" -czf "${ASSET}" gork
+            BIN="${OUTDIR}/gork"
           fi
-          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+          ASSET=$(bash maint/scripts/package_gork.sh \
+            --bin "$BIN" --platform "$PLATFORM" --tag "$TAG" --output-dir "$GITHUB_WORKSPACE")
+          echo "ASSET=$(basename "$ASSET")" >> "$GITHUB_ENV"
+
+      - name: Smoke packaged archive
+        shell: bash
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          VER="${VER%%-gork.*}"
+          bash maint/scripts/smoke_release_archive.sh "${{ env.ASSET }}" \
+            --platform "${{ matrix.platform }}" \
+            --expect-version "$VER"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -240,11 +267,37 @@ jobs:
           path: assets
           merge-multiple: true
 
-      - name: Checksums
+      - name: Checksums and required platforms
         run: |
           set -euo pipefail
           ls -la assets/
+          # Non-experimental matrix: a missing asset means users cannot install
+          # that platform. win32-arm64 is optional (continue-on-error builder).
+          REQUIRED=(linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64)
+          TAG="${{ needs.plan.outputs.tag }}"
+          missing=0
+          for plat in "${REQUIRED[@]}"; do
+            if [[ "$plat" == win32-* ]]; then
+              f="assets/gork-${TAG}-${plat}.zip"
+            else
+              f="assets/gork-${TAG}-${plat}.tar.gz"
+            fi
+            if [[ ! -s "$f" ]]; then
+              echo "FAIL: required release asset missing: $f"
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            echo "refusing to publish an incomplete install matrix" >&2
+            exit 1
+          fi
           (cd assets && shasum -a 256 gork-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          # Re-extract every shipped archive so publish never uploads a
+          # corrupted tarball that the builder claimed was fine.
+          for asset in assets/gork-*; do
+            [[ "$(basename "$asset")" == SHA256SUMS.txt ]] && continue
+            bash maint/scripts/smoke_release_archive.sh "$asset"
+          done
 
       - name: Create release
         env:
@@ -268,7 +321,7 @@ jobs:
 
           Platform matrix mirrors upstream's prebuilt set (darwin/linux/win32 × arm64/x64). macOS binaries are unsigned: \`xattr -d com.apple.quarantine gork\` after extracting.
 
-          Verified in CI before this release: privacy contracts, patch-queue apply, cargo audit.
+          Verified in CI before this release: privacy contracts, patch-queue apply, cargo audit, and a extract-and-run smoke of every shipped archive.
           EOF
           gh release create "$TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \

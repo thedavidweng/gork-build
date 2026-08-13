@@ -250,3 +250,17 @@ jobs:
           echo "$HELP" | grep -q 'Gork Build TUI'
           echo "$HELP" | grep -q 'Usage: gork'
           echo "smoke ok"
+
+      - name: Package linux-x64 like a GitHub Release
+        run: |
+          set -euo pipefail
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' maint/upstream.lock.toml | head -1)
+          ASSET=$(bash maint/scripts/package_gork.sh \
+            --bin .work/src/target/release/gork \
+            --platform linux-x64 \
+            --tag "v${VER}-gork.ci" \
+            --output-dir "$RUNNER_TEMP")
+          bash maint/scripts/smoke_release_archive.sh "$ASSET" \
+            --platform linux-x64 \
+            --expect-version "$VER"
+          echo "release-archive-smoke ok: $ASSET"
