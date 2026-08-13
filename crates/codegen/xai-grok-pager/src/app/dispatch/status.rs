@@ -201,6 +201,11 @@ pub(super) fn set_coding_data_sharing(
     opted_in: bool,
     source: xai_grok_telemetry::events::CodingDataConsentSource,
 ) -> Vec<Effect> {
+    // ── Guard 0: Gork Build privacy lock ─────────────────────────────
+    if xai_grok_version::coding_data_retention_locked_opt_out() && opted_in {
+        app.show_toast("\u{2717} Gork Build locks coding data retention to opt-out");
+        return vec![];
+    }
     // ── Guard 1: Enterprise ZDR ──────────────────────────────────────
     if app.is_zdr {
         app.show_toast("\u{2717} Cannot change: Zero Data Retention enabled");
