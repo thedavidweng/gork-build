@@ -52,6 +52,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure git identity
+        if: matrix.language == 'rust'
+        run: |
+          git config --global user.email "gork-ci@users.noreply.github.com"
+          git config --global user.name "Gork CI"
+
+      - name: Materialize product tree (Rust)
+        if: matrix.language == 'rust'
+        run: python3 maint/scripts/patchctl.py checkout
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:

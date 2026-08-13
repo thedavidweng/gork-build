@@ -33,10 +33,28 @@ def load_patterns(path: Path) -> list[str]:
     return patterns
 
 
+def git_cwd(root: Path) -> Path:
+    import os
+
+    for candidate in (
+        os.environ.get("GORK_WORK_SRC"),
+        os.environ.get("GORK_UPSTREAM_CLONE"),
+        str(root / ".work" / "src"),
+        str(root / ".work" / "upstream"),
+        str(root),
+    ):
+        if not candidate:
+            continue
+        p = Path(candidate)
+        if (p / ".git").exists() or (p / "HEAD").exists():
+            return p
+    return root
+
+
 def git_diff_names(root: Path, old: str, new: str) -> list[str]:
     proc = subprocess.run(
         ["git", "diff", "--name-only", old, new],
-        cwd=root,
+        cwd=git_cwd(root),
         capture_output=True,
         text=True,
         check=False,

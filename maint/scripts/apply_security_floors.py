@@ -10,6 +10,7 @@ closed instead of guessing.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tomllib
@@ -28,9 +29,10 @@ def parse_ver(v: str) -> tuple:
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parents[2]
-    floors_path = root / "maint" / "security-floors.toml"
-    lock_path = root / "Cargo.lock"
+    control = Path(os.environ.get("GORK_CONTROL_ROOT") or Path(__file__).resolve().parents[2])
+    tree = Path(os.environ.get("GORK_WORK_SRC") or control)
+    floors_path = control / "maint" / "security-floors.toml"
+    lock_path = tree / "Cargo.lock"
     if not floors_path.is_file():
         print("security-floors: no maint/security-floors.toml — nothing to do")
         return 0
@@ -68,7 +70,7 @@ def main() -> int:
         print(f"security-floors: {name} {current} -> {precise} ({advisory})")
         proc = subprocess.run(
             ["cargo", "update", "-p", f"{name}@{current}", "--precise", precise],
-            cwd=root,
+            cwd=tree,
         )
         if proc.returncode != 0:
             print(f"security-floors: cargo update failed for {name}", file=sys.stderr)

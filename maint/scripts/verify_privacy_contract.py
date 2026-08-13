@@ -12,8 +12,21 @@ from pathlib import Path
 
 
 def repo_root() -> Path:
+    env = os.environ.get("GORK_CONTROL_ROOT")
+    if env:
+        return Path(env)
     here = Path(__file__).resolve()
     return here.parents[2]
+
+
+def work_src(control: Path) -> Path:
+    env = os.environ.get("GORK_WORK_SRC")
+    if env:
+        return Path(env)
+    candidate = control / ".work" / "src"
+    if (candidate / "Cargo.toml").is_file():
+        return candidate
+    return control
 
 
 def load_contracts(path: Path) -> list[dict]:
@@ -21,7 +34,7 @@ def load_contracts(path: Path) -> list[dict]:
     return list(data.get("contract") or [])
 
 
-def run_contract(root: Path, contract: dict, *, skip_expensive: bool) -> int:
+def run_contract(tree: Path, contract: dict, *, skip_expensive: bool) -> int:
     cid = contract["id"]
     if contract.get("expensive") and skip_expensive:
         print(f"[skip] {cid} (expensive)")
@@ -30,8 +43,8 @@ def run_contract(root: Path, contract: dict, *, skip_expensive: bool) -> int:
     env = os.environ.copy()
     for key, val in (contract.get("env") or {}).items():
         env[str(key)] = str(val)
-    print(f"[run]  {cid}: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=root, env=env)
+    print(f"[run]  {cid}: {' '.join(cmd)}  (cwd={tree})")
+    proc = subprocess.run(cmd, cwd=tree, env=env)
     if proc.returncode != 0:
         print(f"[fail] {cid} exit={proc.returncode}", file=sys.stderr)
     else:
@@ -73,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = repo_root()
+    tree = work_src(root)
     contracts_path = args.contracts or (root / "maint/contracts/privacy-contract.toml")
     if not contracts_path.is_file():
         print(f"missing contracts file: {contracts_path}", file=sys.stderr)
@@ -104,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
 
     failed = 0
     for c in contracts:
-        rc = run_contract(root, c, skip_expensive=args.skip_expensive)
+        rc = run_contract(tree, c, skip_expensive=args.skip_expensive)
         if rc != 0:
             failed += 1
     if failed:
