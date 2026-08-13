@@ -26,7 +26,7 @@ agent-client-protocol = { workspace = true }
 anyhow = { workspace = true }
 xai-grok-announcements = { workspace = true }
 xai-prompt-queue = { workspace = true }
-xai-grok-version = { workspace = true }
+xai-grok-version = { workspace = true, features = ["privacy"] }
 
 async-openai = { workspace = true }
 async-trait = { workspace = true }
