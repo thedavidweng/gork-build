@@ -29,55 +29,62 @@ pub enum UpdateRunMode {
 
 const PROMPT_UPDATE_NOW: &str = "Update now? [Y/n/d]";
 const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
-const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version.";
+const MSG_RUN_UPDATE_MANUAL: &str = "Run `gork update` to get the latest version.";
 /// An empty or `"stable"` channel means stable — the installers' default
 /// (`CHANNEL="${GROK_CHANNEL:-stable}"` in install.sh).
+#[allow(dead_code)]
 fn is_stable_channel(channel: &str) -> bool {
     channel.is_empty() || channel == "stable"
 }
 
-/// Manual-install one-liner for this platform's bootstrap installer.
-///
-/// On Unix the variable must prefix `bash` (which runs install.sh), not
-/// `curl`: in `VAR=x curl … | bash` the assignment applies to `curl` only
-/// and install.sh would fall back to stable.
-fn manual_install_cmd(channel: &str) -> String {
-    // Only interpolate a well-formed channel ([A-Za-z0-9._-]) into the
-    // shell one-liner; anything else falls back to stable (a working
-    // installer beats a broken quoted command).
-    let channel = channel.trim();
-    let safe = !channel.is_empty()
-        && channel
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if channel == "enterprise" {
-        // Enterprise has its own bootstrap script; it needs no channel env.
-        return if cfg!(windows) {
-            "irm https://x.ai/cli/enterprise-install.ps1 | iex".to_string()
-        } else {
-            "curl -fsSL https://x.ai/cli/enterprise-install.sh | bash".to_string()
-        };
+/// Manual reinstall hint for Gork Build (never points at x.ai installers —
+/// those would replace this fork with official Grok Build).
+/// `channel` is accepted for API compatibility with upstream call sites but ignored.
+fn manual_install_cmd(_channel: &str) -> String {
+    "git pull && cargo build -p xai-grok-pager-bin --release  # binary: target/release/gork"
+        .to_string()
+}
+
+/// Env escape hatch for integration tests only (feature-gated).
+#[doc(hidden)]
+pub const TEST_ALLOW_UPDATE_ENV: &str = "GORK_TEST_ALLOW_UPDATE";
+
+/// Gork Build never auto-updates from vendor (x.ai) channels.
+/// Callers must check it; [`run_install_script`] enforces it as the last-line chokepoint.
+#[inline]
+pub fn vendor_auto_update_forbidden() -> bool {
+    #[cfg(feature = "updater-integration-tests")]
+    {
+        // SAFETY: only honored when the integration-tests feature is compiled
+        // in; product builds never link this path.
+        if std::env::var(TEST_ALLOW_UPDATE_ENV).as_deref() == Ok("1") {
+            return false;
+        }
     }
-    if is_stable_channel(channel) || !safe {
-        return if cfg!(windows) {
-            "irm https://x.ai/cli/install.ps1 | iex".to_string()
-        } else {
-            "curl -fsSL https://x.ai/cli/install.sh | bash".to_string()
-        };
-    }
-    if cfg!(windows) {
-        format!("$env:GROK_CHANNEL='{channel}'; irm https://x.ai/cli/install.ps1 | iex")
-    } else {
-        format!("curl -fsSL https://x.ai/cli/install.sh | GROK_CHANNEL='{channel}' bash")
-    }
+    // Compile-time privacy switch. Also consult research_data_collection so a
+    // mis-built binary without PRIVACY_BUILD still fails closed if research is locked.
+    xai_grok_version::PRIVACY_BUILD || xai_grok_version::research_data_collection_forbidden()
+}
+
+/// User-facing explanation when vendor update is blocked.
+pub fn vendor_update_blocked_message() -> String {
+    format!(
+        "Gork Build never installs from vendor (x.ai) update channels — that would replace this privacy fork with official Grok Build.\n\nRebuild from source instead:\n  {}\n\nCommunity releases (when published): https://github.com/thedavidweng/gork-build/releases",
+        manual_install_cmd("stable")
+    )
+}
+
+/// Err used by install/update chokepoints under [`vendor_auto_update_forbidden`].
+fn vendor_update_blocked_err() -> anyhow::Error {
+    anyhow::anyhow!("{}", vendor_update_blocked_message())
 }
 
 /// Build a reinstall hint for a known installer type.
 fn reinstall_hint(installer: &str, channel: &str) -> String {
     match installer {
-        "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
-        _ => format!("Please reinstall via:\n  {}", manual_install_cmd(channel)),
+        "npm" => "Please reinstall via npm:\n  npm i -g @gork-build/gork".to_string(),
+        "gh-release" => "Please reinstall from this fork's GitHub Releases:\n  https://github.com/thedavidweng/gork-build/releases".to_string(),
+        _ => format!("Please reinstall Gork Build from source (do not use x.ai/cli installers):\n  {}", manual_install_cmd(channel)),
     }
 }
 
@@ -191,6 +198,16 @@ pub struct UpdateStatus {
 
 /// Format and print an [`UpdateStatus`] to stdout.
 pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<()> {
+    // Expected policy state for Gork Build: no vendor update path, not a failure.
+    if vendor_auto_update_forbidden() && !json {
+        println!(
+            "Gork Build - v{} [{}]",
+            status.current_version, status.channel
+        );
+        println!("Auto-update: disabled (privacy build never installs from vendor channels).");
+        println!("{}", vendor_update_blocked_message());
+        return Ok(());
+    }
     if json {
         let payload = serde_json::to_string(status)?;
         println!("{payload}");
@@ -199,7 +216,7 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
 
     if let Some(error) = status.error.as_deref() {
         println!(
-            "Grok Build - v{} [{}]",
+            "Gork Build - v{} [{}]",
             status.current_version, status.channel
         );
         println!("Update check failed: {error}");
@@ -211,24 +228,24 @@ pub fn print_update_status(status: &UpdateStatus, json: bool) -> anyhow::Result<
     if status.update_available {
         if let Some(latest_version) = status.latest_version.as_deref() {
             println!(
-                "A new version of Grok Build is available: {} -> {}{}",
+                "A new version of Gork Build is available: {} -> {}{}",
                 status.current_version, latest_version, channel_label
             );
         } else {
-            println!("A new version of Grok Build is available.");
+            println!("A new version of Gork Build is available.");
         }
         return Ok(());
     }
 
     if let Some(latest_version) = status.latest_version.as_deref() {
         println!(
-            "Grok Build - v{} (latest: {}){}",
+            "Gork Build - v{} (latest: {}){}",
             status.current_version, latest_version, channel_label
         );
         return Ok(());
     }
 
-    println!("Grok Build - v{}{}", status.current_version, channel_label);
+    println!("Gork Build - v{}{}", status.current_version, channel_label);
     Ok(())
 }
 
@@ -238,6 +255,18 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     let current_config = config::load_config().await;
     let auto_update = current_config.cli.auto_update;
     let channel = update_config.channel.clone();
+    // Privacy: never advertise vendor updates, but still report installer/current.
+    if vendor_auto_update_forbidden() {
+        return UpdateStatus {
+            current_version,
+            latest_version: None,
+            update_available: false,
+            installer,
+            channel,
+            auto_update: Some(false),
+            error: None,
+        };
+    }
 
     let Some(ref inst) = installer else {
         return UpdateStatus {
@@ -362,6 +391,9 @@ async fn fetch_update_plan(
 /// on the installer (via `installer_allows_downgrade`) so npm is never
 /// downgraded — the decision depends on the installer, never the caller.
 pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'static str, String)> {
+    if vendor_auto_update_forbidden() {
+        return None;
+    }
     let installer = get_installer().await?;
     let current = get_installed_grok_version();
     let policy = config::VersionPolicy::resolve();
@@ -410,6 +442,12 @@ pub struct EnsureLatestOutcome {
 /// re-download is NOT fixed there; only the symlink layout can prove the
 /// disk is current without exec'ing the binary.
 pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<EnsureLatestOutcome> {
+    if vendor_auto_update_forbidden() {
+        return Ok(EnsureLatestOutcome {
+            installed: None,
+            relaunch_needed: false,
+        });
+    }
     let mut outcome = EnsureLatestOutcome {
         installed: None,
         relaunch_needed: false,
@@ -598,6 +636,9 @@ impl BackgroundUpdateCheck {
 /// TUI, the leader's hourly checker) already put the target version on disk,
 /// no download is started — only the restart hint is surfaced.
 pub async fn check_update_background(update_config: &UpdateConfig) -> BackgroundUpdateCheck {
+    if vendor_auto_update_forbidden() {
+        return BackgroundUpdateCheck::none();
+    }
     let Some(installer) = get_installer().await else {
         return BackgroundUpdateCheck::none();
     };
@@ -688,6 +729,9 @@ pub async fn run_update_if_available(
     trigger: CliUpdateTrigger,
     update_config: &UpdateConfig,
 ) -> Result<bool> {
+    if vendor_auto_update_forbidden() {
+        return Ok(false);
+    }
     let Some(inst) = get_installer().await else {
         // Skip update check if no known installer.
         return Ok(false);
@@ -745,7 +789,7 @@ pub async fn run_update_if_available(
     let channel_label = format!(" [{}]", update_config.channel);
     if auto_update {
         eprintln!(
-            "A new version of Grok Build is available: {} -> {}{}",
+            "A new version of Gork Build is available: {} -> {}{}",
             current_version, latest_version, channel_label
         );
         if interactive {
@@ -773,7 +817,7 @@ pub async fn run_update_if_available(
             return Ok(false);
         }
         eprintln!(
-            "A new version of Grok Build is available: {} -> {}{}",
+            "A new version of Gork Build is available: {} -> {}{}",
             current_version, latest_version, channel_label
         );
         if interactive {
@@ -930,6 +974,11 @@ pub async fn run_install_script(
     update_config: &UpdateConfig,
     trigger: CliUpdateTrigger,
 ) -> Result<()> {
+    // Last-line chokepoint: every install path (TUI, leader, minimum_version,
+    // `gork update`, npm / gh-release / internal) must pass here.
+    if vendor_auto_update_forbidden() {
+        return Err(vendor_update_blocked_err());
+    }
     // What's on disk is being replaced, not this (possibly stale) process's
     // version; npm has no trustworthy disk version, so it falls back.
     let from_version =
@@ -1372,6 +1421,10 @@ async fn download_cli_artifact_from_gcs(
 
 /// Returns the version that was actually activated.
 async fn install_internal(target: Option<&str>, update_config: &UpdateConfig) -> Result<String> {
+    // Belt-and-suspenders: production internal installer always hits x.ai/cli.
+    if vendor_auto_update_forbidden() {
+        return Err(vendor_update_blocked_err());
+    }
     let bases = crate::version::cli_base_urls();
     let base_refs: Vec<&str> = bases.iter().map(String::as_str).collect();
     install_internal_from_bases(target, update_config, &base_refs).await
@@ -2644,6 +2697,9 @@ pub async fn run_update(
     update_config: &mut UpdateConfig,
     trigger: CliUpdateTrigger,
 ) -> Result<Option<String>> {
+    if vendor_auto_update_forbidden() {
+        return Err(vendor_update_blocked_err());
+    }
     apply_channel_switch(channel_switch, update_config).await;
     let installer = match get_installer().await {
         Some(i) => i,
@@ -3842,94 +3898,99 @@ mod tests {
 
     #[test]
     fn test_reinstall_hint_npm_mentions_npm_command() {
+        // Gork Build points at the community package, never @xai-official/grok.
         let hint = reinstall_hint("npm", "stable");
         assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
         assert!(
-            hint.contains("@xai-official/grok"),
-            "should name the package: {hint}"
+            hint.contains("@gork-build/gork"),
+            "should name the gork package: {hint}"
+        );
+        assert!(
+            !hint.contains("@xai-official/grok"),
+            "must not recommend vendor npm package: {hint}"
         );
     }
 
     #[test]
     fn test_reinstall_hint_gh_release_mentions_gh_command() {
+        // Gork Build points at this fork's releases, not xai-org installers.
         let hint = reinstall_hint("gh-release", "stable");
         assert!(
-            hint.contains("gh release download"),
-            "should suggest gh release download: {hint}"
+            hint.contains("thedavidweng/gork-build"),
+            "should name the fork releases: {hint}"
         );
         assert!(
-            hint.contains("xai-org-shared/grok-build"),
-            "should name the repo: {hint}"
+            !hint.contains("xai-org") && !hint.contains("gh release download"),
+            "must not recommend vendor gh release path: {hint}"
         );
     }
 
     #[test]
     fn test_reinstall_hint_internal_mentions_platform_installer() {
+        // Privacy: internal installer reinstall is source rebuild, never x.ai scripts.
+        // (Hint prose may mention "x.ai/cli" as a warning — reject only actionable installers.)
         let hint = reinstall_hint("internal", "stable");
-        if cfg!(windows) {
-            assert!(hint.contains("irm"), "should suggest irm install: {hint}");
-            assert!(
-                hint.contains("install.ps1"),
-                "should reference install.ps1: {hint}"
-            );
-            assert!(
-                !hint.contains("GROK_CHANNEL"),
-                "stable must not set channel: {hint}"
-            );
-        } else {
-            assert!(hint.contains("curl"), "should suggest curl install: {hint}");
-            assert!(
-                hint.contains("install.sh"),
-                "should reference install.sh: {hint}"
-            );
-            assert!(
-                !hint.contains("GROK_CHANNEL"),
-                "stable must not set channel: {hint}"
-            );
-        }
+        assert!(
+            hint.contains("cargo build") && hint.contains("gork"),
+            "should point at gork source rebuild: {hint}"
+        );
+        assert!(
+            !hint.contains("curl -")
+                && !hint.contains("irm ")
+                && !hint.contains("install.sh")
+                && !hint.contains("install.ps1")
+                && !hint.contains("https://x.ai/cli"),
+            "must not recommend vendor installers: {hint}"
+        );
+        assert!(
+            !hint.contains("GROK_CHANNEL"),
+            "stable source rebuild must not set channel: {hint}"
+        );
     }
 
     #[test]
     fn test_reinstall_hint_internal_alpha_sets_channel() {
+        // Privacy: channel is ignored; every internal path is the same source rebuild.
         let hint = reinstall_hint("internal", "alpha");
-        if cfg!(windows) {
-            assert!(
-                hint.contains("$env:GROK_CHANNEL='alpha'"),
-                "alpha should set GROK_CHANNEL: {hint}"
-            );
-        } else {
-            assert!(
-                hint.contains("| GROK_CHANNEL='alpha' bash"),
-                "alpha must set GROK_CHANNEL on bash (the process running \
-                 install.sh), not curl: {hint}"
-            );
-        }
+        assert!(
+            hint.contains("cargo build") && hint.contains("gork"),
+            "alpha still points at source rebuild: {hint}"
+        );
+        assert!(
+            !hint.contains("GROK_CHANNEL") && !hint.contains("https://x.ai/cli"),
+            "must not set vendor channel env or installer URL: {hint}"
+        );
     }
 
     #[test]
     fn test_reinstall_hint_enterprise_uses_enterprise_script() {
-        // Enterprise ships via its own bootstrap script (channel hardcoded
-        // there), never install.sh + GROK_CHANNEL.
+        // Privacy: enterprise channel also refuses vendor bootstrap scripts.
         let hint = reinstall_hint("internal", "enterprise");
         assert!(
-            hint.contains("/enterprise-install."),
-            "enterprise must use the published enterprise-install script: {hint}"
+            hint.contains("cargo build") && hint.contains("gork"),
+            "enterprise must also point at source rebuild: {hint}"
         );
         assert!(
-            !hint.contains("GROK_CHANNEL"),
-            "enterprise script needs no channel env: {hint}"
+            !hint.contains("/enterprise-install.")
+                && !hint.contains("GROK_CHANNEL")
+                && !hint.contains("https://x.ai/cli"),
+            "must not recommend vendor enterprise install: {hint}"
         );
     }
 
     #[test]
     fn test_reinstall_hint_malformed_channel_falls_back_to_stable() {
-        // Free-text config channels never reach the shell one-liner unless
-        // they are plain [A-Za-z0-9._-] tokens.
+        // Free-text config channels never reach a shell one-liner under privacy —
+        // all map to the same source-build hint (no GROK_CHANNEL interpolation).
         for bad in ["al pha", "x'; rm -rf ~;'", "a\"b", ""] {
             let hint = reinstall_hint("internal", bad);
             assert!(
                 !hint.contains("GROK_CHANNEL"),
-                "malformed channel {bad:?} must fall back to stable: {hint}"
+                "malformed channel {bad:?} must not reach shell: {hint}"
+            );
+            assert!(
+                hint.contains("cargo build"),
+                "malformed channel {bad:?} still source rebuild: {hint}"
             );
         }
     }
@@ -4733,7 +4794,7 @@ mod tests {
         );
         assert_eq!(
             MSG_RUN_UPDATE_MANUAL,
-            "Run `grok update` to get the latest version."
+            "Run `gork update` to get the latest version."
         );
     }
 
@@ -5413,6 +5474,97 @@ mod tests {
         assert!(
             agent_old.exists(),
             "other executables' leftovers must be untouched"
+        );
+    }
+
+    #[test]
+    fn privacy_build_forbids_vendor_auto_update() {
+        assert!(
+            vendor_auto_update_forbidden(),
+            "PRIVACY_BUILD must forbid vendor auto-update"
+        );
+        let msg = vendor_update_blocked_message();
+        assert!(
+            msg.contains("Gork Build") || msg.contains("vendor") || msg.contains("never"),
+            "{msg}"
+        );
+        assert!(!msg.contains("curl -fsSL https://x.ai/cli"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn run_install_script_fail_closed_under_privacy() {
+        let cfg = UpdateConfig {
+            proxy_base_url: "http://test.invalid/v1".to_string(),
+            auth_scope: "test".to_string(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".to_string(),
+            npm_registry: None,
+        };
+        let err = run_install_script(
+            "internal",
+            Some("1.0.0"),
+            &cfg,
+            CliUpdateTrigger::UserCommand,
+        )
+        .await
+        .expect_err("run_install_script must refuse under privacy");
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("vendor")
+                || s.contains("Gork")
+                || s.contains("privacy")
+                || s.contains("never"),
+            "{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_latest_on_disk_no_install_under_privacy() {
+        let cfg = UpdateConfig {
+            proxy_base_url: "http://test.invalid/v1".to_string(),
+            auth_scope: "test".to_string(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".to_string(),
+            npm_registry: None,
+        };
+        let out = ensure_latest_on_disk(&cfg)
+            .await
+            .expect("privacy path is Ok(no-op), not network error");
+        assert!(
+            out.installed.is_none(),
+            "leader hourly path must not install under privacy"
+        );
+        assert!(
+            !out.relaunch_needed,
+            "must not claim relaunch after a privacy no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_update_target_none_under_privacy() {
+        let cfg = UpdateConfig {
+            proxy_base_url: "http://test.invalid/v1".to_string(),
+            auth_scope: "test".to_string(),
+            deployment_key: None,
+            alpha_test_key: None,
+            channel: "stable".to_string(),
+            npm_registry: None,
+        };
+        assert!(auto_update_target(&cfg).await.is_none());
+    }
+
+    #[test]
+    fn test_reinstall_hint_internal_points_at_gork_source_build() {
+        let hint = reinstall_hint("internal", "stable");
+        assert!(
+            hint.contains("cargo build") && hint.contains("gork"),
+            "Gork Build reinstall must point at source rebuild, not x.ai installers: {hint}"
+        );
+        assert!(
+            !hint.contains("curl -fsSL https://x.ai/cli") && !hint.contains("irm https://x.ai/cli"),
+            "must not recommend vendor installers: {hint}"
         );
     }
 }
