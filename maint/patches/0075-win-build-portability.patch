@@ -1,26 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Davy <95214375+thedavidweng@users.noreply.github.com>
-Date: Sat, 25 Jul 2026 01:15:40 -0700
+From: Gork CI <gork-ci@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 00:35:36 -0700
 Subject: [PATCH] win-build-portability: portable protoc invocation in
  xai-proto-build
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-emit_rerun_if_changed hard-coded --dependency_out=/dev/stdout and
---descriptor_set_out=/dev/null, which do not exist on Windows — native
-win32 builds of every proto-consuming crate failed with
-"protoc command failed". Write both outputs to a temp dir instead and
-parse the dependency file from disk (marker-based split; ':' is ambiguous
-with Windows drive letters). No behavior change on Unix.
-
-Upstream ships win32 npm prebuilds from its Bazel pipeline, which injects
-PROTOC and never hits this code path; the cargo path is what Gork Build's
-release matrix (and any Windows contributor) uses.
 
 Gork-Patch-Id: win-build-portability
-Gork-Invariant: cargo-build-portable-win32
-Gork-Risk: low
+Gork-Invariant: win-protoc-portable
+Gork-Risk: critical
 ---
  crates/build/xai-proto-build/src/lib.rs | 29 ++++++++++++++++++-------
  1 file changed, 21 insertions(+), 8 deletions(-)
@@ -87,12 +73,12 @@ index 3c36bc9d9af20ef9847025ceb8f1fcef4ac11bd5..c8dc2fddd35ad8f6b1293519146e69e3
  
 
 base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
-prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
-prerequisite-patch-id: 34ca1becedc5edfe22fb9108fc3a4215e49bb0d1
-prerequisite-patch-id: ddf4df8a313622a0e120a623b6da56009810f22a
-prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: ecf5704845e72317f02add5cb7a3bdea33898ddf
+prerequisite-patch-id: 3fc1105c0297f05f2dbe599003498bc6783e3ea2
+prerequisite-patch-id: e9ad14073269e96e5ee49d6b6970cedaf0f59f48
+prerequisite-patch-id: 561132f565e3d3e04c045251cbe0b2d3d98ecacb
+prerequisite-patch-id: 2730d2e122b55111a3375ce84c07b0c78d628277
+prerequisite-patch-id: af0edcd4d732f947ad389b939b5e9ea11cd00fa3
 prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
 -- 

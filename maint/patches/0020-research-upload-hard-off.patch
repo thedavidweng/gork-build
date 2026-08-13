@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Davy <95214375+thedavidweng@users.noreply.github.com>
-Date: Fri, 17 Jul 2026 01:03:25 -0700
+From: Gork CI <gork-ci@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 00:35:35 -0700
 Subject: [PATCH] research-upload-hard-off: resolver gates for trace/research
  upload
 
@@ -8,40 +8,27 @@ Gork-Patch-Id: research-upload-hard-off
 Gork-Invariant: research-upload-unreachable
 Gork-Risk: critical
 ---
- .../xai-grok-shell/src/agent/config.rs        | 144 ++++++++++++++++--
- 1 file changed, 134 insertions(+), 10 deletions(-)
+ crates/codegen/xai-grok-shell/Cargo.toml      |   2 +-
+ .../xai-grok-shell/src/agent/config.rs        | 146 +++++++++++++++++-
+ 2 files changed, 140 insertions(+), 8 deletions(-)
 
+diff --git a/crates/codegen/xai-grok-shell/Cargo.toml b/crates/codegen/xai-grok-shell/Cargo.toml
+index 081ccd35d44f64c9a9bf7ac5113009992e03312b..e0156fcf2dc9f6cc8f3df808bfab3e301770dc8a 100644
+--- a/crates/codegen/xai-grok-shell/Cargo.toml
++++ b/crates/codegen/xai-grok-shell/Cargo.toml
+@@ -26,7 +26,7 @@ agent-client-protocol = { workspace = true }
+ anyhow = { workspace = true }
+ xai-grok-announcements = { workspace = true }
+ xai-prompt-queue = { workspace = true }
+-xai-grok-version = { workspace = true }
++xai-grok-version = { workspace = true, features = ["privacy"] }
+ 
+ async-openai = { workspace = true }
+ async-trait = { workspace = true }
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index fec0659ebc8c3bc2769346ae30d4f08034cecd18..389331ca565a1e940612d70d13371147b3deff28 100644
+index fec0659ebc8c3bc2769346ae30d4f08034cecd18..82ffdd0a28e84c96e277b10689078ed9c1b95468 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
-@@ -317,7 +317,7 @@ impl EndpointsConfig {
-     pub(crate) fn resolve_trace_upload_url(&self) -> String {
-         blank_as_unset(&self.trace_upload_url).unwrap_or_else(|| self.proxy_url())
-     }
--    /// Managed deployment-config URL (`grok setup`): explicit `managed_config_url`,
-+    /// Managed deployment-config URL (`gork setup`): explicit `managed_config_url`,
-     /// else `proxy_url` + `/deployment/config`. Never `xai_api_base_url`, so the
-     /// deployment key reaches the proxy, not the inference host.
-     pub(crate) fn resolve_managed_config_url(&self) -> String {
-@@ -1111,7 +1111,7 @@ pub struct RelayConfig {
- /// `[hub]` section from config.toml.
- ///
- /// Optional default Computer Hub URL for **workspace provider** exposure
--/// (`grok workspace` / leader `with_default_hub_url`). Does **not** enable
-+/// (`gork workspace` / leader `with_default_hub_url`). Does **not** enable
- /// agent-side harness/client connections or alter local session behavior.
- ///
- /// ```toml
-@@ -1122,7 +1122,7 @@ pub struct RelayConfig {
- #[serde(default)]
- pub struct HubConfig {
-     /// Hub WebSocket URL (`ws://` or `wss://`) used as the leader default for
--    /// `grok workspace start` when the CLI does not pass `--hub-url`.
-+    /// `gork workspace start` when the CLI does not pass `--hub-url`.
-     #[serde(skip_serializing_if = "Option::is_none")]
-     pub url: Option<String>,
- }
 @@ -1756,6 +1756,8 @@ pub struct SessionConfig {
  #[derive(Debug, Clone, Serialize, Deserialize)]
  #[serde(default)]
@@ -90,16 +77,24 @@ index fec0659ebc8c3bc2769346ae30d4f08034cecd18..389331ca565a1e940612d70d13371147
          let mode = self.resolve_telemetry_mode();
          let ff = if mode.value.is_disabled() {
              None
-@@ -3382,7 +3396,7 @@ pub(crate) fn external_otel_master_switch_from(
- /// Layering follows `resolve_telemetry_mode`: **requirement > env > config >
- /// remote > default**, where the `[telemetry]` `otel_*` keys from the
- /// effective config (which already includes managed-config layers distributed
--/// by `grok setup`) sit under the env vars, requirements pins are applied on
-+/// by `gork setup`) sit under the env vars, requirements pins are applied on
- /// top, and the remote layer is restrictive-only + asynchronous
- /// ([`apply_external_otel_remote_policy`]).
- pub fn resolve_external_otel_config(
-@@ -9326,6 +9340,19 @@ reasoning_effort = "low"
+@@ -2476,7 +2490,15 @@ impl Config {
+             "has_remote_settings": self.remote_settings.is_some(),
+         })
+     }
+-    pub(crate) fn resolve_feedback(&self) -> Resolved<bool> {
++    pub fn resolve_feedback(&self) -> Resolved<bool> {
++        // Privacy build: feedback is off unless the operator explicitly sets
++        // GROK_FEEDBACK_ENABLED. Remote settings cannot turn it on.
++        if xai_grok_version::research_data_collection_forbidden() {
++            if let Some(mode) = env_telemetry_mode("GROK_FEEDBACK_ENABLED") {
++                return Resolved::new(mode.is_enabled(), ConfigSource::Env);
++            }
++            return Resolved::new(false, ConfigSource::Default);
++        }
+         let ff = self
+             .remote_settings
+             .as_ref()
+@@ -9326,6 +9348,19 @@ reasoning_effort = "low"
      #[test]
      #[serial]
      fn resolve_trace_upload_explicit_config_wins_over_telemetry_off() {
@@ -119,7 +114,7 @@ index fec0659ebc8c3bc2769346ae30d4f08034cecd18..389331ca565a1e940612d70d13371147
          unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
          unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
          let mut cfg = Config::default();
-@@ -9356,19 +9383,46 @@ reasoning_effort = "low"
+@@ -9356,19 +9391,46 @@ reasoning_effort = "low"
          });
          let d = cfg.trace_upload_decision_debug();
          assert_eq!(d["trace_upload"], serde_json::json!(false));
@@ -169,7 +164,7 @@ index fec0659ebc8c3bc2769346ae30d4f08034cecd18..389331ca565a1e940612d70d13371147
          unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
          unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
          let mut cfg = Config::default();
-@@ -9381,6 +9435,76 @@ reasoning_effort = "low"
+@@ -9381,6 +9443,76 @@ reasoning_effort = "low"
          let r = cfg.resolve_trace_upload();
          assert!(r.value, "defaults on when telemetry fully enabled");
      }
@@ -248,8 +243,8 @@ index fec0659ebc8c3bc2769346ae30d4f08034cecd18..389331ca565a1e940612d70d13371147
      fn resolve_goal_defaults_to_true_when_unset() {
 
 base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
-prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
+prerequisite-patch-id: ecf5704845e72317f02add5cb7a3bdea33898ddf
+prerequisite-patch-id: 3fc1105c0297f05f2dbe599003498bc6783e3ea2
 -- 
 2.50.1 (Apple Git-155)
 

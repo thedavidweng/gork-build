@@ -12,7 +12,7 @@ contracts = ["privacy-build-enabled", "version-lib"]
 id = "telemetry-hard-off"
 file = "0010-telemetry-hard-off.patch"
 critical = true
-contracts = ["mixpanel-lib", "telemetry-lib", "telemetry-resolvers"]
+contracts = ["mixpanel-lib", "telemetry-lib", "telemetry-chokepoints", "telemetry-resolvers"]
 
 [[patch]]
 id = "research-upload-hard-off"
