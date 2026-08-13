@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Gork Build patch control.
+"""Gork Build patch control (VSCodium / recipe-repo model).
 
-Commands: detect, export, apply, verify, report, roundtrip, bootstrap-stack,
-lint, finalize-sync.
+The control repository holds patches, overlays, contracts, and workflows.
+The product tree is materialized into `.work/src` by fetching the locked
+upstream SHA and applying the series. Commands never rewrite control-repo
+history with wholesale product trees.
+
+Commands: detect, checkout, export, apply, verify, report, roundtrip,
+bootstrap-stack, lint, finalize-sync.
 """
 
 from __future__ import annotations
@@ -50,7 +55,10 @@ BOOTSTRAP_GROUPS: list[tuple[str, str, str, str, list[str]]] = [
         "research-upload-hard-off: resolver gates for trace/research upload",
         "research-upload-unreachable",
         "critical",
-        ["crates/codegen/xai-grok-shell/src/agent/config.rs"],
+        [
+            "crates/codegen/xai-grok-shell/src/agent/config.rs",
+            "crates/codegen/xai-grok-shell/Cargo.toml",
+        ],
     ),
     (
         "retention-opt-out",
@@ -100,12 +108,24 @@ BOOTSTRAP_GROUPS: list[tuple[str, str, str, str, list[str]]] = [
         [".cargo/audit.toml"],
     ),
     (
+        "win-build-portability",
+        "win-build-portability: portable protoc invocation in xai-proto-build",
+        "win-protoc-portable",
+        "critical",
+        ["crates/build/xai-proto-build/"],
+    ),
+    (
         "product-identity",
         "product-identity: CLI binary name and entry surface",
         "product-cli-gork",
         "medium",
         [
             "crates/codegen/xai-grok-pager-bin/",
+            "crates/codegen/xai-grok-pager/src/app/",
+            "crates/codegen/xai-grok-pager/src/completions_cmd.rs",
+            "crates/codegen/xai-grok-pager/src/lib.rs",
+            "crates/codegen/xai-grok-pager/src/views/settings_modal/",
+            "crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs",
         ],
     ),
     (
@@ -119,6 +139,9 @@ BOOTSTRAP_GROUPS: list[tuple[str, str, str, str, list[str]]] = [
 
 
 def repo_root() -> Path:
+    env = os.environ.get("GORK_CONTROL_ROOT")
+    if env:
+        return Path(env)
     proc = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         capture_output=True,
@@ -128,6 +151,28 @@ def repo_root() -> Path:
     if proc.returncode == 0 and proc.stdout.strip():
         return Path(proc.stdout.strip())
     return Path(__file__).resolve().parents[2]
+
+
+def work_dir(root: Path | None = None) -> Path:
+    return (root or repo_root()) / ".work"
+
+
+def work_src(root: Path | None = None) -> Path:
+    override = os.environ.get("GORK_WORK_SRC")
+    if override:
+        return Path(override)
+    return work_dir(root) / "src"
+
+
+def upstream_clone_path(root: Path | None = None) -> Path:
+    return work_dir(root) / "upstream"
+
+
+def work_env(root: Path, src: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["GORK_CONTROL_ROOT"] = str(root)
+    env["GORK_WORK_SRC"] = str(src)
+    return env
 
 
 def run(
@@ -437,31 +482,147 @@ def install_control_plane(root: Path, snapshot: Path) -> list[str]:
     return restored
 
 
-def apply_overlays(root: Path) -> None:
-    overlay = root / "maint" / "overlays"
+def apply_overlays(dest: Path, control: Path | None = None) -> None:
+    overlay = (control or repo_root()) / "maint" / "overlays"
     if not overlay.is_dir():
         return
     for path in overlay.rglob("*"):
         if path.is_file():
             rel = path.relative_to(overlay)
-            dest = root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, dest)
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
             print(f"overlay: {rel}")
 
 
-def run_lock_policy(root: Path) -> None:
+def run_lock_policy(root: Path, src: Path) -> None:
     policy = load_lock_policy(root)
+    env = work_env(root, src)
+
+    def resolve_cmd(cmd: list[str]) -> list[str]:
+        out = list(cmd)
+        if len(out) >= 2 and out[1].startswith("maint/"):
+            out[1] = str(root / out[1])
+        return out
+
     for cmd in policy.get("post_apply_commands") or []:
-        print(f"lock-policy: {' '.join(cmd)}")
-        proc = subprocess.run(list(cmd), cwd=root)
+        resolved = resolve_cmd(list(cmd))
+        print(f"lock-policy: {' '.join(resolved)}")
+        proc = subprocess.run(resolved, cwd=src, env=env)
         if proc.returncode != 0:
             raise SystemExit(f"lock-policy command failed: {cmd}")
     for cmd in policy.get("cargo_update_pins") or []:
         print(f"lock-policy pin: {' '.join(cmd)}")
-        proc = subprocess.run(list(cmd), cwd=root)
+        proc = subprocess.run(list(cmd), cwd=src, env=env)
         if proc.returncode != 0:
             raise SystemExit(f"lock-policy pin failed: {cmd}")
+
+
+def ensure_upstream_clone(root: Path, repository: str) -> Path:
+    clone = upstream_clone_path(root)
+    clone.parent.mkdir(parents=True, exist_ok=True)
+    if (clone / ".git").exists() or (clone / "HEAD").exists():
+        run(
+            ["git", "remote", "set-url", "origin", repository],
+            cwd=clone,
+            check=False,
+            capture=True,
+        )
+        return clone
+    print(f"cloning upstream {repository} -> {clone}")
+    run(
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            repository,
+            str(clone),
+        ],
+        cwd=root,
+    )
+    return clone
+
+
+def fetch_upstream_sha(clone: Path, sha: str) -> None:
+    proc = run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=clone,
+        check=False,
+        capture=True,
+    )
+    if proc.returncode == 0:
+        return
+    print(f"fetching upstream {sha}")
+    run(["git", "fetch", "--no-tags", "origin", sha], cwd=clone)
+
+
+def remove_src_worktree(clone: Path, src: Path) -> None:
+    if src.exists():
+        run(
+            ["git", "worktree", "remove", "--force", str(src)],
+            cwd=clone,
+            check=False,
+            capture=True,
+        )
+        if src.exists():
+            shutil.rmtree(src)
+
+
+def materialize_src(root: Path, sha: str, repository: str) -> Path:
+    """Detach `.work/src` at *sha* (clean upstream, no patches yet)."""
+    clone = ensure_upstream_clone(root, repository)
+    fetch_upstream_sha(clone, sha)
+    src = work_src(root)
+    remove_src_worktree(clone, src)
+    src.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        ["git", "worktree", "add", "--detach", str(src), sha],
+        cwd=clone,
+    )
+    return src
+
+
+def apply_series_to(
+    root: Path, src: Path, series: list[str], meta: dict[str, dict]
+) -> tuple[list[str], list[str], str | None]:
+    applied: list[str] = []
+    skipped: list[str] = []
+    conflicted: str | None = None
+    patch_src = patches_dir(root)
+    for idx, patch_name in enumerate(series):
+        patch_file = patch_src / patch_name
+        if not patch_file.is_file():
+            raise SystemExit(f"missing patch: {patch_file}")
+        print(f"am: {patch_name}")
+        proc = git(
+            ["am", "--3way", str(patch_file)],
+            cwd=src,
+            check=False,
+            capture=True,
+        )
+        if proc.returncode == 0:
+            applied.append(patch_name)
+            continue
+        print(proc.stdout or "", end="")
+        print(proc.stderr or "", end="", file=sys.stderr)
+        git(["am", "--abort"], cwd=src, check=False)
+        entry = meta.get(patch_name, {})
+        critical = entry.get("critical", True)
+        if critical or not is_trailing_skippable(series, idx, meta):
+            conflicted = patch_name
+            print(
+                f"CONFLICT on critical/non-trailing patch {patch_name}; fail-closed",
+                file=sys.stderr,
+            )
+            return applied, skipped, conflicted
+        print(f"SKIP non-critical trailing patch {patch_name}")
+        skipped.append(patch_name)
+        for rest in series[idx + 1 :]:
+            print(f"SKIP non-critical trailing patch {rest}")
+            skipped.append(rest)
+        break
+    return applied, skipped, conflicted
 
 
 def patch_meta_by_file(root: Path) -> dict[str, dict]:
@@ -507,17 +668,10 @@ def cmd_detect(args: argparse.Namespace) -> int:
         return 1
     remote_sha = line[0].split()[0]
 
-    fetch = run(
-        ["git", "fetch", "--no-tags", remote_url, remote_sha],
-        cwd=root,
-        check=False,
-        capture=True,
-    )
-    if fetch.returncode != 0:
-        print(fetch.stderr, file=sys.stderr)
-        return 1
+    clone = ensure_upstream_clone(root, remote_url)
+    fetch_upstream_sha(clone, remote_sha)
 
-    version, source_rev = resolve_upstream_meta(root, remote_sha)
+    version, source_rev = resolve_upstream_meta(clone, remote_sha)
     print(f"lock.repository = {lock.repository}")
     print(f"lock.commit     = {lock.commit}")
     print(f"lock.version    = {lock.version}")
@@ -541,10 +695,11 @@ def cmd_detect(args: argparse.Namespace) -> int:
 
 
 def validated_functional_commits(
-    root: Path, base_sha: str, tip_sha: str
+    git_root: Path, base_sha: str, tip_sha: str, *, control: Path | None = None
 ) -> list[tuple[str, str]]:
     """Return ordered unique (sha, id) for functional commits; hard-fail on issues."""
-    commits = commits_with_patch_id(root, base_sha, tip_sha)
+    control = control or repo_root()
+    commits = commits_with_patch_id(git_root, base_sha, tip_sha)
     functional = [(sha, pid) for sha, pid in commits if pid not in EXCLUDE_PATCH_IDS]
     if not functional:
         raise SystemExit(
@@ -561,7 +716,7 @@ def validated_functional_commits(
         seen[pid] = sha
         ordered.append((sha, pid))
 
-    patchset = load_patchset(root / "maint/patchset.toml")
+    patchset = load_patchset(control / "maint/patchset.toml")
     manifest_ids = [p["id"] for p in patchset]
     if len(manifest_ids) != len(set(manifest_ids)):
         raise SystemExit("duplicate patch ids in patchset.toml")
@@ -600,11 +755,11 @@ def validated_functional_commits(
 
     # After last functional commit, only control files allowed up to tip
     functional_tip = ordered[-1][0]
-    control_cfg = load_control_files(root)
+    control_cfg = load_control_files(control)
     if functional_tip != tip_sha:
         names = git(
             ["diff", "--name-only", functional_tip, tip_sha],
-            cwd=root,
+            cwd=git_root,
             capture=True,
         ).stdout.splitlines()
         bad = [n for n in names if n and not control_path_allowed(n, control_cfg)]
@@ -621,16 +776,20 @@ def validated_functional_commits(
 def cmd_export(args: argparse.Namespace) -> int:
     root = repo_root()
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    src = work_src(root)
+    if not (src / ".git").exists() and not (src / ".git").is_file():
+        # worktree uses a .git file
+        if not src.exists():
+            print("no .work/src — run `patchctl checkout` or `apply` first", file=sys.stderr)
+            return 2
     base = args.base or lock.commit
-    tip = args.tip or lock.patch_tip or "HEAD"
-    if not tip:
-        print("patch_tip is empty; pass --tip or set lock.patch_tip", file=sys.stderr)
-        return 2
+    tip = args.tip or "HEAD"
+    git_src = src if src.exists() else root
 
-    tip_sha = git(["rev-parse", tip], cwd=root, capture=True).stdout.strip()
-    base_sha = git(["rev-parse", base], cwd=root, capture=True).stdout.strip()
+    tip_sha = git(["rev-parse", tip], cwd=git_src, capture=True).stdout.strip()
+    base_sha = git(["rev-parse", base], cwd=git_src, capture=True).stdout.strip()
 
-    ordered = validated_functional_commits(root, base_sha, tip_sha)
+    ordered = validated_functional_commits(git_src, base_sha, tip_sha)
     patchset = load_patchset(root / "maint/patchset.toml")
     id_to_file = {p["id"]: p["file"] for p in patchset}
     by_id = {pid: sha for sha, pid in ordered}
@@ -658,7 +817,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 "--binary",
                 f"--base={base_sha}",
             ],
-            cwd=root,
+            cwd=git_src,
             check=False,
             capture_output=True,
         )
@@ -682,7 +841,56 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def write_apply_status(
+    root: Path,
+    *,
+    upstream_sha: str,
+    version: str,
+    source_rev: str,
+    applied: list[str],
+    skipped: list[str],
+    conflicted: str | None,
+) -> None:
+    status_path = root / "maint" / "last-apply-status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "upstream": upstream_sha,
+                "version": version,
+                "source_rev": source_rev,
+                "work_src": str(work_src(root)),
+                "applied": applied,
+                "skipped": skipped,
+                "conflicted": conflicted,
+                "branding_required": bool(skipped),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def cmd_checkout(args: argparse.Namespace) -> int:
+    """Materialize `.work/src` at the locked (or given) upstream SHA + series."""
+    root = repo_root()
+    lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    sha = getattr(args, "upstream", None) or lock.commit
+    ns = argparse.Namespace(
+        upstream=sha,
+        force=True,
+        verify=False,
+        skip_expensive=True,
+        expect_version=None,
+        expect_source_rev=None,
+        branch=None,
+    )
+    return cmd_apply(ns)
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
+    """Apply the series onto `.work/src`. Never checks out the control repo."""
     root = repo_root()
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
     upstream_sha = args.upstream
@@ -697,9 +905,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return 1
 
     meta = patch_meta_by_file(root)
-    git(["cat-file", "-e", f"{upstream_sha}^{{commit}}"], cwd=root)
-
-    version, source_rev = resolve_upstream_meta(root, upstream_sha)
+    src = materialize_src(root, upstream_sha, lock.repository)
+    version, source_rev = resolve_upstream_meta(src, upstream_sha)
     if args.expect_version and args.expect_version != version:
         print(
             f"version mismatch: expected {args.expect_version} got {version}",
@@ -713,163 +920,61 @@ def cmd_apply(args: argparse.Namespace) -> int:
         )
         return 1
 
-    short = upstream_sha[:7]
-    branch = args.branch or f"sync/upstream-{(version or 'unknown').replace('/', '-')}-{short}"
+    applied, skipped, conflicted = apply_series_to(root, src, series, meta)
+    if conflicted:
+        write_apply_status(
+            root,
+            upstream_sha=upstream_sha,
+            version=version,
+            source_rev=source_rev,
+            applied=applied,
+            skipped=skipped,
+            conflicted=conflicted,
+        )
+        print(
+            f"work_src={src} applied={applied} "
+            f"skipped={skipped} conflicted={conflicted}"
+        )
+        return 3
 
-    control_tmp = Path(tempfile.mkdtemp(prefix="gork-control-"))
+    apply_overlays(src)
     try:
-        snapshot_control_plane(root, control_tmp)
-        patch_src = control_tmp / "maint" / "patches"
+        run_lock_policy(root, src)
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
-        git(["checkout", "--detach", upstream_sha], cwd=root)
-        exists = git(
-            ["show-ref", "--verify", f"refs/heads/{branch}"],
-            cwd=root,
-            check=False,
-            capture=True,
+    write_apply_status(
+        root,
+        upstream_sha=upstream_sha,
+        version=version,
+        source_rev=source_rev,
+        applied=applied,
+        skipped=skipped,
+        conflicted=None,
+    )
+    print(
+        f"applied {len(applied)} patches on {src} "
+        f"(upstream {upstream_sha[:12]}); skipped={skipped}"
+    )
+    print(
+        f"upstream version={version or '?'} "
+        f"source_rev={source_rev or '(empty)'}"
+    )
+    if getattr(args, "verify", False):
+        rc = cmd_verify(
+            argparse.Namespace(
+                skip_expensive=getattr(args, "skip_expensive", True),
+                only=[],
+                exclude_group=[],
+                only_group=[],
+            )
         )
-        if exists.returncode == 0:
-            if not args.force:
-                print(
-                    f"branch {branch} already exists (pass --force to replace)",
-                    file=sys.stderr,
-                )
-                return 1
-            git(["branch", "-D", branch], cwd=root)
-        git(["switch", "-c", branch], cwd=root)
-
-        install_control_plane(root, control_tmp)
-
-        applied: list[str] = []
-        skipped: list[str] = []
-        conflicted: str | None = None
-
-        for idx, patch_name in enumerate(series):
-            patch_file = patch_src / patch_name
-            if not patch_file.is_file():
-                print(f"missing patch: {patch_file}", file=sys.stderr)
-                return 1
-            print(f"am: {patch_name}")
-            proc = git(
-                ["am", "--3way", str(patch_file)],
-                cwd=root,
-                check=False,
-                capture=True,
-            )
-            if proc.returncode == 0:
-                applied.append(patch_name)
-                continue
-
-            print(proc.stdout or "", end="")
-            print(proc.stderr or "", end="", file=sys.stderr)
-            git(["am", "--abort"], cwd=root, check=False)
-
-            entry = meta.get(patch_name, {})
-            critical = entry.get("critical", True)
-            if critical or not is_trailing_skippable(series, idx, meta):
-                conflicted = patch_name
-                print(
-                    f"CONFLICT on critical/non-trailing patch {patch_name}; fail-closed",
-                    file=sys.stderr,
-                )
-                print(
-                    f"branch={branch} applied={applied} "
-                    f"skipped={skipped} conflicted={conflicted}"
-                )
-                # still leave control plane on disk for debugging
-                return 3
-
-            # Trailing non-critical: skip this and remaining non-critical
-            print(f"SKIP non-critical trailing patch {patch_name}")
-            skipped.append(patch_name)
-            for rest in series[idx + 1 :]:
-                print(f"SKIP non-critical trailing patch {rest}")
-                skipped.append(rest)
-            break
-
-        apply_overlays(root)
-        try:
-            run_lock_policy(root)
-        except SystemExit as exc:
-            print(exc, file=sys.stderr)
-            # non-fatal for lock policy metadata-only if cargo missing? keep hard fail
-            return 1
-
-        # Stage control plane + overlays.
-        # Remove CI-only artifacts written to the worktree (e.g. upstream-sensitive.json
-        # from upstream-replay.yml) so they never enter the product tree — otherwise
-        # finalize-sync roundtrip reports a spurious tree mismatch.
-        for artifact in ("upstream-sensitive.json",):
-            p = root / artifact
-            if p.exists():
-                p.unlink()
-        # Python bytecode from running patchctl itself must never be committed.
-        shutil.rmtree(root / "maint" / "scripts" / "__pycache__", ignore_errors=True)
-        git(["add", "-A"], cwd=root)
-        status = git(["status", "--porcelain"], cwd=root, capture=True)
-        if status.stdout.strip():
-            body = (
-                "chore(sync): restore control plane and overlays\n\n"
-                f"{TRAILER_ID}: control-metadata\n"
-                f"{TRAILER_RISK}: low\n"
-            )
-            if skipped:
-                body += f"\nSkipped non-critical patches: {', '.join(skipped)}\n"
-            git(["commit", "-m", body], cwd=root)
-
-        # Write status for CI
-        status_path = root / "maint" / "last-apply-status.json"
-        status_path.parent.mkdir(parents=True, exist_ok=True)
-        status_path.write_text(
-            json.dumps(
-                {
-                    "branch": branch,
-                    "upstream": upstream_sha,
-                    "version": version,
-                    "source_rev": source_rev,
-                    "applied": applied,
-                    "skipped": skipped,
-                    "conflicted": conflicted,
-                    "branding_required": bool(skipped),
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        git(["add", "maint/last-apply-status.json"], cwd=root, check=False)
-        st2 = git(["status", "--porcelain", "--", "maint/last-apply-status.json"], cwd=root, capture=True)
-        if st2.stdout.strip():
-            git(
-                [
-                    "commit",
-                    "-m",
-                    f"chore(sync): record apply status\n\n{TRAILER_ID}: control-metadata\n",
-                ],
-                cwd=root,
-                check=False,
-            )
-
-        print(
-            f"applied {len(applied)} patches on {branch} "
-            f"(upstream {upstream_sha[:12]}); skipped={skipped}"
-        )
-        print(
-            f"upstream version={version or '?'} "
-            f"source_rev={source_rev or '(empty)'}"
-        )
-        if args.verify:
-            rc = cmd_verify(
-                argparse.Namespace(skip_expensive=args.skip_expensive, only=[])
-            )
-            if rc != 0:
-                return rc
-        # Exit 4 signals branding/non-critical skips (still success for draft PR)
-        if skipped:
-            return 4
-        return 0
-    finally:
-        shutil.rmtree(control_tmp, ignore_errors=True)
+        if rc != 0:
+            return rc
+    if skipped:
+        return 4
+    return 0
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -895,6 +1000,10 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not new:
         print("--new SHA is required", file=sys.stderr)
         return 2
+    clone = ensure_upstream_clone(root, lock.repository)
+    fetch_upstream_sha(clone, old)
+    fetch_upstream_sha(clone, new)
+    os.environ["GORK_UPSTREAM_CLONE"] = str(clone)
     script = root / "maint/scripts/upstream_diff_report.py"
     cmd = [sys.executable, str(script), old, new]
     if args.json:
@@ -923,109 +1032,43 @@ def strip_control_paths(root: Path, cfg: dict) -> None:
 
 
 def cmd_roundtrip(args: argparse.Namespace) -> int:
-    """Replay series (+ overlays) on locked base and compare to a product tree.
+    """Replay the series on the locked (or given) upstream SHA in a temp worktree.
 
-    Defaults:
-      expected / series base tip: lock.patch_tip (functional tip)
-      compare_to: lock.product_tip if set, else lock.patch_tip
-      When --compare-to HEAD: detects product drift after patch_tip.
+    Model A: success means the series applies. There is no in-repo product
+    tree to compare against.
     """
     root = repo_root()
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
-    apply_only = bool(getattr(args, "apply_only", False))
-    expected = args.expected or lock.patch_tip
     base = args.base or lock.commit
-    # Product tree = patches + overlays. Prefer explicit compare_to / product_tip.
-    compare_to = args.compare_to
-    if not apply_only and not compare_to:
-        compare_to = lock.product_tip or expected
-    lock_from = args.lock_from or compare_to or expected
-
+    clone = ensure_upstream_clone(root, lock.repository)
+    fetch_upstream_sha(clone, base)
+    verify_sha256sums(root)
+    series = read_series(root)
+    meta = patch_meta_by_file(root)
     with tempfile.TemporaryDirectory(prefix="gork-roundtrip-") as tmp:
         wt = Path(tmp) / "wt"
-        git(["worktree", "add", "--detach", str(wt), base], cwd=root)
+        run(["git", "worktree", "add", "--detach", str(wt), base], cwd=clone)
         try:
-            shutil.copytree(root / "maint", wt / "maint")
-            series = read_series(root)
-            verify_sha256sums(root)
-            meta = patch_meta_by_file(root)
-            for idx, patch_name in enumerate(series):
-                patch_file = wt / "maint" / "patches" / patch_name
-                print(f"roundtrip am: {patch_name}")
-                proc = run(
-                    ["git", "am", "--3way", str(patch_file)],
-                    cwd=wt,
-                    check=False,
-                    capture=True,
-                )
-                if proc.returncode != 0:
-                    print(proc.stdout or "", end="")
-                    print(proc.stderr or "", end="", file=sys.stderr)
-                    run(["git", "am", "--abort"], cwd=wt, check=False)
-                    if is_trailing_skippable(series, idx, meta) and not meta.get(
-                        patch_name, {}
-                    ).get("critical", True):
-                        print(f"roundtrip skip non-critical {patch_name}")
-                        break
-                    print(f"roundtrip CONFLICT on {patch_name}", file=sys.stderr)
-                    return 3
-
+            applied, skipped, conflicted = apply_series_to(root, wt, series, meta)
+            if conflicted:
+                print(f"roundtrip CONFLICT on {conflicted}", file=sys.stderr)
+                return 3
             apply_overlays(wt)
-            if apply_only:
-                print(
-                    f"roundtrip apply-only OK: series applies on {base[:12]} "
-                    f"(+ overlays; tree not compared)"
-                )
-                return 0
-
-            cfg = load_control_files(root)
-            strip_control_paths(wt, cfg)
-
-            run(["git", "add", "-A"], cwd=wt)
-            if lock_from and git_resolvable(root, str(lock_from)):
-                run(
-                    ["git", "checkout", str(lock_from), "--", "Cargo.lock"],
-                    cwd=wt,
-                    check=False,
-                )
-                run(["git", "add", "-A", "--", "Cargo.lock"], cwd=wt, check=False)
-
-            compare_sha = run(
-                ["git", "rev-parse", str(compare_to)], cwd=root, capture=True
-            ).stdout.strip()
-
-            names = run(
-                ["git", "diff", "--cached", "--name-only", compare_sha],
-                cwd=wt,
-                capture=True,
-            )
-            changed = [
-                n
-                for n in names.stdout.splitlines()
-                if n.strip()
-                and n.strip() != "Cargo.lock"
-                and not control_path_allowed(n, cfg)
-            ]
-            if changed:
-                print(
-                    "roundtrip tree mismatch vs product tree:",
-                    file=sys.stderr,
-                )
-                print("\n".join(changed), file=sys.stderr)
-                return 1
-
             print(
-                f"roundtrip OK: base {base[:12]} + series(+overlays) "
-                f"matches product tree {compare_sha[:12]} "
-                f"(Cargo.lock + control files excluded)"
+                f"roundtrip OK: series applies on {base[:12]} "
+                f"(applied={len(applied)} skipped={skipped})"
             )
             return 0
         finally:
-            git(["worktree", "remove", "--force", str(wt)], cwd=root, check=False)
+            run(
+                ["git", "worktree", "remove", "--force", str(wt)],
+                cwd=clone,
+                check=False,
+            )
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    """Hard checks for patch queue integrity."""
+    """Hard checks for patch queue integrity (control repo)."""
     root = repo_root()
     errors: list[str] = []
 
@@ -1051,7 +1094,6 @@ def cmd_lint(args: argparse.Namespace) -> int:
         err(f"duplicate patchset files: {files}")
 
     series = read_series(root)
-    # series must be a prefix of manifest files; missing tail must be non-critical
     if series != files[: len(series)]:
         err(f"series is not a prefix of manifest files\n  series={series}\n  manifest={files}")
     else:
@@ -1065,15 +1107,10 @@ def cmd_lint(args: argparse.Namespace) -> int:
     except SystemExit as exc:
         err(str(exc))
 
-    # critical patches present
     for p in patchset:
         if p.get("critical", True) and p["file"] not in series:
             err(f"critical patch missing from series: {p['id']}")
 
-    # Patches must not touch control-plane paths: cmd_apply restores the
-    # control plane BEFORE `git am`, so a patch creating a control file hits
-    # "untracked working tree files would be overwritten" and fail-closes
-    # (or skips branding). One owner per path — control wins.
     control_cfg = load_control_files(root)
     for fname in series:
         pf = patches_dir(root) / fname
@@ -1088,7 +1125,6 @@ def cmd_lint(args: argparse.Namespace) -> int:
                         "move ownership to maint/control or drop the hunk"
                     )
 
-    # contracts resolve
     contracts_path = root / "maint/contracts/privacy-contract.toml"
     if contracts_path.is_file():
         cdata = tomllib.loads(contracts_path.read_text(encoding="utf-8"))
@@ -1100,115 +1136,28 @@ def cmd_lint(args: argparse.Namespace) -> int:
     else:
         err("missing privacy-contract.toml")
 
-    # trailer / order when both base and patch_tip are present in this clone
-    # (control-plane-only PRs may only carry patches, not authoring commits).
-    if lock.patch_tip and lock.commit:
-        if git_resolvable(root, lock.commit) and git_resolvable(root, lock.patch_tip):
-            try:
+    src = work_src(root)
+    if src.exists() and lock.commit:
+        try:
+            if git_resolvable(src, lock.commit):
                 ordered = validated_functional_commits(
-                    root, lock.commit, lock.patch_tip
+                    src, lock.commit, "HEAD"
                 )
-                tip_sha = git(
-                    ["rev-parse", lock.patch_tip], cwd=root, capture=True
-                ).stdout.strip()
-                if ordered[-1][0] != tip_sha:
-                    err(
-                        f"lock.patch_tip {tip_sha[:12]} is not last functional "
-                        f"commit {ordered[-1][0][:12]}"
-                    )
-            except SystemExit as exc:
-                err(str(exc))
-            except Exception as exc:  # noqa: BLE001
-                err(f"history checks failed: {exc}")
-        else:
-            print(
-                "lint note: lock.patch_tip/commit not in clone; "
-                "skipping trailer history checks (series SHA256 still enforced)"
-            )
+                print(
+                    f"lint note: .work/src functional commits: "
+                    f"{[pid for _, pid in ordered]}"
+                )
+        except SystemExit as exc:
+            err(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            err(f"work-src history checks failed: {exc}")
 
-    # Replay patches+overlays and compare product trees.
-    #
-    # Default target is always current HEAD (minus control paths) so that
-    # unexported product edits after product_tip still fail CI.
-    #
-    # When lock.product_tip is resolvable and differs from HEAD, also verify
-    # the recorded product_tip still rebuilds (lock integrity).
     if not args.skip_roundtrip:
-        if not git_resolvable(root, lock.commit):
-            err(
-                f"lock.commit {lock.commit[:12]} not resolvable; "
-                "cannot roundtrip (fetch full history or tag the base)"
-            )
-        else:
-            head = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
-            explicit = getattr(args, "compare_to", None)
-            # Decide which product trees to compare:
-            # - Explicit --compare-to: only that target.
-            # - Authoring/sync (product_tip ancestor of HEAD): HEAD (drift) +
-            #   product_tip when distinct.
-            # - Control-plane-only (product_tip missing or not ancestor of
-            #   HEAD): do not compare to main's product tree; require clean
-            #   apply, and product_tip rebuild if the tip is resolvable.
-            product_tip_sha = ""
-            if lock.product_tip and git_resolvable(root, lock.product_tip):
-                product_tip_sha = git(
-                    ["rev-parse", lock.product_tip], cwd=root, capture=True
-                ).stdout.strip()
-
-            if explicit:
-                compare_targets = [("compare-to", explicit)]
-            elif product_tip_sha and git_is_ancestor(
-                root, product_tip_sha, head
-            ):
-                compare_targets = [("HEAD", head)]
-                if product_tip_sha != head:
-                    compare_targets.append(
-                        ("lock.product_tip", product_tip_sha)
-                    )
-            elif product_tip_sha:
-                print(
-                    "lint note: product_tip is not an ancestor of HEAD "
-                    "(control-plane or foreign history) — comparing only "
-                    "to product_tip, not HEAD"
-                )
-                compare_targets = [("lock.product_tip", product_tip_sha)]
-            else:
-                print(
-                    "lint note: product_tip not in clone — verifying clean "
-                    "series apply only (no product tree equality)"
-                )
-                compare_targets = []
-
-            if not compare_targets:
-                rc = cmd_roundtrip(
-                    argparse.Namespace(
-                        expected=lock.patch_tip,
-                        compare_to=None,
-                        lock_from=None,
-                        base=None,
-                        apply_only=True,
-                    )
-                )
-                if rc != 0:
-                    err(f"series apply failed on lock.commit (exit {rc})")
-            else:
-                for label, target in compare_targets:
-                    print(f"lint roundtrip vs {label} ({target[:12]})")
-                    rc = cmd_roundtrip(
-                        argparse.Namespace(
-                            expected=lock.patch_tip,
-                            compare_to=target,
-                            lock_from=None,
-                            base=None,
-                            apply_only=False,
-                        )
-                    )
-                    if rc != 0:
-                        err(
-                            f"roundtrip vs {label} failed (exit {rc}); "
-                            "export/finalize product tree or revert "
-                            "unexported edits"
-                        )
+        rc = cmd_roundtrip(
+            argparse.Namespace(expected=None, compare_to=None, lock_from=None, base=None)
+        )
+        if rc != 0:
+            err(f"series apply failed on lock.commit (exit {rc})")
 
     if errors:
         print(f"lint failed: {len(errors)} error(s)", file=sys.stderr)
@@ -1218,29 +1167,34 @@ def cmd_lint(args: argparse.Namespace) -> int:
 
 
 def cmd_finalize_sync(args: argparse.Namespace) -> int:
-    """Update lock + re-export series against new upstream on current branch.
+    """Update lock + re-export series from `.work/src`. Does not commit.
 
-    Call this *after* apply (patches + overlays + control commits). Uses:
-      patch_tip   = last functional Gork-Patch-Id commit
-      product_tip = HEAD after overlays/control (full product tree for roundtrip)
+    Call after a successful apply on --upstream. Writes:
+      lock.commit / version / source_rev
+      maint/patches/* (re-exported from the work tree)
+    CI or the operator commits those control-repo files.
     """
     root = repo_root()
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    src = work_src(root)
+    if not src.exists():
+        print("no .work/src — run apply/checkout first", file=sys.stderr)
+        return 1
     upstream = args.upstream
-    git(["cat-file", "-e", f"{upstream}^{{commit}}"], cwd=root)
-    version = args.version or resolve_upstream_meta(root, upstream)[0]
+    if not git_resolvable(src, upstream):
+        print(f"upstream {upstream} not in .work/src", file=sys.stderr)
+        return 1
+    version = args.version or resolve_upstream_meta(src, upstream)[0]
     source_rev = (
         args.source_rev
         if args.source_rev is not None
-        else resolve_upstream_meta(root, upstream)[1]
+        else resolve_upstream_meta(src, upstream)[1]
     )
-
-    # product_tip = current HEAD (includes overlays applied by cmd_apply)
-    product_tip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
-    functional = commits_with_patch_id(root, upstream, product_tip)
+    head = git(["rev-parse", "HEAD"], cwd=src, capture=True).stdout.strip()
+    functional = commits_with_patch_id(src, upstream, head)
     functional = [(s, p) for s, p in functional if p not in EXCLUDE_PATCH_IDS]
     if not functional:
-        print("no functional patches applied on this branch", file=sys.stderr)
+        print("no functional patches applied in .work/src", file=sys.stderr)
         return 1
     functional_tip = functional[-1][0]
 
@@ -1248,51 +1202,27 @@ def cmd_finalize_sync(args: argparse.Namespace) -> int:
     lock.version = version
     lock.source_rev = source_rev
     lock.patch_tip = functional_tip
-    lock.product_tip = product_tip
+    lock.product_tip = ""
     lock.write(root / "maint/upstream.lock.toml")
     print(
         f"lock updated: {version} {upstream[:12]} "
         f"SOURCE_REV={source_rev or '(empty)'}"
     )
-    print(f"patch_tip={functional_tip}")
-    print(f"product_tip={product_tip}")
+    print(f"patch_tip={functional_tip} (from .work/src; not a control-repo ref)")
 
-    # Re-export only applied functional commits against new base
     rc = cmd_export(argparse.Namespace(base=upstream, tip=functional_tip))
     if rc != 0:
         return rc
 
-    # Roundtrip: series on new base + overlays must match product_tip
     rc = cmd_roundtrip(
         argparse.Namespace(
-            expected=functional_tip,
-            compare_to=product_tip,
-            lock_from=product_tip,
-            base=upstream,
+            expected=None, compare_to=None, lock_from=None, base=upstream
         )
     )
     if rc != 0:
         print("finalize-sync: roundtrip failed", file=sys.stderr)
         return rc
-
-    git(["add", "maint"], cwd=root)
-    st = git(["status", "--porcelain"], cwd=root, capture=True)
-    if st.stdout.strip():
-        git(
-            [
-                "commit",
-                "-m",
-                "chore(sync): finalize upstream lock and re-export patch queue\n\n"
-                f"{TRAILER_ID}: control-metadata\n"
-                f"Upstream: {upstream}\n"
-                f"Version: {version}\n"
-                f"SOURCE_REV: {source_rev}\n"
-                f"patch_tip: {functional_tip}\n"
-                f"product_tip: {product_tip}\n",
-            ],
-            cwd=root,
-        )
-    print("finalize-sync complete")
+    print("finalize-sync complete (commit maint/ lock + patches yourself)")
     return 0
 
 
@@ -1308,17 +1238,18 @@ def path_matches(path: str, prefixes: list[str]) -> bool:
 
 def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
     root = repo_root()
+    git_root = work_src(root) if work_src(root).exists() else root
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
     base = args.base or lock.commit
     tip = args.tip or "HEAD"
     branch = args.branch or "patch-authoring-v1"
 
-    base_sha = git(["rev-parse", base], cwd=root, capture=True).stdout.strip()
-    tip_sha = git(["rev-parse", tip], cwd=root, capture=True).stdout.strip()
+    base_sha = git(["rev-parse", base], cwd=git_root, capture=True).stdout.strip()
+    tip_sha = git(["rev-parse", tip], cwd=git_root, capture=True).stdout.strip()
 
     names = git(
         ["diff", "--name-only", base_sha, tip_sha],
-        cwd=root,
+        cwd=git_root,
         capture=True,
     ).stdout.splitlines()
     names = [
@@ -1376,7 +1307,7 @@ def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
 
     exists = git(
         ["show-ref", "--verify", f"refs/heads/{branch}"],
-        cwd=root,
+        cwd=git_root,
         check=False,
         capture=True,
     )
@@ -1384,12 +1315,12 @@ def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
         if not args.force:
             print(f"branch {branch} exists (pass --force)", file=sys.stderr)
             return 1
-        cur = git(["branch", "--show-current"], cwd=root, capture=True).stdout.strip()
+        cur = git(["branch", "--show-current"], cwd=git_root, capture=True).stdout.strip()
         if cur == branch:
-            git(["switch", "--detach", base_sha], cwd=root)
-        git(["branch", "-D", branch], cwd=root)
+            git(["switch", "--detach", base_sha], cwd=git_root)
+        git(["branch", "-D", branch], cwd=git_root)
 
-    git(["switch", "-c", branch, base_sha], cwd=root)
+    git(["switch", "-c", branch, base_sha], cwd=git_root)
 
     for gid in order:
         paths = assigned.get(gid) or []
@@ -1397,22 +1328,22 @@ def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
             print(f"skip empty group {gid}")
             continue
         _id, subject, invariant, risk, _ = meta[gid]
-        git(["checkout", tip_sha, "--", *paths], cwd=root)
+        git(["checkout", tip_sha, "--", *paths], cwd=git_root)
         deleted = []
         for p in paths:
             chk = git(
                 ["cat-file", "-e", f"{tip_sha}:{p}"],
-                cwd=root,
+                cwd=git_root,
                 check=False,
                 capture=True,
             )
             if chk.returncode != 0:
                 deleted.append(p)
         if deleted:
-            git(["rm", "-f", "--ignore-unmatch", *deleted], cwd=root, check=False)
-        git(["reset", "-q"], cwd=root)
-        git(["add", "-A", "--", *paths], cwd=root)
-        status = git(["status", "--porcelain", "--", *paths], cwd=root, capture=True)
+            git(["rm", "-f", "--ignore-unmatch", *deleted], cwd=git_root, check=False)
+        git(["reset", "-q"], cwd=git_root)
+        git(["add", "-A", "--", *paths], cwd=git_root)
+        status = git(["status", "--porcelain", "--", *paths], cwd=git_root, capture=True)
         if not status.stdout.strip():
             print(f"skip no-op group {gid}")
             continue
@@ -1422,15 +1353,15 @@ def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
             f"{TRAILER_INVARIANT}: {invariant}\n"
             f"{TRAILER_RISK}: {risk}\n"
         )
-        git(["commit", "-m", msg, "--", *paths], cwd=root)
+        git(["commit", "-m", msg, "--", *paths], cwd=git_root)
         print(f"committed {gid} ({len(paths)} paths)")
 
-    # Materialize overlays from tip (binary-safe)
+    # Materialize overlays from tip (binary-safe) into the *control* repo
     ov = root / "maint" / "overlays"
     for path in sorted(set(overlay_files)):
         chk = subprocess.run(
             ["git", "cat-file", "-e", f"{tip_sha}:{path}"],
-            cwd=root,
+            cwd=git_root,
             capture_output=True,
             check=False,
         )
@@ -1440,7 +1371,7 @@ def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(
             ["git", "show", f"{tip_sha}:{path}"],
-            cwd=root,
+            cwd=git_root,
             capture_output=True,
             check=False,
         )
@@ -1448,7 +1379,7 @@ def cmd_bootstrap_stack(args: argparse.Namespace) -> int:
             dest.write_bytes(proc.stdout)
             print(f"overlay staged: {path}")
 
-    tip_new = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+    tip_new = git(["rev-parse", "HEAD"], cwd=git_root, capture=True).stdout.strip()
     lock.patch_tip = tip_new
     if (root / "maint").exists():
         lock.write(root / "maint/upstream.lock.toml")
@@ -1471,7 +1402,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--tip", default=None)
     e.set_defaults(func=cmd_export)
 
-    a = sub.add_parser("apply", help="Apply patch series onto an upstream SHA")
+    c = sub.add_parser("checkout", help="Materialize .work/src at locked upstream + patches")
+    c.add_argument("--upstream", default=None, help="Override lock.commit")
+    c.set_defaults(func=cmd_checkout)
+
+    a = sub.add_parser("apply", help="Apply patch series onto .work/src at an upstream SHA")
     a.add_argument("--upstream", required=True)
     a.add_argument("--branch", default=None)
     a.add_argument("--force", action="store_true")

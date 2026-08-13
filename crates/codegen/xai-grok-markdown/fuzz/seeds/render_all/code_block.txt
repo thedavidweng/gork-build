@@ -1,5 +1,0 @@
-# Heading
-
-```rust
-fn main() {}
-```

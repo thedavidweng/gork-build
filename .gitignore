@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Model A product tree — fetched + patched locally, never committed.
+.work/
+**/__pycache__/

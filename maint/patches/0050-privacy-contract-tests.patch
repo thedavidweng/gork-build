@@ -1,22 +1,22 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Davy <95214375+thedavidweng@users.noreply.github.com>
-Date: Fri, 17 Jul 2026 01:03:26 -0700
+From: Gork CI <gork-ci@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 00:35:36 -0700
 Subject: [PATCH] privacy-contract-tests: resolver and privacy regression tests
 
 Gork-Patch-Id: privacy-contract-tests
 Gork-Invariant: privacy-contracts-present
 Gork-Risk: critical
 ---
- .../xai-grok-shell/tests/privacy_resolvers.rs | 79 +++++++++++++++++++
- 1 file changed, 79 insertions(+)
+ .../xai-grok-shell/tests/privacy_resolvers.rs | 110 ++++++++++++++++++
+ 1 file changed, 110 insertions(+)
  create mode 100644 crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
 
 diff --git a/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8ade06704bf2baeddb34f7d5c61dc48b13e05f38
+index 0000000000000000000000000000000000000000..5147effc1479e1c1e98392f7cfc600d90b9913f5
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,110 @@
 +//! Privacy hard-off regression tests for telemetry / trace-upload resolvers.
 +//!
 +//! Integration tests (not `#[cfg(test)]` unit tests) so they compile against the
@@ -96,13 +96,44 @@ index 0000000000000000000000000000000000000000..8ade06704bf2baeddb34f7d5c61dc48b
 +        std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD");
 +    }
 +}
++
++#[test]
++#[serial]
++fn privacy_build_feedback_ignores_remote_and_defaults_off() {
++    assert!(xai_grok_version::research_data_collection_forbidden());
++    unsafe {
++        std::env::remove_var("GROK_FEEDBACK_ENABLED");
++    }
++    let mut cfg = Config::default();
++    cfg.features.feedback = Some(true);
++    cfg.remote_settings = Some(RemoteSettings {
++        feedback_enabled: Some(true),
++        ..Default::default()
++    });
++    assert!(
++        !cfg.resolve_feedback().value,
++        "privacy hard-off must default feedback off and ignore remote/config"
++    );
++    unsafe {
++        std::env::set_var("GROK_FEEDBACK_ENABLED", "1");
++    }
++    let on = Config::default().resolve_feedback();
++    assert!(
++        on.value,
++        "explicit GROK_FEEDBACK_ENABLED=1 may still opt in: {:?}",
++        on.value
++    );
++    unsafe {
++        std::env::remove_var("GROK_FEEDBACK_ENABLED");
++    }
++}
 
 base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
-prerequisite-patch-id: ecb826718357949eca75699985c9f0b4980c2182
-prerequisite-patch-id: f858646c45a363bc5c055a2188a80af0b047da14
-prerequisite-patch-id: 34ca1becedc5edfe22fb9108fc3a4215e49bb0d1
-prerequisite-patch-id: ddf4df8a313622a0e120a623b6da56009810f22a
+prerequisite-patch-id: ecf5704845e72317f02add5cb7a3bdea33898ddf
+prerequisite-patch-id: 8a4d87ffeadd239c0b5c504db10b4cf492fa89fa
+prerequisite-patch-id: e9ad14073269e96e5ee49d6b6970cedaf0f59f48
+prerequisite-patch-id: 561132f565e3d3e04c045251cbe0b2d3d98ecacb
+prerequisite-patch-id: 2730d2e122b55111a3375ce84c07b0c78d628277
 -- 
 2.50.1 (Apple Git-155)
 

@@ -19,23 +19,38 @@ and [`NOTICE`](NOTICE)).
 
 ## Development setup
 
-Requirements:
+Requirements (after checkout; they live in the materialized tree):
 
-- Rust toolchain from [`rust-toolchain.toml`](rust-toolchain.toml) (`rustup`
-  installs it automatically)
-- `protoc` — see [`bin/protoc`](bin/protoc) or install a system `protoc` /
-  set `$PROTOC`
+- Rust from `.work/src/rust-toolchain.toml` (`rustup` picks it up)
+- `protoc` — `.work/src/bin/protoc`, a system `protoc`, or `$PROTOC`
+
+This repository is a **recipe repo** (VSCodium / ungoogled-chromium shape):
+it stores patches and the control plane, not the full upstream tree.
+Materialize a buildable tree first:
 
 ```sh
 git clone https://github.com/thedavidweng/gork-build.git
 cd gork-build
+python3 maint/scripts/patchctl.py checkout   # or ./scripts/dev.sh
+cd .work/src
 cargo check -p xai-grok-pager-bin
 cargo run -p xai-grok-pager-bin          # launches the TUI binary `gork`
 ```
 
-Useful checks (same gates as GitHub Actions CI):
+Edit privacy behavior in `.work/src`, then re-export:
 
 ```sh
+python3 maint/scripts/patchctl.py export --tip HEAD
+```
+
+Useful checks (same gates as GitHub Actions CI; run from `.work/src` unless
+noted):
+
+```sh
+# control repo:
+python3 maint/scripts/patchctl.py lint --skip-roundtrip
+
+# product tree:
 cargo fmt --all -- --check
 cargo clippy --no-deps \
   -p xai-grok-version -p xai-mixpanel -p xai-grok-telemetry -p xai-grok-update \
@@ -47,7 +62,7 @@ cargo test -p xai-grok-version --lib
 
 Prefer focused tests for the crate you touch over a full workspace run unless
 you are changing shared infrastructure. Full-workspace `cargo clippy -D warnings`
-is not required — the monorepo snapshot is too noisy; CI uses `--no-deps` on the
+is not required — the upstream monorepo is too noisy; CI uses `--no-deps` on the
 privacy crates and the `gork` binary.
 
 ## Branching and commits

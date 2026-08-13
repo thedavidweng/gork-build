@@ -33,6 +33,14 @@ command = [
 ]
 
 [[contract]]
+id = "telemetry-chokepoints"
+group = "privacy"
+# One cargo filter: all three tests are named *_under_privacy.
+command = [
+  "cargo", "test", "-p", "xai-grok-telemetry", "--lib", "under_privacy",
+]
+
+[[contract]]
 id = "updater-product-build"
 group = "privacy"
 # Product binary has no updater-integration-tests feature: lib/unit tests only.
@@ -89,9 +97,10 @@ id = "cargo-audit"
 group = "supply-chain"
 command = ["cargo", "audit"]
 
+# Egress smoke is optional and shallow (--version/--help/update only).
+# It is not a privacy guarantee and is not a required CI gate.
 [[contract]]
 id = "release-egress-smoke"
 group = "egress"
-# Expensive: builds release binary if missing. Skip with --skip-expensive.
 expensive = true
 command = ["./scripts/privacy_egress_check.sh"]

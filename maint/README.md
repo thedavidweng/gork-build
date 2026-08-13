@@ -3,46 +3,51 @@
 Privacy patches, upstream lock, and contracts for replaying Gork hard-offs onto
 new [`xai-org/grok-build`](https://github.com/xai-org/grok-build) monorepo syncs.
 
-## The flywheel (no-intervention path)
+## Layout (recipe repo)
 
-Daily, fully automated when the patch series applies cleanly:
+This git tree is the **control plane** only: `maint/patches`, overlays,
+contracts, and workflows. The product source is **not** committed.
+
+```
+python3 maint/scripts/patchctl.py checkout   # -> .work/src  (gitignored)
+```
+
+`.work/src` is a worktree of `xai-org/grok-build` at the locked SHA with the
+series applied. `cargo run` from there.
+
+## The flywheel (human-gated)
+
+Daily, when the patch series applies cleanly:
 
 1. **`upstream-watch.yml`** (cron) — detects upstream drift, dispatches replay.
-2. **`upstream-replay.yml`** — replays the patch series on the pinned upstream
-   SHA, runs privacy contracts, `finalize-sync`s the lock, pushes the
-   `sync/upstream-<ver>-<sha7>` branch, then publishes a **wholesale-tree merge
-   branch** (`sync-merge/<ver>-<sha7>`: merge commit with parents
-   `(main, sync-tip)` and tree = sync tip) and opens a ready PR. When contracts
-   passed and no branding patch was skipped it dispatches the required-check
-   workflows onto that branch and arms **auto-merge** — the PR merges itself
-   once the 8 branch-protection contexts are green.
-3. **`release.yml`** (cron) — releases once per product version: when `main`
-   carries a version with no `v<version>-gork.1` release yet, it tags and
-   builds the six-target matrix upstream ships prebuilds for
-   (darwin/linux/win32 × arm64/x64 — same set as
-   `crates/codegen/xai-grok-pager/npm/`) and publishes a GitHub release with
-   `SHA256SUMS.txt`.
+2. **`upstream-replay.yml`** — applies the series onto `.work/src`, runs
+   privacy contracts, and only then `finalize-sync`s the lock and re-exports
+   patches. It opens a **draft** PR that touches only `maint/` (lock +
+   patches). No wholesale product-tree merge. No auto-merge. A sensitive-path
+   hit adds `security-review-required`.
+3. **`release.yml`** (cron) — materializes `.work/src` and publishes
+   `v<upstream>-gork.N` (N increments so a patch-only fix can ship) for the
+   six-target matrix.
 
 Fail-closed exits from the loop (human/agent needed):
 
 - Critical patch conflict → issue labeled `upstream-sync`,
   `security-review-required`; resolve by replaying manually (see Commands),
-  amending fixes into the owning patch commit, and re-running `finalize-sync`.
-- Privacy contracts failed or branding patches skipped → PR opens but
-  auto-merge is **not** armed.
-- Required check red on the sync-merge PR (e.g. `cargo audit`) → PR waits.
+  amending the owning patch, and re-running `finalize-sync`.
+- Privacy contracts failed → **no** finalize-sync, **no** PR.
+- Branding skipped or sensitive paths changed → draft PR, human review.
 
 ## Commands
 
 ```bash
-python maint/scripts/patchctl.py detect
-python maint/scripts/patchctl.py export --tip HEAD   # sets patch_tip to last *functional* commit
-python maint/scripts/patchctl.py apply --upstream <SHA>
-python maint/scripts/patchctl.py verify --skip-expensive
-python maint/scripts/patchctl.py lint                # static + roundtrip vs HEAD (and product_tip)
-python maint/scripts/patchctl.py finalize-sync --upstream <SHA> --version X --source-rev Y
-python maint/scripts/patchctl.py roundtrip
-python maint/scripts/patchctl.py report --new <sha> --json
+python3 maint/scripts/patchctl.py checkout           # .work/src at lock.commit + series
+python3 maint/scripts/patchctl.py detect
+python3 maint/scripts/patchctl.py export --tip HEAD  # from .work/src
+python3 maint/scripts/patchctl.py apply --upstream <SHA>
+python3 maint/scripts/patchctl.py verify --skip-expensive
+python3 maint/scripts/patchctl.py lint               # static + apply-only roundtrip
+python3 maint/scripts/patchctl.py finalize-sync --upstream <SHA> --version X --source-rev Y
+python3 maint/scripts/patchctl.py report --new <sha> --json
 ```
 
 ## Apply policy

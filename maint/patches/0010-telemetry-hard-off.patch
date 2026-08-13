@@ -1,21 +1,22 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Davy <95214375+thedavidweng@users.noreply.github.com>
-Date: Fri, 17 Jul 2026 01:03:25 -0700
+From: Gork CI <gork-ci@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 00:35:35 -0700
 Subject: [PATCH] telemetry-hard-off: Mixpanel and product telemetry no-ops
 
 Gork-Patch-Id: telemetry-hard-off
 Gork-Invariant: product-telemetry-disabled
 Gork-Risk: critical
 ---
- crates/codegen/xai-grok-telemetry/Cargo.toml  |  4 +-
- .../codegen/xai-grok-telemetry/src/client.rs  | 12 ++--
- .../codegen/xai-grok-telemetry/src/config.rs  | 44 +++++++-------
- .../codegen/xai-grok-telemetry/src/sentry.rs  | 11 ++--
- crates/codegen/xai-mixpanel/src/lib.rs        | 57 ++++++-------------
- 5 files changed, 49 insertions(+), 79 deletions(-)
+ crates/codegen/xai-grok-telemetry/Cargo.toml  |   5 +-
+ .../codegen/xai-grok-telemetry/src/client.rs  | 115 ++++++++++++++++--
+ .../codegen/xai-grok-telemetry/src/config.rs  |  44 +++----
+ .../xai-grok-telemetry/src/otel_layer/mod.rs  |   5 +
+ .../codegen/xai-grok-telemetry/src/sentry.rs  |  11 +-
+ crates/codegen/xai-mixpanel/src/lib.rs        |  57 +++------
+ 6 files changed, 154 insertions(+), 83 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-telemetry/Cargo.toml b/crates/codegen/xai-grok-telemetry/Cargo.toml
-index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..180372c12b9635f4f787baf538a9ec8bbbdec524 100644
+index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..efa5fbd3d246a51a0d2c56a8357367078cbde7ee 100644
 --- a/crates/codegen/xai-grok-telemetry/Cargo.toml
 +++ b/crates/codegen/xai-grok-telemetry/Cargo.toml
 @@ -3,8 +3,8 @@ license = "Apache-2.0"
@@ -29,11 +30,19 @@ index 548166f7f66bb5a808d7b0974e48553a22d1fc3f..180372c12b9635f4f787baf538a9ec8b
  
  [features]
  default = []
+@@ -32,6 +32,7 @@ git2 = { version = "0.20", default-features = false, features = [
+ reqwest = { workspace = true }
+ url = { workspace = true }
+ xai-grok-env = { workspace = true }
++xai-grok-version = { workspace = true, features = ["privacy"] }
+ xai-grok-secrets = { workspace = true }
+ xai-mixpanel = { workspace = true }
+ xai-grok-config = { workspace = true }
 diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
-index 49eb1691081af33ddacc67ff106c7c3c8572c547..319ba906b0c47ddb5e6563bbd7c8e4f776a9852a 100644
+index 49eb1691081af33ddacc67ff106c7c3c8572c547..cb0c6ba1a1d0abd2c403c2ff23b6179436ebed15 100644
 --- a/crates/codegen/xai-grok-telemetry/src/client.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/client.rs
-@@ -85,14 +85,10 @@ impl TelemetryClient {
+@@ -85,13 +85,16 @@ impl TelemetryClient {
          subscription_tier: Option<String>,
          http_client: reqwest::Client,
      ) -> Self {
@@ -42,16 +51,166 @@ index 49eb1691081af33ddacc67ff106c7c3c8572c547..319ba906b0c47ddb5e6563bbd7c8e4f7
 -                .mixpanel_token
 -                .as_ref()
 -                .map(|token| Arc::new(Mixpanel::new(token.as_str())))
--        } else {
--            None
--        };
-+        // Gork Build: never construct a Mixpanel client. `Mixpanel::{track,engage}`
-+        // are also no-ops as a second line of defense.
++        // Gork Build: never construct a Mixpanel client or keep a first-party
++        // events sink. `Mixpanel::{track,engage}` and [`track`] are also
++        // no-ops as a second line of defense.
 +        let _ = (config.mixpanel_enabled, config.mixpanel_token.as_ref());
++        let privacy = xai_grok_version::research_data_collection_forbidden();
 +        let mixpanel: Option<Arc<Mixpanel>> = None;
++        let (events_url, events_api_key) = if privacy {
++            (None, None)
+         } else {
+-            None
++            (config.events_url, config.events_api_key)
+         };
          let deployment_id = deployment_key
              .filter(|s| !s.is_empty())
-             .map(|k| deployment_id_from_key(&k));
+@@ -103,8 +106,8 @@ impl TelemetryClient {
+ 
+         Self {
+             mode,
+-            events_url: config.events_url,
+-            events_api_key: config.events_api_key,
++            events_url,
++            events_api_key,
+             mixpanel,
+             user_id,
+             team_id,
+@@ -181,6 +184,10 @@ impl UserContext {
+ 
+ /// Core telemetry emitter. Routes to product events + Mixpanel.
+ pub async fn track(event_name: &str, request_id: &str, ctx: &UserContext, mut metadata: Metadata) {
++    // Entry-point hard-off: even a mis-initialized client cannot POST.
++    if xai_grok_version::research_data_collection_forbidden() {
++        return;
++    }
+     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
+     let client = {
+         let guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+@@ -349,7 +356,7 @@ pub fn init(
+ ) {
+     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
+     let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+-    *guard = if mode.is_disabled() {
++    *guard = if mode.is_disabled() || xai_grok_version::research_data_collection_forbidden() {
+         None
+     } else {
+         Some(TelemetryClient::from_config(
+@@ -382,7 +389,7 @@ pub fn init_if_needed(
+     subscription_tier: Option<String>,
+     http_client: reqwest::Client,
+ ) {
+-    if mode.is_disabled() {
++    if mode.is_disabled() || xai_grok_version::research_data_collection_forbidden() {
+         return;
+     }
+     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
+@@ -427,6 +434,9 @@ mod tests {
+ 
+     /// SessionMetrics must not attempt Mixpanel profile engage — sync_profile
+     /// is a no-op unless mode is fully Enabled.
++    ///
++    /// Gork Build: `init` itself refuses to install a client, so this is a
++    /// stronger no-op than upstream (no live SessionMetrics funnel).
+     #[test]
+     fn sync_profile_is_noop_in_session_metrics_mode() {
+         // No tokio runtime here BY DESIGN: if the gate wrongly falls through,
+@@ -469,12 +479,93 @@ mod tests {
+         // Explicit call must no-op too (init already invoked it once).
+         sync_profile();
+         assert!(
+-            is_session_metrics_enabled(),
+-            "client must be live for session metrics"
++            !is_session_metrics_enabled(),
++            "privacy build must not install a telemetry client"
+         );
+         assert!(!is_enabled(), "product analytics must stay off");
+     }
+ 
++    #[test]
++    fn init_enabled_still_installs_no_client_under_privacy() {
++        struct ClearClient;
++        impl Drop for ClearClient {
++            fn drop(&mut self) {
++                let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
++                *lock.lock().unwrap_or_else(|err| err.into_inner()) = None;
++            }
++        }
++        let _clear = ClearClient;
++        let cfg = TelemetryConfig {
++            mixpanel_enabled: true,
++            mixpanel_token: Some("test-token".into()),
++            events_url: Some("https://events.example.invalid/v1".into()),
++            events_api_key: Some("k".into()),
++            ..TelemetryConfig::default()
++        };
++        init(
++            cfg,
++            TelemetryMode::Enabled,
++            Some("user-1".into()),
++            None,
++            None,
++            None,
++            "0.0.0-test".into(),
++            None,
++            reqwest::Client::new(),
++        );
++        assert!(!is_enabled());
++        assert!(!is_session_metrics_enabled());
++    }
++
++    #[test]
++    fn from_config_drops_events_sink_under_privacy() {
++        let cfg = TelemetryConfig {
++            mixpanel_enabled: true,
++            mixpanel_token: Some("test-token".into()),
++            events_url: Some("https://events.example.invalid/v1".into()),
++            events_api_key: Some("k".into()),
++            ..TelemetryConfig::default()
++        };
++        let client = TelemetryClient::from_config(
++            cfg,
++            TelemetryMode::Enabled,
++            Some("user-1".into()),
++            None,
++            None,
++            None,
++            "0.0.0-test".into(),
++            None,
++            reqwest::Client::new(),
++        );
++        assert!(client.events_url.is_none());
++        assert!(client.events_api_key.is_none());
++        assert!(client.mixpanel.is_none());
++    }
++
++    #[tokio::test]
++    async fn track_is_hard_return_under_privacy() {
++        struct ClearClient;
++        impl Drop for ClearClient {
++            fn drop(&mut self) {
++                let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
++                *lock.lock().unwrap_or_else(|err| err.into_inner()) = None;
++            }
++        }
++        let _clear = ClearClient;
++        // Even if a client were somehow installed, track must return before POST.
++        track(
++            "grok-shell-turn",
++            "req-1",
++            &UserContext {
++                country: "US".into(),
++                language: "en".into(),
++                timestamp: "0".into(),
++            },
++            Metadata::new(),
++        )
++        .await;
++    }
++
+     /// Names without a known emitter prefix pass through unchanged (preserves
+     /// the old `unwrap_or(event_name)` fallback).
+     #[test]
 diff --git a/crates/codegen/xai-grok-telemetry/src/config.rs b/crates/codegen/xai-grok-telemetry/src/config.rs
 index 04ee011e27289ff70ac00a4e85b0b9c921ae3e18..dd5ded3f29120830e7bb44ec46b1f8ff9b9fb8e0 100644
 --- a/crates/codegen/xai-grok-telemetry/src/config.rs
@@ -115,6 +274,22 @@ index 04ee011e27289ff70ac00a4e85b0b9c921ae3e18..dd5ded3f29120830e7bb44ec46b1f8ff
 +        assert_eq!(cfg.enabled, Some(false));
      }
  }
+diff --git a/crates/codegen/xai-grok-telemetry/src/otel_layer/mod.rs b/crates/codegen/xai-grok-telemetry/src/otel_layer/mod.rs
+index f030db3beebe8653be5393b4f568dd5669a999da..dc5f00c88d1aa6f0e43c23500ac0b95acbf7ee8e 100644
+--- a/crates/codegen/xai-grok-telemetry/src/otel_layer/mod.rs
++++ b/crates/codegen/xai-grok-telemetry/src/otel_layer/mod.rs
+@@ -106,6 +106,11 @@ where
+         .with_filter(otel_filter)
+ }
+ fn build_tracer_provider(client: OtelClientInfo, config: OtelLayerConfig) -> SdkTracerProvider {
++    // Privacy build: never construct the vendor OTLP exporter (cli-chat-proxy
++    // traces), including workspace Server mode.
++    if xai_grok_version::research_data_collection_forbidden() {
++        return SdkTracerProvider::builder().build();
++    }
+     match instrumentation::current_mode() {
+         instrumentation::InstrumentationMode::Server => build_server_provider(client, config),
+         _ => SdkTracerProvider::builder().build(),
 diff --git a/crates/codegen/xai-grok-telemetry/src/sentry.rs b/crates/codegen/xai-grok-telemetry/src/sentry.rs
 index 74a83a2eb5948c130aa9105805c8d1b5614004ca..250c01e2d3763bcbb88310053495cdd29904e412 100644
 --- a/crates/codegen/xai-grok-telemetry/src/sentry.rs
@@ -237,7 +412,7 @@ index 94a1a836706b674827af4fcde1c61bfab17505d1..437e3634849f2e8ec7b473111b2e36c5
  }
 
 base-commit: be713136d2a69080743a3f6b3c72077057e5948f
-prerequisite-patch-id: 530dd638bb0618ddbc5ef71542d90265d6cc86ec
+prerequisite-patch-id: ecf5704845e72317f02add5cb7a3bdea33898ddf
 -- 
 2.50.1 (Apple Git-155)
 

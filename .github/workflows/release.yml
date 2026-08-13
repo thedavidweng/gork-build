@@ -52,23 +52,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codegen/xai-grok-version/Cargo.toml | head -1)
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' maint/upstream.lock.toml | head -1)
           if [[ -z "$VER" ]]; then
-            echo "could not read product version" >&2
+            echo "could not read product version from lock" >&2
             exit 1
           fi
-          TAG="v${VER}-gork.1"
           MAIN_SHA=$(git rev-parse HEAD)
+          # Increment v<upstream>-gork.N so a patch-only fix can ship.
+          EXISTING=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName --jq '.[].tagName' | grep -E "^v${VER}-gork\\.[0-9]+$" || true)
+          N=1
+          if [[ -n "$EXISTING" ]]; then
+            MAX=$(echo "$EXISTING" | sed -n "s/^v${VER}-gork\\.//p" | sort -n | tail -1)
+            N=$((MAX + 1))
+          fi
+          TAG="v${VER}-gork.${N}"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release ${TAG} already exists — nothing to do"
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "will release ${TAG} from ${MAIN_SHA}"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          fi
+          echo "will release ${TAG} from ${MAIN_SHA}"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -102,6 +105,14 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.main_sha }}
           persist-credentials: false
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "gork-ci@users.noreply.github.com"
+          git config --global user.name "Gork CI"
+
+      - name: Materialize product tree
+        run: python3 maint/scripts/patchctl.py checkout
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
@@ -167,9 +178,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${{ matrix.target }}" ]]; then
-            cargo build -p xai-grok-pager-bin --release --target "${{ matrix.target }}"
+            cargo build -p xai-grok-pager-bin --release --target "${{ matrix.target }}" \
+              --manifest-path .work/src/Cargo.toml
           else
-            cargo build -p xai-grok-pager-bin --release
+            cargo build -p xai-grok-pager-bin --release \
+              --manifest-path .work/src/Cargo.toml
           fi
 
       - name: Package
@@ -179,9 +192,9 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          OUTDIR="target/release"
+          OUTDIR=".work/src/target/release"
           if [[ -n "${{ matrix.target }}" ]]; then
-            OUTDIR="target/${{ matrix.target }}/release"
+            OUTDIR=".work/src/target/${{ matrix.target }}/release"
           fi
           STAGE=$(mktemp -d)
           if [[ "$PLATFORM" == win32-* ]]; then
@@ -242,20 +255,20 @@ jobs:
         run: |
           set -euo pipefail
           UPSTREAM=$(sed -n 's/^commit = "\(.*\)"/\1/p' maint/upstream.lock.toml | head -1)
-          SOURCE_REV=$(head -1 SOURCE_REV | tr -d '[:space:]')
+          SOURCE_REV=$(sed -n 's/^source_rev = "\(.*\)"/\1/p' maint/upstream.lock.toml | head -1)
           cat > notes.md <<EOF
-          Community privacy build of Grok Build **${VERSION}**.
+          Community privacy build of Grok Build **${VERSION}** (\`${TAG}\`).
 
-          Based on upstream [\`xai-org/grok-build\`](https://github.com/xai-org/grok-build) commit \`${UPSTREAM}\` (SOURCE_REV \`${SOURCE_REV}\`) with the full Gork privacy patch queue applied:
+          Based on upstream [\`xai-org/grok-build\`](https://github.com/xai-org/grok-build) commit \`${UPSTREAM}\` (SOURCE_REV \`${SOURCE_REV}\`) with the Gork privacy patch queue applied at build time:
 
           - Product analytics (Mixpanel / events): **hard-off**
           - Client research / trace / session uploads: **hard-off** (remote flags cannot re-enable)
           - Coding-data retention: **locked to opt-out**
-          - Vendor auto-update (x.ai/cli): **hard-disabled** — update from this page or rebuild from source
+          - Vendor auto-update (x.ai/cli): **hard-disabled** — update from this page or rebuild from this repository
 
           Platform matrix mirrors upstream's prebuilt set (darwin/linux/win32 × arm64/x64). macOS binaries are unsigned: \`xattr -d com.apple.quarantine gork\` after extracting.
 
-          Verified in CI before this release: privacy contracts, patch-queue roundtrip, cargo audit, and a release-binary egress smoke.
+          Verified in CI before this release: privacy contracts, patch-queue apply, cargo audit.
           EOF
           gh release create "$TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \

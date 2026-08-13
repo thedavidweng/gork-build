@@ -1,8 +1,8 @@
 {
-  "branch": "sync/upstream-1.0.0-b13fa52",
-  "upstream": "b13fa526f5112c0b20dad5f1f2300d3d3b127895",
-  "version": "1.0.0",
-  "source_rev": "a51a1dc62fe20029ac39a665985bba78edbb870f",
+  "upstream": "be713136d2a69080743a3f6b3c72077057e5948f",
+  "version": "1.0.1",
+  "source_rev": "5d08d7e4123092567ccd584cd9f99afa2972065c",
+  "work_src": ".work/src",
   "applied": [
     "0001-privacy-core.patch",
     "0010-telemetry-hard-off.patch",
@@ -16,9 +16,7 @@
     "0080-product-identity.patch",
     "0081-package-publishing.patch"
   ],
-  "skipped": [
-    "0082-branding-docs.patch"
-  ],
+  "skipped": [],
   "conflicted": null,
-  "branding_required": true
+  "branding_required": false
 }

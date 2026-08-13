@@ -1,4 +1,4 @@
-# Fail closed if the privacy patch series no longer rebuilds the locked tip.
+# Fail closed if the privacy patch series no longer applies on the locked SHA.
 name: Patch roundtrip
 
 on:
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   lint-and-roundtrip:
-    name: Lint + roundtrip
+    name: Lint + apply-only roundtrip
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -21,42 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Configure git identity (required for git am in roundtrip)
+      - name: Configure git identity
         run: |
           git config --global user.email "gork-ci@users.noreply.github.com"
           git config --global user.name "Gork CI"
 
-      - name: Ensure locked base is present
-        run: |
-          set -euo pipefail
-          BASE=$(python3 - <<'PY'
-          import tomllib
-          from pathlib import Path
-          print(tomllib.loads(Path("maint/upstream.lock.toml").read_text())["commit"])
-          PY
-          )
-          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            git fetch --no-tags https://github.com/xai-org/grok-build.git "$BASE"
-          fi
-          # Best-effort: fetch recorded tips if they exist on origin
-          python3 - <<'PY'
-          import subprocess, tomllib
-          from pathlib import Path
-          lock = tomllib.loads(Path("maint/upstream.lock.toml").read_text())
-          for key in ("patch_tip", "product_tip"):
-              rev = (lock.get(key) or "").strip()
-              if not rev:
-                  continue
-              r = subprocess.run(["git", "cat-file", "-e", f"{rev}^{{commit}}"])
-              if r.returncode != 0:
-                  subprocess.run(
-                      ["git", "fetch", "--no-tags", "origin", rev],
-                      check=False,
-                  )
-          PY
+      - name: Cache upstream clone
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .work/upstream
+          key: upstream-${{ hashFiles('maint/upstream.lock.toml') }}
 
-      - name: patchctl lint (roundtrip vs HEAD + product_tip when available)
+      - name: patchctl lint (static + apply-only)
         run: python3 maint/scripts/patchctl.py lint
