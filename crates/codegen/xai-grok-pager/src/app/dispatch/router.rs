@@ -91,9 +91,9 @@ use super::settings::setters::{
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
-    dispatch_open_reset_confirm, dispatch_open_settings, dispatch_toggle_compact_mode,
-    dispatch_toggle_mouse_capture, dispatch_toggle_multiline, dispatch_toggle_timestamps,
-    dispatch_toggle_vim_mode,
+    dispatch_open_prompts, dispatch_open_reset_confirm, dispatch_open_settings,
+    dispatch_toggle_compact_mode, dispatch_toggle_mouse_capture, dispatch_toggle_multiline,
+    dispatch_toggle_timestamps, dispatch_toggle_vim_mode,
 };
 use super::status::{
     dispatch_copy_session_id, dispatch_manage_billing, dispatch_open_gboom, dispatch_open_tutorial,
@@ -1321,10 +1321,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             }
             vec![]
         }
+        Action::OpenPromptsModal => dispatch_open_prompts(app),
         Action::OpenGboom => dispatch_open_gboom(app),
         Action::SuspendForEditor {
             path,
             refresh_agents_modal,
+            refresh_prompts_modal,
         } => {
             if app.pending_editor.is_none() {
                 if let ActiveView::Agent(id) = app.active_view
@@ -1336,6 +1338,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     crate::app::external_editor::PendingEditorRequest::ConfigFile {
                         path,
                         refresh_agents_modal,
+                        refresh_prompts_modal,
                     },
                 );
             }

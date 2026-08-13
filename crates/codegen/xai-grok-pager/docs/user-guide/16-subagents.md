@@ -264,6 +264,8 @@ model = "grok-4.6"
 prompt_file = ".grok/prompts/researcher.md"
 ```
 
+`prompt_file` here is a **custom role** body (project- or user-scoped path). It is separate from the built-in system / stock-subagent templates you browse and override with [`/prompts`](25-prompts.md) under `~/.grok/prompts/<catalog-id>.md`.
+
 Define custom personas with behavioral instructions:
 
 ```toml

@@ -3526,7 +3526,12 @@ impl AgentView {
         if self.active_modal.is_some() {
             self.draw_active_modal(area, buf, theme, compact);
             self.pane_areas = layout.pane_areas();
-            return (None, crate::terminal::overlay::clear().map(Into::into));
+            // Most modals have no caret; `/prompts` in-TUI edit exposes one.
+            let cursor = match self.active_modal.as_ref() {
+                Some(crate::views::modal::ActiveModal::PromptsBrowser { state }) => state.caret(),
+                _ => None,
+            };
+            return (cursor, crate::terminal::overlay::clear().map(Into::into));
         }
         match self.shortcuts_bar_content(registry, esc_owned_before_agent) {
             ShortcutsBarContent::Hidden => {}

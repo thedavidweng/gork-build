@@ -309,6 +309,7 @@ fn config_editor_action_still_uses_typed_request() {
         Action::SuspendForEditor {
             path: path.clone(),
             refresh_agents_modal: Some(crate::views::agents_modal::AgentsTab::Agents),
+            refresh_prompts_modal: false,
         },
         &mut app,
     );
@@ -317,6 +318,7 @@ fn config_editor_action_still_uses_typed_request() {
         Some(crate::app::external_editor::PendingEditorRequest::ConfigFile {
             path: ref queued,
             refresh_agents_modal: Some(crate::views::agents_modal::AgentsTab::Agents),
+            refresh_prompts_modal: false,
         }) if queued == &path
     ));
 }

@@ -31,6 +31,57 @@ pub(in crate::app::dispatch) fn save_success_toast(label: &str, on: bool) -> Str
     format!("\u{2713} {label}: {value}")
 }
 
+/// Open the `/prompts` catalog modal (mirrors settings open: ensure an agent view).
+pub(in crate::app::dispatch) fn dispatch_open_prompts(app: &mut AppView) -> Vec<Effect> {
+    use crate::views::modal::ActiveModal;
+    use crate::views::prompts_modal::PromptsModalState;
+
+    let mut effects = vec![];
+    let id = match app.active_view {
+        ActiveView::Agent(id) => id,
+        _ => {
+            if let Some(existing) = app.agents.keys().next().copied() {
+                crate::app::dispatch::ctx::switch_to_agent(
+                    app,
+                    existing,
+                    crate::app::dispatch::ctx::SwitchCause::Picker,
+                );
+                existing
+            } else {
+                let (new_id, create_effects) =
+                    crate::app::dispatch::session::lifecycle::dispatch_new_session_inner_with_id(
+                        app, None,
+                    );
+                effects.extend(create_effects);
+                new_id
+            }
+        }
+    };
+
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return effects;
+    };
+
+    if matches!(&agent.active_modal, Some(ActiveModal::PromptsBrowser { .. })) {
+        agent.active_modal = None;
+        return effects;
+    }
+
+    // Bind the prompt catalog to this agent's session before the modal reads
+    // it: presets are per session, so the browser must show — and edit — the
+    // prompts this session actually resolves.
+    if let Some(session_id) = agent.session.session_id.as_ref()
+        && let Err(e) = xai_grok_agent::activate_session(session_id.0.as_ref())
+    {
+        tracing::warn!(error = %e, "prompt preset activation failed");
+    }
+
+    agent.active_modal = Some(ActiveModal::PromptsBrowser {
+        state: Box::new(PromptsModalState::new()),
+    });
+    effects
+}
+
 /// Refresh every open settings modal's `ui_snapshot` and `pager_snapshot` so the next render reads the latest live state.
 /// The modal stores snapshots by value; without this, toggles would appear stuck.
 pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {

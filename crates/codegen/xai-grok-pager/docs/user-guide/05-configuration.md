@@ -823,6 +823,8 @@ The key ones. See the README for the complete list.
 | `~/.grok/auth.json` | Authentication credentials (auto-managed) |
 | `~/.grok/sessions/` | Persisted sessions (organized by working directory) |
 | `~/.grok/memory/` | Cross-session memory files and index |
+| `~/.grok/prompts/` | Active overrides for built-in system / subagent prompt templates ([`/prompts`](25-prompts.md)) |
+| `~/.grok/prompt-presets/` | Named snapshots of prompt overrides (apply / update from `/prompts`) |
 | `~/.grok/skills/` | User-scoped skill definitions |
 | `~/.grok/plugins/` | User-scoped plugins |
 | `~/.grok/agents/` | User-scoped agent definitions |

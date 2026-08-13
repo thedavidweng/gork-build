@@ -34,6 +34,7 @@ pub mod privacy_banner;
 pub mod progress_bar;
 pub mod prompt_suggestion;
 pub mod prompt_widget;
+pub mod prompts_modal;
 pub mod question_view;
 pub mod queue_pane;
 pub mod rewind;

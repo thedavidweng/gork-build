@@ -69,6 +69,7 @@ impl AgentView {
                 InputOutcome::Action(Action::SuspendForEditor {
                     path,
                     refresh_agents_modal: Some(tab),
+                    refresh_prompts_modal: false,
                 })
             }
             crate::views::agents_modal::AgentsModalOutcome::Changed => InputOutcome::Changed,
@@ -133,6 +134,7 @@ impl AgentView {
                 InputOutcome::Action(Action::SuspendForEditor {
                     path,
                     refresh_agents_modal: Some(crate::views::agents_modal::AgentsTab::Personas),
+                    refresh_prompts_modal: false,
                 })
             }
             PersonaDetailOutcome::Changed => InputOutcome::Changed,

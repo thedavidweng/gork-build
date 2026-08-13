@@ -898,6 +898,8 @@ pub enum Action {
     },
     /// Open the memory browser modal.
     OpenMemoryModal,
+    /// Open the LLM prompts browser modal (`/prompts`).
+    OpenPromptsModal,
     /// Open the hidden `/gboom` easter egg (DOOM-style raycaster modal).
     OpenGboom,
     /// Suspend the TUI and open a configuration file in `$EDITOR`.
@@ -905,6 +907,8 @@ pub enum Action {
         path: std::path::PathBuf,
         /// Reload `/config-agents` list after the editor exits (when set).
         refresh_agents_modal: Option<crate::views::agents_modal::AgentsTab>,
+        /// Re-open `/prompts` after the editor exits.
+        refresh_prompts_modal: bool,
     },
     /// Edit the current minimal-mode composer draft in an external editor.
     EditPromptExternal,

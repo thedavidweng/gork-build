@@ -277,6 +277,10 @@ pub enum ActiveModal {
     MemoryBrowser {
         state: Box<crate::views::memory_modal::MemoryModalState>,
     },
+    /// LLM prompt templates browser (/prompts).
+    PromptsBrowser {
+        state: Box<crate::views::prompts_modal::PromptsModalState>,
+    },
     /// Settings modal (F2, /settings, palette). Boxed because the state is large.
     Settings {
         state: Box<crate::views::settings_modal::SettingsModalState>,
@@ -654,6 +658,7 @@ impl ActiveModal {
             | ActiveModal::DocViewer { .. }
             | ActiveModal::ShortcutsHelp { .. }
             | ActiveModal::MemoryBrowser { .. }
+            | ActiveModal::PromptsBrowser { .. }
             | ActiveModal::Settings { .. }
             | ActiveModal::UsageInfo { .. }
             | ActiveModal::RememberNoteReview { .. } => vec![],
@@ -684,6 +689,7 @@ impl ActiveModal {
             ActiveModal::DocViewer { title, .. } => title.as_str(),
             ActiveModal::ShortcutsHelp { .. } => "Keyboard Shortcuts",
             ActiveModal::MemoryBrowser { .. } => "Memory",
+            ActiveModal::PromptsBrowser { .. } => crate::views::prompts_modal::MODAL_TITLE,
             ActiveModal::Settings { .. } => crate::views::settings_modal::MODAL_TITLE,
             ActiveModal::ResetSettingsConfirm { .. } => "Reset setting?",
             ActiveModal::RememberNoteReview { .. } => "Memory Note",

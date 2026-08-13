@@ -5,7 +5,7 @@
 //! This struct does NOT own a render engine; it provides placeholders and discovered sections.
 use crate::config::PromptMode;
 use crate::prompt::agents_md::{self, AgentConfigFile};
-use crate::prompt::template::{apply_patch_template, base_template, subagent_template};
+use crate::prompt::catalog::{self, PromptId};
 use serde::de;
 use serde::{Deserialize, Serialize};
 /// Selects which base template to use for `Extend` mode rendering.
@@ -137,6 +137,14 @@ pub struct PromptContext {
     /// Not the UI picker name. Defaults to [`DEFAULT_SYSTEM_PROMPT_LABEL`].
     #[serde(default = "default_system_prompt_label")]
     pub system_prompt_label: String,
+    /// Session this prompt belongs to, used to resolve its prompt preset.
+    ///
+    /// Prompt overrides are per session, and the process that runs the agent
+    /// (a leader can host several sessions at once) is not necessarily the one
+    /// that picked the preset — so the id travels with the context instead of
+    /// being read from process state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_session_id: Option<String>,
 }
 /// Default identity on trim-tool-descriptions (`You are Grok released by xAI`).
 pub const DEFAULT_SYSTEM_PROMPT_LABEL: &str = "Grok";
@@ -179,6 +187,7 @@ impl Default for PromptContext {
             current_date: None,
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
+            prompt_session_id: None,
         }
     }
 }
@@ -252,20 +261,25 @@ impl PromptContext {
         let render = |template: &str| renderer.render_with_extra(template, &placeholders).ok();
         let prompt = match self.prompt_mode {
             PromptMode::Extend => {
-                let decrypted;
+                // Owned storage for decrypted defaults and user overrides.
+                // User overrides from `$GROK_HOME/prompts/` take precedence
+                // over the embedded templates when present.
+                let owned_base: String;
+                let session = self.prompt_session_id.as_deref();
                 let base = match &self.system_prompt {
                     TemplateOverride::Custom(template) => template.as_str(),
                     TemplateOverride::Codex => {
-                        decrypted = apply_patch_template();
-                        &decrypted
+                        owned_base = catalog::resolve_body_for(session, PromptId::ApplyPatch);
+                        owned_base.as_str()
                     }
                     TemplateOverride::None => {
-                        decrypted = if self.audience == PromptAudience::Subagent {
-                            subagent_template()
+                        let id = if self.audience == PromptAudience::Subagent {
+                            PromptId::SubagentShell
                         } else {
-                            base_template()
+                            PromptId::BaseSystem
                         };
-                        &decrypted
+                        owned_base = catalog::resolve_body_for(session, id);
+                        owned_base.as_str()
                     }
                 };
                 let mut prompt = render(base)?;
@@ -307,6 +321,7 @@ mod tests {
             current_date: None,
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
+            prompt_session_id: None,
         }
     }
     #[test]
@@ -609,6 +624,7 @@ mod tests {
             current_date: None,
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
+            prompt_session_id: None,
         }
     }
     #[test]

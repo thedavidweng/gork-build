@@ -32,6 +32,7 @@ Customize and extend Grok Build.
 | 11 | [Custom Models](11-custom-models.md) | Bring-your-own-key, Ollama, and OpenAI-compatible endpoints |
 | 12 | [Project Rules (AGENTS.md)](12-project-rules.md) | Per-directory AGENTS.md instructions and their precedence |
 | 13 | [Memory](13-memory.md) | Cross-session knowledge persistence with `/flush`, `/dream`, and hybrid search |
+| 25 | [Prompt templates (`/prompts`)](25-prompts.md) | Browse, edit, and preset system / subagent prompt templates under `~/.grok` |
 
 ---
 

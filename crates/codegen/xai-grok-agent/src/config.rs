@@ -703,6 +703,12 @@ pub struct AgentDefinition {
     /// Prevents external definitions from opting into built-in-only policy by name.
     #[serde(skip)]
     pub(crate) builtin_name: Option<BuiltinAgentName>,
+    /// Catalog id backing `prompt_body` when it came from an overridable
+    /// template. `prompt_body` is resolved once at definition time; the builder
+    /// re-resolves it from this id for the owning session, so a per-session
+    /// preset wins over the process-wide default.
+    #[serde(skip)]
+    pub(crate) prompt_catalog_id: Option<crate::prompt::catalog::PromptId>,
     #[serde(default = "default_prompt_mode")]
     pub prompt_mode: PromptMode,
     #[serde(default = "default_grok_build_toolset")]
@@ -1424,6 +1430,7 @@ impl AgentDefinition {
             description: description.to_string(),
             plugin_name: None,
             builtin_name: None,
+            prompt_catalog_id: None,
             prompt_mode: PromptMode::Extend,
             tool_config: default_grok_build_toolset(),
             capability_mode: None,
@@ -1519,34 +1526,37 @@ impl AgentDefinition {
         }
     }
     pub fn general_purpose() -> Self {
-        use crate::prompt::subagent_prompts;
+        use crate::prompt::catalog::{self, PromptId};
         Self {
             description: xai_tool_types::GENERAL_PURPOSE_SUBAGENT
                 .description
                 .to_string(),
             tool_config: general_purpose_toolset(),
-            prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
+            prompt_body: Some(catalog::resolve_body(PromptId::SubagentGeneralPurpose)),
+            prompt_catalog_id: Some(PromptId::SubagentGeneralPurpose),
             ..Self::base(BuiltinAgentName::GeneralPurpose, "")
         }
     }
     pub fn explore() -> Self {
-        use crate::prompt::subagent_prompts;
+        use crate::prompt::catalog::{self, PromptId};
         Self {
             description: xai_tool_types::EXPLORE_SUBAGENT.description.to_string(),
             tool_config: explore_toolset(),
             permission_mode: PermissionMode::Plan,
-            prompt_body: Some(subagent_prompts::EXPLORE_PROMPT.to_string()),
+            prompt_body: Some(catalog::resolve_body(PromptId::SubagentExplore)),
+            prompt_catalog_id: Some(PromptId::SubagentExplore),
             inherit_skills: false,
             ..Self::base(BuiltinAgentName::Explore, "")
         }
     }
     pub fn plan() -> Self {
-        use crate::prompt::subagent_prompts;
+        use crate::prompt::catalog::{self, PromptId};
         Self {
             description: xai_tool_types::PLAN_SUBAGENT.description.to_string(),
             tool_config: plan_toolset(),
             permission_mode: PermissionMode::Plan,
-            prompt_body: Some(subagent_prompts::PLAN_PROMPT.to_string()),
+            prompt_body: Some(catalog::resolve_body(PromptId::SubagentPlan)),
+            prompt_catalog_id: Some(PromptId::SubagentPlan),
             inherit_skills: false,
             ..Self::base(BuiltinAgentName::Plan, "")
         }

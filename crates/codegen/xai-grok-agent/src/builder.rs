@@ -1152,7 +1152,15 @@ impl AgentBuilder {
             version: 1,
             prompt_mode: definition.prompt_mode.clone(),
             audience: self.prompt_audience,
-            prompt_body: definition.prompt_body.clone(),
+            // A built-in subagent body comes from the overridable catalog, and
+            // `definition` resolved it with no session in hand. Re-resolve it
+            // for the owning session so its preset wins.
+            prompt_body: definition
+                .prompt_catalog_id
+                .map(|id| {
+                    crate::prompt::catalog::resolve_body_for(self.owner_session_id.as_deref(), id)
+                })
+                .or_else(|| definition.prompt_body.clone()),
             include_browser_verification: definition.include_browser_verification(),
             system_prompt: definition.system_prompt.clone(),
             agents_md_files,
@@ -1173,6 +1181,7 @@ impl AgentBuilder {
             ),
             is_non_interactive: self.is_non_interactive,
             system_prompt_label: self.system_prompt_label,
+            prompt_session_id: self.owner_session_id.clone(),
         };
         let system_prompt = prompt_context
             .render(&tool_bridge)

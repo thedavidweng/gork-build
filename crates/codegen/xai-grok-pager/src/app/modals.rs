@@ -396,6 +396,60 @@ impl AgentView {
             }
         }
 
+        // PromptsBrowser: sub-modes own Esc; chrome handles close + tabs.
+        if let ActiveModal::PromptsBrowser { state } = modal {
+            use crate::views::prompts_modal::{PromptsModalMode, PromptsTab};
+            if matches!(
+                state.mode,
+                PromptsModalMode::FilterFocused
+                    | PromptsModalMode::Editing { .. }
+                    | PromptsModalMode::NamingPreset { .. }
+                    | PromptsModalMode::ConfirmingReset { .. }
+                    | PromptsModalMode::ConfirmingDeletePreset { .. }
+            ) {
+                return crate::views::prompts_modal::handle_prompts_key(state, key);
+            }
+            let tab_labels = ["Catalog", "Presets"];
+            let chrome_cfg = mw::ModalWindowConfig {
+                title: "",
+                tabs: Some(&tab_labels),
+                shortcuts: &[],
+                sizing: mw::ModalSizing::default(),
+                fold_info: None,
+            };
+            let outcome = mw::handle_modal_key(&mut state.window, key, &chrome_cfg);
+            match outcome {
+                ModalWindowOutcome::CloseRequested => {
+                    self.active_modal = None;
+                    return InputOutcome::Changed;
+                }
+                ModalWindowOutcome::TabChanged(idx) => {
+                    let tab = if idx == 0 {
+                        PromptsTab::Catalog
+                    } else {
+                        PromptsTab::Presets
+                    };
+                    // switch_tab is private — drive via Tab key handler
+                    state.window.active_tab = idx;
+                    // Public path: set tab through key simulation when needed
+                    // Prefer direct field access + refresh.
+                    if state.tab != tab {
+                        // Reconstruct browse mode on the requested tab.
+                        state.tab = tab;
+                        state.mode = PromptsModalMode::Browse;
+                        state.selected = 0;
+                        state.scroll_offset = 0;
+                        state.refresh();
+                    }
+                    return InputOutcome::Changed;
+                }
+                ModalWindowOutcome::Unhandled => {
+                    return crate::views::prompts_modal::handle_prompts_key(state, key);
+                }
+                _ => return InputOutcome::Changed,
+            }
+        }
+
         // Settings: route through ModalWindow chrome, then delegate.
         if let ActiveModal::Settings { state } = modal {
             // Sub-mode short-circuit: FilterFocused, PickingEnum, PickingGroup, and EditingValue handle their own Esc and keystrokes
@@ -512,6 +566,7 @@ impl AgentView {
             | ActiveModal::DocViewer { .. }
             | ActiveModal::ShortcutsHelp { .. }
             | ActiveModal::MemoryBrowser { .. }
+            | ActiveModal::PromptsBrowser { .. }
             | ActiveModal::Settings { .. }
             | ActiveModal::UsageInfo { .. }
             | ActiveModal::ResetSettingsConfirm { .. }
@@ -551,6 +606,9 @@ impl AgentView {
         }
         if let Some(ActiveModal::MemoryBrowser { state }) = self.active_modal.as_mut() {
             return crate::views::memory_modal::handle_memory_paste(state, text);
+        }
+        if let Some(ActiveModal::PromptsBrowser { state }) = self.active_modal.as_mut() {
+            return crate::views::prompts_modal::handle_prompts_paste(state, text);
         }
         let settings_outcome = match self.active_modal.as_mut() {
             Some(ActiveModal::Settings { state }) => Some(
@@ -1564,6 +1622,31 @@ impl AgentView {
             }
         }
 
+        // PromptsBrowser: editing/naming own the mouse (click-to-place caret);
+        // otherwise chrome first (close/tabs), then content.
+        if let Some(ActiveModal::PromptsBrowser { state }) = &mut self.active_modal {
+            use crate::views::prompts_modal::PromptsModalMode;
+            if matches!(
+                state.mode,
+                PromptsModalMode::Editing { .. } | PromptsModalMode::NamingPreset { .. }
+            ) {
+                return crate::views::prompts_modal::handle_prompts_mouse(state, mouse);
+            }
+            let outcome =
+                mw::handle_modal_mouse(&mut state.window, mouse.kind, mouse.column, mouse.row);
+            match outcome {
+                ModalWindowOutcome::CloseRequested => {
+                    self.active_modal = None;
+                    return InputOutcome::Changed;
+                }
+                ModalWindowOutcome::Handled => return InputOutcome::Changed,
+                ModalWindowOutcome::Unhandled => {
+                    return crate::views::prompts_modal::handle_prompts_mouse(state, mouse);
+                }
+                _ => return InputOutcome::Changed,
+            }
+        }
+
         // Settings: route through ModalWindow chrome, then delegate.
         if let Some(ActiveModal::Settings { state }) = &mut self.active_modal {
             let outcome =
@@ -2449,6 +2532,8 @@ impl AgentView {
                 );
             } else if let modal::ActiveModal::MemoryBrowser { state: mem_state } = active_modal {
                 crate::views::memory_modal::render_memory_modal(buf, area, mem_state, compact);
+            } else if let modal::ActiveModal::PromptsBrowser { state: prompts_state } = active_modal {
+                crate::views::prompts_modal::render_prompts_modal(buf, area, prompts_state, compact);
             } else if let modal::ActiveModal::Settings {
                 state: settings_state,
             } = active_modal

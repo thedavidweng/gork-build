@@ -119,6 +119,8 @@ cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
 cargo fmt --all               # rustfmt.toml at the repo root
 ```
 
+Notable addition in this tree: **[`/prompts`](crates/codegen/xai-grok-pager/docs/user-guide/25-prompts.md)** — browse and edit system / subagent prompt templates; overrides and presets stay under `~/.grok` (not project git). See also [CHANGELOG Unreleased](crates/codegen/xai-grok-shell/CHANGELOG.md).
+
 ## Contributing
 
 > [!NOTE]

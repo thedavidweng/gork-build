@@ -85,8 +85,10 @@ impl SessionActor {
             for item in conversation.iter_mut() {
                 if let ConversationItem::System(sys) = item {
                     if use_concise {
+                        // Through the agent so the session's own prompt preset
+                        // applies, not the process-wide default.
                         sys.content = std::sync::Arc::<str>::from(
-                            xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT,
+                            self.agent.borrow().compact_system_prompt(),
                         );
                     } else {
                         sys.content =

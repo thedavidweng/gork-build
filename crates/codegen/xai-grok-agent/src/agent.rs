@@ -97,8 +97,15 @@ impl Agent {
     }
 
     /// Compact system prompt for post-compaction use.
-    pub fn compact_system_prompt(&self) -> &str {
-        crate::prompt::template::COMPACT_SYSTEM_PROMPT
+    ///
+    /// Honours this session's prompt preset (or the unnamed overrides) when one
+    /// carries `compact-system`; otherwise the built-in default. Returns an
+    /// owned string so overrides can vary.
+    pub fn compact_system_prompt(&self) -> String {
+        crate::prompt::catalog::resolve_body_for(
+            self.prompt_context.prompt_session_id.as_deref(),
+            crate::prompt::catalog::PromptId::CompactSystem,
+        )
     }
 
     pub fn tool_bridge(&self) -> &Arc<ToolBridge> {

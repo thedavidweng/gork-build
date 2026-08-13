@@ -439,6 +439,21 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
 
 Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
 
+### `/prompts`
+
+Open the [prompt templates](25-prompts.md) browser: preview stock system / subagent prompts, edit overrides in the TUI (or `$EDITOR`), reset to the binary defaults, and save or apply named presets under `~/.grok`. Aliases: `/prompt`, `/system-prompts`.
+
+```
+/prompts                   # open the browser
+/prompts list              # presets, and what this session reads from
+/prompts use <name>        # bind this session to a preset
+/prompts save <name>       # save this session's prompts as a new preset
+/prompts update <name>     # replace an existing preset from this session
+/prompts defaults          # run this session on built-in prompts only
+```
+
+Presets are **per session**: applying one here never disturbs another session, and a resumed session comes back on the preset it ran on. Defaults always resolve from the installed binary; personal overrides live only in `$GROK_HOME/prompts/` and `$GROK_HOME/prompt-presets/` so they are not part of project git history. Full keyboard map, catalog ids, and on-disk layout: [Prompt templates (`/prompts`)](25-prompts.md).
+
 ### `/timestamps`
 
 Toggle message timestamps on or off.

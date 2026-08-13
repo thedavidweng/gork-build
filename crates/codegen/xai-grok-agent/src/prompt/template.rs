@@ -48,6 +48,11 @@ pub(crate) fn subagent_template() -> Zeroizing<String> {
     decrypt(SUBAGENT_PROMPT_ENC, PROMPT_SEEDS[2])
 }
 
+/// The subagent base template source, exposed for `grok prompt` / `/prompts`.
+pub fn subagent_template_source() -> Zeroizing<String> {
+    subagent_template()
+}
+
 /// The compact system prompt used after conversation compaction.
 pub const COMPACT_SYSTEM_PROMPT: &str = "You are an AI coding agent. You operate in a workspace with a provided codebase.\n\n\
      Your main goal is to complete the user's request, denoted within the <user_query> tag.";

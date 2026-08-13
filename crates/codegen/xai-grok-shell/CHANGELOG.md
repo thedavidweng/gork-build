@@ -1,5 +1,12 @@
 # Changelog
 
+# Unreleased
+
+## Features
+
+- **`/prompts`** opens a TUI browser for system and subagent prompt templates: preview the stock defaults shipped in the binary, edit overrides in-app (or with `$EDITOR`), reset to defaults, and save/apply named presets under `~/.grok` so personal prompts never live in the project git tree. See [Prompt templates (`/prompts`)](../xai-grok-pager/docs/user-guide/25-prompts.md).
+
+
 # 1.0.16 — 2026-09-01
 
 ## Breaking Changes
@@ -219,7 +226,6 @@
 - **Concurrent subagents** no longer trigger rate-limit errors during bursts.
 - **MCP server connections** no longer delay session startup when many servers are configured.
 
-
 # 1.0.8 — 2026-08-20
 
 ## Features
@@ -288,7 +294,6 @@
 - **Consent notice links** are now stricter and more reliable on all terminals.
 - **Video generation** now surfaces a clear ZDR error instead of raw API responses when output storage is required.
 - **Project hooks** on Windows now correctly expand $CLAUDE_PROJECT_DIR when invoking PowerShell scripts.
-
 
 # 1.0.5 — 2026-08-15
 
