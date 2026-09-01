@@ -30,7 +30,7 @@ index e90be50af5eac8bcde3605536c4e500002f85c18..6e037de1bd93161196bb5e2d77139ae7
  [features]
  default = []
 diff --git a/crates/codegen/xai-grok-telemetry/src/client.rs b/crates/codegen/xai-grok-telemetry/src/client.rs
-index 94a1aeff508823e9cc71be21b5032490b377350e..f8a5add5bab157b5d9657dc40cb3518ce6bb72a2 100644
+index 3279917f1cf2fc5ad381bbe548c2d08936214708..0846111034121d4dee977514c7c6af92ca375aa3 100644
 --- a/crates/codegen/xai-grok-telemetry/src/client.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/client.rs
 @@ -79,14 +79,10 @@ impl TelemetryClient {
@@ -53,10 +53,10 @@ index 94a1aeff508823e9cc71be21b5032490b377350e..f8a5add5bab157b5d9657dc40cb3518c
              .filter(|s| !s.is_empty())
              .map(|k| deployment_id_from_key(&k));
 diff --git a/crates/codegen/xai-grok-telemetry/src/config.rs b/crates/codegen/xai-grok-telemetry/src/config.rs
-index d002d7b286fdd082184bfd928e6d6f021d0c8944..5315f67ec6dac9d55121522e469ab8d56873f8c9 100644
+index f1a2324b14c8182ddf07a8473cb390e1db7751d9..69da087146e88393d02295a16846d1473c79ef4c 100644
 --- a/crates/codegen/xai-grok-telemetry/src/config.rs
 +++ b/crates/codegen/xai-grok-telemetry/src/config.rs
-@@ -145,23 +145,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
+@@ -185,23 +185,19 @@ fn build_env_default(value: Option<&'static str>) -> Option<String> {
  }
  impl Default for TelemetryConfig {
      fn default() -> Self {
@@ -92,7 +92,7 @@ index d002d7b286fdd082184bfd928e6d6f021d0c8944..5315f67ec6dac9d55121522e469ab8d5
              otel_enabled: None,
              otel_metrics_exporter: None,
              otel_logs_exporter: None,
-@@ -244,14 +240,14 @@ mod tests {
+@@ -299,15 +295,15 @@ mod tests {
          assert_eq!(build_env_default(Some(" key ")), Some("key".to_owned()));
      }
      #[test]
@@ -114,7 +114,8 @@ index d002d7b286fdd082184bfd928e6d6f021d0c8944..5315f67ec6dac9d55121522e469ab8d5
 +        assert_eq!(cfg.trace_upload, Some(false));
 +        assert_eq!(cfg.enabled, Some(false));
      }
- }
+     #[test]
+     fn otel_timeout_fields_accept_int_or_string() {
 diff --git a/crates/codegen/xai-grok-telemetry/src/sentry.rs b/crates/codegen/xai-grok-telemetry/src/sentry.rs
 index c12d653d779e0d61a44f7599fbfc9fc105b71979..dbfd16843984f0cabd82f5c86a0cd0b46a3fb685 100644
 --- a/crates/codegen/xai-grok-telemetry/src/sentry.rs
@@ -246,8 +247,8 @@ index cd748e55d7402283c770d717da0bd74365f85ed8..05ffebf211a4e84b6563630cd4aef0a4
      }
  }
 
-base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
-prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
 -- 
 2.43.0
 

@@ -24,10 +24,10 @@ index 673b126431f595f60aa57727d0e3be8ee8b111c8..10797ae923764282a2a56934bbbfa6ed
      next_display_order = None,
      help_template = "\
 diff --git a/crates/codegen/xai-grok-pager/src/app/mod.rs b/crates/codegen/xai-grok-pager/src/app/mod.rs
-index d636cd908f06e93e0d0dbd8611aa9fdaaf361529..bbb461f4adb58bcc7327ceb799ce64594daa6370 100644
+index 22d651594c7e85ca7d608d790fa9e214deb80b4c..d0fa0b9edc3b7c2606a8544d2c4f9faaff57e3db 100644
 --- a/crates/codegen/xai-grok-pager/src/app/mod.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/mod.rs
-@@ -2292,7 +2292,7 @@ mod tests {
+@@ -2322,7 +2322,7 @@ mod tests {
          assert_eq!(
              first_5,
              vec![
@@ -37,22 +37,22 @@ index d636cd908f06e93e0d0dbd8611aa9fdaaf361529..bbb461f4adb58bcc7327ceb799ce6459
                  "Usage: grok [OPTIONS] [PROMPT] [COMMAND]",
                  "",
 
-base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
-prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
-prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
+prerequisite-patch-id: 5334f8182338a8406ef54556119a815f49cc11ba
 prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
 prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
 prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
-prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 586f4e22105f7f778afdbe214b0f87de3c01da98
 prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
 prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
 prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
 prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
 prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
 prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
-prerequisite-patch-id: 9d5465258ca88f29996d9ea084cbc6f185766ee9
-prerequisite-patch-id: 0c19e50f968d0bc035b0229e236bb686060ab3d5
+prerequisite-patch-id: b7b868bef270a86ff2d7d824026ead2393013212
+prerequisite-patch-id: 32b5ac39eb9c9b810d0d406b578956f0323639b7
 prerequisite-patch-id: 670c947ac20ef7c49d7b7a590f1e6077a98becd7
 -- 
 2.43.0

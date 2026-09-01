@@ -88,10 +88,10 @@ index 632f5f3ff156cb68f1732be04076873b53ca3a75..2f6223e3c18e08871630883cbe5e2327
      );
      assert!(
 diff --git a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
-index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f99ef4aa8 100644
+index b0a9a0868f529448f8d1f60397750262c9c1a41d..7f800b2a8b1a0c61242d2f89330f3f6e421e4db1 100644
 --- a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
 +++ b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
-@@ -414,11 +414,14 @@ fn space_on_confirm_before_rewind_dispatches_typed_setter() {
+@@ -415,11 +415,14 @@ fn space_on_confirm_before_rewind_dispatches_typed_setter() {
  
  #[test]
  fn space_on_combine_queued_prompts_dispatches_typed_setter() {
@@ -108,7 +108,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  }
  
  #[test]
-@@ -709,6 +712,9 @@ fn mouse_click_on_page_flip_on_send_indicator_toggles_in_one_click() {
+@@ -710,6 +713,9 @@ fn mouse_click_on_page_flip_on_send_indicator_toggles_in_one_click() {
  
  #[test]
  fn mouse_click_on_combine_queued_prompts_indicator_toggles_in_one_click() {
@@ -118,7 +118,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
      let mut s = make_state();
      synth_rects(&mut s);
      let row_y = row_idx_for(&s, "combine_queued_prompts") as u16;
-@@ -718,8 +724,7 @@ fn mouse_click_on_combine_queued_prompts_indicator_toggles_in_one_click() {
+@@ -719,8 +725,7 @@ fn mouse_click_on_combine_queued_prompts_indicator_toggles_in_one_click() {
          72,
          row_y,
      );
@@ -128,7 +128,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  }
  
  #[test]
-@@ -2006,6 +2011,8 @@ fn defaults_round_trip_through_registry() {
+@@ -2008,6 +2013,8 @@ fn defaults_round_trip_through_registry() {
      xai_grok_pager::appearance::cache::set_follow_up_behavior(
          xai_grok_pager::appearance::FollowUpBehavior::Queue,
      );
@@ -137,7 +137,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
      xai_grok_pager::appearance::cache::set_scroll_mode(
          xai_grok_pager::appearance::ScrollMode::Auto,
      );
-@@ -4678,94 +4685,46 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
+@@ -4681,94 +4688,46 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
      }
  }
  
@@ -260,7 +260,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  }
  
  /// Esc in non-preview picker returns to Browse without Action.
-@@ -4846,7 +4805,13 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
+@@ -4849,7 +4808,13 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
      );
  }
  
@@ -275,7 +275,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  #[test]
  fn pr9_search_privacy_matches_coding_data_sharing() {
      let reg = SettingsRegistry::defaults();
-@@ -4854,21 +4819,16 @@ fn pr9_search_privacy_matches_coding_data_sharing() {
+@@ -4857,21 +4822,16 @@ fn pr9_search_privacy_matches_coding_data_sharing() {
      // The category label "Privacy" appears as a header but is not part of `search()`'s haystack (search ignores categories)
      // Matches come from the meta's keywords, label, and description
      let hit_keys: Vec<&str> = hits.iter().map(|m| m.key).collect();
@@ -305,7 +305,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
      );
  }
  
-@@ -5349,9 +5309,13 @@ fn pr10_enter_on_plan_mode_row_enters_picking_enum() {
+@@ -5352,9 +5312,13 @@ fn pr10_enter_on_plan_mode_row_enters_picking_enum() {
      }
  }
  
@@ -322,7 +322,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  #[test]
  fn pr10_plan_mode_picker_nav_does_not_dispatch_preview() {
      for nav_key in &[
-@@ -6231,7 +6195,10 @@ fn pr13_space_on_auto_update_dispatches_typed_setter() {
+@@ -6234,7 +6198,10 @@ fn pr13_space_on_auto_update_dispatches_typed_setter() {
      let mut s = make_state();
      navigate_to(&mut s, "auto_update");
      let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
@@ -334,7 +334,7 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  }
  
  /// Value-column click on `show_tips` toggles in one click.
-@@ -6275,7 +6242,8 @@ fn pr13_mouse_click_on_auto_update_two_stage_select_then_toggle() {
+@@ -6278,7 +6245,8 @@ fn pr13_mouse_click_on_auto_update_two_stage_select_then_toggle() {
          10,
          row_y,
      );
@@ -345,14 +345,14 @@ index 556a1498fcfbbe3df7ab74f65fc37d361a519f77..9b1870e0267fed1d332c3152255dd77f
  
  /// CLI-batch settings are all `restart_required: true`.
 
-base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
-prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
-prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
+prerequisite-patch-id: 5334f8182338a8406ef54556119a815f49cc11ba
 prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
 prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
 prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
 prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
-prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 586f4e22105f7f778afdbe214b0f87de3c01da98
 prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
 -- 
 2.43.0

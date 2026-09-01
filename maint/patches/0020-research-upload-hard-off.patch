@@ -13,10 +13,10 @@ Gork-Risk: critical
  2 files changed, 129 insertions(+), 6 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
-index 6d22429e238bc6adfa6ae08910f7fa09260d5cd8..d56d0127f43bdaf230a938a40221d3fb68badf16 100644
+index 953734d29292e3630ce34b589c6105566265cd01..2bc791070e5874e97eb914dd5fce3b04a1167375 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config.rs
-@@ -1622,6 +1622,8 @@ pub struct SessionConfig {
+@@ -1650,6 +1650,8 @@ pub struct SessionConfig {
  #[derive(Debug, Clone, Serialize, Deserialize)]
  #[serde(default)]
  pub struct RepoChangesDedupConfig {
@@ -25,7 +25,7 @@ index 6d22429e238bc6adfa6ae08910f7fa09260d5cd8..d56d0127f43bdaf230a938a40221d3fb
      pub enabled: bool,
      /// Include inline content even when references exist.
      pub include_inline_fallback: bool,
-@@ -1637,7 +1639,8 @@ impl RepoChangesDedupConfig {}
+@@ -1665,7 +1667,8 @@ impl RepoChangesDedupConfig {}
  impl Default for RepoChangesDedupConfig {
      fn default() -> Self {
          Self {
@@ -35,7 +35,7 @@ index 6d22429e238bc6adfa6ae08910f7fa09260d5cd8..d56d0127f43bdaf230a938a40221d3fb
              include_inline_fallback: false,
              max_inline_bytes: 0,
              dedup_untracked: true,
-@@ -2353,7 +2356,13 @@ impl Config {
+@@ -2381,7 +2384,13 @@ impl Config {
      pub(crate) fn is_two_pass_compaction_enabled(&self) -> bool {
          self.is_feature_enabled(Feature::TwoPassCompaction)
      }
@@ -50,7 +50,7 @@ index 6d22429e238bc6adfa6ae08910f7fa09260d5cd8..d56d0127f43bdaf230a938a40221d3fb
          if let Some(mode) = self.requirements.telemetry.pinned() {
              return Resolved::new(mode, ConfigSource::Requirement);
          }
-@@ -2375,7 +2384,12 @@ impl Config {
+@@ -2403,7 +2412,12 @@ impl Config {
          }
          Resolved::new(TelemetryMode::Disabled, ConfigSource::Default)
      }
@@ -65,10 +65,10 @@ index 6d22429e238bc6adfa6ae08910f7fa09260d5cd8..d56d0127f43bdaf230a938a40221d3fb
          let ff = if mode.value.is_disabled() {
              None
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config_tests.rs b/crates/codegen/xai-grok-shell/src/agent/config_tests.rs
-index 570d4d6a6b81bee7a14bf5878c6cf113131aa0a3..118558373d5f27a3772a773f843ad1b5b7c111f2 100644
+index 222e3983b8a78d964e03441ed50b8721e711ec46..0ca4e0cb854f40f11389f736816c1857cacc8550 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config_tests.rs
 +++ b/crates/codegen/xai-grok-shell/src/agent/config_tests.rs
-@@ -4046,6 +4046,19 @@ fn resolve_trace_upload_disabled_when_telemetry_off_despite_remote_flag() {
+@@ -4077,6 +4077,19 @@ fn resolve_trace_upload_disabled_when_telemetry_off_despite_remote_flag() {
  #[test]
  #[serial]
  fn resolve_trace_upload_explicit_config_wins_over_telemetry_off() {
@@ -88,7 +88,7 @@ index 570d4d6a6b81bee7a14bf5878c6cf113131aa0a3..118558373d5f27a3772a773f843ad1b5
      unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
      unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
      let mut cfg = Config::default();
-@@ -4076,19 +4089,46 @@ fn trace_upload_decision_debug_reports_winning_source() {
+@@ -4107,19 +4120,46 @@ fn trace_upload_decision_debug_reports_winning_source() {
      });
      let d = cfg.trace_upload_decision_debug();
      assert_eq!(d["trace_upload"], serde_json::json!(false));
@@ -138,7 +138,7 @@ index 570d4d6a6b81bee7a14bf5878c6cf113131aa0a3..118558373d5f27a3772a773f843ad1b5
      unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
      unsafe { std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD") };
      let mut cfg = Config::default();
-@@ -4101,6 +4141,75 @@ fn resolve_trace_upload_honors_config_when_telemetry_on() {
+@@ -4132,6 +4172,75 @@ fn resolve_trace_upload_honors_config_when_telemetry_on() {
      let r = cfg.resolve_trace_upload();
      assert!(r.value, "defaults on when telemetry fully enabled");
  }
@@ -215,9 +215,9 @@ index 570d4d6a6b81bee7a14bf5878c6cf113131aa0a3..118558373d5f27a3772a773f843ad1b5
  #[serial]
  fn resolve_goal_defaults_to_true_when_unset() {
 
-base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
-prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
-prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
+prerequisite-patch-id: 5334f8182338a8406ef54556119a815f49cc11ba
 -- 
 2.43.0
 
