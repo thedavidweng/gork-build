@@ -1,0 +1,246 @@
+# Amorce : build + publish des assets client (Linux + Windows).
+# Canon : docs/DISTRIBUTION.md
+#
+# Assets (contrat dur, alignés docs/DISTRIBUTION.md et privacy-client-update.sh) :
+#   grok-linux-x86_64
+#   grok-windows-x86_64.exe
+#
+# Triggers :
+#   - push tag v*  → build + GitHub Release
+#   - workflow_dispatch → build (+ release si create_release=true)
+#
+# Rebuild atelier (push/tag auto) = TODO ; ce workflow est le côté publish.
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create/update a GitHub Release and upload assets"
+        type: boolean
+        default: false
+      tag_name:
+        description: "Tag for the release (workflow_dispatch only; e.g. v0.2.112)"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: release-binaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.92.0"
+
+# Pin third-party actions to full commit SHAs (supply-chain), same style as grok-privacy.yml.
+# checkout@v7.0.0, rust-toolchain, rust-cache@v2.9.1, upload-artifact@v7.0.1,
+# softprops/action-gh-release@v2.2.1
+
+jobs:
+  build:
+    name: Build (${{ matrix.asset_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    # Windows is optional until MSVC LNK4319 (PDB limit on VS 2022/18 runners) is fixed.
+    # Linux remains required for a successful release.
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: grok-linux-x86_64
+            bin_name: grok
+            optional: false
+          - os: windows-latest
+            asset_name: grok-windows-x86_64.exe
+            bin_name: grok.exe
+            optional: true
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler pkg-config libssl-dev cmake libclang-dev \
+            build-essential
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Official protoc zip (choco + repo bin/protoc dotslash both fail on Windows CI).
+          # bin/protoc in this repo is a Linux/dotslash wrapper — not a Win32 binary.
+          $ver = "28.3"
+          $zip = "protoc-$ver-win64.zip"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/$zip"
+          $dest = "$env:RUNNER_TEMP\protoc"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\$zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\$zip" -DestinationPath $dest -Force
+          $protoc = Join-Path $dest "bin\protoc.exe"
+          if (-not (Test-Path $protoc)) { throw "protoc.exe missing after extract" }
+          & $protoc --version
+          # Prefer real Windows protoc over repo bin/protoc (see xai-proto-build find_protoc).
+          echo "PROTOC=$protoc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "$dest\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Prevent accidental pick of the Linux/dotslash wrapper.
+          if (Test-Path "bin\protoc") { Remove-Item "bin\protoc" -Force }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: release-${{ matrix.asset_name }}
+          cache-targets: "true"
+
+      - name: Build release binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo build -p xai-grok-pager-bin --release --bin grok
+
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PROTOC: ${{ env.PROTOC }}
+          # MSVC LNK4319: full /DEBUG PDBs blow the public-symbol limit on this
+          # binary. rustc still passes /DEBUG even with debuginfo=0; override to
+          # FASTLINK and strip. (RUSTFLAGS replaces .cargo/config target flags.)
+          RUSTFLAGS: "-C target-feature=+crt-static -C debuginfo=0 -C strip=symbols -C link-arg=/DEBUG:FASTLINK"
+        # Only ship `grok` (contract asset). Building both bins doubles link cost.
+        run: >-
+          cargo build -p xai-grok-pager-bin --release --bin grok
+          --config 'profile.release.debug=false'
+          --config 'profile.release.incremental=false'
+          --config 'profile.release.strip="symbols"'
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Cargo bin name is `grok` (default-run); ship under contract asset names.
+          SRC=""
+          for cand in \
+            "target/release/${{ matrix.bin_name }}" \
+            "target/release/grok" \
+            "target/release/grok.exe" \
+            "target/release/xai-grok-pager" \
+            "target/release/xai-grok-pager.exe"
+          do
+            if [[ -f "$cand" ]]; then
+              SRC="$cand"
+              break
+            fi
+          done
+          if [[ -z "$SRC" ]]; then
+            echo "No release binary found under target/release/" >&2
+            ls -la target/release/ || true
+            exit 1
+          fi
+          cp -f "$SRC" "dist/${{ matrix.asset_name }}"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "dist/${{ matrix.asset_name }}"
+          fi
+          ls -la dist/
+          # Best-effort version stamp in logs (may fail if deps incomplete on runner)
+          "dist/${{ matrix.asset_name }}" --version 2>/dev/null || true
+
+      - name: Upload asset artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Tag pushes always publish. workflow_dispatch only if create_release=true.
+    # Publish even when optional Windows matrix cell failed (continue-on-error).
+    if: >
+      always()
+      && (startsWith(github.ref, 'refs/tags/v')
+          || (github.event_name == 'workflow_dispatch' && inputs.create_release == true))
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download Linux asset (required)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: grok-linux-x86_64
+          path: dist
+
+      - name: Download Windows asset (optional)
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: grok-windows-x86_64.exe
+          path: dist
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ inputs.tag_name }}" ]]; then
+            echo "name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflow_dispatch with create_release requires tag_name (e.g. v0.2.112)" >&2
+            exit 1
+          fi
+
+      - name: Require Linux asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist/ || true
+          test -f dist/grok-linux-x86_64 || {
+            echo "missing required asset dist/grok-linux-x86_64" >&2
+            exit 1
+          }
+          if [[ ! -f dist/grok-windows-x86_64.exe ]]; then
+            echo "::warning::Windows asset missing — releasing Linux only; check the windows-latest build job"
+          fi
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.name, 'alpha') || contains(steps.tag.outputs.name, 'beta') || contains(steps.tag.outputs.name, 'rc') }}
+          generate_release_notes: true
+          # Windows may be absent while LNK4319 is open.
+          fail_on_unmatched_files: false
+          files: |
+            dist/grok-linux-x86_64
+            dist/grok-windows-x86_64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,157 @@
+# Functional privacy patch queue. Order is apply order.
+# file names under maint/patches/ must match series.
+#
+# Per-patch keys:
+#   critical      conflict stops the sync (default true); trailing non-critical
+#                 patches are skipped instead.
+#   contracts     privacy contracts this patch answers for. They are the gate a
+#                 conflict resolution must pass before it is accepted.
+#   auto_resolve  whether `--auto-resolve-conflicts` may run the resolver here.
+#                 Absent, it follows `contracts`: a patch that can prove itself
+#                 is resolvable. Set it to say otherwise — `true` accepts a
+#                 resolution no contract covers (the apply warns and records it
+#                 under `unverified` in last-apply-status.json), `false` keeps a
+#                 patch on the manual path even though it declares contracts.
+schema = 1
+
+[[patch]]
+id = "privacy-core"
+file = "0001-privacy-core.patch"
+critical = true
+contracts = ["privacy-build-enabled", "version-lib"]
+
+[[patch]]
+id = "telemetry-hard-off"
+file = "0010-telemetry-hard-off.patch"
+critical = true
+contracts = ["mixpanel-lib", "telemetry-lib", "telemetry-resolvers"]
+
+[[patch]]
+id = "research-upload-hard-off"
+file = "0020-research-upload-hard-off.patch"
+critical = true
+contracts = ["telemetry-resolvers"]
+
+[[patch]]
+id = "retention-opt-out"
+file = "0030-retention-opt-out.patch"
+critical = true
+contracts = ["privacy-build-enabled"]
+
+[[patch]]
+id = "vendor-updater-hard-off"
+file = "0040-vendor-updater-hard-off.patch"
+critical = true
+contracts = [
+  "updater-product-build",
+  "updater-privacy-filters",
+  "installer-chokepoint-static",
+]
+
+[[patch]]
+id = "privacy-contract-tests"
+file = "0050-privacy-contract-tests.patch"
+critical = true
+contracts = ["telemetry-resolvers", "updater-product-build"]
+
+[[patch]]
+id = "session-writeback-hard-off"
+file = "0055-session-writeback-hard-off.patch"
+critical = true
+contracts = ["session-writeback-off", "writeback-chokepoint-static"]
+
+[[patch]]
+id = "consent-record-hard-off"
+file = "0056-consent-record-hard-off.patch"
+critical = true
+contracts = ["consent-record-off", "consent-record-chokepoint-static"]
+
+[[patch]]
+id = "pager-test-drift"
+file = "0057-pager-test-drift.patch"
+# Critical: it keeps `cargo test -p xai-grok-pager` honest. A conflict here
+# means upstream churned the settings tests and the fork's expectations need
+# a fresh read, not a silent skip.
+critical = true
+contracts = []
+# No contract to gate a resolution here, but upstream churns these tests at
+# nearly every release and a hand port each time is what stalled the syncs.
+# The resolver gets a go; `cargo test -p xai-grok-pager` still has to be green
+# before anything ships, and the apply flags the resolution as unverified.
+auto_resolve = true
+
+[[patch]]
+id = "update-test-drift"
+file = "0058-update-test-drift.patch"
+# Critical: it keeps `cargo test -p xai-grok-update` green, and that suite *is*
+# the updater-product-build contract. Declaring the contract it repairs is also
+# what lets a conflict here be auto-resolved and then proved.
+critical = true
+contracts = ["updater-product-build"]
+
+[[patch]]
+id = "egress-guard"
+file = "0060-egress-guard.patch"
+critical = true
+contracts = ["release-egress-smoke"]
+
+[[patch]]
+id = "supply-chain-policy"
+file = "0070-supply-chain-policy.patch"
+critical = true
+contracts = ["cargo-audit"]
+
+[[patch]]
+id = "win-build-portability"
+file = "0075-win-build-portability.patch"
+# Critical: the release matrix's native win32 builds depend on it; a conflict
+# means upstream touched the protoc invocation and needs a fresh port (or
+# upstream fixed it — then drop this patch deliberately).
+critical = true
+contracts = []
+# Same call as pager-test-drift: a protoc invocation is not a privacy
+# invariant, so no contract can vouch for a resolution, and refusing one only
+# guarantees a manual port. The Windows release matrix is the real check.
+auto_resolve = true
+
+[[patch]]
+id = "prompts-modal"
+file = "0078-prompts-modal.patch"
+# Critical on purpose. It is a feature, not a privacy guarantee, so the reflex
+# would be to file it with the trailing non-critical patches — but those are
+# skipped silently on conflict, and this patch exists precisely because the
+# feature once vanished that way (it lived outside the queue and the 1.0.1
+# repatch dropped it). A conflict here must stop the sync.
+critical = true
+contracts = ["prompts-templates", "prompts-modal-ui"]
+
+# Trailing non-critical: may be skipped on upstream conflict (draft PR still opens).
+[[patch]]
+id = "product-identity"
+file = "0080-product-identity.patch"
+critical = false
+contracts = []
+# Branding: a conflict here skips the patch silently, and porting the skipped
+# brandings by hand afterwards has been a chore at every release. Let the
+# resolver try first; nothing privacy-critical rides on these.
+auto_resolve = true
+
+[[patch]]
+id = "package-publishing"
+file = "0081-package-publishing.patch"
+critical = false
+contracts = []
+# Branding: a conflict here skips the patch silently, and porting the skipped
+# brandings by hand afterwards has been a chore at every release. Let the
+# resolver try first; nothing privacy-critical rides on these.
+auto_resolve = true
+
+[[patch]]
+id = "branding-docs"
+file = "0082-branding-docs.patch"
+critical = false
+contracts = []
+# Branding: a conflict here skips the patch silently, and porting the skipped
+# brandings by hand afterwards has been a chore at every release. Let the
+# resolver try first; nothing privacy-critical rides on these.
+auto_resolve = true

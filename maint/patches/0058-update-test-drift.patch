@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Tue, 1 Sep 2026 23:08:51 +0200
+Subject: [PATCH] update-test-drift: skip desktop install.sh tests absent from
+ the export
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`install_scripts_refuse_bad_proxy_url_for_deployment_key` and
+`install_scripts_allow_custom_https_proxy_url` arrived in 1.0.11 and cannot
+pass in this repository. Both resolve `frontend/apps/grok-desktop/scripts/
+install.sh` through `desktop_install_sh_path()`, and `frontend/` is a monorepo
+directory that xAI's public grok-build export strips: the path never exists, so
+the `.expect()` panics on a bare upstream checkout as much as on this fork.
+
+Three lines above, the same tests already handle a missing pager `install.sh`
+with a skip. That idiom is applied to the desktop script too, which is what
+upstream meant to write.
+
+Left red, the two failures take `cargo test -p xai-grok-update` down with them,
+and that suite is the `updater-product-build` contract — so an upstream
+oversight in a desktop test path was enough to fail the privacy gate and stop
+every sync.
+
+Gork-Patch-Id: update-test-drift
+Gork-Invariant: updater-suite-green
+Gork-Risk: low
+---
+ .../xai-grok-update/tests/test_install_sh.rs   | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-update/tests/test_install_sh.rs b/crates/codegen/xai-grok-update/tests/test_install_sh.rs
+index fb2b3279fd6d7b728b32ab26753d429c7a7947c8..0a70e4e74415853adb782fb4e01aaa5e358a0676 100644
+--- a/crates/codegen/xai-grok-update/tests/test_install_sh.rs
++++ b/crates/codegen/xai-grok-update/tests/test_install_sh.rs
+@@ -463,8 +463,13 @@ fn install_scripts_refuse_bad_proxy_url_for_deployment_key() {
+         eprintln!("skipping: install.sh not found relative to crate; run under cargo");
+         return;
+     };
+-    let desktop = desktop_install_sh_path()
+-        .expect("desktop install.sh must resolve when pager install.sh is present");
++    // `frontend/` is a monorepo directory the public grok-build export strips,
++    // so this path never resolves here. Skipped the way the pager script above
++    // already is, rather than failing a suite that gates the privacy contracts.
++    let Some(desktop) = desktop_install_sh_path() else {
++        eprintln!("skipping: desktop install.sh is not part of the public export");
++        return;
++    };
+ 
+     let mut scripts: Vec<(&str, PathBuf)> = vec![
+         ("install.sh", pager_install),
+@@ -545,8 +550,13 @@ fn install_scripts_allow_custom_https_proxy_url() {
+         eprintln!("skipping: install.sh not found relative to crate; run under cargo");
+         return;
+     };
+-    let desktop = desktop_install_sh_path()
+-        .expect("desktop install.sh must resolve when pager install.sh is present");
++    // `frontend/` is a monorepo directory the public grok-build export strips,
++    // so this path never resolves here. Skipped the way the pager script above
++    // already is, rather than failing a suite that gates the privacy contracts.
++    let Some(desktop) = desktop_install_sh_path() else {
++        eprintln!("skipping: desktop install.sh is not part of the public export");
++        return;
++    };
+ 
+     let mut scripts: Vec<(&str, PathBuf)> = vec![
+         ("install.sh", pager_install),
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+-- 
+2.43.0
+

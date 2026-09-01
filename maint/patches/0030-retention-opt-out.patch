@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Thu, 23 Jul 2026 00:27:54 +0200
+Subject: [PATCH] retention-opt-out: lock coding data retention to opt-out
+
+Gork-Patch-Id: retention-opt-out
+Gork-Invariant: coding-retention-opt-out
+Gork-Risk: critical
+---
+ .../xai-grok-pager/src/settings/defs.rs       | 37 +++++-------
+ .../xai-grok-pager/src/settings/registry.rs   | 18 +++---
+ .../src/slash/commands/privacy.rs             |  9 ++-
+ .../xai-grok-pager/tests/settings_e2e.rs      | 27 +++------
+ .../xai-grok-shell/src/auth/manager.rs        | 12 +++-
+ .../xai-grok-shell/src/auth/manager_tests.rs  | 57 +++++++++----------
+ .../codegen/xai-grok-shell/src/auth/model.rs  |  9 ++-
+ .../xai-grok-shell/src/extensions/privacy.rs  | 19 ++++++-
+ 8 files changed, 96 insertions(+), 92 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager/src/settings/defs.rs b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+index 9ed368f190d4fecc53be2b70a3b560a42e7b61df..dc2a094e7578dde8027583699c1584fdb9db8ea5 100644
+--- a/crates/codegen/xai-grok-pager/src/settings/defs.rs
++++ b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+@@ -121,19 +121,13 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
+ // `supports_preview: false` because toggling fires an async ACP call that can fail. Commit on Enter only.
+ // ---------------------------------------------------------------------------
+ 
+-// The setting's own description carries the full explanation, so the choices are bare labels; an empty description collapses each to a single line
+-const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[
+-    EnumChoice {
+-        canonical: "opt-in",
+-        display: "Opt in",
+-        description: "",
+-    },
+-    EnumChoice {
+-        canonical: "opt-out",
+-        display: "Opt out",
+-        description: "",
+-    },
+-];
++// Privacy build: single locked choice (opt-out). Bare labels elsewhere still
++// collapse to one line when description is empty; here the lock needs copy.
++const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[EnumChoice {
++    canonical: "opt-out",
++    display: "Opt out (locked)",
++    description: "Privacy build locks coding data retention to opt-out. Opt-in is not available.",
++}];
+ 
+ // ---------------------------------------------------------------------------
+ // Plan-mode catalog.
+@@ -1169,19 +1163,14 @@ pub fn default_settings() -> Vec<SettingMeta> {
+         },
+         // SHELL-owned. Persisted in auth metadata (not config.toml).
+         // Reads from `PagerLocalSnapshot.coding_data_sharing_opt_out`.
+-        // The default "opt-out" matches `AuthEntry::coding_data_retention_opt_out = true`
+-        // That is the safer consumer default; server enrichment may still opt the user in
+-        // ZDR / non-admin guards are enforced at dispatch time.
++        // Privacy build: locked to opt-out (single choice); ZDR / non-admin guards are still enforced at dispatch time.
+         // Do not put "telemetry" in keywords: that word is the config-file analytics toggle (Monitoring / Configuration docs)
+         SettingMeta {
+             key: "coding_data_sharing",
+             category: SettingCategory::Privacy,
+             owner: SettingOwner::Shell,
+             label: "Coding data, retention, and training",
+-            description: "Opt-in to provide SpaceXAI the ability to retain and train on \
+-                          coding data, e.g., prompts, traces, & metrics, for training and \
+-                          debugging purposes. We may still collect simple user metrics, \
+-                          e.g. how many times you use the product or a feature.",
++            description: "Locked to opt-out in this privacy build. Opt-in is not offered.",
+             keywords: &[
+                 "privacy",
+                 "data",
+@@ -1189,7 +1178,6 @@ pub fn default_settings() -> Vec<SettingMeta> {
+                 "coding",
+                 "retention",
+                 "training",
+-                "opt-in",
+                 "opt-out",
+             ],
+             kind: SettingKind::Enum {
+@@ -1346,12 +1334,13 @@ pub fn default_settings() -> Vec<SettingMeta> {
+             category: SettingCategory::Advanced,
+             owner: SettingOwner::Shell,
+             label: "Auto-update",
+-            description: "Automatically download and install pager updates on startup. \
+-                          Restart required.",
++            description: "Unused in Grok Privacy. Vendor (x.ai) auto-update is hard-disabled so \
++                          this fork is never overwritten by official Grok Build installers. \
++                          Update by rebuilding from the grok-privacy repository.",
+             keywords: &[
+                 "auto", "update", "updates", "upgrade", "version", "install", "channel",
+             ],
+-            kind: SettingKind::Bool { default: true },
++            kind: SettingKind::Bool { default: false },
+             restart_required: true,
+             hidden_in_minimal: false,
+         },
+diff --git a/crates/codegen/xai-grok-pager/src/settings/registry.rs b/crates/codegen/xai-grok-pager/src/settings/registry.rs
+index 070dc61ee4fa0a826542cf92f176063f223d41c9..8e055f68add4dd909deec2421380c32f6ce755c0 100644
+--- a/crates/codegen/xai-grok-pager/src/settings/registry.rs
++++ b/crates/codegen/xai-grok-pager/src/settings/registry.rs
+@@ -266,7 +266,7 @@ pub struct PagerLocalSnapshot {
+     pub plan_mode_active: bool,
+     /// `[cli].show_tips` mirror; `None` means no TOML override, so the default `true` applies.
+     pub show_tips: Option<bool>,
+-    /// `[cli].auto_update` mirror; `None` means no TOML override, so the default `true` applies.
++    /// `[cli].auto_update` mirror; `None` means no TOML override, so the default `false` applies in Grok Privacy (no silent x.ai channel updates).
+     pub auto_update: Option<bool>,
+     /// Process-wide vim-mode scrollback flag.
+     /// Mirrors `appearance::cache::load_vim_mode()` at snapshot time.
+@@ -299,6 +299,7 @@ impl Default for PagerLocalSnapshot {
+             auto_mode: false,
+             current_model_name: None,
+             available_models: Vec::new(),
++            // Privacy build: opt-out by default.
+             coding_data_sharing_opt_out: true,
+             coding_data_sharing_lock: None,
+             plan_mode_active: false,
+@@ -675,7 +676,7 @@ pub fn current_value_for(
+         )),
+         // CLI batch: snapshot mirrors; `None` means the effective default `true`
+         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
+-        "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
++        "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(false))),
+         // fork_secondary_model: the baseline value folds to the empty string
+         // The mirror persists the ModelId slug but the DynamicEnum canonicals are catalog display names, so resolve via the snapshot
+         // A stale id passes through raw
+@@ -922,15 +923,12 @@ mod tests {
+                         "max_thoughts_width default drifts from UiConfig::default()",
+                     );
+                 }
+-                // coding_data_sharing: no UiConfig field; the default is pinned against auth metadata (opt_out=true reads as "opt-out")
++                // coding_data_sharing: no UiConfig field; the privacy default is opt-out (auth metadata opt_out=true reads as "opt-out")
+                 ("coding_data_sharing", SettingKind::Enum { default, .. }) => {
+                     let expected = "opt-out";
+                     assert_eq!(
+                         *default, expected,
+-                        "coding_data_sharing registry default must be 'opt-out' — \
+-                         the on-disk source of truth is `AuthEntry::coding_data_retention_opt_out: \
+-                         bool` (defaults to `true`, i.e. user has opted out until they \
+-                         explicitly share or the server opts them in)",
++                        "coding_data_sharing registry default must be 'opt-out' in privacy build",
+                     );
+                 }
+                 // CLI batch: fields live on CliConfig, not UiConfig.
+@@ -940,9 +938,9 @@ mod tests {
+                 }
+                 ("auto_update", SettingKind::Bool { default }) => {
+                     assert!(
+-                        *default,
+-                        "auto_update registry default must be true \
+-                         (matches auto_update.rs's `.unwrap_or(true)`)"
++                        !*default,
++                        "auto_update registry default must be false in Grok Privacy \
++                         (no silent x.ai channel updates)"
+                     );
+                 }
+                 // vim_mode: Option<bool>; None reads as false
+diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs b/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
+index 200515d123b7169b5f17e1bf13518466d7f82b3f..68e32eab37491a97b3f0ea8aa7a81a1c71043ab4 100644
+--- a/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
++++ b/crates/codegen/xai-grok-pager/src/slash/commands/privacy.rs
+@@ -1,4 +1,7 @@
+ //! `/privacy`: open the "Coding data, retention, and training" setting.
++//!
++//! In Grok Privacy the setting is locked to opt-out (single choice). `/privacy`
++//! still opens that row so the lock is visible; args are ignored.
+ 
+ use crate::app::actions::Action;
+ use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+@@ -11,12 +14,12 @@ pub struct PrivacyCommand;
+ impl SlashCommand for PrivacyCommand {
+     slash_meta! {
+         name: "privacy",
+-        // Reads as the row it opens: "Coding data, retention, and training".
+-        description: "Open coding data, retention, and training settings",
++        // Reads as the row it opens; the privacy build locks that row to opt-out.
++        description: "Open coding data retention settings (locked to opt-out)",
+         usage: "/privacy",
+     }
+ 
+-    /// Trailing text is ignored, not rejected: `/privacy opt-in` from muscle memory should land on the page, not error.
++    /// Trailing text is ignored, not rejected: `/privacy opt-in` from muscle memory should land on the page, not error. The page itself has no opt-in.
+     fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {
+         CommandResult::Action(Action::OpenSettingsFocus {
+             key: CODING_DATA_SHARING_KEY,
+diff --git a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
+index f069843ecd7d46b992ef6828b2fcb8870e8d53bb..c6d45b0f724a55b6c6510501e0a951b38a5acf42 100644
+--- a/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
++++ b/crates/codegen/xai-grok-pager/tests/settings_e2e.rs
+@@ -2045,7 +2045,7 @@ fn defaults_round_trip_through_registry() {
+             "voice_stt_language" => SettingValue::Enum("en"),
+             "plan_mode" => SettingValue::Enum("off"),
+             "show_tips" => SettingValue::Bool(true),
+-            "auto_update" => SettingValue::Bool(true),
++            "auto_update" => SettingValue::Bool(false),
+             "fork_secondary_model" => SettingValue::String(String::new()),
+             "show_thinking_blocks" => SettingValue::Bool(true),
+             "prompt_suggestions" => SettingValue::Bool(true),
+@@ -4664,7 +4664,7 @@ fn pr9_enter_on_coding_data_sharing_row_enters_picking_enum() {
+             assert_eq!(
+                 original_value,
+                 &SettingValue::Enum("opt-out"),
+-                "default snapshot opt_out=true → original 'opt-out'"
++                "privacy default snapshot opt_out=true → original 'opt-out'"
+             );
+         }
+         other => panic!("expected PickingEnum mode, got {other:?}"),
+@@ -4823,7 +4823,7 @@ fn pr9_picker_seeds_choices_idx_from_pager_snapshot_opt_out_true() {
+     }
+ }
+ 
+-/// Exactly 2 canonical choices: {opt-in, opt-out}.
++/// Grok Privacy: only opt-out (locked).
+ #[test]
+ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
+     let reg = SettingsRegistry::defaults();
+@@ -4833,19 +4833,9 @@ fn pr9_coding_data_sharing_choices_use_canonical_strings() {
+         _ => panic!("coding_data_sharing must be Enum"),
+     };
+     assert_eq!(
+-        canonicals.len(),
+-        2,
+-        "coding_data_sharing catalog must be exactly {{opt-in, opt-out}} — adding a \
+-         choice requires updating the action_for_enum_commit arm in \
+-         views/settings_modal.rs AND the action_for_reset arm in dispatch.rs",
+-    );
+-    assert!(
+-        canonicals.contains(&"opt-in"),
+-        "coding_data_sharing must include 'opt-in' canonical"
+-    );
+-    assert!(
+-        canonicals.contains(&"opt-out"),
+-        "coding_data_sharing must include 'opt-out' canonical"
++        canonicals,
++        vec!["opt-out"],
++        "Grok Privacy locks coding_data_sharing to a single opt-out choice",
+     );
+ }
+ 
+@@ -6307,14 +6297,13 @@ fn pr13_cli_batch_defaults_roundtrip_via_current_value_for() {
+     use xai_grok_pager::settings::current_value_for;
+     let ui = UiConfig::default();
+     let pager = PagerLocalSnapshot::default();
+-    for (key, expected) in [("show_tips", true), ("auto_update", true)] {
++    for (key, expected) in [("show_tips", true), ("auto_update", false)] {
+         let value = current_value_for(key, &ui, &pager)
+             .unwrap_or_else(|| panic!("current_value_for(`{key}`) must resolve"));
+         assert_eq!(
+             value,
+             SettingValue::Bool(expected),
+-            "PR 13: `{key}` defaults to {expected} (matches the consumer's \
+-             .unwrap_or(...) at the original read site)",
++            "PR 13: `{key}` defaults to {expected} (Grok Privacy: auto_update off)",
+         );
+     }
+ }
+diff --git a/crates/codegen/xai-grok-shell/src/auth/manager.rs b/crates/codegen/xai-grok-shell/src/auth/manager.rs
+index 6f843d2e28ed843cb6e0987665febc74006ec0b8..f436d719b55f023072d57d35b2fd767c61451311 100644
+--- a/crates/codegen/xai-grok-shell/src/auth/manager.rs
++++ b/crates/codegen/xai-grok-shell/src/auth/manager.rs
+@@ -793,9 +793,14 @@ impl AuthManager {
+     /// `true` when data collection must be suppressed: the team has ZDR or the user opted out of coding data retention.
+     /// Reads [`Self::current_or_expired`] because neither flag changes on token expiry and `current()` returns `None` during the refresh window.
+     ///
+-    /// Fail-open: with no credential this returns `false` (not disabled).
++    /// Grok Privacy: always `true` (research uploads hard-off).
++    ///
++    /// Fail-open only in non-privacy builds: with no credential this returns `false` (not disabled).
+     /// Collection paths that must not act on unknown privacy state should use the fail-closed [`Self::allows_data_collection`] instead.
+     pub(crate) fn is_data_collection_disabled(&self) -> bool {
++        if xai_grok_version::research_data_collection_forbidden() {
++            return true;
++        }
+         self.current_or_expired()
+             .is_some_and(|a| a.is_data_collection_disabled())
+     }
+@@ -803,7 +808,12 @@ impl AuthManager {
+     /// Fail-closed collection predicate: `true` only when a credential exists and carries no ZDR / retention-opt-out flag.
+     /// Missing or cleared auth (e.g. after a mid-session `/logout`) counts as disabled.
+     /// Nothing may leave the machine while the privacy state is unknown.
++    ///
++    /// Grok Privacy: always `false`.
+     pub(crate) fn allows_data_collection(&self) -> bool {
++        if xai_grok_version::research_data_collection_forbidden() {
++            return false;
++        }
+         self.current_or_expired()
+             .is_some_and(|a| !a.is_data_collection_disabled())
+     }
+diff --git a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
+index b1ab1975a5eda35407b2cf6c6f5e7415d929667f..7c9825b32f056c149a59910d7dd24f10e44a81aa 100644
+--- a/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/auth/manager_tests.rs
+@@ -409,52 +409,49 @@ fn clear_does_not_remove_legacy_scope() {
+ }
+ #[test]
+ fn is_data_collection_disabled_matrix() {
+-    let cases: &[(&[&str], bool, bool)] = &[
+-        (&["BLOCKED_REASON_NO_LOGS"], false, true),
+-        (&["BLOCKED_REASON_NO_LOGS_MODERATED"], false, true),
+-        (&[], true, true),
+-        (&["BLOCKED_REASON_NO_LOGS"], true, true),
+-        (&[], false, false),
++    // Grok Privacy: research collection is always disabled, independent of
++    // ZDR / opt-out flags (those still matter for server-side retention).
++    let cases: &[(&[&str], bool)] = &[
++        (&["BLOCKED_REASON_NO_LOGS"], false),
++        (&["BLOCKED_REASON_NO_LOGS_MODERATED"], false),
++        (&[], true),
++        (&["BLOCKED_REASON_NO_LOGS"], true),
++        (&[], false),
+         (
+             &["BLOCKED_REASON_BILLING", "BLOCKED_REASON_SUSPENDED"],
+             false,
+-            false,
+-        ),
+-        (&["BLOCKED_REASON_BILLING"], true, true),
+-        (
+-            &["BLOCKED_REASON_BILLING", "BLOCKED_REASON_NO_LOGS"],
+-            false,
+-            true,
+         ),
++        (&["BLOCKED_REASON_BILLING"], true),
++        (&["BLOCKED_REASON_BILLING", "BLOCKED_REASON_NO_LOGS"], false),
+     ];
+-    for (reasons, opt_out, expected) in cases {
++    for (reasons, opt_out) in cases {
+         let auth = GrokAuth {
+             team_blocked_reasons: reasons.iter().map(|s| (*s).into()).collect(),
+             coding_data_retention_opt_out: *opt_out,
+             ..GrokAuth::test_default()
+         };
+-        assert_eq!(
++        assert!(
+             auth.is_data_collection_disabled(),
+-            *expected,
+-            "reasons={reasons:?} opt_out={opt_out} expected={expected}",
++            "Grok Privacy: reasons={reasons:?} opt_out={opt_out} must disable collection",
+         );
+     }
+ }
+-/// Fail directions of the two `AuthManager` collection predicates.
+-/// `is_data_collection_disabled` fails open on missing credentials, the legacy behavior the telemetry and sync gates share.
+-/// `allows_data_collection` fails closed: nothing may leave the machine while privacy state is unknown, e.g. after a mid-session `/logout`.
++/// Grok Privacy: both collection predicates permanently suppress research uploads, including with no credential and with a "normal" user.
+ #[test]
+ fn manager_collection_predicates_fail_directions() {
+     let dir = tempfile::tempdir().unwrap();
+     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+-    assert!(!mgr.is_data_collection_disabled());
++    assert!(mgr.is_data_collection_disabled());
+     assert!(
+         !mgr.allows_data_collection(),
+-        "missing credential must fail closed for collection"
++        "Grok Privacy: missing credential must not allow collection"
+     );
+     mgr.hot_swap(GrokAuth::test_default());
+-    assert!(!mgr.is_data_collection_disabled());
+-    assert!(mgr.allows_data_collection());
++    assert!(mgr.is_data_collection_disabled());
++    assert!(
++        !mgr.allows_data_collection(),
++        "Grok Privacy: normal user must not allow research collection"
++    );
+     mgr.hot_swap(GrokAuth {
+         coding_data_retention_opt_out: true,
+         ..GrokAuth::test_default()
+@@ -462,12 +459,9 @@ fn manager_collection_predicates_fail_directions() {
+     assert!(mgr.is_data_collection_disabled());
+     assert!(!mgr.allows_data_collection());
+     mgr.hot_swap(GrokAuth::test_default());
+-    assert!(mgr.allows_data_collection(), "precondition");
+     mgr.clear_in_memory();
+-    assert!(
+-        !mgr.allows_data_collection(),
+-        "cleared credentials must close the collection gate"
+-    );
++    assert!(!mgr.allows_data_collection());
++    assert!(mgr.is_data_collection_disabled());
+ }
+ #[test]
+ fn token_suffix_matrix() {
+@@ -3109,9 +3103,10 @@ async fn enrich_auth_inline_keeps_fields_absent_from_response() {
+     assert_eq!(auth.principal_type.as_deref(), Some("Team"));
+     assert_eq!(auth.principal_id.as_deref(), Some("team-1"));
+     assert!(auth.is_zdr_team());
++    // Grok Privacy forces opt-out even when /user omits the field.
+     assert!(
+-        !auth.coding_data_retention_opt_out,
+-        "absent field stays unchanged"
++        auth.coding_data_retention_opt_out,
++        "privacy build locks coding_data_retention_opt_out"
+     );
+ }
+ #[tokio::test]
+diff --git a/crates/codegen/xai-grok-shell/src/auth/model.rs b/crates/codegen/xai-grok-shell/src/auth/model.rs
+index fa4955ec6b1ac4cd957839da6371b8ad32024307..b36e37b015d8870ed3611a8f2900db3f3bd751b9 100644
+--- a/crates/codegen/xai-grok-shell/src/auth/model.rs
++++ b/crates/codegen/xai-grok-shell/src/auth/model.rs
+@@ -176,7 +176,12 @@ impl GrokAuth {
+     /// `true` when the team has ZDR or the user opted out of coding data retention.
+     /// Use this for trace-upload and research-data gates.
+     /// Product analytics (`telemetry_enabled`) and user-facing sync features should use `is_zdr_team()` directly.
++    ///
++    /// Grok Privacy ([`xai_grok_version::PRIVACY_BUILD`]) always returns `true`: research data never leaves the machine regardless of account flags.
+     pub(crate) fn is_data_collection_disabled(&self) -> bool {
++        if xai_grok_version::research_data_collection_forbidden() {
++            return true;
++        }
+         self.is_zdr_team() || self.coding_data_retention_opt_out
+     }
+ 
+@@ -219,7 +224,9 @@ impl Default for GrokAuth {
+             organization_role: None,
+             user_blocked_reason: None,
+             team_blocked_reasons: vec![],
+-            coding_data_retention_opt_out: default_coding_data_retention_opt_out(),
++            // Privacy build: always start opted out of coding-data retention.
++            coding_data_retention_opt_out: xai_grok_version::PRIVACY_BUILD
++                || default_coding_data_retention_opt_out(),
+             has_grok_code_access: None,
+             refresh_token: None,
+             expires_at: None,
+diff --git a/crates/codegen/xai-grok-shell/src/extensions/privacy.rs b/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
+index b5b56dcac472fe4e92871a80d6ffc54470900c76..34b17e4a37a27be9d6e2552e21d6230083f2414b 100644
+--- a/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
++++ b/crates/codegen/xai-grok-shell/src/extensions/privacy.rs
+@@ -26,6 +26,19 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+ 
+     let params: Params = parse_params(args)?;
+ 
++    // Grok Privacy: coding-data retention is locked to opt-out.
++    if xai_grok_version::coding_data_retention_locked_opt_out()
++        && !params.coding_data_retention_opt_out
++    {
++        return Err(acp::Error::invalid_params()
++            .data("Grok Privacy locks coding data retention to opt-out; opt-in is not available."));
++    }
++    let opt_out = if xai_grok_version::coding_data_retention_locked_opt_out() {
++        true
++    } else {
++        params.coding_data_retention_opt_out
++    };
++
+     let auth = agent.auth_manager.auth().await.map_err(|e| {
+         tracing::warn!(error = %e, "privacy: auth resolution failed");
+         acp::Error::auth_required()
+@@ -37,7 +50,7 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+     let token_header = agent.auth_manager.grok_com_config().token_header.clone();
+ 
+     let body = serde_json::json!({
+-        "codingDataRetentionOptOut": params.coding_data_retention_opt_out,
++        "codingDataRetentionOptOut": opt_out,
+     });
+ 
+     let provider: std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider> = std::sync::Arc::new(
+@@ -81,10 +94,10 @@ async fn handle_set(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+     // Use save_without_enrichment to avoid a race
+     // update() spawns a background GET /user enrichment that may read stale ACL state and overwrite the opt-out flag back to its previous value
+     let mut updated = auth.clone();
+-    updated.coding_data_retention_opt_out = params.coding_data_retention_opt_out;
++    updated.coding_data_retention_opt_out = opt_out;
+     let _ = agent.auth_manager.save_without_enrichment(updated).await;
+ 
+     to_raw_response(&serde_json::json!({
+-        "codingDataRetentionOptOut": params.coding_data_retention_opt_out,
++        "codingDataRetentionOptOut": opt_out,
+     }))
+ }
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+-- 
+2.43.0
+

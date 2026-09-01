@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Thu, 23 Jul 2026 00:28:24 +0200
+Subject: [PATCH] supply-chain-policy: cargo audit pins and policy
+
+Gork-Patch-Id: supply-chain-policy
+Gork-Invariant: supply-chain-policy
+Gork-Risk: critical
+---
+ .cargo/audit.toml | 43 +++++++++++++++++++++++++++++++++++++++++++
+ Cargo.lock        |  4 ++--
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+ create mode 100644 .cargo/audit.toml
+
+diff --git a/.cargo/audit.toml b/.cargo/audit.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..52e7c11563657ae27fbac392915b963d3db12a02
+--- /dev/null
++++ b/.cargo/audit.toml
+@@ -0,0 +1,43 @@
++# cargo-audit configuration for Grok Privacy.
++#
++# CI treats audit as a **hard gate**: any vulnerability *not* listed here fails
++# the job. This is "block new unignored vulns", not "tree is clean".
++#
++# Config path: `.cargo/audit.toml` (cargo-audit project discovery).
++# See: https://docs.rs/cargo-audit/latest/cargo_audit/
++
++[advisories]
++ignore = [
++    # --- RUSTSEC-2023-0071 (rsa, Marvin Attack) ---
++    # Package: rsa (no fixed upgrade on crates.io as of 2026-07).
++    # Dependency chain: rsa ← jsonwebtoken / sigstore-* (via xai-grok-shell graph).
++    # Why ignore: RustSec marks no patched version; only full stack migration
++    #   away from `rsa` crate removes the finding.
++    # Remove when: jsonwebtoken/sigstore (or our fork pins) drop `rsa`, or
++    #   RUSTSEC-2023-0071 gains a fixed release we can lock to.
++    "RUSTSEC-2023-0071",
++
++    # --- RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml DoS) ---
++    # Package: quick-xml < 0.41.0
++    # Dependency chain:
++    #   quick-xml ^0.38 ← xai-grok-tools (direct)
++    #   quick-xml ^0.39 ← pdf_oxide ← xai-grok-tools
++    # Why ignore: fix requires >=0.41; cannot cargo-update without bumping
++    #   xai-grok-tools / pdf_oxide API major pins (coordinated change).
++    # Remove when: xai-grok-tools + pdf_oxide accept quick-xml >=0.41 and
++    #   Cargo.lock is refreshed accordingly. Track: follow-up dep-bump PR.
++    "RUSTSEC-2026-0194",
++    "RUSTSEC-2026-0195",
++
++    # --- RUSTSEC-2026-0257 (webbrowser, Unix BROWSER argument injection) ---
++    # Package: webbrowser 1.0.6 (fix: >=1.2.2).
++    # Dependency chain: webbrowser ← xai-grok-shell (auth/device-code, OIDC
++    #   login, Grok Build open) and ← xai-grok-mcp (MCP OAuth).
++    # Why ignore: Cargo.lock is inherit-upstream (lock-policy.toml); bumping
++    #   locally would deviate from the locked upstream tree on every repatch.
++    #   Exposure is narrow: all call sites open product-built URLs; the only
++    #   third-party-shaped input is the OAuth URL of a user-configured MCP
++    #   server, and the injection additionally requires BROWSER to be set.
++    # Remove when: the upstream lock ships webbrowser >=1.2.2.
++    "RUSTSEC-2026-0257",
++]
+diff --git a/Cargo.lock b/Cargo.lock
+index f3c2274115954a767460297f8599261ab6e413d1..f3c764c40ecbaf6687d5e7caebf3abdfcde2f0c6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2270,9 +2270,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "crossbeam-epoch"
+-version = "0.9.18"
++version = "0.9.20"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
++checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+ dependencies = [
+  "crossbeam-utils",
+ ]
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
+-- 
+2.43.0
+

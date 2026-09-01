@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Thu, 23 Jul 2026 00:27:54 +0200
+Subject: [PATCH] privacy-contract-tests: resolver integration tests
+
+Gork-Patch-Id: privacy-contract-tests
+Gork-Invariant: privacy-contracts
+Gork-Risk: critical
+---
+ .../xai-grok-shell/tests/privacy_resolvers.rs | 79 +++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+ create mode 100644 crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
+
+diff --git a/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ade06704bf2baeddb34f7d5c61dc48b13e05f38
+--- /dev/null
++++ b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
+@@ -0,0 +1,79 @@
++//! Privacy hard-off regression tests for telemetry / trace-upload resolvers.
++//!
++//! Integration tests (not `#[cfg(test)]` unit tests) so they compile against the
++//! normal shell library — full `xai-grok-shell --lib` unit tests currently fail
++//! upstream due to missing test helpers.
++//!
++//! These drive the **shipped** `Config::resolve_telemetry_mode` /
++//! `resolve_trace_upload` entry points with env, config, and remote settings
++//! that would re-enable product telemetry on upstream Grok Build.
++
++use serial_test::serial;
++use xai_grok_config_types::RemoteSettings;
++use xai_grok_shell::agent::config::{Config, TelemetryMode};
++
++#[test]
++#[serial]
++fn privacy_build_telemetry_mode_ignores_env_config_and_remote() {
++    assert!(
++        xai_grok_version::research_data_collection_forbidden(),
++        "this fork must lock research collection off"
++    );
++    // SAFETY: #[serial]
++    unsafe {
++        std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
++    }
++    let mut cfg = Config::default();
++    cfg.features.telemetry = Some(TelemetryMode::Enabled);
++    cfg.requirements.telemetry.pin(
++        TelemetryMode::Enabled,
++        xai_grok_shell::config::RequirementSource::Unknown,
++    );
++    cfg.remote_settings = Some(RemoteSettings {
++        telemetry_enabled: Some(true),
++        telemetry_mode: Some("enabled".into()),
++        ..Default::default()
++    });
++    let r = cfg.resolve_telemetry_mode();
++    assert!(
++        r.value.is_disabled(),
++        "privacy hard-off must win over env/config/remote: mode={:?}",
++        r.value
++    );
++    unsafe {
++        std::env::remove_var("GROK_TELEMETRY_ENABLED");
++    }
++}
++
++#[test]
++#[serial]
++fn privacy_build_trace_upload_ignores_env_config_and_remote() {
++    assert!(xai_grok_version::research_data_collection_forbidden());
++    // SAFETY: #[serial]
++    unsafe {
++        std::env::set_var("GROK_TELEMETRY_ENABLED", "1");
++        std::env::set_var("GROK_TELEMETRY_TRACE_UPLOAD", "1");
++    }
++    let mut cfg = Config::default();
++    cfg.features.telemetry = Some(TelemetryMode::Enabled);
++    cfg.telemetry.trace_upload = Some(true);
++    cfg.requirements
++        .trace_upload
++        .pin(true, xai_grok_shell::config::RequirementSource::Unknown);
++    cfg.remote_settings = Some(RemoteSettings {
++        telemetry_enabled: Some(true),
++        telemetry_mode: Some("enabled".into()),
++        trace_upload_enabled: Some(true),
++        ..Default::default()
++    });
++    let r = cfg.resolve_trace_upload();
++    assert!(
++        !r.value,
++        "privacy hard-off must win over env/config/remote for trace upload"
++    );
++    assert!(!cfg.is_trace_upload_enabled());
++    unsafe {
++        std::env::remove_var("GROK_TELEMETRY_ENABLED");
++        std::env::remove_var("GROK_TELEMETRY_TRACE_UPLOAD");
++    }
++}
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+-- 
+2.43.0
+

@@ -1,0 +1,165 @@
+# Privacy contracts — single source of truth for local + CI verification.
+# Commands run from repository root. Fail-closed: any non-zero exit fails verify.
+#
+# Groups:
+#   privacy      — unit/integration privacy hard-off checks (default CI)
+#   supply-chain — cargo-audit (dedicated job; needs cargo-audit installed)
+#   egress       — release binary network smoke (expensive)
+schema = 1
+
+[[contract]]
+id = "version-lib"
+group = "privacy"
+min_tests = 2
+command = ["cargo", "test", "-p", "xai-grok-version", "--lib"]
+
+[[contract]]
+id = "privacy-build-enabled"
+group = "privacy"
+min_tests = 1
+command = [
+  "cargo", "test", "-p", "xai-grok-version", "--lib",
+  "privacy_build_locks_research_and_retention_policy",
+]
+
+[[contract]]
+id = "mixpanel-lib"
+group = "privacy"
+min_tests = 1
+command = ["cargo", "test", "-p", "xai-mixpanel", "--lib"]
+
+[[contract]]
+id = "telemetry-lib"
+group = "privacy"
+min_tests = 1
+command = [
+  "cargo", "test", "-p", "xai-grok-telemetry", "--lib", "default_is_privacy",
+]
+
+[[contract]]
+id = "updater-product-build"
+group = "privacy"
+min_tests = 150
+command = ["cargo", "test", "-p", "xai-grok-update"]
+
+[[contract]]
+id = "updater-privacy-filters"
+group = "privacy"
+min_tests = 10
+command = [
+  "cargo", "test", "-p", "xai-grok-update", "--lib", "privacy",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "updater-env-cannot-disable"
+group = "privacy"
+min_tests = 1
+command = [
+  "cargo", "test", "-p", "xai-grok-update", "--lib", "env_cannot_disable",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "updater-installer-integration"
+group = "privacy"
+min_tests = 40
+# Requires feature + env; targets integration binaries only (not lib tests).
+env = { GROK_TEST_ALLOW_UPDATE = "1" }
+command = [
+  "cargo", "test", "-p", "xai-grok-update",
+  "--features", "updater-integration-tests",
+  "--test", "test_install_internal",
+  "--test", "test_blitz_cancel",
+  "--test", "test_check_status_regression",
+  "--test", "test_concurrent_convergence",
+  "--test", "test_downgrade_matrix",
+]
+
+[[contract]]
+id = "telemetry-resolvers"
+group = "privacy"
+min_tests = 2
+command = [
+  "cargo", "test", "-p", "xai-grok-shell", "--test", "privacy_resolvers",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "session-writeback-off"
+group = "privacy"
+min_tests = 4
+command = [
+  "cargo", "test", "-p", "xai-grok-shell", "--test", "privacy_resolvers",
+  "writeback", "--", "--nocapture",
+]
+
+[[contract]]
+id = "consent-record-off"
+group = "privacy"
+min_tests = 1
+command = [
+  "cargo", "test", "-p", "xai-grok-pager", "--lib",
+  "accepting_records_the_answer_and_replays_deferred_startup",
+  "--", "--nocapture",
+]
+
+[[contract]]
+id = "consent-record-chokepoint-static"
+group = "privacy"
+command = ["bash", "maint/scripts/check_consent_record_chokepoint.sh"]
+
+[[contract]]
+id = "external-otel-double-opt-in"
+group = "privacy"
+# Locks the upstream double opt-in of the external OTLP export: master switch
+# alone or exporters alone must enable nothing; both together activate.
+min_tests = 4
+command = [
+  "cargo", "test", "-p", "xai-grok-telemetry", "--lib", "--",
+  "external::config::tests::default_is_off",
+  "external::config::tests::master_switch_alone_enables_nothing",
+  "external::config::tests::exporters_alone_enable_nothing",
+  "external::config::tests::double_opt_in_activates",
+]
+
+[[contract]]
+id = "installer-chokepoint-static"
+group = "privacy"
+command = ["bash", "maint/scripts/check_installer_chokepoint.sh"]
+
+[[contract]]
+id = "writeback-chokepoint-static"
+group = "privacy"
+command = ["bash", "maint/scripts/check_writeback_chokepoint.sh"]
+
+[[contract]]
+id = "cargo-audit"
+group = "supply-chain"
+command = ["cargo", "audit"]
+
+[[contract]]
+id = "release-egress-smoke"
+group = "egress"
+# Expensive: builds release binary if missing. Skip with --skip-expensive.
+expensive = true
+command = ["./scripts/privacy_egress_check.sh"]
+
+# Feature contracts for 0078-prompts-modal: not privacy invariants, but the
+# feature once vanished silently in a repatch, and declaring contracts is what
+# makes the patch eligible for --auto-resolve-conflicts. In the "privacy"
+# group so the default sweep keeps guarding it (sub-second once compiled).
+# Deliberately narrow filters: upstream 1.0.5 ships two broken queue-drain
+# tests under the wider `prompts` filter that are theirs, not this patch's.
+
+[[contract]]
+id = "prompts-templates"
+group = "privacy"
+min_tests = 200
+command = ["cargo", "test", "-p", "xai-grok-agent", "--lib", "prompt"]
+
+[[contract]]
+id = "prompts-modal-ui"
+group = "privacy"
+min_tests = 5
+command = ["cargo", "test", "-p", "xai-grok-pager", "--lib", "views::prompts_modal"]

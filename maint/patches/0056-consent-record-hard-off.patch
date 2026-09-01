@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Sun, 16 Aug 2026 18:41:29 +0200
+Subject: [PATCH] consent-record-hard-off: consent acknowledgments stay local
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream 1.0.4 introduced a consent flow whose acceptance emits an ACP
+"x.ai/consent/record" request. Today it dies on method_not_found (no
+server handler yet), so the wire behavior is unchanged — but a future
+upstream release would start reporting acceptances silently, outside
+every existing gate.
+
+Two gates, mirroring the session-writeback pattern:
+- dispatch_accept_consent only emits Effect::RecordConsentUpstream
+  outside privacy builds; the local PersistConsentAnswer is untouched,
+  so the notice never re-arms and the consent screen works as before.
+- the effect handler is the send-site chokepoint: even a caller that
+  emits the effect directly cannot reach acp_send in a privacy build.
+
+Gork-Patch-Id: consent-record-hard-off
+Gork-Invariant: consent-ack-stays-local
+Gork-Risk: critical
+---
+ .../src/app/dispatch/session/lifecycle.rs             |  7 ++++++-
+ .../src/app/dispatch/tests/session/lifecycle.rs       |  4 +++-
+ crates/codegen/xai-grok-pager/src/app/effects/mod.rs  | 11 +++++++++++
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/session/lifecycle.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/session/lifecycle.rs
+index bc8f3ed4d9c8c9cdce80c9c596efe7aae85b2756..c05085980906f2d6493ae58d981425fd312e9bbd 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/session/lifecycle.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/session/lifecycle.rs
+@@ -653,7 +653,12 @@ pub(in crate::app::dispatch) fn dispatch_accept_consent(app: &mut AppView) -> Ve
+             acked: false,
+         });
+     }
+-    effects.push(Effect::RecordConsentUpstream { notice_id, version });
++    // Grok Privacy: the acceptance is recorded in the local config only —
++    // nothing about it is reported to xAI. The send site keeps a second gate
++    // (see `Effect::RecordConsentUpstream` in `app/effects/mod.rs`).
++    if !xai_grok_version::PRIVACY_BUILD {
++        effects.push(Effect::RecordConsentUpstream { notice_id, version });
++    }
+     effects.extend(finish_consent(app));
+     effects
+ }
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/lifecycle.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/lifecycle.rs
+index 5f715a3a6d39d970296abba34ef89b1ecec39612..fb6e2ef67ae28f6fc90c28ea6f6e71598739f927 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/lifecycle.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/session/lifecycle.rs
+@@ -1231,10 +1231,12 @@ fn accepting_records_the_answer_and_replays_deferred_startup() {
+                 && *version == 3
+                 && !acked
+     )));
++    // Grok Privacy: the acceptance stays local — nothing is reported to xAI.
+     assert!(
+-        effects
++        !effects
+             .iter()
+             .any(|e| matches!(e, Effect::RecordConsentUpstream { .. })),
++        "accepting a consent notice must not emit an upstream record in a privacy build",
+     );
+     assert!(
+         effects
+diff --git a/crates/codegen/xai-grok-pager/src/app/effects/mod.rs b/crates/codegen/xai-grok-pager/src/app/effects/mod.rs
+index 02d5995c9448311eedcffe507ff909008a72ce6e..897e37ae3f72dd4a124e66da8f6dbdb9c4cb4ddb 100644
+--- a/crates/codegen/xai-grok-pager/src/app/effects/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/app/effects/mod.rs
+@@ -2116,6 +2116,17 @@ pub(crate) fn execute(
+                 });
+         }
+         Effect::RecordConsentUpstream { notice_id, version } => {
++            // Grok Privacy chokepoint: consent acknowledgments never leave this
++            // machine, even if a future caller emits the effect without going
++            // through `dispatch_accept_consent`.
++            if xai_grok_version::PRIVACY_BUILD {
++                tracing::info!(
++                    notice = %notice_id,
++                    version,
++                    "privacy: consent acknowledgment stays local; not reported upstream"
++                );
++                return (false, meta);
++            }
+             let tx = acp_tx.clone();
+             tasks
+                 .spawn(async move {
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+-- 
+2.43.0
+

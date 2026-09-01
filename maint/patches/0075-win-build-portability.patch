@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Sat, 25 Jul 2026 01:15:40 -0700
+Subject: [PATCH] win-build-portability: portable protoc invocation in
+ xai-proto-build
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+emit_rerun_if_changed hard-coded --dependency_out=/dev/stdout and
+--descriptor_set_out=/dev/null, which do not exist on Windows — native
+win32 builds of every proto-consuming crate failed with
+"protoc command failed". Write both outputs to a temp dir instead and
+parse the dependency file from disk (marker-based split; ':' is ambiguous
+with Windows drive letters). No behavior change on Unix.
+
+Upstream ships win32 npm prebuilds from its Bazel pipeline, which injects
+PROTOC and never hits this code path; the cargo path is what Grok Privacy's
+release matrix (and any Windows contributor) uses.
+
+Gork-Patch-Id: win-build-portability
+Gork-Invariant: cargo-build-portable-win32
+Gork-Risk: low
+---
+ crates/build/xai-proto-build/src/lib.rs | 29 ++++++++++++++++++-------
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/crates/build/xai-proto-build/src/lib.rs b/crates/build/xai-proto-build/src/lib.rs
+index 9404ea49010119c0636917a41c328301546108af..aea5d7a13e8d3659c2cac5c789f290474e8bc875 100644
+--- a/crates/build/xai-proto-build/src/lib.rs
++++ b/crates/build/xai-proto-build/src/lib.rs
+@@ -141,12 +141,20 @@ impl XaiProtoBuilder {
+             );
+         }
+ 
++        // protoc outputs go to real temp files: `/dev/stdout` / `/dev/null`
++        // do not exist on Windows, so native win32 builds fail with them.
++        let tmp = tempfile::TempDir::new().context("create protoc temp dir")?;
++        let dep_file = tmp.path().join("protoc-deps.d");
++        let descriptor_file = tmp.path().join("protoc-descriptor.bin");
++        let dep_file_str = dep_file.to_str().context("temp path not UTF-8")?;
++        let descriptor_file_str = descriptor_file.to_str().context("temp path not UTF-8")?;
++
+         // Can only process one input file when using --dependency_out=FILE.
+         for proto in protos {
+             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
+             command
+-                .arg("--dependency_out=/dev/stdout")
+-                .arg("--descriptor_set_out=/dev/null");
++                .arg(format!("--dependency_out={dep_file_str}"))
++                .arg(format!("--descriptor_set_out={descriptor_file_str}"));
+ 
+             // Add protoc's well-known types include directory first (if found).
+             // This is needed for Bazel sandboxed builds where protoc and its
+@@ -173,21 +181,26 @@ impl XaiProtoBuilder {
+             }
+ 
+             let output =
+-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
++                fs::read_to_string(&dep_file).context("protoc dependency_out not readable")?;
+ 
+             let mut lines = output.lines();
+-            let first_line = lines.next().context("protoc command output is empty")?;
+-            let prefix = "/dev/null:";
+-            let rem = first_line.strip_prefix(prefix).with_context(|| {
+-                format!("protoc command output must start with /dev/null: {output:?}")
++            let first_line = lines.next().context("protoc dependency_out is empty")?;
++            // Format: "<descriptor_set_out>: dep1 \" — match on the marker
++            // filename rather than splitting on ':' (Windows drive letters).
++            let marker = "protoc-descriptor.bin:";
++            let idx = first_line.find(marker).with_context(|| {
++                format!("dependency_out must start with the descriptor path: {output:?}")
+             })?;
++            let rem = &first_line[idx + marker.len()..];
+             for line in iter::once(rem).chain(lines) {
+                 let line = line.trim();
+                 let line = line.strip_suffix("\\").unwrap_or(line);
+                 // Depending on absolute paths like
+                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
+                 // is valid, but we want to have output more deterministic.
+-                if line.contains("/include/google/protobuf/") {
++                if line.contains("/include/google/protobuf/")
++                    || line.contains("\\include\\google\\protobuf\\")
++                {
+                     continue;
+                 }
+ 
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
+prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
+-- 
+2.43.0
+

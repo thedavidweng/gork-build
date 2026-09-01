@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Thu, 23 Jul 2026 00:28:24 +0200
+Subject: [PATCH] package-publishing: npm package metadata privacy fork
+
+Gork-Patch-Id: package-publishing
+Gork-Invariant: package-publishing
+Gork-Risk: low
+---
+ .../npm/grok-darwin-arm64/README.md           | 10 ++-
+ .../npm/grok-darwin-arm64/package.json        |  4 +-
+ .../npm/grok-darwin-x64/README.md             | 10 ++-
+ .../npm/grok-darwin-x64/package.json          |  4 +-
+ .../npm/grok-linux-arm64/README.md            | 10 ++-
+ .../npm/grok-linux-arm64/package.json         |  4 +-
+ .../npm/grok-linux-x64/README.md              | 10 ++-
+ .../npm/grok-linux-x64/package.json           |  4 +-
+ .../npm/grok-win32-arm64/README.md            | 10 ++-
+ .../npm/grok-win32-arm64/package.json         |  4 +-
+ .../npm/grok-win32-x64/README.md              | 10 ++-
+ .../npm/grok-win32-x64/package.json           |  4 +-
+ .../codegen/xai-grok-pager/npm/grok/README.md | 65 +++++++------------
+ .../npm/grok/bin/postinstall.js               | 17 ++---
+ .../xai-grok-pager/npm/grok/package.json      | 17 ++---
+ .../scripts/assemble-platform-packages.js     |  2 +-
+ 16 files changed, 79 insertions(+), 106 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
+index b8cbeaf5506095bb68f37cca5302c87fdb4f8594..f7fbaf773613c35914d8366fb5a299e3dc79990c 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-darwin-arm64
++# @lycaos/grok-privacy-darwin-arm64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on darwin-arm64.
++Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @lycaos/grok-privacy
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json
+index 56d67d4ca207e394319ba25afadb2dd2210e3d92..8c27c56638e8a722862cb29361ea3cafacf8dc83 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-arm64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-darwin-arm64",
++    "name": "@lycaos/grok-privacy-darwin-arm64",
+     "version": "0.2.0-dev",
+-    "description": "darwin-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "darwin-arm64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md
+index 3d235b7ded4de0bf74ed7a98cea06c1e7fc84c58..6933982d9a2388f8f19f3c49b9f71e7131ec7e81 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-darwin-x64
++# @lycaos/grok-privacy-darwin-x64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on darwin-x64.
++Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @lycaos/grok-privacy
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json
+index 5a000f9cc34142754ac52a1796a2fa445b85e07c..4b8eb1a87935e69092d7cdc3ae4e2779a0eaaac6 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-darwin-x64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-darwin-x64",
++    "name": "@lycaos/grok-privacy-darwin-x64",
+     "version": "0.2.0-dev",
+-    "description": "darwin-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "darwin-x64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md
+index 14834a94785852348ce6a756d692b3b9175bd30d..95226279eec73c6c8ac5e00b6274ba1329fc7139 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-linux-arm64
++# @lycaos/grok-privacy-linux-arm64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on linux-arm64.
++Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @lycaos/grok-privacy
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json
+index 6faaa6aac0fc95424654df255a03ef00803a1059..9b9f54e510c17675c343a95b524a613ed54ed10b 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-arm64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-linux-arm64",
++    "name": "@lycaos/grok-privacy-linux-arm64",
+     "version": "0.2.0-dev",
+-    "description": "linux-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "linux-arm64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md
+index 7acfdeed4a06a640c91cb44bc010cff990b5c9dc..4be14a750ba8e3fffa97cad05819213e6af2b138 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-linux-x64
++# @lycaos/grok-privacy-linux-x64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on linux-x64.
++Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @lycaos/grok-privacy
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json
+index 35c2d0fb4414732c6e14cce5f55459f130a82a9f..d9323425aca997bda51afd337e1f7ee6f6a490ae 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-linux-x64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-linux-x64",
++    "name": "@lycaos/grok-privacy-linux-x64",
+     "version": "0.2.0-dev",
+-    "description": "linux-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "linux-x64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md
+index 02c15d2b3845ce56e44bb72d878215ea2467faf7..fd6bd0753ea176ba7fa675f1a740caa6ed87e426 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-win32-arm64
++# @lycaos/grok-privacy-win32-arm64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on win32-arm64.
++Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @lycaos/grok-privacy
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json
+index e00fcb3cf2308ce7d994ba2d17507c42223fc417..aa4721d0ef08d06454bbf48077b051e9491af305 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-arm64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-win32-arm64",
++    "name": "@lycaos/grok-privacy-win32-arm64",
+     "version": "0.2.0-dev",
+-    "description": "win32-arm64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "win32-arm64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md
+index ef0c4a4dc0e3537055e9b12985900fa2c2ef164e..bc60e7901461ddea8b248e0012b85df5bfee2aa7 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/README.md
+@@ -1,11 +1,9 @@
+-# @xai-official/grok-win32-x64
++# @lycaos/grok-privacy-win32-x64
+ 
+-Platform-specific binary for [`@xai-official/grok`](https://www.npmjs.com/package/@xai-official/grok) on win32-x64.
++Platform binary optional dependency for [`@lycaos/grok-privacy`](https://www.npmjs.com/package/@lycaos/grok-privacy).
+ 
+-Do not install this package directly. Install the main package instead:
++Do not install this package directly:
+ 
+ ```sh
+-npm install -g @xai-official/grok
++npm install -g @lycaos/grok-privacy
+ ```
+-
+-The main package will automatically pull the correct binary for your platform via `optionalDependencies`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json
+index 3e07dbc7958cb1db883763c80fa281d0caf27ddf..9bd21bb9768b0e44eaae4c430208716255bb111b 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok-win32-x64/package.json
+@@ -1,7 +1,7 @@
+ {
+-    "name": "@xai-official/grok-win32-x64",
++    "name": "@lycaos/grok-privacy-win32-x64",
+     "version": "0.2.0-dev",
+-    "description": "win32-x64 binary for @xai-official/grok. Do not install directly; install @xai-official/grok instead.",
++    "description": "win32-x64 binary for @lycaos/grok-privacy. Do not install directly; install @lycaos/grok-privacy instead.",
+     "license": "Apache-2.0",
+     "files": [
+         "bin/",
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/README.md b/crates/codegen/xai-grok-pager/npm/grok/README.md
+index b70910e6f298d3964133f3ec6bb9594d9c03119e..d7d807fa105c327486b4820cff32cefc7fccbcd8 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/README.md
++++ b/crates/codegen/xai-grok-pager/npm/grok/README.md
+@@ -1,61 +1,44 @@
+-# Grok
++# Grok Privacy (`@lycaos/grok-privacy`)
+ 
+-Bring Grok into your terminal. Fast, flicker-free CLI built for plans, subagents, and parallel work.
++Community VSCodium-style distribution of Grok Build — **vendor telemetry and
++branding removed**.
+ 
+-**[Homepage](https://x.ai/cli)** | **[Documentation](https://docs.x.ai/build/overview)**
++**[Repository](https://github.com/lycaos/grok-privacy)** ·
++**[Privacy](https://github.com/lycaos/grok-privacy/blob/main/PRIVACY.md)** ·
++**[Wire analysis (why)](https://gist.github.com/cereblab/dc9a40bc26120f4540e4e09b75ffb547)**
+ 
+-## Install
++Upstream credit: based on [xai-org/grok-build](https://github.com/xai-org/grok-build)
++(Apache-2.0). Not affiliated with SpaceXAI / xAI.
+ 
+-```bash
+-curl -fsSL https://x.ai/cli/install.sh | bash
+-```
++## Install
+ 
+-Or install with npm:
++Prefer building from source for the latest privacy hard-offs:
+ 
+ ```bash
+-npm i -g @xai-official/grok
++git clone https://github.com/lycaos/grok-privacy.git
++cd grok-privacy
++cargo build -p xai-grok-pager-bin --release
++# → target/release/grok
+ ```
+ 
+-## Get Started
++npm packages (when published) install as:
+ 
+ ```bash
+-# Launch the interactive TUI
++npm i -g @lycaos/grok-privacy
+ grok
+-
+-# Run a single task
+-grok -p "Explain this codebase"
+-```
+-
+-On first launch, Grok opens your browser to authenticate. For CI or headless environments, use an API key from [console.x.ai](https://console.x.ai):
+-
+-```bash
+-export XAI_API_KEY="xai-..."
+-```
+-
+-## Update
+-
+-```bash
+-grok update
+ ```
+ 
+-Or if installed via npm:
++## Get started
+ 
+ ```bash
+-npm i -g @xai-official/grok@latest
++grok                    # interactive TUI
++grok -p "Explain this"  # one-shot
+ ```
+ 
+-## Supported Platforms
+-
+-| Platform | Architecture |
+-|---|---|
+-| macOS | Apple Silicon (arm64) |
+-| Linux | x86_64, arm64 |
+-| Windows | x86_64 |
+-
+-## Documentation
+-
+-For full documentation including configuration, MCP servers, custom models, headless mode, agent mode, and more, visit [docs.x.ai/build/overview](https://docs.x.ai/build/overview).
++Authenticate with your Grok / xAI account (or `XAI_API_KEY`) — model inference
++still uses the Grok API. Research uploads and product analytics stay off in
++this build.
+ 
+-## Feedback
++## License
+ 
+-Run `/feedback` inside Grok to report issues or send feedback directly.
++Apache-2.0 — see the repository `LICENSE` and `NOTICE`.
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js b/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
+index 38ec2676ab922563fca5963ad862695718b8a7cb..2059550d34328a4533f81b35e4cd7a021a0f6472 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
++++ b/crates/codegen/xai-grok-pager/npm/grok/bin/postinstall.js
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env node
+ // Runs once after npm install/update. Reads the grok binary from the
+-// matching per-platform optional dependency (@xai-official/grok-<platform>)
++// matching per-platform optional dependency (@lycaos/grok-privacy-<platform>)
+ // and installs it to ~/.grok/bin/ using versioned filenames:
+ //
+ //   Unix:    grok-<version>  +  grok  (symlink)
+@@ -36,7 +36,7 @@ const SUPPORTED = new Set([
+     'win32-arm64',
+ ]);
+ if (!SUPPORTED.has(key)) {
+-    console.error(`@xai-official/grok: unsupported platform ${key}`);
++    console.error(`@lycaos/grok-privacy: unsupported platform ${key}`);
+     process.exit(0);
+ }
+ 
+@@ -45,7 +45,7 @@ if (!SUPPORTED.has(key)) {
+ // other five are silently skipped. If the matching one is missing, npm was
+ // likely invoked with --no-optional or the platform is unsupported.
+ function resolvePlatformPackageDir() {
+-    const platformPkg = `@xai-official/grok-${key}`;
++    const platformPkg = `@lycaos/grok-privacy-${key}`;
+     try {
+         return path.dirname(require.resolve(`${platformPkg}/package.json`));
+     } catch {
+@@ -56,7 +56,7 @@ function resolvePlatformPackageDir() {
+ let version;
+ try { version = require('../package.json').version; } catch {}
+ if (!version) {
+-    console.error('@xai-official/grok: unable to determine version');
++    console.error('@lycaos/grok-privacy: unable to determine version');
+     process.exit(0);
+ }
+ 
+@@ -89,6 +89,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
+     const brotliPath = path.join(sourceDir, 'bin', vendorSubpath + '.br');
+     const binaryPath = path.join(sourceDir, 'bin', vendorSubpath);
+ 
++
+     const versionedName = `${binName}-${version}${EXE}`;
+     const versionedPath = path.join(CANONICAL_DIR, versionedName);
+     const canonicalName = `${binName}${EXE}`;
+@@ -119,7 +120,7 @@ function installBinary(binName, sourceDir, vendorSubpath) {
+                     throw copyErr;
+                 }
+             } catch (e2) {
+-                console.error(`@xai-official/grok: failed to update ${canonicalPath}: ${e2.message}`);
++                console.error(`@lycaos/grok-privacy: failed to update ${canonicalPath}: ${e2.message}`);
+                 console.error('Close all running grok processes and try again.');
+                 return false;
+             }
+@@ -180,9 +181,9 @@ function cleanupOldVersions(binName) {
+ 
+ const platformDir = resolvePlatformPackageDir();
+ if (!platformDir) {
+-    console.error(`@xai-official/grok: platform package @xai-official/grok-${key} not installed.`);
++    console.error(`@lycaos/grok-privacy: platform package @lycaos/grok-privacy-${key} not installed.`);
+     console.error('  This usually means npm was invoked with --no-optional, or the install failed.');
+-    console.error('  Try: npm install -g @xai-official/grok');
++    console.error('  Try: npm install -g @lycaos/grok-privacy');
+     process.exit(0);
+ }
+ 
+@@ -231,7 +232,7 @@ const npmRegistry = process.env.GROK_NPM_REGISTRY
+     || (() => {
+         try {
+             const resolved = execSync(
+-                'npm config get @xai-official:registry',
++                'npm config get @lycaos:registry',
+                 { encoding: 'utf8', timeout: 5000 }
+             ).trim();
+             if (resolved && resolved !== 'undefined') return resolved;
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/package.json b/crates/codegen/xai-grok-pager/npm/grok/package.json
+index 37708dc74c60607ea27abc922ac612dd86e03aae..360f1b4d956d09be587112f945b24f9c843ccfa5 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/package.json
++++ b/crates/codegen/xai-grok-pager/npm/grok/package.json
+@@ -1,9 +1,10 @@
+ {
+-    "name": "@xai-official/grok",
++    "name": "@lycaos/grok-privacy",
+     "version": "0.1.220-alpha.4",
+-    "description": "Bring Grok into your terminal",
++    "description": "Grok Privacy \u2014 community VSCodium-style Grok Build (no vendor telemetry)",
+     "license": "Apache-2.0",
+     "bin": {
++        "grokp": "bin/grok",
+         "grok": "bin/grok"
+     },
+     "files": [
+@@ -31,11 +32,11 @@
+         "@iarna/toml": "^3.0.0"
+     },
+     "optionalDependencies": {
+-        "@xai-official/grok-darwin-arm64": "0.1.220-alpha.4",
+-        "@xai-official/grok-darwin-x64": "0.1.220-alpha.4",
+-        "@xai-official/grok-linux-arm64": "0.1.220-alpha.4",
+-        "@xai-official/grok-linux-x64": "0.1.220-alpha.4",
+-        "@xai-official/grok-win32-arm64": "0.1.220-alpha.4",
+-        "@xai-official/grok-win32-x64": "0.1.220-alpha.4"
++        "@lycaos/grok-privacy-darwin-arm64": "0.1.220-alpha.4",
++        "@lycaos/grok-privacy-darwin-x64": "0.1.220-alpha.4",
++        "@lycaos/grok-privacy-linux-arm64": "0.1.220-alpha.4",
++        "@lycaos/grok-privacy-linux-x64": "0.1.220-alpha.4",
++        "@lycaos/grok-privacy-win32-arm64": "0.1.220-alpha.4",
++        "@lycaos/grok-privacy-win32-x64": "0.1.220-alpha.4"
+     }
+ }
+diff --git a/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js b/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js
+index f64800f9e92b786f7b0c666ed873ab95a42e50f0..41a5e3c04d0cf90655819a8072438d32c121526e 100644
+--- a/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js
++++ b/crates/codegen/xai-grok-pager/npm/grok/scripts/assemble-platform-packages.js
+@@ -6,7 +6,7 @@
+ //   2. Stamps the sub-package's version to match the meta package
+ //
+ // Each per-platform package is its own npm publish target. The meta package
+-// (`@xai-official/grok`) lists all six as `optionalDependencies` pinned to
++// (`@lycaos/grok-privacy`) lists all six as `optionalDependencies` pinned to
+ // the same version; npm installs only the one matching the host's
+ // `os` + `cpu` filters.
+ //
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
+prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
+prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
+prerequisite-patch-id: 9d5465258ca88f29996d9ea084cbc6f185766ee9
+prerequisite-patch-id: 0c19e50f968d0bc035b0229e236bb686060ab3d5
+-- 
+2.43.0
+

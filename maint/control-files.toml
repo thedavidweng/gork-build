@@ -1,0 +1,28 @@
+# Files restored onto every sync branch after applying patches.
+# Paths are relative to the repository root (or under maint/control/ as templates).
+schema = 1
+
+# Live paths that must exist on the control tree and be copied to sync branches.
+paths = [
+  "maint",
+  ".github/workflows/grok-privacy.yml",
+  ".github/workflows/patch-roundtrip.yml",
+  ".github/workflows/upstream-watch.yml",
+  ".github/workflows/upstream-replay.yml",
+  ".github/workflows/release.yml",
+  # Atelier client (doivent survivre un apply sur branche sync/*)
+  "scripts/privacy-simple.sh",
+  "scripts/privacy-rebuild.sh",
+  "scripts/privacy-client-update.sh",
+  # Même contrat, pour les machines sans bash ni wrapper (PowerShell).
+  "scripts/privacy-client-update.ps1",
+  "scripts/privacy-update.sh",
+  "scripts/grok-wrapper.sh",
+  "scripts/README-rebuild.md",
+  "scripts/README.md",
+  "docs/DISTRIBUTION.md",
+]
+
+# Optional templates under maint/control/ that overwrite/create the live paths above
+# after apply (same relative layout under maint/control/).
+template_root = "maint/control"

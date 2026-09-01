@@ -1,0 +1,74 @@
+{
+  "branch": "sync/upstream-1.0.13-bb7f39d",
+  "upstream": "bb7f39d5",
+  "version": "1.0.13",
+  "source_rev": "d761e8ba538084df023de79d26892eaf73ed7411",
+  "applied": [
+    "0001-privacy-core.patch",
+    "0010-telemetry-hard-off.patch",
+    "0020-research-upload-hard-off.patch",
+    "0030-retention-opt-out.patch",
+    "0040-vendor-updater-hard-off.patch",
+    "0050-privacy-contract-tests.patch",
+    "0055-session-writeback-hard-off.patch",
+    "0056-consent-record-hard-off.patch",
+    "0057-pager-test-drift.patch",
+    "0058-update-test-drift.patch",
+    "0060-egress-guard.patch",
+    "0070-supply-chain-policy.patch",
+    "0075-win-build-portability.patch",
+    "0078-prompts-modal.patch",
+    "0080-product-identity.patch",
+    "0081-package-publishing.patch",
+    "0082-branding-docs.patch"
+  ],
+  "skipped": [],
+  "conflicted": null,
+  "auto_resolved": [
+    {
+      "patch": "0001-privacy-core.patch",
+      "method": "rerere",
+      "files": [],
+      "unverified": false
+    },
+    {
+      "patch": "0030-retention-opt-out.patch",
+      "method": "rerere",
+      "files": [],
+      "unverified": false
+    },
+    {
+      "patch": "0040-vendor-updater-hard-off.patch",
+      "method": "rerere",
+      "files": [],
+      "unverified": false
+    },
+    {
+      "patch": "0055-session-writeback-hard-off.patch",
+      "method": "rerere",
+      "files": [],
+      "unverified": false
+    },
+    {
+      "patch": "0057-pager-test-drift.patch",
+      "method": "rerere",
+      "files": [],
+      "unverified": false
+    },
+    {
+      "patch": "0078-prompts-modal.patch",
+      "method": "rerere",
+      "files": [],
+      "unverified": false
+    },
+    {
+      "patch": "0081-package-publishing.patch",
+      "method": "ai",
+      "files": [
+        "crates/codegen/xai-grok-pager/npm/grok/bin/grok"
+      ],
+      "unverified": true
+    }
+  ],
+  "branding_required": false
+}

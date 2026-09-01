@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Thu, 23 Jul 2026 00:28:49 +0200
+Subject: [PATCH] branding-docs: apply maint/overlays onto product tree
+
+Gork-Patch-Id: branding-docs
+Gork-Risk: low
+---
+ crates/codegen/xai-grok-pager/src/app/cli.rs | 2 +-
+ crates/codegen/xai-grok-pager/src/app/mod.rs | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
+index 673b126431f595f60aa57727d0e3be8ee8b111c8..10797ae923764282a2a56934bbbfa6ed1cc66326 100644
+--- a/crates/codegen/xai-grok-pager/src/app/cli.rs
++++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
+@@ -401,7 +401,7 @@ pub struct LeaderArgs {
+ #[command(
+     name = "grok",
+     version = xai_grok_version::full_version(),
+-    about = "Grok Build TUI",
++    about = "Grok Privacy TUI",
+     disable_version_flag = true,
+     next_display_order = None,
+     help_template = "\
+diff --git a/crates/codegen/xai-grok-pager/src/app/mod.rs b/crates/codegen/xai-grok-pager/src/app/mod.rs
+index d636cd908f06e93e0d0dbd8611aa9fdaaf361529..bbb461f4adb58bcc7327ceb799ce64594daa6370 100644
+--- a/crates/codegen/xai-grok-pager/src/app/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/app/mod.rs
+@@ -2292,7 +2292,7 @@ mod tests {
+         assert_eq!(
+             first_5,
+             vec![
+-                "Grok Build TUI",
++                "Grok Privacy TUI",
+                 "",
+                 "Usage: grok [OPTIONS] [PROMPT] [COMMAND]",
+                 "",
+
+base-commit: bb7f39d5858cbf5e00de639367f59debbdcb0138
+prerequisite-patch-id: fa1deb7e367da623d23752a1bb860c1892b80e24
+prerequisite-patch-id: 5487467b3ad20cc7a81907e28a3c24f3d109d316
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: a4a572dc12631982f61813d5da21c8b36e37035f
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
+prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
+prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
+prerequisite-patch-id: 9d5465258ca88f29996d9ea084cbc6f185766ee9
+prerequisite-patch-id: 0c19e50f968d0bc035b0229e236bb686060ab3d5
+prerequisite-patch-id: 670c947ac20ef7c49d7b7a590f1e6077a98becd7
+-- 
+2.43.0
+
