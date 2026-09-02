@@ -143,7 +143,16 @@ class QueueRepo:
 
         exported = patchctl(root, "export", "--tip", "HEAD")
         assert exported.returncode == 0, exported.stdout + exported.stderr
-        commit(root, "chore: export queue")
+        # Shaped like production: the control commit carries an *excluded*
+        # trailer and rewrites the overlay-managed README. A fold that mistakes
+        # it for the functional tip makes the export straddle that rewrite and
+        # refuse with "non-control files after functional tip".
+        write(root, "README.md", "fork readme\n")
+        commit(
+            root,
+            "chore: restore control plane and export queue\n\n"
+            "Gork-Patch-Id: control-metadata",
+        )
 
     def head(self) -> str:
         return git(self.root, "rev-parse", "HEAD").stdout.strip()

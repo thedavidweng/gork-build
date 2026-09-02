@@ -1726,8 +1726,12 @@ def fold_abort(root: Path) -> int:
 
 def fold_finish(root: Path, state: dict) -> int:
     branch = state["branch"]
-    git(["branch", "-f", branch, "HEAD"], cwd=root)
-    git(["checkout", branch, "-q"], cwd=root)
+    # Idempotent: a resume re-enters here with the branch already moved and
+    # checked out, and `branch -f` refuses to touch the branch it is standing
+    # on. Only move it while HEAD is still detached from the rebase.
+    if current_branch(root) != branch:
+        git(["branch", "-f", branch, "HEAD"], cwd=root)
+        git(["checkout", branch, "-q"], cwd=root)
 
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
     # Same filter the export applies: a `control-metadata` / `overlays` /
