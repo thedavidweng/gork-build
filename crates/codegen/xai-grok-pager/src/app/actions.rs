@@ -128,6 +128,11 @@ pub enum Action {
     ConfirmWelcomeLocalWorkspaceAck,
     /// Create a new session with a client-chosen session ID (`--session-id`).
     NewSessionWithId(String),
+    /// Open a new session running a named agent definition (`/agent <name>`).
+    ///
+    /// Sets the same `agent_override` that `--agent` fills at launch, so the
+    /// next `session/new` carries it as `_meta.agentProfile`.
+    OpenSessionWithAgent(String),
     /// Startup `--fork-session`: fork `parent` then load the child.
     /// Optional second string is the desired new session ID.
     StartupForkSession {

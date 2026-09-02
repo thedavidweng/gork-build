@@ -439,6 +439,19 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
 
 Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
 
+### `/agent`
+
+Open a **new session running a named agent definition**. Alias: `/use-agent`.
+
+```
+/agent            # list the agent definitions discovered here
+/agent <name>     # open a new session running that one
+```
+
+The agent a session runs on is decided when the session is created, so this opens a new one rather than converting the current session. Definitions live in `.grok/agents/*.md` and `~/.grok/agents/*.md`; browse and edit them with [`/agents`](16-subagents.md) (that modal manages definitions — `/agents-dashboard` lists running sessions instead).
+
+The same choice at launch: `grok --agent <name>`, or `GROK_AGENT=<name> grok`. To shape a subagent's behavior rather than the session's, see [personas and roles](16-subagents.md).
+
 ### `/prompts`
 
 Open the [prompt templates](25-prompts.md) browser: preview stock system / subagent prompts, edit overrides in the TUI (or `$EDITOR`), reset to the binary defaults, and save or apply named presets under `~/.grok`. Aliases: `/prompt`, `/system-prompts`.

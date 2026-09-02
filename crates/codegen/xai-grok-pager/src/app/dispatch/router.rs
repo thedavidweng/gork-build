@@ -271,6 +271,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             dispatch_load_session(app, session_id, session_cwd, chat_kind)
         }
         Action::NewSessionWithId(session_id) => dispatch_new_session_with_id(app, session_id),
+        Action::OpenSessionWithAgent(name) => {
+            // Same field `--agent` fills at launch: the next session/new stamps
+            // it as `_meta.agentProfile`, which the shell prefers over
+            // `[agent] name` and `GROK_AGENT`. It sticks for later sessions of
+            // this process too, matching how the launch flag behaves.
+            app.agent_override = Some(serde_json::Value::String(name));
+            dispatch_new_session(app)
+        }
         Action::StartupForkSession {
             parent_session_id,
             parent_cwd,
