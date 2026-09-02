@@ -173,3 +173,11 @@ id = "personas-wired"
 group = "privacy"
 min_tests = 2
 command = ["cargo", "test", "-p", "xai-grok-tools", "--lib", "persona"]
+
+# Choosing the agent a session runs on used to be launch-time only (`--agent`,
+# `GROK_AGENT`, `[agent] name`). These pin the in-session path.
+[[contract]]
+id = "session-agent-command"
+group = "privacy"
+min_tests = 2
+command = ["cargo", "test", "-p", "xai-grok-pager", "--lib", "slash::commands::agent"]

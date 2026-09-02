@@ -135,6 +135,20 @@ file = "0079-personas-rewire.patch"
 critical = true
 contracts = ["personas-wired"]
 
+[[patch]]
+id = "session-agent"
+file = "0079b-session-agent.patch"
+# Numbered `0079b` on purpose: the queue order is `patchset.toml`, but the file
+# names are what a human reads in `ls`, and there is no integer between 0079
+# and 0080. Renumbering the branding patches to make room would churn three
+# files for cosmetics.
+#
+# Critical for the same reason as its neighbours: it is a feature, so the
+# reflex is to file it with the trailing non-critical patches — which are
+# skipped silently on conflict. A conflict here must stop the sync.
+critical = true
+contracts = ["session-agent-command"]
+
 # Trailing non-critical: may be skipped on upstream conflict (draft PR still opens).
 [[patch]]
 id = "product-identity"
