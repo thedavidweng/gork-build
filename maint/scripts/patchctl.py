@@ -1465,6 +1465,495 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── Guard: a product commit outside the queue is a commit that will vanish ──
+#
+# `patchctl apply` rebuilds a sync branch from upstream plus maint/patches/
+# alone. Anything committed to the product tree without a `Gork-Patch-Id`
+# trailer is therefore dropped at the next sync, and dropped *silently* — that
+# is how the /prompts feature was lost once already. The guard makes that
+# failure mode unreachable instead of merely documented.
+
+GUARD_HOOK_DIR = "maint/hooks"
+GUARD_ENV = "PATCHCTL_GUARD"
+FOLD_STATE_FILE = "grok-fold-state.json"
+FOLD_PATCH_FILE = "grok-fold-pending.patch"
+FOLD_BACKUP_REF = "refs/patchctl/fold-backup"
+CONTROL_REEXPORT_SUBJECT = "chore(sync): re-export patch queue"
+
+GUARD_HOOK = """#!/usr/bin/env sh
+# Versioned hook, installed by `patchctl guard --install`.
+# Refuses a commit that changes the product tree with no Gork-Patch-Id
+# trailer: `patchctl apply` rebuilds the branch from upstream + the patch
+# queue alone, so such a commit disappears at the next sync.
+root=$(git rev-parse --show-toplevel) || exit 0
+exec python3 "$root/maint/scripts/patchctl.py" guard --commit-msg "$1"
+"""
+
+
+def current_branch(root: Path) -> str:
+    return git(
+        ["branch", "--show-current"], cwd=root, capture=True, check=False
+    ).stdout.strip()
+
+
+def overlay_managed_paths(root: Path) -> set[str]:
+    """Product paths that `apply_overlays` rewrites after every apply.
+
+    A commit touching one of these is not lost by a resync — the overlay puts
+    it back — so the guard must not treat it as an orphan.
+    """
+    overlay = root / "maint" / "overlays"
+    if not overlay.is_dir():
+        return set()
+    return {
+        str(p.relative_to(overlay)).replace(os.sep, "/")
+        for p in overlay.rglob("*")
+        if p.is_file()
+    }
+
+
+def guard_exempt(path: str, control_cfg: dict, overlays: set[str]) -> bool:
+    """True when `path` survives a rebuild without belonging to the queue."""
+    if control_path_allowed(path, control_cfg):
+        return True
+    if path in overlays:
+        return True
+    # lock-policy.toml keeps Cargo.lock inherited from upstream, deliberately
+    # out of the functional series.
+    return path == "Cargo.lock"
+
+
+def orphan_product_files(root: Path, paths: list[str]) -> list[str]:
+    control_cfg = load_control_files(root)
+    overlays = overlay_managed_paths(root)
+    return [p for p in paths if not guard_exempt(p, control_cfg, overlays)]
+
+
+def commit_changed_files(root: Path, sha: str) -> list[str]:
+    # Merges print nothing here, so they read as control-only and are skipped:
+    # the queue is a linear series, a merge never carries a patch.
+    out = git(
+        ["show", "--pretty=format:", "--name-only", sha], cwd=root, capture=True
+    ).stdout
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def range_changed_files(root: Path, a: str, b: str) -> list[str]:
+    out = git(["diff", "--name-only", a, b], cwd=root, capture=True).stdout
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def commit_trailer_id(root: Path, sha: str) -> str | None:
+    body = git(["log", "-1", "--format=%B", sha], cwd=root, capture=True).stdout
+    m = re.search(rf"^{TRAILER_ID}:\s*(\S+)\s*$", body, re.M)
+    return m.group(1) if m else None
+
+
+def known_patch_ids(root: Path) -> set[str]:
+    return {p["id"] for p in load_patchset(root / "maint/patchset.toml")}
+
+
+def guard_offenders(root: Path, base: str, tip: str) -> list[tuple[str, str, str]]:
+    """(sha, subject, reason) for commits the next apply would silently drop."""
+    known = known_patch_ids(root)
+    out: list[tuple[str, str, str]] = []
+    log = git(
+        ["log", "--reverse", "--format=%H%x00%s", f"{base}..{tip}"],
+        cwd=root,
+        capture=True,
+    ).stdout
+    for line in log.splitlines():
+        if not line.strip():
+            continue
+        sha, _, subject = line.partition("\0")
+        touched = orphan_product_files(root, commit_changed_files(root, sha))
+        if not touched:
+            continue  # control-only / overlay-only: legitimately trailerless
+        pid = commit_trailer_id(root, sha)
+        sample = ", ".join(touched[:3]) + (" …" if len(touched) > 3 else "")
+        if pid is None:
+            out.append(
+                (
+                    sha,
+                    subject,
+                    f"changes {len(touched)} product file(s) with no {TRAILER_ID} "
+                    f"trailer ({sample})",
+                )
+            )
+        elif pid not in known and pid not in EXCLUDE_PATCH_IDS:
+            out.append(
+                (sha, subject, f"{TRAILER_ID}={pid} is absent from maint/patchset.toml")
+            )
+    return out
+
+
+GUARD_ADVICE = f"""
+`patchctl apply` rebuilds a sync branch from upstream plus maint/patches/
+alone, so a product commit outside that queue is dropped at the next sync —
+silently. That is exactly how the /prompts feature was lost once.
+
+Pick one:
+  * fold it into an existing patch   ->  do not commit; leave the change in the
+                                         working tree and run:
+                                             patchctl fold <patch-id>
+  * it deserves a patch of its own   ->  add a [[patch]] block to
+                                         maint/patchset.toml, then commit with a
+                                         `{TRAILER_ID}: <id>` trailer
+  * it is control plane after all    ->  keep the change under maint/
+  * you know better, just this once  ->  {GUARD_ENV}=0 git commit …
+"""
+
+
+def guard_pending_commit(root: Path, msg_path: Path) -> int:
+    """commit-msg hook mode: judge the commit that is about to be created."""
+    if not (root / "maint/patchset.toml").is_file():
+        return 0  # not a queue repository
+    staged = git(
+        ["diff", "--cached", "--name-only"], cwd=root, capture=True
+    ).stdout.splitlines()
+    touched = orphan_product_files(root, [s.strip() for s in staged if s.strip()])
+    if not touched:
+        return 0
+    body = msg_path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(rf"^{TRAILER_ID}:\s*(\S+)\s*$", body, re.M)
+    if m:
+        pid = m.group(1)
+        if pid in known_patch_ids(root) or pid in EXCLUDE_PATCH_IDS:
+            return 0
+        sys.stderr.write(
+            f"\npatchctl guard: refused.\n\n"
+            f"  {TRAILER_ID}: {pid}\n"
+            f"is not listed in maint/patchset.toml, so the export has no file to\n"
+            f"write this patch to and the commit is dropped at the next apply.\n"
+            f"Add its [[patch]] block first, or use an id that exists:\n"
+            f"  {', '.join(sorted(known_patch_ids(root)))}\n"
+        )
+        return 1
+    listing = "\n".join(f"    {p}" for p in touched[:20])
+    more = f"\n    … and {len(touched) - 20} more" if len(touched) > 20 else ""
+    sys.stderr.write(
+        f"\npatchctl guard: refused.\n\n"
+        f"This commit changes {len(touched)} product file(s) and carries no "
+        f"{TRAILER_ID} trailer:\n{listing}{more}\n{GUARD_ADVICE}"
+    )
+    return 1
+
+
+def cmd_guard(args: argparse.Namespace) -> int:
+    root = repo_root()
+    if args.install:
+        hooks = root / GUARD_HOOK_DIR
+        hooks.mkdir(parents=True, exist_ok=True)
+        hook = hooks / "commit-msg"
+        hook.write_text(GUARD_HOOK, encoding="utf-8")
+        hook.chmod(0o755)
+        existing = git(
+            ["config", "--get", "core.hooksPath"], cwd=root, capture=True, check=False
+        ).stdout.strip()
+        if existing and existing != GUARD_HOOK_DIR:
+            print(
+                f"guard: core.hooksPath is already {existing!r} — left untouched.\n"
+                f"       Chain the guard yourself from {existing}/commit-msg:\n"
+                f"         python3 maint/scripts/patchctl.py guard --commit-msg \"$1\"",
+                file=sys.stderr,
+            )
+            return 2
+        git(["config", "core.hooksPath", GUARD_HOOK_DIR], cwd=root)
+        print(f"guard installed: {GUARD_HOOK_DIR}/commit-msg (core.hooksPath set)")
+        return 0
+    if args.uninstall:
+        git(["config", "--unset", "core.hooksPath"], cwd=root, check=False)
+        print("guard uninstalled (core.hooksPath unset; the hook file stays versioned)")
+        return 0
+    if os.environ.get(GUARD_ENV) == "0":
+        return 0
+    if args.commit_msg:
+        return guard_pending_commit(root, Path(args.commit_msg))
+
+    lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    base = args.base or lock.commit
+    offenders = guard_offenders(root, base, args.tip)
+    if not offenders:
+        print(f"guard: no orphan product commit in {base[:12]}..{args.tip}")
+        return 0
+    for sha, subject, reason in offenders:
+        print(f"guard: {sha[:12]} {subject}\n       {reason}", file=sys.stderr)
+    sys.stderr.write(GUARD_ADVICE)
+    return 3
+
+
+# ── Fold: land a change inside an existing queue patch ─────────────────────
+
+
+def fold_state_path(root: Path) -> Path:
+    return git_dir(root) / FOLD_STATE_FILE
+
+
+def save_fold_state(root: Path, state: dict) -> None:
+    fold_state_path(root).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def load_fold_state(root: Path) -> dict | None:
+    path = fold_state_path(root)
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def clear_fold_state(root: Path) -> None:
+    fold_state_path(root).unlink(missing_ok=True)
+    (git_dir(root) / FOLD_PATCH_FILE).unlink(missing_ok=True)
+
+
+def fold_abort(root: Path) -> int:
+    state = load_fold_state(root)
+    if not state:
+        print("fold: no fold in progress", file=sys.stderr)
+        return 2
+    git(["rebase", "--abort"], cwd=root, check=False, capture=True)
+    git(["checkout", "-f", state["branch"], "-q"], cwd=root, check=False, capture=True)
+    # `-f` is safe here and only here: every byte of the pending change was
+    # committed into `backup` before the fold touched anything.
+    git(["reset", "--hard", state["backup"], "-q"], cwd=root, check=False)
+    clear_fold_state(root)
+    print(
+        f"fold aborted — {state['branch']} is back at {state['backup'][:12]}.\n"
+        f"Your pending change is the commit at the tip; `git reset --soft HEAD~1`\n"
+        f"puts it back in the working tree."
+    )
+    return 0
+
+
+def fold_finish(root: Path, state: dict) -> int:
+    branch = state["branch"]
+    git(["branch", "-f", branch, "HEAD"], cwd=root)
+    git(["checkout", branch, "-q"], cwd=root)
+
+    lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    pairs = commits_with_patch_id(root, lock.commit, "HEAD")
+    if not pairs:
+        print("fold: no functional commit left to export", file=sys.stderr)
+        return 3
+    functional_tip = pairs[-1][0]
+    # Export from the functional tip, never from HEAD: control commits sitting
+    # after it (overlay restore, apply status) trip the export's control-file
+    # guard, which is the trap this command exists to remove.
+    rc = cmd_export(argparse.Namespace(tip=functional_tip, base=None))
+    if rc != 0:
+        print("fold: export failed — state kept for --continue", file=sys.stderr)
+        return int(rc)
+
+    if git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip():
+        head_subject = git(
+            ["log", "-1", "--format=%s"], cwd=root, capture=True
+        ).stdout.strip()
+        head_is_reexport = head_subject.startswith(
+            CONTROL_REEXPORT_SUBJECT
+        ) and not orphan_product_files(root, commit_changed_files(root, "HEAD"))
+        git(["add", "-A"], cwd=root)
+        if head_is_reexport:
+            git(
+                ["commit", "--amend", "--no-edit", "--no-verify", "-q"],
+                cwd=root,
+                env={GUARD_ENV: "0"},
+            )
+        else:
+            git(
+                [
+                    "commit",
+                    "--no-verify",
+                    "-q",
+                    "-m",
+                    f"{CONTROL_REEXPORT_SUBJECT} after fold into {state['patch_id']}",
+                ],
+                cwd=root,
+                env={GUARD_ENV: "0"},
+            )
+
+    backup = state["backup"]
+    patch_id = state["patch_id"]
+    no_lint = state.get("no_lint", False)
+    clear_fold_state(root)
+    print(
+        f"\nfold: change folded into {patch_id}; queue re-exported from "
+        f"{functional_tip[:12]}.\n"
+        f"      previous tip kept at {FOLD_BACKUP_REF} ({backup[:12]}) — roll back with\n"
+        f"        git reset --hard {backup[:12]}"
+    )
+    if no_lint:
+        return 0
+    return int(cmd_lint(argparse.Namespace(skip_roundtrip=False, compare_to=None)))
+
+
+def fold_after_apply(root: Path, state: dict, message_file: str | None) -> int:
+    amend = ["commit", "--amend", "--no-verify", "-q"]
+    amend += ["-F", message_file] if message_file else ["--no-edit"]
+    git(amend, cwd=root, env={GUARD_ENV: "0"})
+    state["new_target"] = git(
+        ["rev-parse", "HEAD"], cwd=root, capture=True
+    ).stdout.strip()
+    state["phase"] = "rebase"
+    save_fold_state(root, state)
+
+    if state["old_tip"] != state["target"]:
+        proc = git(
+            ["rebase", "--onto", state["new_target"], state["target"], state["old_tip"]],
+            cwd=root,
+            check=False,
+            capture=True,
+        )
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stdout or "")
+            sys.stderr.write(proc.stderr or "")
+            print(
+                "\nfold: the replay of the commits after "
+                f"{state['patch_id']} conflicts.\n"
+                "  resolve, `git add`, `git rebase --continue`, then:\n"
+                "    patchctl fold --continue\n"
+                "  or give up with: patchctl fold --abort",
+                file=sys.stderr,
+            )
+            return 3
+    return fold_finish(root, state)
+
+
+def cmd_fold(args: argparse.Namespace) -> int:
+    root = repo_root()
+    if args.abort:
+        return fold_abort(root)
+
+    state = load_fold_state(root)
+    if args.continue_fold:
+        if not state:
+            print("fold: nothing to continue", file=sys.stderr)
+            return 2
+        if unmerged_paths(root):
+            print(
+                "fold: unresolved conflicts remain — resolve and `git add` first",
+                file=sys.stderr,
+            )
+            return 2
+        if state.get("phase") == "apply":
+            return fold_after_apply(root, state, args.message_file)
+        return fold_finish(root, state)
+    if state:
+        print(
+            "fold: a fold is already in progress (--continue or --abort)",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.patch_id:
+        print("fold: a patch id is required (see maint/patchset.toml)", file=sys.stderr)
+        return 2
+
+    lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    base = lock.commit
+    branch = current_branch(root)
+    if not branch:
+        print("fold: detached HEAD — check the sync branch out first", file=sys.stderr)
+        return 2
+
+    by_id = {pid: sha for sha, pid in commits_with_patch_id(root, base, "HEAD")}
+    if args.patch_id not in by_id:
+        print(
+            f"fold: no commit carries {TRAILER_ID}={args.patch_id} in "
+            f"{base[:12]}..HEAD",
+            file=sys.stderr,
+        )
+        print("  available: " + ", ".join(sorted(by_id)), file=sys.stderr)
+        return 2
+    target = by_id[args.patch_id]
+
+    # Normalize both entry points to "a trailerless commit sits at the tip":
+    # nothing is ever stashed or reset away, so every state is recoverable.
+    if git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip():
+        git(["add", "-A"], cwd=root)
+        git(
+            ["commit", "--no-verify", "-q", "-m", f"fold-wip: {args.patch_id}"],
+            cwd=root,
+            env={GUARD_ENV: "0"},
+        )
+    wip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+    if commit_trailer_id(root, wip) is not None:
+        print(
+            "fold: nothing to fold — the tree is clean and HEAD is already a "
+            "queue commit",
+            file=sys.stderr,
+        )
+        return 2
+    parents = git(
+        ["rev-list", "--parents", "-n", "1", wip], cwd=root, capture=True
+    ).stdout.split()
+    if len(parents) != 2:
+        print("fold: HEAD is a merge or a root commit — unsupported", file=sys.stderr)
+        return 2
+    old_tip = parents[1]
+
+    pending = range_changed_files(root, old_tip, wip)
+    shared: dict[str, str] = {}
+    for sha, pid in commits_with_patch_id(root, base, old_tip):
+        if sha == target:
+            continue
+        for f in commit_changed_files(root, sha):
+            if f in pending:
+                shared.setdefault(f, pid)
+    if shared and not args.allow_shared:
+        print(
+            f"fold: refused — {len(shared)} file(s) in this change are also "
+            f"carried by another patch:",
+            file=sys.stderr,
+        )
+        for f, pid in sorted(shared.items()):
+            print(f"       {f}  (also in {pid})", file=sys.stderr)
+        print(
+            "\n  Folding here would still apply, but the patch would then claim a\n"
+            "  change that belongs to its neighbour — and the next conflict lands\n"
+            "  on whoever reads it. Split the change by hand, or accept the\n"
+            "  attribution with --allow-shared.",
+            file=sys.stderr,
+        )
+        return 3
+
+    git(["update-ref", FOLD_BACKUP_REF, wip], cwd=root)
+    patch_path = git_dir(root) / FOLD_PATCH_FILE
+    patch_path.write_text(
+        git(
+            ["diff", "--binary", "--full-index", old_tip, wip], cwd=root, capture=True
+        ).stdout,
+        encoding="utf-8",
+    )
+    state = {
+        "patch_id": args.patch_id,
+        "branch": branch,
+        "target": target,
+        "old_tip": old_tip,
+        "backup": wip,
+        "phase": "apply",
+        "no_lint": bool(args.no_lint),
+    }
+    save_fold_state(root, state)
+
+    git(["checkout", "--detach", target, "-q"], cwd=root)
+    proc = git(
+        ["apply", "--3way", "--index", str(patch_path)],
+        cwd=root,
+        check=False,
+        capture=True,
+    )
+    if proc.returncode != 0 or unmerged_paths(root):
+        sys.stderr.write(proc.stderr or proc.stdout or "")
+        print(
+            f"\nfold: the change does not apply cleanly onto {args.patch_id} "
+            f"({target[:12]}).\n"
+            "  resolve the conflicts, `git add`, then:\n"
+            "    patchctl fold --continue\n"
+            "  or give up with: patchctl fold --abort",
+            file=sys.stderr,
+        )
+        return 3
+    return fold_after_apply(root, state, args.message_file)
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
     if getattr(args, "continue_apply", False):
         return cmd_apply_continue(args)
@@ -1793,6 +2282,11 @@ def cmd_lint(args: argparse.Namespace) -> int:
     for p in patchset:
         if p.get("critical", True) and p["file"] not in series:
             err(f"critical patch missing from series: {p['id']}")
+
+    # No product commit outside the queue: the next apply would drop it.
+    if git_resolvable(root, lock.commit):
+        for sha, subject, reason in guard_offenders(root, lock.commit, "HEAD"):
+            err(f"orphan commit {sha[:12]} ({subject}): {reason}")
 
     # contracts resolve
     contracts_path = root / "maint/contracts/privacy-contract.toml"
@@ -2267,6 +2761,50 @@ def build_parser() -> argparse.ArgumentParser:
     fs.add_argument("--version", default=None)
     fs.add_argument("--source-rev", default=None)
     fs.set_defaults(func=cmd_finalize_sync)
+
+    g = sub.add_parser(
+        "guard",
+        help="Refuse product commits the next apply would silently drop",
+    )
+    g.add_argument(
+        "--install",
+        action="store_true",
+        help=f"Install the versioned commit-msg hook ({GUARD_HOOK_DIR}) via core.hooksPath",
+    )
+    g.add_argument("--uninstall", action="store_true", help="Unset core.hooksPath")
+    g.add_argument("--commit-msg", default=None, help=argparse.SUPPRESS)
+    g.add_argument("--base", default=None, help="Range start (default lock.commit)")
+    g.add_argument("--tip", default="HEAD")
+    g.set_defaults(func=cmd_guard)
+
+    fo = sub.add_parser(
+        "fold",
+        help="Fold the working tree into an existing queue patch and re-export",
+    )
+    fo.add_argument(
+        "patch_id",
+        nargs="?",
+        help=f"{TRAILER_ID} of the target patch (see maint/patchset.toml)",
+    )
+    fo.add_argument(
+        "--allow-shared",
+        action="store_true",
+        help="Proceed even when a touched file is also carried by another patch",
+    )
+    fo.add_argument(
+        "--message-file",
+        default=None,
+        help="Replace the target patch's commit message (keep its trailer!)",
+    )
+    fo.add_argument("--no-lint", action="store_true", help="Skip the closing lint")
+    fo.add_argument(
+        "--continue",
+        dest="continue_fold",
+        action="store_true",
+        help="Resume a fold interrupted by a conflict",
+    )
+    fo.add_argument("--abort", action="store_true", help="Restore the pre-fold tip")
+    fo.set_defaults(func=cmd_fold)
 
     b = sub.add_parser("bootstrap-stack", help="One-time path-group stack rebuild")
     b.add_argument("--base", default=None)

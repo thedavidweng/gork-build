@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# Versioned hook, installed by `patchctl guard --install`.
+# Refuses a commit that changes the product tree with no Gork-Patch-Id
+# trailer: `patchctl apply` rebuilds the branch from upstream + the patch
+# queue alone, so such a commit disappears at the next sync.
+root=$(git rev-parse --show-toplevel) || exit 0
+exec python3 "$root/maint/scripts/patchctl.py" guard --commit-msg "$1"
