@@ -163,3 +163,13 @@ id = "prompts-modal-ui"
 group = "privacy"
 min_tests = 5
 command = ["cargo", "test", "-p", "xai-grok-pager", "--lib", "views::prompts_modal"]
+
+# Personas: upstream ships the feature with its model-facing entry point removed
+# (`persona` off the task schema, `format_personas_section` stubbed to None).
+# The fork re-wires it, and these tests are what stops a future sync from
+# quietly restoring the stub.
+[[contract]]
+id = "personas-wired"
+group = "privacy"
+min_tests = 2
+command = ["cargo", "test", "-p", "xai-grok-tools", "--lib", "persona"]

@@ -1,0 +1,608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Wed, 2 Sep 2026 04:30:46 +0200
+Subject: [PATCH] personas-rewire: restore the model-facing persona entry point
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Personas are a documented, fully implemented feature — `[subagents.personas.*]`
+in config.toml, `.grok/personas/*.toml`, `~/.grok/personas/*.toml`, a
+`/personas` modal, resolution with model / reasoning-effort / isolation
+defaults, and injection of the persona instructions as a `<system-reminder>`
+in the child conversation. Upstream ships it with both ends cut:
+
+  - `PromptContext::format_personas_section` returns `None` unconditionally,
+    so the `<personas>` catalog never reaches the model;
+  - `render_io_summary` has no caller in the tree and the session is handed
+    `Vec::new()` for `persona_summaries`, so the catalog would be empty anyway;
+  - the `task` tool builds its spawn request with a hardcoded `persona: None`
+    because the parameter was dropped from the model-facing schema.
+
+Everything between those points is intact, including the fail-closed guard
+that aborts a spawn when a persona name does not resolve.
+
+This reconnects the three: the session builds its catalog from the effective
+personas map (sorted by name — the system prompt is cached, so a HashMap's
+iteration order must not leak into it), `format_personas_section` renders the
+block, and `TaskToolInput` advertises `persona` again and forwards it to
+subagent resolution with the same sentinel handling as `model`. Unlike
+`model`, it survives a resume: the resume footer asks for the source's
+persona back and resume-identity validation compares them.
+
+`.grok/` joins .gitignore for the same reason the feature is worth having.
+Personas resolve from a project scope too (`<cwd>/.grok/personas/*.toml`),
+which puts user-authored persona text inside whichever repository the session
+runs in — this fork included, where nothing under `.grok/` is tracked and a
+stray `git add -A` would publish it. Prompt overrides and presets never had
+this exposure: they live under `$GROK_HOME`, outside every git tree.
+
+Critical in the queue for the same reason as prompts-modal: upstream keeps
+shipping the stub, so a silent skip on conflict would restore the amputation.
+The `personas-wired` contract is what proves the entry point is still open.
+
+Gork-Patch-Id: personas-rewire
+Gork-Risk: low
+---
+ .gitignore                                    | 12 +++
+ .../xai-grok-agent/src/prompt/context.rs      | 54 ++++++++++--
+ .../docs/user-guide/16-subagents.md           | 12 ++-
+ .../src/agent/mvp_agent/agent_ops.rs          | 22 ++++-
+ .../session/acp_session_impl/tool_calls.rs    |  1 +
+ .../implementations/grok_build/task/mod.rs    | 82 ++++++++++++++++++-
+ .../src/permission/policy.rs                  |  1 +
+ .../src/permission/types.rs                   |  1 +
+ crates/common/xai-tool-types/src/task.rs      | 17 ++++
+ 9 files changed, 192 insertions(+), 10 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index ecbd5bb65a9fab1df60b4522fc1bffa6dcf26bcf..6b84e766a871a5654dd36402f7552857e71ec0fd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,15 @@
+ /target
+ **/*.rs.bk
+ .DS_Store
++
++# Personal agent config kept out of the source tree.
++#
++# Personas resolve from two scopes: `~/.grok/personas/` (user) and
++# `<cwd>/.grok/personas/` (project) — and the second one lands inside whatever
++# repository the session runs in, this fork included. Nothing under `.grok/`
++# is tracked here, so ignoring it costs nothing and is what stops a stray
++# `git add -A` from publishing personal persona text. Prompt overrides and
++# presets live under `$GROK_HOME` and never reach a git tree at all.
++#
++# A project that genuinely wants to share a persona still can: `git add -f`.
++.grok/
+diff --git a/crates/codegen/xai-grok-agent/src/prompt/context.rs b/crates/codegen/xai-grok-agent/src/prompt/context.rs
+index b217faa26ffd0ca5bf7a6ac8cb9e28c01098059c..6ed48c6d080634d02c83cf63369f08db834870b4 100644
+--- a/crates/codegen/xai-grok-agent/src/prompt/context.rs
++++ b/crates/codegen/xai-grok-agent/src/prompt/context.rs
+@@ -219,9 +219,25 @@ impl PromptContext {
+         let section = self.format_personas_section()?;
+         Some(format!("<system-reminder>\n{section}</system-reminder>"))
+     }
+-    /// Always returns `None`: the `persona` parameter was removed from the task tool input, so persona summaries are never injected.
++    /// Catalog of personas the parent may apply when it spawns a subagent.
++    ///
++    /// `None` when the session defines no persona: an empty `<personas>` block
++    /// would advertise a capability with nothing behind it.
+     pub fn format_personas_section(&self) -> Option<String> {
+-        None
++        if self.persona_summaries.is_empty() {
++            return None;
++        }
++        let mut section = String::from("<personas>\n");
++        section.push_str(
++            "Named behavioral overlays for subagents. Pass `persona=\"<name>\"` to the task \
++             tool to apply one; omit it for the subagent type's own default behavior.\n",
++        );
++        for summary in &self.persona_summaries {
++            section.push_str(summary);
++            section.push('\n');
++        }
++        section.push_str("</personas>\n");
++        Some(section)
+     }
+     /// Build the placeholder JSON for template rendering.
+     ///
+@@ -553,14 +569,26 @@ mod tests {
+         assert!(section.contains("<system-reminder>"));
+     }
+     #[test]
+-    fn test_format_personas_section_always_none() {
++    fn format_personas_section_lists_the_available_personas() {
+         let mut ctx = test_context();
+         ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
++        let section = ctx
++            .format_personas_section()
++            .expect("personas defined by the session must reach the model");
++        assert!(section.contains("<personas>"));
++        assert!(section.contains("</personas>"));
++        assert!(section.contains("reviewer"));
+         assert!(
+-            ctx.format_personas_section().is_none(),
+-            "persona section is disabled — persona param removed from task tool"
++            section.contains("persona="),
++            "the catalog must name the task-tool parameter that applies a persona"
+         );
+     }
++
++    #[test]
++    fn format_personas_section_is_none_without_personas() {
++        let ctx = test_context();
++        assert!(ctx.format_personas_section().is_none());
++    }
+     /// AGENTS.md user reminder must be present for the default template when files are present.
+     #[test]
+     fn agents_md_user_reminder_included_for_default_template() {
+@@ -590,12 +618,24 @@ mod tests {
+         assert!(ctx.format_agents_md_section().is_some());
+     }
+     #[test]
+-    fn personas_user_reminder_always_none() {
++    fn personas_user_reminder_wraps_the_catalog() {
++        let mut ctx = test_context();
++        ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
++        let reminder = ctx
++            .personas_user_reminder()
++            .expect("primary sessions receive the persona catalog");
++        assert!(reminder.starts_with("<system-reminder>"));
++        assert!(reminder.contains("reviewer"));
++    }
++
++    #[test]
++    fn personas_user_reminder_skips_subagents() {
+         let mut ctx = test_context();
++        ctx.audience = PromptAudience::Subagent;
+         ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
+         assert!(
+             ctx.personas_user_reminder().is_none(),
+-            "persona reminder is disabled — persona param removed from task tool"
++            "`task` is parent-only, so a child never needs the persona catalog"
+         );
+     }
+     fn child_general_purpose_context() -> PromptContext {
+diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md b/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md
+index 47d6ad83183bc55500a4f939f17ef27349be0d63..d165b9427bed0e7aea92235784c8a73ae9e20ac0 100644
+--- a/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md
++++ b/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md
+@@ -89,7 +89,17 @@ Each file defines one persona, and the file name (without the extension) becomes
+ 
+ Manage personas in the Personas tab of the agents modal (`/personas`). Bundled personas are read-only; personas you define are editable.
+ 
+-> **Note:** Grok Build applies personas through subagent resolution and roles, not through a `spawn_subagent` parameter. The main agent does not pass a persona name when it spawns a child.
++### Applying a persona
++
++The personas available to a session are advertised to the model in a `<personas>` block, and the `task` tool takes a `persona` parameter, so the main agent can pick one when it spawns a child:
++
++```
++task(subagent_type="general-purpose", persona="researcher", description="...", prompt="...")
++```
++
++Resolution order stays the same as for a persona applied through a role: an explicit spawn value wins over the role default, which wins over the persona's own defaults. A persona name that does not resolve **fails the spawn** rather than quietly running the child without its overlay, and a resumed subagent should be given the same persona as its source (the resume footer states which one it used).
++
++Personas still apply through subagent resolution and roles as well; the spawn parameter is one more way in, not a replacement.
+ 
+ ### Persona Fields
+ 
+diff --git a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs
+index 0c32c24a15081ea2ead2a2fe9604367e9ded729b..3c7614e9440d0e42456e805ac7027f292181f1bb 100644
+--- a/crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs
++++ b/crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs
+@@ -4549,6 +4549,26 @@ impl MvpAgent {
+         let respect_gitignore = self.cfg.borrow().respect_gitignore;
+         let path_not_found_hints = self.cfg.borrow().path_not_found_hints;
+         let subagent_toggle = self.cfg.borrow().subagent_toggle.clone();
++        // Persona catalog for this session's `<personas>` block. Upstream hands
++        // an empty vec to the session, which hides every configured persona from
++        // the model and leaves the `task` tool's `persona` argument unusable.
++        // Sorted by name: the system prompt is cached, so a HashMap's iteration
++        // order must not leak into it.
++        let persona_summaries = {
++            let cfg = self.cfg.borrow();
++            let (_, personas) = crate::config::SubagentsConfig::effective_definition_maps(
++                &cfg.subagent_roles,
++                &cfg.subagent_personas,
++                tool_ctx.cwd.as_path(),
++                crate::agent::folder_trust::project_scope_allowed(tool_ctx.cwd.as_path()),
++            );
++            let mut entries: Vec<_> = personas.into_iter().collect();
++            entries.sort_by(|a, b| a.0.cmp(&b.0));
++            entries
++                .into_iter()
++                .map(|(name, persona)| persona.render_io_summary(&name))
++                .collect::<Vec<String>>()
++        };
+         let handle_display_cwd = prompt_display_cwd.clone();
+         let auth_manager = Some(self.auth_manager.clone());
+         let bash_params_json = {
+@@ -4810,7 +4830,7 @@ impl MvpAgent {
+                     client_hooks,
+                     prompt_display_cwd,
+                     subagent_toggle,
+-                    Vec::new(),
++                    persona_summaries,
+                     xai_grok_agent::prompt::context::PromptAudience::Primary,
+                     None,
+                     None,
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
+index 46f83774c8c96a1399fa20a1989afbafd2a8ed19..40daed9eb054bddf5a9c41b674af634f00ec0764 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs
+@@ -3392,6 +3392,7 @@ mod plan_mode_edit_gate_tests {
+                     resume_from: None,
+                     cwd: None,
+                     model: None,
++                    persona: None,
+                     task_id: None,
+                 })
+             ),
+diff --git a/crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs b/crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs
+index d3736246af246b75eaef503104f15301ae7ac5e9..01bbd6a625e24c23bda7fdea41f6816f8127c7d2 100644
+--- a/crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs
++++ b/crates/codegen/xai-grok-tools/src/implementations/grok_build/task/mod.rs
+@@ -454,6 +454,11 @@ impl xai_tool_runtime::Tool for TaskTool {
+             model
+         };
+ 
++        // Same sentinel handling as `model`. Unlike `model`, a persona is kept
++        // on resume: the resume footer asks for the source's persona back, and
++        // resume-identity validation compares them.
++        let persona = xai_tool_types::sanitize_optional_arg(input.persona.clone());
++
+         // Treat blank/empty/"null" cwd as absent (models sometimes emit these).
+         // Also strip stray surrounding quote characters and expand `~`.
+         let cwd = input.cwd.as_deref().and_then(sanitize_cwd_value);
+@@ -602,7 +607,7 @@ impl xai_tool_runtime::Tool for TaskTool {
+                 model,
+                 model_override_provenance: ModelOverrideProvenance::Tool,
+                 reasoning_effort: None,
+-                persona: None,
++                persona,
+                 // JSON cannot set this field. Compat-harness adapters still
+                 // populate it in-process; model-facing spawns stay `None`.
+                 capability_mode: input.capability_mode,
+@@ -856,6 +861,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -895,6 +901,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -929,6 +936,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -960,6 +968,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -1018,6 +1027,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -1074,6 +1084,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -1117,6 +1128,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -1225,6 +1237,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: None,
++            persona: None,
+             task_id: None,
+         }
+     }
+@@ -1833,6 +1846,55 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn task_tool_input_schema_advertises_persona() {
++        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
++        let persona = schema["properties"]
++            .get("persona")
++            .expect("persona must be advertised so the model can apply one");
++        assert!(
++            persona["description"]
++                .as_str()
++                .unwrap_or_default()
++                .contains("<personas>"),
++            "the description must point at the catalog block that lists valid names"
++        );
++    }
++
++    #[tokio::test]
++    async fn persona_reaches_the_spawn_request() {
++        let (backend, mut rx) = make_backend();
++        let resources = resources_for_task(backend);
++        let shared = resources.into_shared();
++        let handle = tokio::spawn(async move {
++            let request = unwrap_spawn(rx.recv().await.unwrap());
++            assert_eq!(
++                request.runtime_overrides.persona.as_deref(),
++                Some("reviewer"),
++                "a model-facing persona must reach subagent resolution"
++            );
++            let id = request.id.clone();
++            request
++                .result_tx
++                .send(SubagentResult {
++                    success: true,
++                    output: "ok".into(),
++                    subagent_id: id.clone(),
++                    child_session_id: id,
++                    ..Default::default()
++                })
++                .unwrap();
++        });
++
++        let mut input = task_input("general-purpose", false);
++        input.persona = Some("  reviewer  ".into());
++        let result = xai_tool_runtime::Tool::run(&TaskTool, test_ctx(shared), input)
++            .await
++            .unwrap();
++        handle.await.unwrap();
++        assert!(matches!(result, ToolOutput::SubagentCompleted(_)));
++    }
++
+     #[test]
+     fn runtime_overrides_struct_default_is_all_none() {
+         let overrides = SubagentRuntimeOverrides::default();
+@@ -1854,6 +1916,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: Some("test-model".into()),
++            persona: None,
+             task_id: Some("task-123".into()),
+         };
+         let json = serde_json::to_string(&input).unwrap();
+@@ -2122,6 +2185,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: None,
++            persona: None,
+             task_id: None,
+         })
+         .unwrap();
+@@ -2171,6 +2235,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2207,6 +2272,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: None,
++            persona: None,
+             task_id: None,
+         };
+         let json = serde_json::to_string(&input).unwrap();
+@@ -2253,6 +2319,7 @@ mod tests {
+                 resume_from: Some("prev-id".into()),
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2319,6 +2386,7 @@ mod tests {
+                     resume_from: Some(sentinel.into()),
+                     cwd: None,
+                     model: None,
++                    persona: None,
+                     task_id: None,
+                 },
+             )
+@@ -2365,6 +2433,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: None,
++            persona: None,
+             task_id: None,
+         };
+         let json = serde_json::to_string(&input).unwrap();
+@@ -2393,6 +2462,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("/tmp".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2447,6 +2517,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2497,6 +2568,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("null".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2547,6 +2619,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("  ".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2600,6 +2673,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2634,6 +2708,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2689,6 +2764,7 @@ mod tests {
+                     resume_from: None,
+                     cwd: Some(sentinel.into()),
+                     model: None,
++                    persona: None,
+                     task_id: None,
+                 },
+             )
+@@ -2742,6 +2818,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("/tmp".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2799,6 +2876,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("\"/tmp".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2851,6 +2929,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: Some("/tmp".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+@@ -2899,6 +2978,7 @@ mod tests {
+                 resume_from: Some("prev-id".into()),
+                 cwd: Some("/tmp/some-dir".into()),
+                 model: None,
++                persona: None,
+                 task_id: None,
+             },
+         )
+diff --git a/crates/codegen/xai-grok-workspace/src/permission/policy.rs b/crates/codegen/xai-grok-workspace/src/permission/policy.rs
+index f00dc3f983ba93e68379ea3b6302b210cb54f0a5..1c1feb2931c29f29f4882b92bcb1ef1be4cc0845 100644
+--- a/crates/codegen/xai-grok-workspace/src/permission/policy.rs
++++ b/crates/codegen/xai-grok-workspace/src/permission/policy.rs
+@@ -1304,6 +1304,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: None,
++            persona: None,
+             task_id: None,
+         }));
+ 
+diff --git a/crates/codegen/xai-grok-workspace/src/permission/types.rs b/crates/codegen/xai-grok-workspace/src/permission/types.rs
+index e516d13470f9e19a55950be5741d9bd49f511272..bef96e1bb35b6fe09664692f25bd402fbc09f3ed 100644
+--- a/crates/codegen/xai-grok-workspace/src/permission/types.rs
++++ b/crates/codegen/xai-grok-workspace/src/permission/types.rs
+@@ -788,6 +788,7 @@ mod tests {
+                 resume_from: None,
+                 cwd: None,
+                 model: None,
++                persona: None,
+                 task_id: None,
+             })),
+             AccessKind::Edit(p) if p == "task:general-purpose"
+diff --git a/crates/common/xai-tool-types/src/task.rs b/crates/common/xai-tool-types/src/task.rs
+index bb81f82c06e08c69677210f0ba230a9ed3042071..07ff316d4aa4cfdcc9a44b889d35a25b36d84873 100644
+--- a/crates/common/xai-tool-types/src/task.rs
++++ b/crates/common/xai-tool-types/src/task.rs
+@@ -103,6 +103,22 @@ pub struct TaskToolInput {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub model: Option<String>,
+ 
++    /// Optional persona applied to this subagent as a behavioral overlay.
++    ///
++    /// Resolved against the session's personas (`config.toml`
++    /// `[subagents.personas.*]`, `.grok/personas/*.toml`, `~/.grok/personas/*.toml`).
++    /// The available names are advertised to the model in the `<personas>`
++    /// section; an unknown name fails the spawn rather than silently running
++    /// without the overlay.
++    #[schemars(
++        description = "Optional persona name applied to this subagent as a behavioral overlay \
++            (tone, output format, task focus). Use one of the names listed in the <personas> \
++            section; omit it when no persona fits. When resuming, pass the same persona the \
++            source subagent used."
++    )]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub persona: Option<String>,
++
+     /// Server-injected before execution. Becomes the subagent's session ID.
+     #[schemars(skip)]
+     #[serde(default)]
+@@ -1405,6 +1421,7 @@ mod tests {
+             resume_from: None,
+             cwd: None,
+             model: None,
++            persona: None,
+             task_id: None,
+         };
+         let value = serde_json::to_value(&input).unwrap();
+
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
+prerequisite-patch-id: 5334f8182338a8406ef54556119a815f49cc11ba
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 586f4e22105f7f778afdbe214b0f87de3c01da98
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
+prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
+prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
+prerequisite-patch-id: f350eb478b08b349e42de5d6d841966b29051846
+-- 
+2.43.0
+

@@ -22,38 +22,56 @@ Ported to 1.0.3 with two conflicts, both trivial: `prompt/mod.rs` (upstream
 added `browser_verification` next to this patch's `catalog`; both kept) and
 the shell CHANGELOG (the Unreleased section now sits above 1.0.1-1.0.3).
 
+Presets became per session in 1.0.16. A preset directory is the source of
+truth instead of a shared working copy, each session binds to one by id in
+`prompt-presets/.state.json`, and `PromptContext` carries the session id so
+resolution stays correct in a leader process hosting several sessions at
+once. The old shape mirrored every edit into the active preset and let
+`apply` rewrite one shared `prompts/` directory, so two sessions could not
+hold two prompt sets and an experiment silently rewrote the preset it
+started from.
+
+Saving onto a name that exists now asks instead of overwriting (the
+`PresetExists` error was declared and never constructed), `c` no longer
+deletes anything — it points the session at the built-in defaults — and the
+modal gains rename, duplicate, a filter over the preset list, per-preset
+metadata and a permanent source indicator. `/prompts` takes list/use/save/
+update/defaults so presets are drivable without the modal. Pre-existing
+overrides are promoted once into a preset, non-destructively.
+
 Gork-Patch-Id: prompts-modal
 Gork-Risk: low
 ---
  README.md                                     |    2 +
- crates/codegen/xai-grok-agent/src/agent.rs    |    7 +-
- crates/codegen/xai-grok-agent/src/config.rs   |   12 +-
- crates/codegen/xai-grok-agent/src/lib.rs      |   11 +
- .../xai-grok-agent/src/prompt/catalog.rs      |  777 +++++++
- .../xai-grok-agent/src/prompt/context.rs      |   20 +-
+ crates/codegen/xai-grok-agent/src/agent.rs    |   11 +-
+ crates/codegen/xai-grok-agent/src/builder.rs  |   11 +-
+ crates/codegen/xai-grok-agent/src/config.rs   |   22 +-
+ crates/codegen/xai-grok-agent/src/lib.rs      |   14 +
+ .../xai-grok-agent/src/prompt/catalog.rs      | 1551 ++++++++++++
+ .../xai-grok-agent/src/prompt/context.rs      |   32 +-
  .../codegen/xai-grok-agent/src/prompt/mod.rs  |    1 +
  .../xai-grok-agent/src/prompt/template.rs     |    5 +
- .../docs/user-guide/04-slash-commands.md      |   10 +
+ .../docs/user-guide/04-slash-commands.md      |   15 +
  .../docs/user-guide/05-configuration.md       |    2 +
  .../docs/user-guide/16-subagents.md           |    2 +
- .../docs/user-guide/25-prompts.md             |  153 ++
+ .../docs/user-guide/25-prompts.md             |  193 ++
  .../xai-grok-pager/docs/user-guide/README.md  |    1 +
  .../codegen/xai-grok-pager/src/app/actions.rs |    4 +
  .../src/app/agent_view/modals.rs              |    2 +
  .../src/app/agent_view/render.rs              |    7 +-
  .../xai-grok-pager/src/app/dispatch/router.rs |    9 +-
- .../src/app/dispatch/settings/ui.rs           |   42 +
+ .../src/app/dispatch/settings/ui.rs           |   51 +
  .../src/app/dispatch/tests/router.rs          |    2 +
  .../xai-grok-pager/src/app/external_editor.rs |   14 +
  .../codegen/xai-grok-pager/src/app/modals.rs  |   85 +
  .../xai-grok-pager/src/slash/commands/mod.rs  |    2 +
- .../src/slash/commands/prompts.rs             |   63 +
+ .../src/slash/commands/prompts.rs             |  181 ++
  .../codegen/xai-grok-pager/src/views/mod.rs   |    1 +
  .../codegen/xai-grok-pager/src/views/modal.rs |    6 +
- .../xai-grok-pager/src/views/prompts_modal.rs | 1909 +++++++++++++++++
+ .../xai-grok-pager/src/views/prompts_modal.rs | 2093 +++++++++++++++++
  crates/codegen/xai-grok-shell/CHANGELOG.md    |    9 +-
- .../session/acp_session_impl/model_switch.rs  |    2 +-
- 28 files changed, 3137 insertions(+), 23 deletions(-)
+ .../session/acp_session_impl/model_switch.rs  |    4 +-
+ 29 files changed, 4308 insertions(+), 24 deletions(-)
  create mode 100644 crates/codegen/xai-grok-agent/src/prompt/catalog.rs
  create mode 100644 crates/codegen/xai-grok-pager/docs/user-guide/25-prompts.md
  create mode 100644 crates/codegen/xai-grok-pager/src/slash/commands/prompts.rs
@@ -73,28 +91,82 @@ index 4569db83fe4fee02ba656f8eaa52db22e43e8e63..f2e07f38abeec62ba128a29478bc9931
  
  > [!NOTE]
 diff --git a/crates/codegen/xai-grok-agent/src/agent.rs b/crates/codegen/xai-grok-agent/src/agent.rs
-index 9cd595eb3091811b6e6a58359d371b4544b6d8ed..20897f279e0d5790c95b59d5505cad8dfb6affc0 100644
+index 9cd595eb3091811b6e6a58359d371b4544b6d8ed..32e38936e57eda9487a96c795ae93e0c060c624f 100644
 --- a/crates/codegen/xai-grok-agent/src/agent.rs
 +++ b/crates/codegen/xai-grok-agent/src/agent.rs
-@@ -97,8 +97,11 @@ impl Agent {
+@@ -97,8 +97,15 @@ impl Agent {
      }
  
      /// Compact system prompt for post-compaction use.
 -    pub fn compact_system_prompt(&self) -> &str {
 -        crate::prompt::template::COMPACT_SYSTEM_PROMPT
 +    ///
-+    /// Honours `$GROK_HOME/prompts/compact-system.md` when present; otherwise
-+    /// the built-in default. Returns an owned string so overrides can vary.
++    /// Honours this session's prompt preset (or the unnamed overrides) when one
++    /// carries `compact-system`; otherwise the built-in default. Returns an
++    /// owned string so overrides can vary.
 +    pub fn compact_system_prompt(&self) -> String {
-+        crate::prompt::catalog::resolve_body(crate::prompt::catalog::PromptId::CompactSystem)
++        crate::prompt::catalog::resolve_body_for(
++            self.prompt_context.prompt_session_id.as_deref(),
++            crate::prompt::catalog::PromptId::CompactSystem,
++        )
      }
  
      pub fn tool_bridge(&self) -> &Arc<ToolBridge> {
+diff --git a/crates/codegen/xai-grok-agent/src/builder.rs b/crates/codegen/xai-grok-agent/src/builder.rs
+index 4a8683906fe025d698f8069df3b4125cc41e2471..8623b48da4631e6580765ed42441fd090cf15db6 100644
+--- a/crates/codegen/xai-grok-agent/src/builder.rs
++++ b/crates/codegen/xai-grok-agent/src/builder.rs
+@@ -1152,7 +1152,15 @@ impl AgentBuilder {
+             version: 1,
+             prompt_mode: definition.prompt_mode.clone(),
+             audience: self.prompt_audience,
+-            prompt_body: definition.prompt_body.clone(),
++            // A built-in subagent body comes from the overridable catalog, and
++            // `definition` resolved it with no session in hand. Re-resolve it
++            // for the owning session so its preset wins.
++            prompt_body: definition
++                .prompt_catalog_id
++                .map(|id| {
++                    crate::prompt::catalog::resolve_body_for(self.owner_session_id.as_deref(), id)
++                })
++                .or_else(|| definition.prompt_body.clone()),
+             include_browser_verification: definition.include_browser_verification(),
+             system_prompt: definition.system_prompt.clone(),
+             agents_md_files,
+@@ -1173,6 +1181,7 @@ impl AgentBuilder {
+             ),
+             is_non_interactive: self.is_non_interactive,
+             system_prompt_label: self.system_prompt_label,
++            prompt_session_id: self.owner_session_id.clone(),
+         };
+         let system_prompt = prompt_context
+             .render(&tool_bridge)
 diff --git a/crates/codegen/xai-grok-agent/src/config.rs b/crates/codegen/xai-grok-agent/src/config.rs
-index fc46a7bd1dbfe2d7625e70d56c5d26fc0e980454..ee3b73e88283abf9d0cd9d9a4d743fac5cf3c75f 100644
+index fc46a7bd1dbfe2d7625e70d56c5d26fc0e980454..e6935512ddc86a771b6a249bbc4d640d4ba8744e 100644
 --- a/crates/codegen/xai-grok-agent/src/config.rs
 +++ b/crates/codegen/xai-grok-agent/src/config.rs
-@@ -1519,34 +1519,34 @@ impl AgentDefinition {
+@@ -703,6 +703,12 @@ pub struct AgentDefinition {
+     /// Prevents external definitions from opting into built-in-only policy by name.
+     #[serde(skip)]
+     pub(crate) builtin_name: Option<BuiltinAgentName>,
++    /// Catalog id backing `prompt_body` when it came from an overridable
++    /// template. `prompt_body` is resolved once at definition time; the builder
++    /// re-resolves it from this id for the owning session, so a per-session
++    /// preset wins over the process-wide default.
++    #[serde(skip)]
++    pub(crate) prompt_catalog_id: Option<crate::prompt::catalog::PromptId>,
+     #[serde(default = "default_prompt_mode")]
+     pub prompt_mode: PromptMode,
+     #[serde(default = "default_grok_build_toolset")]
+@@ -1424,6 +1430,7 @@ impl AgentDefinition {
+             description: description.to_string(),
+             plugin_name: None,
+             builtin_name: None,
++            prompt_catalog_id: None,
+             prompt_mode: PromptMode::Extend,
+             tool_config: default_grok_build_toolset(),
+             capability_mode: None,
+@@ -1519,34 +1526,37 @@ impl AgentDefinition {
          }
      }
      pub fn general_purpose() -> Self {
@@ -107,6 +179,7 @@ index fc46a7bd1dbfe2d7625e70d56c5d26fc0e980454..ee3b73e88283abf9d0cd9d9a4d743fac
              tool_config: general_purpose_toolset(),
 -            prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
 +            prompt_body: Some(catalog::resolve_body(PromptId::SubagentGeneralPurpose)),
++            prompt_catalog_id: Some(PromptId::SubagentGeneralPurpose),
              ..Self::base(BuiltinAgentName::GeneralPurpose, "")
          }
      }
@@ -119,6 +192,7 @@ index fc46a7bd1dbfe2d7625e70d56c5d26fc0e980454..ee3b73e88283abf9d0cd9d9a4d743fac
              permission_mode: PermissionMode::Plan,
 -            prompt_body: Some(subagent_prompts::EXPLORE_PROMPT.to_string()),
 +            prompt_body: Some(catalog::resolve_body(PromptId::SubagentExplore)),
++            prompt_catalog_id: Some(PromptId::SubagentExplore),
              inherit_skills: false,
              ..Self::base(BuiltinAgentName::Explore, "")
          }
@@ -132,23 +206,27 @@ index fc46a7bd1dbfe2d7625e70d56c5d26fc0e980454..ee3b73e88283abf9d0cd9d9a4d743fac
              permission_mode: PermissionMode::Plan,
 -            prompt_body: Some(subagent_prompts::PLAN_PROMPT.to_string()),
 +            prompt_body: Some(catalog::resolve_body(PromptId::SubagentPlan)),
++            prompt_catalog_id: Some(PromptId::SubagentPlan),
              inherit_skills: false,
              ..Self::base(BuiltinAgentName::Plan, "")
          }
 diff --git a/crates/codegen/xai-grok-agent/src/lib.rs b/crates/codegen/xai-grok-agent/src/lib.rs
-index 647f765e369bacc01323a0d670ebcd00760b32a3..17eb6ceae0d05aa45b7896941c836d1b85774d11 100644
+index 647f765e369bacc01323a0d670ebcd00760b32a3..6e047f6c56529a8a667a831bc7c57a1bfacdd4fc 100644
 --- a/crates/codegen/xai-grok-agent/src/lib.rs
 +++ b/crates/codegen/xai-grok-agent/src/lib.rs
-@@ -22,5 +22,16 @@ pub use config::preset_names;
+@@ -22,5 +22,19 @@ pub use config::preset_names;
  pub use config::toolset_for_preset;
  pub use config::workspace_grok_build_toolset;
  pub use error::AgentBuildError;
 +pub use prompt::catalog::{
-+    EffectivePrompt, PromptCatalogError, PromptCategory, PromptDefinition, PromptId,
-+    PromptPresetInfo, active_preset_name, apply_preset, clear_active_preset, clear_all_overrides,
-+    default_body, delete_preset, effective_prompt, has_override, list_presets, list_prompts,
-+    materialize_for_edit, override_path, presets_root, prompts_dir, reset_override, resolve_body,
-+    save_override, save_preset, validate_preset_name,
++    EffectivePrompt, PresetWriteMode, PromptCatalogError, PromptCategory, PromptDefinition,
++    PromptId, PromptPresetInfo, PromptSource, activate_session, active_preset_name, apply_preset,
++    clear_active_preset, clear_all_overrides, current_session_id, deactivate_session, default_body,
++    delete_preset, duplicate_preset, effective_prompt, has_override, list_presets, list_prompts,
++    effective_prompt_for, materialize_for_edit, override_path, preset_exists, presets_root,
++    prompts_dir, rename_preset, reset_override, resolve_body, resolve_body_for, save_override,
++    save_preset, session_source, set_preset_description, set_session_source, source_for_session,
++    suggest_preset_name, use_defaults_only, validate_preset_name,
 +};
  pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext};
 +pub use prompt::template::{
@@ -158,10 +236,10 @@ index 647f765e369bacc01323a0d670ebcd00760b32a3..17eb6ceae0d05aa45b7896941c836d1b
  pub use system_reminder::ReminderPolicy;
 diff --git a/crates/codegen/xai-grok-agent/src/prompt/catalog.rs b/crates/codegen/xai-grok-agent/src/prompt/catalog.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965ec1e8af8b
+index 0000000000000000000000000000000000000000..3e873cee5176ec736d0f5c3115c837c76c58df71
 --- /dev/null
 +++ b/crates/codegen/xai-grok-agent/src/prompt/catalog.rs
-@@ -0,0 +1,777 @@
+@@ -0,0 +1,1551 @@
 +//! Catalog of user-overridable LLM prompt templates.
 +//!
 +//! # Defaults vs user data
@@ -170,17 +248,31 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +//!   shipped in the binary. They are never snapshotted to disk as the source
 +//!   of truth — a Grok Build update that changes templates updates the
 +//!   default automatically for any prompt without a user override.
-+//! - **User overrides** live only under `$GROK_HOME` (typically `~/.grok`),
++//! - **User data** lives only under `$GROK_HOME` (typically `~/.grok`),
 +//!   outside any project git tree:
-+//!   - `$GROK_HOME/prompts/<id>.md` — active working overrides
-+//!   - `$GROK_HOME/prompt-presets/<name>/` — named snapshots of overrides
++//!   - `$GROK_HOME/prompt-presets/<name>/<id>.md` — preset bodies
++//!   - `$GROK_HOME/prompt-presets/<name>/meta.json` — preset metadata
++//!   - `$GROK_HOME/prompt-presets/.active` — preset new sessions start on
++//!   - `$GROK_HOME/prompt-presets/.state.json` — per-session bindings
++//!   - `$GROK_HOME/prompts/<id>.md` — unnamed scratch overrides (legacy)
 +//!
 +//! Rebuild / update / force-push of the source repo therefore never ships
 +//! personal prompts to GitHub; the installed binary still carries the stock
-+//! defaults, and local presets under `$GROK_HOME` are preserved.
++//! defaults, and everything under `$GROK_HOME` is preserved across updates.
++//!
++//! # Per-session prompt source
++//!
++//! Each session resolves its own [`PromptSource`]: pure built-in defaults, the
++//! unnamed scratch overrides, or one named preset. The binding is keyed by
++//! session id and persisted, so resuming a session restores the preset it ran
++//! on. Two sessions can therefore run different presets at the same time —
++//! nothing is copied into a shared working directory.
 +
++use std::collections::BTreeMap;
 +use std::path::{Path, PathBuf};
++use std::sync::RwLock;
 +
++use serde::{Deserialize, Serialize};
 +use thiserror::Error;
 +
 +use crate::prompt::subagent_prompts;
@@ -212,7 +304,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +        PromptId::SubagentPlan,
 +    ];
 +
-+    /// File-safe id used as `~/.grok/prompts/<id>.md`.
++    /// File-safe id used as `<source>/<id>.md`.
 +    pub fn as_str(self) -> &'static str {
 +        match self {
 +            Self::BaseSystem => "base-system",
@@ -226,10 +318,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    }
 +
 +    pub fn parse(s: &str) -> Option<Self> {
-+        Self::ALL
-+            .iter()
-+            .copied()
-+            .find(|id| id.as_str() == s)
++        Self::ALL.iter().copied().find(|id| id.as_str() == s)
 +    }
 +
 +    pub fn category(self) -> PromptCategory {
@@ -272,12 +361,8 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +            Self::SubagentGeneralPurpose => {
 +                "Persona body for the general-purpose subagent (appended to the subagent shell)."
 +            }
-+            Self::SubagentExplore => {
-+                "Persona body for the read-only explore subagent."
-+            }
-+            Self::SubagentPlan => {
-+                "Persona body for the read-only plan / architect subagent."
-+            }
++            Self::SubagentExplore => "Persona body for the read-only explore subagent.",
++            Self::SubagentPlan => "Persona body for the read-only plan / architect subagent.",
 +        }
 +    }
 +
@@ -355,8 +440,41 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    PresetNotFound(String),
 +    #[error("preset already exists: {0}")]
 +    PresetExists(String),
++    #[error("prompt source is read-only: built-in defaults cannot be edited in place")]
++    ReadOnlySource,
 +    #[error("io error for prompt override: {0}")]
 +    Io(#[from] std::io::Error),
++}
++
++/// Where a session reads its prompt bodies from.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
++pub enum PromptSource {
++    /// Pure built-in templates; on-disk overrides are ignored.
++    Defaults,
++    /// The unnamed `$GROK_HOME/prompts/` scratch overrides.
++    Scratch,
++    /// A named preset under `$GROK_HOME/prompt-presets/`.
++    Preset(String),
++}
++
++impl PromptSource {
++    /// Preset name, when this source is a named preset.
++    pub fn preset_name(&self) -> Option<&str> {
++        match self {
++            Self::Preset(name) => Some(name.as_str()),
++            _ => None,
++        }
++    }
++
++    /// Short label for status lines / the modal subtitle.
++    pub fn label(&self) -> String {
++        match self {
++            Self::Defaults => "built-in defaults".to_string(),
++            Self::Scratch => "unnamed overrides".to_string(),
++            Self::Preset(name) => name.clone(),
++        }
++    }
 +}
 +
 +/// Metadata for a named prompt preset under `$GROK_HOME/prompt-presets/`.
@@ -365,12 +483,30 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    pub name: String,
 +    /// Number of override files in the preset (catalog ids only).
 +    pub override_count: usize,
++    /// Whether the current session resolves through this preset.
 +    pub is_active: bool,
++    /// Free-form description from `meta.json`.
++    pub description: Option<String>,
++    /// RFC3339 timestamp of the last write, from `meta.json`.
++    pub updated: Option<String>,
++}
++
++/// Whether a preset write may replace an existing preset.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum PresetWriteMode {
++    /// Fail with [`PromptCatalogError::PresetExists`] when the name is taken.
++    Create,
++    /// Replace the preset's catalog files when the name is taken.
++    Overwrite,
 +}
 +
 +/// List all catalog definitions in display order (grouped by category).
 +pub fn list_prompts() -> Vec<PromptDefinition> {
-+    PromptId::ALL.iter().copied().map(PromptDefinition::from).collect()
++    PromptId::ALL
++        .iter()
++        .copied()
++        .map(PromptDefinition::from)
++        .collect()
 +}
 +
 +/// Built-in default body for `id` (always fresh; never reads overrides).
@@ -391,22 +527,199 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +#[cfg(test)]
 +static TEST_PROMPTS_HOME: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 +
-+/// Directory that holds user prompt overrides (`$GROK_HOME/prompts`).
-+pub fn prompts_dir() -> Option<PathBuf> {
++fn grok_home() -> Option<PathBuf> {
 +    #[cfg(test)]
 +    {
 +        if let Ok(guard) = TEST_PROMPTS_HOME.lock()
 +            && let Some(ref home) = *guard
 +        {
-+            return Some(home.join("prompts"));
++            return Some(home.clone());
 +        }
 +    }
-+    xai_grok_config::user_grok_home().map(|h| h.join("prompts"))
++    xai_grok_config::user_grok_home()
 +}
 +
-+/// Override file path for `id`, or `None` when GROK_HOME is unavailable.
++/// Directory that holds the unnamed scratch overrides (`$GROK_HOME/prompts`).
++pub fn prompts_dir() -> Option<PathBuf> {
++    grok_home().map(|h| h.join("prompts"))
++}
++
++// ── Per-session source state ───────────────────────────────────────────────
++
++#[derive(Debug, Default)]
++struct SessionState {
++    session_id: Option<String>,
++    source: Option<PromptSource>,
++}
++
++static SESSION: RwLock<SessionState> = RwLock::new(SessionState {
++    session_id: None,
++    source: None,
++});
++
++fn session_state_read<R>(f: impl FnOnce(&SessionState) -> R) -> R {
++    match SESSION.read() {
++        Ok(guard) => f(&guard),
++        Err(poisoned) => f(&poisoned.into_inner()),
++    }
++}
++
++fn session_state_write<R>(f: impl FnOnce(&mut SessionState) -> R) -> R {
++    match SESSION.write() {
++        Ok(mut guard) => f(&mut guard),
++        Err(poisoned) => f(&mut poisoned.into_inner()),
++    }
++}
++
++/// The session id this process currently resolves prompts for, if any.
++pub fn current_session_id() -> Option<String> {
++    session_state_read(|s| s.session_id.clone())
++}
++
++/// Bind this process to `session_id` and resolve the source it should use.
++///
++/// Resolution order: persisted binding for this session id, then the `.active`
++/// preset, then the scratch overrides when they hold anything, then defaults.
++/// Called on session start / resume / switch.
++pub fn activate_session(session_id: &str) -> Result<PromptSource, PromptCatalogError> {
++    ensure_migrated()?;
++    let bound = load_state()?
++        .bindings
++        .get(session_id)
++        .map(|b| b.source.clone());
++    let source = match bound {
++        // A preset that has since been deleted falls back to the default source.
++        Some(PromptSource::Preset(name)) if !preset_dir(&name)?.is_dir() => default_source(),
++        Some(source) => source,
++        None => default_source(),
++    };
++    session_state_write(|s| {
++        s.session_id = Some(session_id.to_string());
++        s.source = Some(source.clone());
++    });
++    Ok(source)
++}
++
++/// Forget the process-level session binding (tests, session teardown).
++pub fn deactivate_session() {
++    session_state_write(|s| {
++        s.session_id = None;
++        s.source = None;
++    });
++}
++
++/// Source used by a session with no binding of its own: the `.active` preset,
++/// else the unnamed scratch overrides.
++///
++/// Never [`PromptSource::Defaults`] — an empty scratch already resolves to the
++/// built-in bodies, and unlike `Defaults` it is writable, so a first edit has
++/// somewhere to land. `Defaults` is only ever reached on explicit request.
++fn default_source() -> PromptSource {
++    if let Ok(Some(name)) = read_active_marker()
++        && preset_dir(&name).map(|d| d.is_dir()).unwrap_or(false)
++    {
++        return PromptSource::Preset(name);
++    }
++    PromptSource::Scratch
++}
++
++fn scratch_has_overrides() -> bool {
++    let Some(dir) = prompts_dir() else {
++        return false;
++    };
++    PromptId::ALL
++        .iter()
++        .any(|id| non_empty_file(&dir.join(format!("{}.md", id.as_str()))))
++}
++
++/// The source this session resolves prompt bodies from.
++pub fn session_source() -> PromptSource {
++    if let Some(source) = session_state_read(|s| s.source.clone()) {
++        return source;
++    }
++    default_source()
++}
++
++/// Point this session at `source`, persisting the binding when a session id is
++/// known. A named preset also becomes the `.active` default for new sessions.
++pub fn set_session_source(source: PromptSource) -> Result<(), PromptCatalogError> {
++    if let PromptSource::Preset(ref name) = source {
++        let name = validate_preset_name(name)?;
++        if !preset_dir(&name)?.is_dir() {
++            return Err(PromptCatalogError::PresetNotFound(name));
++        }
++        write_active_marker(Some(&name))?;
++    }
++    if let Some(session_id) = current_session_id() {
++        update_state(|state| {
++            state.bindings.insert(
++                session_id.clone(),
++                SessionBinding {
++                    source: source.clone(),
++                    updated: now_rfc3339(),
++                },
++            );
++            prune_bindings(&mut state.bindings);
++        })?;
++    }
++    session_state_write(|s| s.source = Some(source));
++    Ok(())
++}
++
++/// The source `session_id` resolves through.
++///
++/// The binding lives on disk, so a TUI and the leader process that actually
++/// runs the agent agree on it even though they are different processes. The
++/// in-memory source wins for the session this process is focused on, so a
++/// switch takes effect before anything is persisted.
++pub fn source_for_session(session_id: Option<&str>) -> PromptSource {
++    let Some(session_id) = session_id else {
++        return session_source();
++    };
++    if let Some(source) = session_state_read(|s| {
++        (s.session_id.as_deref() == Some(session_id))
++            .then(|| s.source.clone())
++            .flatten()
++    }) {
++        return source;
++    }
++    let bound = load_state()
++        .ok()
++        .and_then(|state| state.bindings.get(session_id).map(|b| b.source.clone()));
++    match bound {
++        Some(PromptSource::Preset(name)) if !preset_exists(&name) => default_source(),
++        Some(source) => source,
++        None => default_source(),
++    }
++}
++
++/// Directory backing `source`, or `None` for pure defaults.
++fn source_dir_for(source: &PromptSource) -> Option<PathBuf> {
++    match source {
++        PromptSource::Defaults => None,
++        PromptSource::Scratch => prompts_dir(),
++        PromptSource::Preset(name) => preset_dir(name).ok(),
++    }
++}
++
++/// Directory backing the session's overrides, or `None` for pure defaults.
++fn override_source_dir() -> Option<PathBuf> {
++    source_dir_for(&session_source())
++}
++
++/// Writable directory backing the session's overrides.
++fn writable_source_dir() -> Result<PathBuf, PromptCatalogError> {
++    match session_source() {
++        PromptSource::Defaults => Err(PromptCatalogError::ReadOnlySource),
++        PromptSource::Scratch => prompts_dir().ok_or(PromptCatalogError::NoGrokHome),
++        PromptSource::Preset(name) => preset_dir(&name),
++    }
++}
++
++/// Override file path for `id` in the session's source, or `None` when the
++/// session runs on pure defaults (or `GROK_HOME` is unavailable).
 +pub fn override_path(id: PromptId) -> Option<PathBuf> {
-+    prompts_dir().map(|d| d.join(format!("{}.md", id.as_str())))
++    override_source_dir().map(|d| d.join(format!("{}.md", id.as_str())))
 +}
 +
 +/// Override path under an explicit home (tests).
@@ -436,9 +749,25 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    }
 +}
 +
-+/// Effective body = override if present, else default.
++fn non_empty_file(path: &Path) -> bool {
++    path.is_file()
++        && std::fs::read_to_string(path)
++            .map(|b| !b.trim().is_empty())
++            .unwrap_or(false)
++}
++
++/// Effective body = the session source's override if present, else default.
 +pub fn effective_prompt(id: PromptId) -> Result<EffectivePrompt, PromptCatalogError> {
-+    let path = override_path(id);
++    effective_prompt_for(None, id)
++}
++
++/// [`effective_prompt`] resolved for one specific session.
++pub fn effective_prompt_for(
++    session_id: Option<&str>,
++    id: PromptId,
++) -> Result<EffectivePrompt, PromptCatalogError> {
++    let path = source_dir_for(&source_for_session(session_id))
++        .map(|d| d.join(format!("{}.md", id.as_str())));
 +    if let Some(ref p) = path
 +        && let Some(body) = load_override_at(p)?
 +    {
@@ -459,7 +788,12 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +
 +/// Convenience: body only (falls back to default on IO / missing home).
 +pub fn resolve_body(id: PromptId) -> String {
-+    match effective_prompt(id) {
++    resolve_body_for(None, id)
++}
++
++/// [`resolve_body`] resolved for one specific session.
++pub fn resolve_body_for(session_id: Option<&str>, id: PromptId) -> String {
++    match effective_prompt_for(session_id, id) {
 +        Ok(ep) => ep.body,
 +        Err(e) => {
 +            tracing::warn!(error = %e, prompt = id.as_str(), "prompt override resolve failed; using default");
@@ -476,29 +810,24 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    matches!(load_override(id), Ok(Some(_)))
 +}
 +
-+/// Write `body` to the override file, creating `$GROK_HOME/prompts` as needed.
++/// Write `body` into the session's source, creating the directory as needed.
 +///
 +/// If `body` matches the built-in default (trimmed), the override is **removed**
 +/// instead so future binary updates keep delivering the stock template.
++///
++/// Editing while a preset is bound writes into that preset only: no mirroring,
++/// no shared working copy, so a parallel session on another preset is untouched.
 +pub fn save_override(id: PromptId, body: &str) -> Result<PathBuf, PromptCatalogError> {
-+    let path = override_path(id).ok_or(PromptCatalogError::NoGrokHome)?;
++    let dir = writable_source_dir()?;
++    let path = dir.join(format!("{}.md", id.as_str()));
 +    if body.trim() == default_body(id).trim() {
 +        reset_override(id)?;
 +        // Still return the canonical path (may not exist after clear).
 +        return Ok(path);
 +    }
-+    if let Some(parent) = path.parent() {
-+        std::fs::create_dir_all(parent)?;
-+    }
++    std::fs::create_dir_all(&dir)?;
 +    std::fs::write(&path, body)?;
-+    // Keep the active preset in sync when one is selected.
-+    if let Some(name) = active_preset_name()? {
-+        let preset_path = preset_dir(&name)?.join(format!("{}.md", id.as_str()));
-+        if let Some(parent) = preset_path.parent() {
-+            std::fs::create_dir_all(parent)?;
-+        }
-+        std::fs::write(&preset_path, body)?;
-+    }
++    touch_source_meta();
 +    Ok(path)
 +}
 +
@@ -506,51 +835,52 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +///
 +/// If an override already exists, returns its path unchanged.
 +pub fn materialize_for_edit(id: PromptId) -> Result<PathBuf, PromptCatalogError> {
-+    if let Some(path) = override_path(id)
-+        && path.is_file()
-+    {
++    let dir = writable_source_dir()?;
++    let path = dir.join(format!("{}.md", id.as_str()));
++    if path.is_file() {
 +        return Ok(path);
 +    }
 +    // Force-write even if equal to default (editor needs a path on disk).
-+    let dir = prompts_dir().ok_or(PromptCatalogError::NoGrokHome)?;
 +    std::fs::create_dir_all(&dir)?;
-+    let path = dir.join(format!("{}.md", id.as_str()));
 +    std::fs::write(&path, default_body(id))?;
++    touch_source_meta();
 +    Ok(path)
 +}
 +
-+/// Delete the override file. No-op if absent.
++/// Delete the override file in the session's source. No-op if absent.
 +pub fn reset_override(id: PromptId) -> Result<(), PromptCatalogError> {
-+    let Some(path) = override_path(id) else {
-+        return Err(PromptCatalogError::NoGrokHome);
-+    };
++    let dir = writable_source_dir()?;
++    let path = dir.join(format!("{}.md", id.as_str()));
 +    match std::fs::remove_file(&path) {
-+        Ok(()) => {}
++        Ok(()) => touch_source_meta(),
 +        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 +        Err(e) => return Err(e.into()),
-+    }
-+    // Mirror into active preset when set.
-+    if let Some(name) = active_preset_name()? {
-+        let preset_path = preset_dir(&name)?.join(format!("{}.md", id.as_str()));
-+        let _ = std::fs::remove_file(preset_path);
 +    }
 +    Ok(())
 +}
 +
-+/// Remove every active catalog override (pure built-in defaults).
++/// Run this session on pure built-in defaults, without deleting anything.
++///
++/// The preset (or scratch file set) stays on disk; only this session's source
++/// changes, so another session keeps running its own preset.
++pub fn use_defaults_only() -> Result<(), PromptCatalogError> {
++    set_session_source(PromptSource::Defaults)
++}
++
++/// Delete every override file in the unnamed scratch set.
++///
++/// Presets are untouched. Kept for callers that really want the legacy
++/// working directory emptied; the `/prompts` modal uses [`use_defaults_only`].
 +pub fn clear_all_overrides() -> Result<(), PromptCatalogError> {
++    let dir = prompts_dir().ok_or(PromptCatalogError::NoGrokHome)?;
 +    for id in PromptId::ALL {
-+        let path = match override_path(*id) {
-+            Some(p) => p,
-+            None => return Err(PromptCatalogError::NoGrokHome),
-+        };
++        let path = dir.join(format!("{}.md", id.as_str()));
 +        match std::fs::remove_file(&path) {
 +            Ok(()) => {}
 +            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 +            Err(e) => return Err(e.into()),
 +        }
 +    }
-+    set_active_preset_name(None)?;
 +    Ok(())
 +}
 +
@@ -558,18 +888,19 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +
 +const PRESETS_SUBDIR: &str = "prompt-presets";
 +const ACTIVE_MARKER: &str = ".active";
++const STATE_FILE: &str = ".state.json";
++const META_FILE: &str = "meta.json";
++/// On-disk schema version for `meta.json` / `.state.json`. A newer binary
++/// reads older files; an older binary ignores fields it does not know.
++const STATE_VERSION: u32 = 1;
++/// Cap on remembered session bindings (oldest are pruned first).
++const MAX_BINDINGS: usize = 256;
++/// Preset name the legacy scratch overrides migrate into.
++const MIGRATED_PRESET_NAME: &str = "perso";
 +
 +/// `$GROK_HOME/prompt-presets`.
 +pub fn presets_root() -> Option<PathBuf> {
-+    #[cfg(test)]
-+    {
-+        if let Ok(guard) = TEST_PROMPTS_HOME.lock()
-+            && let Some(ref home) = *guard
-+        {
-+            return Some(home.join(PRESETS_SUBDIR));
-+        }
-+    }
-+    xai_grok_config::user_grok_home().map(|h| h.join(PRESETS_SUBDIR))
++    grok_home().map(|h| h.join(PRESETS_SUBDIR))
 +}
 +
 +fn presets_root_required() -> Result<PathBuf, PromptCatalogError> {
@@ -581,12 +912,12 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    Ok(presets_root_required()?.join(name))
 +}
 +
-+/// Accept `a-zA-Z0-9._-` only, 1..=64 chars, not `.` / `..`.
++/// Accept `a-zA-Z0-9._-` only, 1..=64 chars, not `.` / `..`, no leading dot
++/// (dot-prefixed entries are catalog control files, not presets).
 +pub fn validate_preset_name(name: &str) -> Result<String, PromptCatalogError> {
 +    let name = name.trim();
 +    if name.is_empty()
-+        || name == "."
-+        || name == ".."
++        || name.starts_with('.')
 +        || name.len() > 64
 +        || !name
 +            .chars()
@@ -597,14 +928,36 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    Ok(name.to_string())
 +}
 +
-+/// Name of the currently active preset, if any.
-+pub fn active_preset_name() -> Result<Option<String>, PromptCatalogError> {
-+    let root = match presets_root() {
-+        Some(r) => r,
-+        None => return Ok(None),
++/// Suggest a free preset name (`base`, `base-2`, `base-3`, …).
++///
++/// Probes the directory directly rather than going through [`list_presets`],
++/// which would re-enter the migration that calls this.
++pub fn suggest_preset_name(base: &str) -> String {
++    let base = base.trim();
++    let base = if validate_preset_name(base).is_ok() {
++        base.to_string()
++    } else {
++        "preset".to_string()
 +    };
-+    let marker = root.join(ACTIVE_MARKER);
-+    match std::fs::read_to_string(&marker) {
++    if !preset_exists(&base) {
++        return base;
++    }
++    (2..1000)
++        .map(|i| format!("{base}-{i}"))
++        .find(|candidate| !preset_exists(candidate))
++        .unwrap_or(base)
++}
++
++/// Name of the preset the current session runs on, if any.
++pub fn active_preset_name() -> Result<Option<String>, PromptCatalogError> {
++    Ok(session_source().preset_name().map(str::to_string))
++}
++
++fn read_active_marker() -> Result<Option<String>, PromptCatalogError> {
++    let Some(root) = presets_root() else {
++        return Ok(None);
++    };
++    match std::fs::read_to_string(root.join(ACTIVE_MARKER)) {
 +        Ok(s) => {
 +            let t = s.trim();
 +            if t.is_empty() {
@@ -618,7 +971,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    }
 +}
 +
-+fn set_active_preset_name(name: Option<&str>) -> Result<(), PromptCatalogError> {
++fn write_active_marker(name: Option<&str>) -> Result<(), PromptCatalogError> {
 +    let root = presets_root_required()?;
 +    std::fs::create_dir_all(&root)?;
 +    let marker = root.join(ACTIVE_MARKER);
@@ -636,26 +989,187 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    Ok(())
 +}
 +
++// ── Persisted catalog state ────────────────────────────────────────────────
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct SessionBinding {
++    source: PromptSource,
++    updated: String,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct CatalogState {
++    #[serde(default = "state_version")]
++    version: u32,
++    /// Whether the legacy scratch overrides were already promoted to a preset.
++    #[serde(default)]
++    migrated_scratch: bool,
++    #[serde(default)]
++    bindings: BTreeMap<String, SessionBinding>,
++}
++
++fn state_version() -> u32 {
++    STATE_VERSION
++}
++
++impl Default for CatalogState {
++    fn default() -> Self {
++        Self {
++            version: STATE_VERSION,
++            migrated_scratch: false,
++            bindings: BTreeMap::new(),
++        }
++    }
++}
++
++fn now_rfc3339() -> String {
++    chrono::Utc::now().to_rfc3339()
++}
++
++fn load_state() -> Result<CatalogState, PromptCatalogError> {
++    let Some(root) = presets_root() else {
++        return Ok(CatalogState::default());
++    };
++    match std::fs::read_to_string(root.join(STATE_FILE)) {
++        // A corrupt or future-shaped state file must never wedge prompt
++        // resolution: fall back to defaults and let the next write heal it.
++        Ok(raw) => Ok(serde_json::from_str(&raw).unwrap_or_default()),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogState::default()),
++        Err(e) => Err(e.into()),
++    }
++}
++
++fn update_state(
++    f: impl FnOnce(&mut CatalogState),
++) -> Result<(), PromptCatalogError> {
++    let root = presets_root_required()?;
++    let mut state = load_state()?;
++    state.version = STATE_VERSION;
++    f(&mut state);
++    std::fs::create_dir_all(&root)?;
++    let body = serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".to_string());
++    write_atomic(&root.join(STATE_FILE), &body)
++}
++
++/// Write via a sibling temp file + rename so a concurrent reader never sees a
++/// half-written control file.
++fn write_atomic(path: &Path, body: &str) -> Result<(), PromptCatalogError> {
++    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
++    std::fs::write(&tmp, body)?;
++    match std::fs::rename(&tmp, path) {
++        Ok(()) => Ok(()),
++        Err(e) => {
++            let _ = std::fs::remove_file(&tmp);
++            Err(e.into())
++        }
++    }
++}
++
++fn prune_bindings(bindings: &mut BTreeMap<String, SessionBinding>) {
++    if bindings.len() <= MAX_BINDINGS {
++        return;
++    }
++    let mut by_age: Vec<(String, String)> = bindings
++        .iter()
++        .map(|(k, v)| (k.clone(), v.updated.clone()))
++        .collect();
++    by_age.sort_by(|a, b| a.1.cmp(&b.1));
++    let excess = bindings.len() - MAX_BINDINGS;
++    for (key, _) in by_age.into_iter().take(excess) {
++        bindings.remove(&key);
++    }
++}
++
++// ── Preset metadata ────────────────────────────────────────────────────────
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct PresetMeta {
++    #[serde(default = "state_version")]
++    version: u32,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    description: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    created: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    updated: Option<String>,
++}
++
++impl Default for PresetMeta {
++    fn default() -> Self {
++        Self {
++            version: STATE_VERSION,
++            description: None,
++            created: None,
++            updated: None,
++        }
++    }
++}
++
++fn load_meta(dir: &Path) -> PresetMeta {
++    std::fs::read_to_string(dir.join(META_FILE))
++        .ok()
++        .and_then(|raw| serde_json::from_str(&raw).ok())
++        .unwrap_or_default()
++}
++
++fn write_meta(dir: &Path, meta: &PresetMeta) -> Result<(), PromptCatalogError> {
++    std::fs::create_dir_all(dir)?;
++    let body = serde_json::to_string_pretty(meta).unwrap_or_else(|_| "{}".to_string());
++    write_atomic(&dir.join(META_FILE), &body)
++}
++
++/// Stamp `updated` on the preset backing the current session (best effort).
++fn touch_source_meta() {
++    let Some(name) = session_source().preset_name().map(str::to_string) else {
++        return;
++    };
++    let Ok(dir) = preset_dir(&name) else {
++        return;
++    };
++    let mut meta = load_meta(&dir);
++    meta.version = STATE_VERSION;
++    meta.created.get_or_insert_with(now_rfc3339);
++    meta.updated = Some(now_rfc3339());
++    let _ = write_meta(&dir, &meta);
++}
++
++/// Set a preset's free-form description.
++pub fn set_preset_description(
++    name: &str,
++    description: Option<&str>,
++) -> Result<(), PromptCatalogError> {
++    let dir = preset_dir(name)?;
++    if !dir.is_dir() {
++        return Err(PromptCatalogError::PresetNotFound(name.to_string()));
++    }
++    let mut meta = load_meta(&dir);
++    meta.version = STATE_VERSION;
++    meta.created.get_or_insert_with(now_rfc3339);
++    meta.updated = Some(now_rfc3339());
++    meta.description = description
++        .map(str::trim)
++        .filter(|d| !d.is_empty())
++        .map(str::to_string);
++    write_meta(&dir, &meta)
++}
++
 +fn count_preset_overrides(dir: &Path) -> usize {
 +    PromptId::ALL
 +        .iter()
-+        .filter(|id| {
-+            let p = dir.join(format!("{}.md", id.as_str()));
-+            p.is_file()
-+                && std::fs::read_to_string(&p)
-+                    .map(|b| !b.trim().is_empty())
-+                    .unwrap_or(false)
-+        })
++        .filter(|id| non_empty_file(&dir.join(format!("{}.md", id.as_str()))))
 +        .count()
 +}
 +
-+/// List named presets (sorted), marking the active one.
++/// List named presets (sorted), marking the one the session runs on.
++///
++/// Read-only on purpose: promoting the legacy overrides is [`activate_session`]'s
++/// job, so merely listing presets never writes into `$GROK_HOME`.
 +pub fn list_presets() -> Result<Vec<PromptPresetInfo>, PromptCatalogError> {
 +    let root = match presets_root() {
 +        Some(r) => r,
 +        None => return Ok(Vec::new()),
 +    };
-+    let active = active_preset_name()?;
++    let active = session_source().preset_name().map(str::to_string);
 +    let mut out = Vec::new();
 +    let entries = match std::fs::read_dir(&root) {
 +        Ok(e) => e,
@@ -671,76 +1185,138 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
 +            continue;
 +        };
-+        if name.starts_with('.') {
-+            continue;
-+        }
 +        if validate_preset_name(name).is_err() {
 +            continue;
 +        }
++        let meta = load_meta(&path);
 +        out.push(PromptPresetInfo {
 +            name: name.to_string(),
 +            override_count: count_preset_overrides(&path),
 +            is_active: active.as_deref() == Some(name),
++            description: meta.description,
++            updated: meta.updated,
 +        });
 +    }
 +    out.sort_by(|a, b| a.name.cmp(&b.name));
 +    Ok(out)
 +}
 +
-+/// Snapshot the **current active overrides** into a named preset and mark it active.
++/// Whether a preset with this name exists.
++pub fn preset_exists(name: &str) -> bool {
++    preset_dir(name).map(|d| d.is_dir()).unwrap_or(false)
++}
++
++/// Copy the catalog `.md` files from `src` into `dest`, replacing `dest`'s set.
++fn copy_catalog_files(src: &Path, dest: &Path) -> Result<(), PromptCatalogError> {
++    std::fs::create_dir_all(dest)?;
++    for id in PromptId::ALL {
++        let file = format!("{}.md", id.as_str());
++        let _ = std::fs::remove_file(dest.join(&file));
++        let from = src.join(&file);
++        if let Ok(body) = std::fs::read_to_string(&from)
++            && !body.trim().is_empty()
++        {
++            std::fs::write(dest.join(&file), body)?;
++        }
++    }
++    Ok(())
++}
++
++/// Snapshot the session's current overrides into a named preset and bind the
++/// session to it.
 +///
-+/// Only override files are copied — built-in defaults are never duplicated.
-+pub fn save_preset(name: &str) -> Result<(), PromptCatalogError> {
++/// `mode` decides what an existing name means: [`PresetWriteMode::Create`]
++/// refuses it, [`PresetWriteMode::Overwrite`] replaces its catalog files.
++/// Built-in defaults are never duplicated — only real override files are copied.
++pub fn save_preset(name: &str, mode: PresetWriteMode) -> Result<(), PromptCatalogError> {
 +    let name = validate_preset_name(name)?;
 +    let dest = preset_dir(&name)?;
-+    if dest.exists() {
-+        // Overwrite: clear previous catalog files first.
-+        for id in PromptId::ALL {
-+            let _ = std::fs::remove_file(dest.join(format!("{}.md", id.as_str())));
-+        }
-+    } else {
-+        std::fs::create_dir_all(&dest)?;
++    let existed = dest.is_dir();
++    if existed && mode == PresetWriteMode::Create {
++        return Err(PromptCatalogError::PresetExists(name));
 +    }
-+    let src = prompts_dir().ok_or(PromptCatalogError::NoGrokHome)?;
-+    for id in PromptId::ALL {
-+        let from = src.join(format!("{}.md", id.as_str()));
-+        if let Ok(body) = std::fs::read_to_string(&from)
-+            && !body.trim().is_empty()
-+        {
-+            std::fs::write(dest.join(format!("{}.md", id.as_str())), body)?;
-+        }
++    match override_source_dir() {
++        Some(src) if src != dest => copy_catalog_files(&src, &dest)?,
++        // Pure defaults, or saving a preset onto itself: keep the files as-is.
++        _ => std::fs::create_dir_all(&dest)?,
 +    }
-+    set_active_preset_name(Some(&name))?;
++    let mut meta = load_meta(&dest);
++    meta.version = STATE_VERSION;
++    meta.created.get_or_insert_with(now_rfc3339);
++    meta.updated = Some(now_rfc3339());
++    write_meta(&dest, &meta)?;
++    set_session_source(PromptSource::Preset(name))
++}
++
++/// Copy `src` to a new preset `dest` without touching the session's source.
++pub fn duplicate_preset(src: &str, dest: &str) -> Result<(), PromptCatalogError> {
++    let src_name = validate_preset_name(src)?;
++    let dest_name = validate_preset_name(dest)?;
++    let src_dir = preset_dir(&src_name)?;
++    if !src_dir.is_dir() {
++        return Err(PromptCatalogError::PresetNotFound(src_name));
++    }
++    let dest_dir = preset_dir(&dest_name)?;
++    if dest_dir.is_dir() {
++        return Err(PromptCatalogError::PresetExists(dest_name));
++    }
++    copy_catalog_files(&src_dir, &dest_dir)?;
++    let mut meta = load_meta(&src_dir);
++    meta.version = STATE_VERSION;
++    meta.created = Some(now_rfc3339());
++    meta.updated = Some(now_rfc3339());
++    write_meta(&dest_dir, &meta)
++}
++
++/// Rename a preset, carrying the `.active` marker and session bindings over.
++pub fn rename_preset(old: &str, new: &str) -> Result<(), PromptCatalogError> {
++    let old_name = validate_preset_name(old)?;
++    let new_name = validate_preset_name(new)?;
++    if old_name == new_name {
++        return Ok(());
++    }
++    let old_dir = preset_dir(&old_name)?;
++    if !old_dir.is_dir() {
++        return Err(PromptCatalogError::PresetNotFound(old_name));
++    }
++    let new_dir = preset_dir(&new_name)?;
++    if new_dir.exists() {
++        return Err(PromptCatalogError::PresetExists(new_name));
++    }
++    std::fs::rename(&old_dir, &new_dir)?;
++    let mut meta = load_meta(&new_dir);
++    meta.version = STATE_VERSION;
++    meta.updated = Some(now_rfc3339());
++    write_meta(&new_dir, &meta)?;
++    if read_active_marker()?.as_deref() == Some(old_name.as_str()) {
++        write_active_marker(Some(&new_name))?;
++    }
++    update_state(|state| {
++        for binding in state.bindings.values_mut() {
++            if binding.source == PromptSource::Preset(old_name.clone()) {
++                binding.source = PromptSource::Preset(new_name.clone());
++                binding.updated = now_rfc3339();
++            }
++        }
++    })?;
++    session_state_write(|s| {
++        if s.source == Some(PromptSource::Preset(old_name.clone())) {
++            s.source = Some(PromptSource::Preset(new_name.clone()));
++        }
++    });
 +    Ok(())
 +}
 +
-+/// Replace active overrides with a preset's snapshot and mark it active.
++/// Bind the session to `name` (the preset must exist).
 +pub fn apply_preset(name: &str) -> Result<(), PromptCatalogError> {
 +    let name = validate_preset_name(name)?;
-+    let src = preset_dir(&name)?;
-+    if !src.is_dir() {
++    if !preset_dir(&name)?.is_dir() {
 +        return Err(PromptCatalogError::PresetNotFound(name));
 +    }
-+    let dest = prompts_dir().ok_or(PromptCatalogError::NoGrokHome)?;
-+    std::fs::create_dir_all(&dest)?;
-+    // Clear working overrides first.
-+    for id in PromptId::ALL {
-+        let _ = std::fs::remove_file(dest.join(format!("{}.md", id.as_str())));
-+    }
-+    for id in PromptId::ALL {
-+        let from = src.join(format!("{}.md", id.as_str()));
-+        if let Ok(body) = std::fs::read_to_string(&from)
-+            && !body.trim().is_empty()
-+        {
-+            std::fs::write(dest.join(format!("{}.md", id.as_str())), body)?;
-+        }
-+    }
-+    set_active_preset_name(Some(&name))?;
-+    Ok(())
++    set_session_source(PromptSource::Preset(name))
 +}
 +
-+/// Delete a named preset. If it was active, clears the active marker only
-+/// (working overrides under `prompts/` are left as-is).
++/// Delete a named preset and drop every binding that pointed at it.
 +pub fn delete_preset(name: &str) -> Result<(), PromptCatalogError> {
 +    let name = validate_preset_name(name)?;
 +    let dir = preset_dir(&name)?;
@@ -748,15 +1324,58 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +        return Err(PromptCatalogError::PresetNotFound(name));
 +    }
 +    std::fs::remove_dir_all(&dir)?;
-+    if active_preset_name()?.as_deref() == Some(name.as_str()) {
-+        set_active_preset_name(None)?;
++    if read_active_marker()?.as_deref() == Some(name.as_str()) {
++        write_active_marker(None)?;
 +    }
++    let gone = PromptSource::Preset(name.clone());
++    update_state(|state| {
++        state.bindings.retain(|_, b| b.source != gone);
++    })?;
++    session_state_write(|s| {
++        if s.source.as_ref() == Some(&gone) {
++            s.source = None;
++        }
++    });
 +    Ok(())
 +}
 +
-+/// Detach from any preset label without wiping working overrides.
++/// Detach from any preset without deleting it: fall back to the unnamed
++/// scratch overrides.
 +pub fn clear_active_preset() -> Result<(), PromptCatalogError> {
-+    set_active_preset_name(None)
++    set_session_source(PromptSource::Scratch)
++}
++
++// ── Migration ──────────────────────────────────────────────────────────────
++
++/// Promote pre-existing scratch overrides into a real preset, once.
++///
++/// Non-destructive: the scratch files stay where they are, so an older binary
++/// still finds them. Runs at most once per `$GROK_HOME` (recorded in the state
++/// file) and is a no-op when there is nothing to promote.
++fn ensure_migrated() -> Result<(), PromptCatalogError> {
++    let state = load_state()?;
++    if state.migrated_scratch {
++        return Ok(());
++    }
++    if !scratch_has_overrides() {
++        // Nothing to promote; record it so we stop probing on every call.
++        return update_state(|s| s.migrated_scratch = true);
++    }
++    let src = prompts_dir().ok_or(PromptCatalogError::NoGrokHome)?;
++    let name = suggest_preset_name(MIGRATED_PRESET_NAME);
++    let dest = preset_dir(&name)?;
++    copy_catalog_files(&src, &dest)?;
++    let meta = PresetMeta {
++        version: STATE_VERSION,
++        description: Some("Migrated from the unnamed prompt overrides.".to_string()),
++        created: Some(now_rfc3339()),
++        updated: Some(now_rfc3339()),
++    };
++    write_meta(&dest, &meta)?;
++    if read_active_marker()?.is_none() {
++        write_active_marker(Some(&name))?;
++    }
++    update_state(|s| s.migrated_scratch = true)
 +}
 +
 +/// Test helpers: operate under an explicit home directory.
@@ -792,9 +1411,16 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +        let tmp = TempDir::new().unwrap();
 +        // Isolate from process-wide `grok_home()` OnceLock via test hook.
 +        *TEST_PROMPTS_HOME.lock().unwrap() = Some(tmp.path().to_path_buf());
++        deactivate_session();
 +        let result = f(tmp.path());
++        deactivate_session();
 +        *TEST_PROMPTS_HOME.lock().unwrap() = None;
 +        result
++    }
++
++    /// Put the session on the scratch source, the pre-preset default.
++    fn use_scratch() {
++        session_state_write(|s| s.source = Some(PromptSource::Scratch));
 +    }
 +
 +    #[test]
@@ -829,6 +1455,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    #[serial]
 +    fn save_load_reset_override() {
 +        with_temp_grok_home(|home| {
++            use_scratch();
 +            let id = PromptId::CompactSystem;
 +            assert!(!has_override(id));
 +            let ep = effective_prompt(id).unwrap();
@@ -860,6 +1487,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    #[serial]
 +    fn materialize_for_edit_creates_file_once() {
 +        with_temp_grok_home(|_| {
++            use_scratch();
 +            let id = PromptId::BaseSystem;
 +            let path1 = materialize_for_edit(id).unwrap();
 +            assert!(path1.is_file());
@@ -878,6 +1506,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    #[serial]
 +    fn empty_override_falls_through_to_default() {
 +        with_temp_grok_home(|_| {
++            use_scratch();
 +            let id = PromptId::CompactSystem;
 +            // Force-write empty via direct IO (save_override clears defaults only).
 +            let path = override_path(id).unwrap();
@@ -893,6 +1522,7 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    #[serial]
 +    fn save_equal_to_default_clears_override() {
 +        with_temp_grok_home(|_| {
++            use_scratch();
 +            let id = PromptId::CompactSystem;
 +            save_override(id, "custom").unwrap();
 +            assert!(has_override(id));
@@ -906,14 +1536,17 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    #[serial]
 +    fn preset_save_apply_delete() {
 +        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
 +            let id = PromptId::CompactSystem;
 +            save_override(id, "preset-body-a").unwrap();
-+            save_preset("alpha").unwrap();
++            save_preset("alpha", PresetWriteMode::Create).unwrap();
 +            assert_eq!(active_preset_name().unwrap().as_deref(), Some("alpha"));
++            assert_eq!(resolve_body(id), "preset-body-a");
 +
-+            clear_all_overrides().unwrap();
++            use_defaults_only().unwrap();
 +            assert!(!has_override(id));
 +            assert!(active_preset_name().unwrap().is_none());
++            assert_eq!(resolve_body(id), COMPACT_SYSTEM_PROMPT);
 +
 +            apply_preset("alpha").unwrap();
 +            assert_eq!(resolve_body(id), "preset-body-a");
@@ -923,11 +1556,14 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +            assert_eq!(list.len(), 1);
 +            assert!(list[0].is_active);
 +            assert_eq!(list[0].override_count, 1);
++            assert!(list[0].updated.is_some(), "meta.json stamps updated");
 +
 +            delete_preset("alpha").unwrap();
 +            assert!(list_presets().unwrap().is_empty());
-+            // Working overrides remain after delete.
-+            assert_eq!(resolve_body(id), "preset-body-a");
++            // The session no longer resolves through the deleted preset, and
++            // nothing points at it any more.
++            assert!(active_preset_name().unwrap().is_none());
++            assert!(!preset_exists("alpha"));
 +        });
 +    }
 +
@@ -935,12 +1571,228 @@ index 0000000000000000000000000000000000000000..259624187dd539e930c51764a73e965e
 +    fn reject_bad_preset_names() {
 +        assert!(validate_preset_name("").is_err());
 +        assert!(validate_preset_name("..").is_err());
++        assert!(validate_preset_name(".active").is_err());
 +        assert!(validate_preset_name("has space").is_err());
 +        assert!(validate_preset_name("ok-name_1").is_ok());
 +    }
++
++    #[test]
++    #[serial]
++    fn create_mode_refuses_to_clobber_an_existing_preset() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            save_override(PromptId::CompactSystem, "first").unwrap();
++            save_preset("dup", PresetWriteMode::Create).unwrap();
++
++            use_defaults_only().unwrap();
++            use_scratch();
++            save_override(PromptId::CompactSystem, "second").unwrap();
++
++            let err = save_preset("dup", PresetWriteMode::Create).unwrap_err();
++            assert!(
++                matches!(err, PromptCatalogError::PresetExists(ref n) if n == "dup"),
++                "expected PresetExists, got {err:?}"
++            );
++            // The original preset is intact.
++            apply_preset("dup").unwrap();
++            assert_eq!(resolve_body(PromptId::CompactSystem), "first");
++
++            // Overwrite is the explicit path and does replace it.
++            use_scratch();
++            save_preset("dup", PresetWriteMode::Overwrite).unwrap();
++            assert_eq!(resolve_body(PromptId::CompactSystem), "second");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn sessions_bind_to_their_own_preset() {
++        with_temp_grok_home(|_| {
++            // Session 1 builds and runs on `alpha`.
++            activate_session("s-1").unwrap();
++            save_override(PromptId::CompactSystem, "body-alpha").unwrap();
++            save_preset("alpha", PresetWriteMode::Create).unwrap();
++
++            // Session 2 builds and runs on `beta`.
++            activate_session("s-2").unwrap();
++            use_defaults_only().unwrap();
++            use_scratch();
++            save_override(PromptId::CompactSystem, "body-beta").unwrap();
++            save_preset("beta", PresetWriteMode::Create).unwrap();
++            assert_eq!(resolve_body(PromptId::CompactSystem), "body-beta");
++
++            // Coming back to session 1 restores its own preset and body.
++            let source = activate_session("s-1").unwrap();
++            assert_eq!(source, PromptSource::Preset("alpha".into()));
++            assert_eq!(resolve_body(PromptId::CompactSystem), "body-alpha");
++
++            // And session 2 still resolves its own.
++            assert_eq!(
++                activate_session("s-2").unwrap(),
++                PromptSource::Preset("beta".into())
++            );
++            assert_eq!(resolve_body(PromptId::CompactSystem), "body-beta");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn editing_a_preset_leaves_the_others_untouched() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            save_override(PromptId::CompactSystem, "shared").unwrap();
++            save_preset("one", PresetWriteMode::Create).unwrap();
++            save_preset("two", PresetWriteMode::Create).unwrap();
++
++            apply_preset("one").unwrap();
++            save_override(PromptId::CompactSystem, "only-in-one").unwrap();
++
++            apply_preset("two").unwrap();
++            assert_eq!(
++                resolve_body(PromptId::CompactSystem),
++                "shared",
++                "editing `one` must not write through to `two`"
++            );
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn new_session_starts_on_the_last_used_preset() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            save_override(PromptId::CompactSystem, "inherited").unwrap();
++            save_preset("shared", PresetWriteMode::Create).unwrap();
++
++            // A session with no binding inherits the `.active` default.
++            let source = activate_session("fresh").unwrap();
++            assert_eq!(source, PromptSource::Preset("shared".into()));
++            assert_eq!(resolve_body(PromptId::CompactSystem), "inherited");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn defaults_only_is_not_destructive() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            save_override(PromptId::CompactSystem, "kept").unwrap();
++            save_preset("keeper", PresetWriteMode::Create).unwrap();
++
++            use_defaults_only().unwrap();
++            assert_eq!(resolve_body(PromptId::CompactSystem), COMPACT_SYSTEM_PROMPT);
++            assert!(save_override(PromptId::CompactSystem, "x").is_err());
++
++            apply_preset("keeper").unwrap();
++            assert_eq!(resolve_body(PromptId::CompactSystem), "kept");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn rename_and_duplicate_preserve_bodies_and_binding() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            save_override(PromptId::CompactSystem, "body").unwrap();
++            save_preset("orig", PresetWriteMode::Create).unwrap();
++
++            duplicate_preset("orig", "copy").unwrap();
++            assert!(preset_exists("copy"));
++            // Duplicating does not move the session.
++            assert_eq!(active_preset_name().unwrap().as_deref(), Some("orig"));
++
++            let err = duplicate_preset("orig", "copy").unwrap_err();
++            assert!(matches!(err, PromptCatalogError::PresetExists(_)));
++
++            rename_preset("orig", "renamed").unwrap();
++            assert!(!preset_exists("orig"));
++            assert_eq!(active_preset_name().unwrap().as_deref(), Some("renamed"));
++            assert_eq!(resolve_body(PromptId::CompactSystem), "body");
++
++            // The persisted binding followed the rename.
++            let source = activate_session("s-1").unwrap();
++            assert_eq!(source, PromptSource::Preset("renamed".into()));
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn scratch_overrides_migrate_into_a_preset_once() {
++        with_temp_grok_home(|home| {
++            // Pre-existing layout written by an older binary.
++            test_support::save_override_in(home, PromptId::CompactSystem, "legacy-body");
++
++            let source = activate_session("s-1").unwrap();
++            assert_eq!(source, PromptSource::Preset(MIGRATED_PRESET_NAME.into()));
++            assert_eq!(resolve_body(PromptId::CompactSystem), "legacy-body");
++
++            // Non-destructive: the legacy file is still readable by an old binary.
++            assert_eq!(
++                test_support::load_override_in(home, PromptId::CompactSystem).as_deref(),
++                Some("legacy-body")
++            );
++
++            // Idempotent: a second activation does not create `perso-2`.
++            activate_session("s-2").unwrap();
++            let names: Vec<String> = list_presets()
++                .unwrap()
++                .into_iter()
++                .map(|p| p.name)
++                .collect();
++            assert_eq!(names, vec![MIGRATED_PRESET_NAME.to_string()]);
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn presets_survive_a_binary_update_that_changes_defaults() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            // Only the prompts the user actually customized are stored…
++            save_override(PromptId::CompactSystem, "user-body").unwrap();
++            save_preset("kept", PresetWriteMode::Create).unwrap();
++
++            let dir = preset_dir("kept").unwrap();
++            assert!(dir.join("compact-system.md").is_file());
++            assert!(
++                !dir.join("base-system.md").exists(),
++                "untouched prompts must not be snapshotted, so updates keep delivering them"
++            );
++
++            // …so an updated binary shipping a new default still wins for them.
++            assert_eq!(resolve_body(PromptId::BaseSystem), default_body(PromptId::BaseSystem));
++            assert_eq!(resolve_body(PromptId::CompactSystem), "user-body");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn suggested_names_avoid_collisions() {
++        with_temp_grok_home(|_| {
++            activate_session("s-1").unwrap();
++            assert_eq!(suggest_preset_name("perso"), "perso");
++            save_override(PromptId::CompactSystem, "b").unwrap();
++            save_preset("perso", PresetWriteMode::Create).unwrap();
++            assert_eq!(suggest_preset_name("perso"), "perso-2");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn corrupt_state_file_does_not_wedge_resolution() {
++        with_temp_grok_home(|_| {
++            let root = presets_root().unwrap();
++            std::fs::create_dir_all(&root).unwrap();
++            std::fs::write(root.join(STATE_FILE), "{ not json").unwrap();
++            // Falls back to a fresh state instead of erroring out.
++            let source = activate_session("s-1").unwrap();
++            assert_eq!(source, PromptSource::Scratch);
++            assert_eq!(resolve_body(PromptId::CompactSystem), COMPACT_SYSTEM_PROMPT);
++        });
++    }
 +}
 diff --git a/crates/codegen/xai-grok-agent/src/prompt/context.rs b/crates/codegen/xai-grok-agent/src/prompt/context.rs
-index aa7db592dcb19d772e599275c177ba2b93c58f18..b87c60e867e87fc4f47ed27858f23c0b4c4e9751 100644
+index aa7db592dcb19d772e599275c177ba2b93c58f18..b217faa26ffd0ca5bf7a6ac8cb9e28c01098059c 100644
 --- a/crates/codegen/xai-grok-agent/src/prompt/context.rs
 +++ b/crates/codegen/xai-grok-agent/src/prompt/context.rs
 @@ -5,7 +5,7 @@
@@ -952,7 +1804,30 @@ index aa7db592dcb19d772e599275c177ba2b93c58f18..b87c60e867e87fc4f47ed27858f23c0b
  use serde::de;
  use serde::{Deserialize, Serialize};
  /// Selects which base template to use for `Extend` mode rendering.
-@@ -252,20 +252,24 @@ impl PromptContext {
+@@ -137,6 +137,14 @@ pub struct PromptContext {
+     /// Not the UI picker name. Defaults to [`DEFAULT_SYSTEM_PROMPT_LABEL`].
+     #[serde(default = "default_system_prompt_label")]
+     pub system_prompt_label: String,
++    /// Session this prompt belongs to, used to resolve its prompt preset.
++    ///
++    /// Prompt overrides are per session, and the process that runs the agent
++    /// (a leader can host several sessions at once) is not necessarily the one
++    /// that picked the preset — so the id travels with the context instead of
++    /// being read from process state.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub prompt_session_id: Option<String>,
+ }
+ /// Default identity on trim-tool-descriptions (`You are Grok released by xAI`).
+ pub const DEFAULT_SYSTEM_PROMPT_LABEL: &str = "Grok";
+@@ -179,6 +187,7 @@ impl Default for PromptContext {
+             current_date: None,
+             is_non_interactive: false,
+             system_prompt_label: default_system_prompt_label(),
++            prompt_session_id: None,
+         }
+     }
+ }
+@@ -252,20 +261,25 @@ impl PromptContext {
          let render = |template: &str| renderer.render_with_extra(template, &placeholders).ok();
          let prompt = match self.prompt_mode {
              PromptMode::Extend => {
@@ -961,12 +1836,13 @@ index aa7db592dcb19d772e599275c177ba2b93c58f18..b87c60e867e87fc4f47ed27858f23c0b
 +                // User overrides from `$GROK_HOME/prompts/` take precedence
 +                // over the embedded templates when present.
 +                let owned_base: String;
++                let session = self.prompt_session_id.as_deref();
                  let base = match &self.system_prompt {
                      TemplateOverride::Custom(template) => template.as_str(),
                      TemplateOverride::Codex => {
 -                        decrypted = apply_patch_template();
 -                        &decrypted
-+                        owned_base = catalog::resolve_body(PromptId::ApplyPatch);
++                        owned_base = catalog::resolve_body_for(session, PromptId::ApplyPatch);
 +                        owned_base.as_str()
                      }
                      TemplateOverride::None => {
@@ -979,11 +1855,27 @@ index aa7db592dcb19d772e599275c177ba2b93c58f18..b87c60e867e87fc4f47ed27858f23c0b
 +                            PromptId::BaseSystem
                          };
 -                        &decrypted
-+                        owned_base = catalog::resolve_body(id);
++                        owned_base = catalog::resolve_body_for(session, id);
 +                        owned_base.as_str()
                      }
                  };
                  let mut prompt = render(base)?;
+@@ -307,6 +321,7 @@ mod tests {
+             current_date: None,
+             is_non_interactive: false,
+             system_prompt_label: default_system_prompt_label(),
++            prompt_session_id: None,
+         }
+     }
+     #[test]
+@@ -609,6 +624,7 @@ mod tests {
+             current_date: None,
+             is_non_interactive: false,
+             system_prompt_label: default_system_prompt_label(),
++            prompt_session_id: None,
+         }
+     }
+     #[test]
 diff --git a/crates/codegen/xai-grok-agent/src/prompt/mod.rs b/crates/codegen/xai-grok-agent/src/prompt/mod.rs
 index cad1c60d5ac474a44a7047f6320d9319db442efc..295824ae9f6db20d5ba1525dae2a7ff798191ae1 100644
 --- a/crates/codegen/xai-grok-agent/src/prompt/mod.rs
@@ -1012,10 +1904,10 @@ index cc6f45687c76c8e9de3a5c7e6fb5c410a5af36fc..065de257b7ef6b73e2934d2cb443661a
  pub const COMPACT_SYSTEM_PROMPT: &str = "You are an AI coding agent. You operate in a workspace with a provided codebase.\n\n\
       Your main goal is to complete the user's request, denoted within the <user_query> tag.";
 diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
-index 082c676f68f0cca4ba430f2878e3136a30b63eb4..e55aae8aa6821db1ac869d08d2423f1af54059da 100644
+index 082c676f68f0cca4ba430f2878e3136a30b63eb4..fcb5c627828d6cc0c9f5dc095727439172145a26 100644
 --- a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
 +++ b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
-@@ -439,6 +439,16 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
+@@ -439,6 +439,21 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
  
  Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
  
@@ -1024,10 +1916,15 @@ index 082c676f68f0cca4ba430f2878e3136a30b63eb4..e55aae8aa6821db1ac869d08d2423f1a
 +Open the [prompt templates](25-prompts.md) browser: preview stock system / subagent prompts, edit overrides in the TUI (or `$EDITOR`), reset to the binary defaults, and save or apply named presets under `~/.grok`. Aliases: `/prompt`, `/system-prompts`.
 +
 +```
-+/prompts
++/prompts                   # open the browser
++/prompts list              # presets, and what this session reads from
++/prompts use <name>        # bind this session to a preset
++/prompts save <name>       # save this session's prompts as a new preset
++/prompts update <name>     # replace an existing preset from this session
++/prompts defaults          # run this session on built-in prompts only
 +```
 +
-+Defaults always resolve from the installed binary; personal overrides live only in `$GROK_HOME/prompts/` and `$GROK_HOME/prompt-presets/` so they are not part of project git history. Full keyboard map, catalog ids, and on-disk layout: [Prompt templates (`/prompts`)](25-prompts.md).
++Presets are **per session**: applying one here never disturbs another session, and a resumed session comes back on the preset it ran on. Defaults always resolve from the installed binary; personal overrides live only in `$GROK_HOME/prompts/` and `$GROK_HOME/prompt-presets/` so they are not part of project git history. Full keyboard map, catalog ids, and on-disk layout: [Prompt templates (`/prompts`)](25-prompts.md).
 +
  ### `/timestamps`
  
@@ -1060,10 +1957,10 @@ index a5361b7bf8304db8c850115a97f232bdb5b1d3c5..47d6ad83183bc55500a4f939f17ef273
  ```toml
 diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/25-prompts.md b/crates/codegen/xai-grok-pager/docs/user-guide/25-prompts.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a1ddc929d
+index 0000000000000000000000000000000000000000..7b9b972e7eea01447138d39180dc09ea78a1c05c
 --- /dev/null
 +++ b/crates/codegen/xai-grok-pager/docs/user-guide/25-prompts.md
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,193 @@
 +# Prompt templates (`/prompts`)
 +
 +Browse, edit, and preset the LLM system prompts Grok injects into sessions and subagents. Defaults always come from the **installed binary** (embedded templates); your personal overrides and presets live only under `$GROK_HOME` (typically `~/.grok`), outside any project repository.
@@ -1074,7 +1971,15 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +
 +Aliases: `/prompt`, `/system-prompts`.
 +
-+You can also open the modal from the command palette.
++You can also open the modal from the command palette, or drive presets without it:
++
++```
++/prompts list              # presets, and what this session reads from
++/prompts use <name>        # bind this session to a preset
++/prompts save <name>       # save this session's prompts as a new preset
++/prompts update <name>     # replace an existing preset from this session
++/prompts defaults          # run this session on built-in prompts only
++```
 +
 +---
 +
@@ -1082,7 +1987,31 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +
 +- **See what the model actually gets** — catalog entries include the base session system prompt, compaction prompt, apply-patch profile, and built-in subagent personas.
 +- **Customize without forking the binary** — save an override; leave a template alone and a future Grok update still refreshes its stock default.
++- **One preset per session** — two sessions can run two different prompt sets at the same time, and a resumed session comes back on the preset it ran on.
 +- **Keep personal prompts off GitHub** — overrides and presets are written under `~/.grok`, never under the project tree. Rebuilds, updates, and force-pushes of the source repo do not ship your private prompt text.
++
++---
++
++## Per-session presets
++
++Each session resolves prompts from exactly one **source**:
++
++| Source | Meaning |
++|--------|---------|
++| A preset | `~/.grok/prompt-presets/<name>/` — the normal case |
++| Unnamed overrides | `~/.grok/prompts/` — the legacy scratch set, when no preset is bound |
++| Built-in defaults | Nothing on disk is read; prompts come from the binary |
++
++The source is chosen per session and remembered by session id in `~/.grok/prompt-presets/.state.json`, so:
++
++- Applying a preset in one session **never** disturbs a session running elsewhere.
++- Editing a prompt writes into the bound preset only — no shared working copy, no silent write-through to a preset you started from.
++- Resuming a session restores the preset it used.
++- A session with no binding of its own starts on `.active`, the last preset you selected anywhere; failing that, on the unnamed overrides (empty ones simply resolve to the built-in prompts).
++
++Create as many presets as you like: there is no cap, names just have to be unique. Saving under a name that already exists **asks first** (`o` / `Enter` to replace, `Esc` to keep); `u` on the Presets tab is the explicit "replace this one" path.
++
++The modal's status line always names the source the session reads from.
 +
 +---
 +
@@ -1091,17 +2020,21 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +| Source | Where it lives | When it updates |
 +|--------|----------------|-----------------|
 +| **Default** | Embedded MiniJinja templates / constants in the binary | Every install or rebuild that ships new templates |
-+| **Override** | `~/.grok/prompts/<id>.md` | Only when you save from `/prompts` or edit the file |
-+| **Preset** | `~/.grok/prompt-presets/<name>/` | Snapshot of the current override set (apply / update / delete from the Presets tab) |
++| **Preset body** | `~/.grok/prompt-presets/<name>/<id>.md` | Only when you save from `/prompts` or edit the file |
++| **Preset metadata** | `~/.grok/prompt-presets/<name>/meta.json` | Description and timestamps, written by the modal |
 +
 +Resolution for each catalog id:
 +
-+1. If a **non-empty** override file exists → use it.
++1. If the session's source holds a **non-empty** file for that id → use it.
 +2. Otherwise → use the binary default.
 +
-+Saving an override that is **byte-identical** to the current default **clears** the override file (you stay on the stock template). Reset does the same: delete the override and fall back to default.
++So a preset only carries the prompts you actually changed: everything else keeps tracking the stock template, and a Grok update still refreshes it. Saving an override that is **byte-identical** to the current default **clears** that file. Reset (`r`) does the same.
 +
-+Override `GROK_HOME` to relocate all of this (and the rest of Grok’s user data). See [Configuration](05-configuration.md#file-locations).
++Override `GROK_HOME` to relocate all of this (and the rest of Grok's user data). See [Configuration](05-configuration.md#file-locations).
++
++### Upgrading from the pre-preset layout
++
++If `~/.grok/prompts/` already held overrides, they are promoted **once** into a preset named `perso`, which becomes the default for new sessions. The original files are left untouched, so an older binary still finds them.
 +
 +---
 +
@@ -1109,8 +2042,8 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +
 +### Session
 +
-+| Title | File id (`~/.grok/prompts/<id>.md`) | Role |
-+|-------|--------------------------------------|------|
++| Title | File id (`<source>/<id>.md`) | Role |
++|-------|------------------------------|------|
 +| Base system | `base-system` | Primary session system-prompt template (`prompt.md`). MiniJinja with `${{ }}` delimiters. |
 +| Subagent shell | `subagent-shell` | Base system template for subagents; persona body is appended (extend mode). |
 +| Apply-patch | `apply-patch` | Coding / apply-patch profile system template. |
@@ -1124,7 +2057,7 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +| explore | `subagent-explore` | Persona body for the read-only explore subagent. |
 +| plan | `subagent-plan` | Persona body for the read-only plan / architect subagent. |
 +
-+> **Not the same as** `prompt_file = ".grok/prompts/researcher.md"` on a **custom role** in `config.toml`. That path is project-scoped role configuration ([Subagents](16-subagents.md)). The `/prompts` catalog only covers the **built-in** session and stock subagent templates under `$GROK_HOME/prompts/`.
++> **Not the same as** `prompt_file = ".grok/prompts/researcher.md"` on a **custom role** in `config.toml`. That path is project-scoped role configuration ([Subagents](16-subagents.md)). The `/prompts` catalog only covers the **built-in** session and stock subagent templates.
 +
 +---
 +
@@ -1137,7 +2070,7 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +| Tab | Purpose |
 +|-----|---------|
 +| **Catalog** | List every built-in prompt, show preview, edit or reset overrides. |
-+| **Presets** | Named snapshots of the full override set; apply, update, delete, or clear all overrides. |
++| **Presets** | Named prompt sets: bind one to this session, create, update, rename, duplicate, delete. |
 +
 +Switch tabs with `Tab` (or the chrome tab strip).
 +
@@ -1149,7 +2082,7 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +| `/` | Focus the filter field (type to narrow; `Esc` leaves filter) |
 +| `Enter` | Edit the selected prompt **in the TUI** |
 +| `r` | Reset selected override to the binary default (confirm with `r` again) |
-+| `n` | Save the **current** override set as a new named preset |
++| `n` | Save this session's prompts as a new named preset |
 +| `Ctrl+F` | Toggle fullscreen |
 +| `Esc` | Close the modal (or cancel edit / filter / confirm) |
 +
@@ -1160,26 +2093,29 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +| Key | Action |
 +|-----|--------|
 +| (type) | Edit multi-line body |
-+| `Ctrl+S` | Save override (or clear it if the body matches the default) |
++| `Ctrl+S` | Save into the session's source (or clear it if the body matches the default) |
 +| `Ctrl+E` | Suspend and open the file in `$VISUAL` / `$EDITOR` |
 +| `Esc` | Cancel and discard unsaved changes |
 +| Click | Place the blinking caret in the field |
 +
-+The editor uses the same hardware terminal caret as the main prompt. After save, the catalog marks overridden entries; preview shows the effective body.
++Editing while the session runs on **built-in defaults** is refused: bind or create a preset first, so an edit always has a home.
 +
 +### Presets tab
 +
 +| Key | Action |
 +|-----|--------|
 +| `↑` / `↓` | Navigate presets |
-+| `Enter` | Apply preset (writes its files into `~/.grok/prompts/`) |
-+| `n` | Name and save a new preset from the **current** overrides |
-+| `u` | Update the selected preset from the current overrides |
++| `/` | Filter by name or description |
++| `Enter` | Use the selected preset **in this session** |
++| `n` | Name and save a new preset from this session's prompts |
++| `u` | Update (replace) the selected preset from this session's prompts |
++| `R` | Rename the selected preset (bindings and `.active` follow) |
++| `y` | Duplicate the selected preset under a new name |
 +| `d` | Delete the selected preset (confirm with `d`) |
-+| `c` | Clear **all** active overrides (pure built-in defaults; confirm) |
++| `c` | Run this session on built-in defaults (confirm with `c`; deletes nothing) |
 +| `Tab` | Back to Catalog |
 +
-+Preset names accept `a-z`, `0-9`, `_`, `-`, and `.`. The active preset (if any) is shown in the modal chrome.
++Preset names accept `a-z`, `0-9`, `_`, `-`, and `.`, up to 64 characters, and may not start with a dot. The name field is pre-filled with a free name, so `n` twice in a row never collides.
 +
 +---
 +
@@ -1187,27 +2123,28 @@ index 0000000000000000000000000000000000000000..0cdc26d7f112e22d4035c84d9913020a
 +
 +```
 +$GROK_HOME/                    # default: ~/.grok
-+  prompts/                     # active working overrides
++  prompts/                     # unnamed scratch overrides (legacy)
 +    base-system.md
-+    subagent-explore.md
 +    ...
 +  prompt-presets/
-+    .active                    # optional: last applied preset name
++    .active                    # preset new sessions start on
++    .state.json                # per-session bindings (versioned)
 +    my-coding-style/
++      meta.json                # description + timestamps
 +      base-system.md
 +      ...
 +```
 +
-+You may edit these Markdown files outside Grok; the next session / render of `/prompts` picks them up. Prefer the modal when you want preview, reset-to-default, and preset apply/update in one place.
++You may edit these Markdown files outside Grok; the next session / render of `/prompts` picks them up. Prefer the modal when you want preview, reset-to-default, and per-session binding in one place.
 +
 +---
 +
 +## Tips
 +
-+- **Binary update, keep customizations** — only override what you changed; untouched ids track stock templates automatically.
-+- **Experiment safely** — save a preset before a large edit; apply another preset or clear overrides to roll back.
-+- **MiniJinja** — most templates use `${{ }}` / `${% %}` delimiters. Broken templates can break session start; keep a preset of a known-good set.
-+- **Privacy / open source** — do not commit `~/.grok/prompts/` into a public tree; it is user data, not project config.
++- **Binary update, keep customizations** — only override what you changed; untouched ids track stock templates automatically. Nothing under `$GROK_HOME` is touched by an update, which only replaces the binary.
++- **Experiment safely** — duplicate a preset (`y`) before a large edit, then switch back with `Enter` if it goes wrong.
++- **MiniJinja** — most templates use `${{ }}` / `${% %}` delimiters. Broken templates can break session start; keep a known-good preset around.
++- **Privacy / open source** — do not commit `~/.grok/prompts/` or `~/.grok/prompt-presets/` into a public tree; that is user data, not project config.
 +
 +---
 +
@@ -1328,10 +2265,10 @@ index 8a9b9b378d56e4f1d722c1bc16cfa35c79dc7675..366d3fe41c265403f321f2a614c2608b
                  );
              }
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/settings/ui.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/settings/ui.rs
-index 04a960dcb56fa24dde491d3c7c2339124f1c08f7..51ddf60813897e44bf1a03456852fb6f46643081 100644
+index 04a960dcb56fa24dde491d3c7c2339124f1c08f7..a4ef5fbb84ded2d319c0a2293c3ce970bcd907d4 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/settings/ui.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/settings/ui.rs
-@@ -31,6 +31,48 @@ pub(in crate::app::dispatch) fn save_success_toast(label: &str, on: bool) -> Str
+@@ -31,6 +31,57 @@ pub(in crate::app::dispatch) fn save_success_toast(label: &str, on: bool) -> Str
      format!("\u{2713} {label}: {value}")
  }
  
@@ -1369,6 +2306,15 @@ index 04a960dcb56fa24dde491d3c7c2339124f1c08f7..51ddf60813897e44bf1a03456852fb6f
 +    if matches!(&agent.active_modal, Some(ActiveModal::PromptsBrowser { .. })) {
 +        agent.active_modal = None;
 +        return effects;
++    }
++
++    // Bind the prompt catalog to this agent's session before the modal reads
++    // it: presets are per session, so the browser must show — and edit — the
++    // prompts this session actually resolves.
++    if let Some(session_id) = agent.session.session_id.as_ref()
++        && let Err(e) = xai_grok_agent::activate_session(session_id.0.as_ref())
++    {
++        tracing::warn!(error = %e, "prompt preset activation failed");
 +    }
 +
 +    agent.active_modal = Some(ActiveModal::PromptsBrowser {
@@ -1609,11 +2555,13 @@ index b98b974a33286017fcc5d31ca04bb99f38de2710..909c623f21fd5d594bf7054beb44e17a
          Arc::new(import_claude::ImportClaudeCommand),
 diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/prompts.rs b/crates/codegen/xai-grok-pager/src/slash/commands/prompts.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7985f06c4da28221c7fd058f5a22cdb7d21ed4fc
+index 0000000000000000000000000000000000000000..45e26ded94ad6baa66bce25ae2429319d9774db2
 --- /dev/null
 +++ b/crates/codegen/xai-grok-pager/src/slash/commands/prompts.rs
-@@ -0,0 +1,63 @@
-+//! `/prompts` — open the LLM prompt templates browser.
+@@ -0,0 +1,181 @@
++//! `/prompts` — open the LLM prompt templates browser, or drive presets by name.
++
++use xai_grok_agent::{PresetWriteMode, PromptSource};
 +
 +use crate::app::actions::Action;
 +use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
@@ -1635,12 +2583,112 @@ index 0000000000000000000000000000000000000000..7985f06c4da28221c7fd058f5a22cdb7
 +    }
 +
 +    fn usage(&self) -> &str {
-+        "/prompts"
++        "/prompts [list | use <name> | save <name> | update <name> | defaults]"
 +    }
 +
-+    fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {
-+        CommandResult::Action(Action::OpenPromptsModal)
++    fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
++        let args = args.trim();
++        if args.is_empty() {
++            return CommandResult::Action(Action::OpenPromptsModal);
++        }
++
++        // Presets are per session: bind the catalog to the caller's session so
++        // a switch lands here and not on whichever session ran last.
++        if let Some(session_id) = ctx.session_id
++            && let Err(e) = xai_grok_agent::activate_session(session_id.0.as_ref())
++        {
++            return CommandResult::Error(format!("Could not read prompt presets: {e}"));
++        }
++
++        let (verb, rest) = args
++            .split_once(char::is_whitespace)
++            .unwrap_or((args, ""));
++        let name = rest.trim();
++
++        match verb {
++            "list" | "ls" => list_presets_message(),
++            "use" | "apply" => {
++                if name.is_empty() {
++                    return CommandResult::Error("Usage: /prompts use <name>".into());
++                }
++                match xai_grok_agent::apply_preset(name) {
++                    Ok(()) => CommandResult::Message(format!(
++                        "This session now uses prompt preset `{name}`."
++                    )),
++                    Err(e) => CommandResult::Error(e.to_string()),
++                }
++            }
++            "save" | "new" => {
++                if name.is_empty() {
++                    return CommandResult::Error("Usage: /prompts save <name>".into());
++                }
++                match xai_grok_agent::save_preset(name, PresetWriteMode::Create) {
++                    Ok(()) => CommandResult::Message(format!(
++                        "Saved this session's prompts as preset `{name}`."
++                    )),
++                    Err(xai_grok_agent::PromptCatalogError::PresetExists(_)) => {
++                        CommandResult::Error(format!(
++                            "Preset `{name}` already exists. Use `/prompts update {name}` to replace it."
++                        ))
++                    }
++                    Err(e) => CommandResult::Error(e.to_string()),
++                }
++            }
++            "update" => {
++                if name.is_empty() {
++                    return CommandResult::Error("Usage: /prompts update <name>".into());
++                }
++                if !xai_grok_agent::preset_exists(name) {
++                    return CommandResult::Error(format!(
++                        "No preset named `{name}`. Use `/prompts save {name}` to create it."
++                    ));
++                }
++                match xai_grok_agent::save_preset(name, PresetWriteMode::Overwrite) {
++                    Ok(()) => CommandResult::Message(format!("Preset `{name}` updated.")),
++                    Err(e) => CommandResult::Error(e.to_string()),
++                }
++            }
++            "defaults" => match xai_grok_agent::use_defaults_only() {
++                Ok(()) => CommandResult::Message(
++                    "This session now runs on the built-in prompts. Presets are untouched.".into(),
++                ),
++                Err(e) => CommandResult::Error(e.to_string()),
++            },
++            other => CommandResult::Error(format!(
++                "Unknown /prompts subcommand `{other}`. Try: list, use, save, update, defaults."
++            )),
++        }
 +    }
++}
++
++fn list_presets_message() -> CommandResult {
++    let presets = match xai_grok_agent::list_presets() {
++        Ok(p) => p,
++        Err(e) => return CommandResult::Error(e.to_string()),
++    };
++    let source = xai_grok_agent::session_source();
++    if presets.is_empty() {
++        return CommandResult::Message(format!(
++            "No prompt presets yet (this session reads from: {}).\n\
++             Save one with `/prompts save <name>`.",
++            source.label()
++        ));
++    }
++    let mut out = format!("Prompt presets (this session reads from: {}):", source.label());
++    for p in &presets {
++        let marker = if p.is_active { "*" } else { " " };
++        out.push_str(&format!(
++            "\n{marker} {} — {} override(s)",
++            p.name, p.override_count
++        ));
++        if let Some(ref description) = p.description {
++            out.push_str(&format!(" — {description}"));
++        }
++    }
++    if matches!(source, PromptSource::Defaults) {
++        out.push_str("\n\nNo preset is applied here; prompts come from the binary.");
++    }
++    CommandResult::Message(out)
 +}
 +
 +#[cfg(test)]
@@ -1650,10 +2698,7 @@ index 0000000000000000000000000000000000000000..7985f06c4da28221c7fd058f5a22cdb7
 +    use crate::app::bundle::BundleState;
 +    use crate::settings::PagerLocalSnapshot;
 +
-+    fn exec_ctx<'a>(
-+        models: &'a ModelState,
-+        bundle: &'a BundleState,
-+    ) -> CommandExecCtx<'a> {
++    fn exec_ctx<'a>(models: &'a ModelState, bundle: &'a BundleState) -> CommandExecCtx<'a> {
 +        CommandExecCtx {
 +            models,
 +            session_id: None,
@@ -1674,6 +2719,25 @@ index 0000000000000000000000000000000000000000..7985f06c4da28221c7fd058f5a22cdb7
 +            result,
 +            CommandResult::Action(Action::OpenPromptsModal)
 +        ));
++    }
++
++    #[test]
++    fn rejects_an_unknown_subcommand() {
++        let models = ModelState::default();
++        let bundle = BundleState::default();
++        let result = PromptsCommand.run(&mut exec_ctx(&models, &bundle), "frobnicate");
++        assert!(matches!(result, CommandResult::Error(_)));
++    }
++
++    #[test]
++    fn use_without_a_name_explains_the_usage() {
++        let models = ModelState::default();
++        let bundle = BundleState::default();
++        let result = PromptsCommand.run(&mut exec_ctx(&models, &bundle), "use");
++        match result {
++            CommandResult::Error(msg) => assert!(msg.contains("/prompts use <name>")),
++            other => panic!("expected a usage error, got {other:?}"),
++        }
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-pager/src/views/mod.rs b/crates/codegen/xai-grok-pager/src/views/mod.rs
@@ -1721,10 +2785,10 @@ index 88956bbaa6644c937b3e7d7340a9588b3a3bc838..eb7e5eed2e3513975e706eaed957dddc
              ActiveModal::RememberNoteReview { .. } => "Memory Note",
 diff --git a/crates/codegen/xai-grok-pager/src/views/prompts_modal.rs b/crates/codegen/xai-grok-pager/src/views/prompts_modal.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020d0d8e189
+index 0000000000000000000000000000000000000000..c580775ba4df1eb90df5936fe9060f123d6cd5d6
 --- /dev/null
 +++ b/crates/codegen/xai-grok-pager/src/views/prompts_modal.rs
-@@ -0,0 +1,1909 @@
+@@ -0,0 +1,2093 @@
 +//! `/prompts` modal — catalog, in-TUI edit, and named presets.
 +//!
 +//! Defaults always resolve from the binary templates (never snapshotted as
@@ -1741,7 +2805,10 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +use ratatui::text::{Line, Span};
 +use ratatui::widgets::StatefulWidgetRef;
 +use unicode_width::UnicodeWidthStr;
-+use xai_grok_agent::{PromptCategory, PromptId, PromptPresetInfo, list_presets, list_prompts};
++use xai_grok_agent::{
++    PresetWriteMode, PromptCategory, PromptId, PromptPresetInfo, PromptSource, list_presets,
++    list_prompts,
++};
 +use xai_ratatui_textarea::{TextArea, TextAreaState};
 +
 +use crate::app::actions::Action;
@@ -1798,14 +2865,42 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +        dirty: bool,
 +        original: String,
 +    },
-+    /// Name a new preset from the current overrides.
++    /// Name a preset: new snapshot, rename, or duplicate.
 +    NamingPreset {
 +        editor: LineEditor,
 +        error: Option<String>,
++        intent: NamingIntent,
 +    },
 +    ConfirmingDeletePreset {
 +        name: String,
 +    },
++    /// A new preset was named after an existing one: confirm the replacement.
++    ConfirmingOverwritePreset {
++        name: String,
++    },
++    /// Confirm running this session on pure built-in defaults.
++    ConfirmingDefaults,
++}
++
++/// What the name being typed in [`PromptsModalMode::NamingPreset`] is for.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) enum NamingIntent {
++    /// Snapshot the session's current overrides under a new name.
++    New,
++    /// Rename an existing preset.
++    Rename(String),
++    /// Copy an existing preset under a new name.
++    Duplicate(String),
++}
++
++impl NamingIntent {
++    fn title(&self) -> String {
++        match self {
++            Self::New => "Save current prompts as a new preset".to_string(),
++            Self::Rename(from) => format!("Rename preset `{from}`"),
++            Self::Duplicate(from) => format!("Duplicate preset `{from}`"),
++        }
++    }
 +}
 +
 +pub struct PromptsModalState {
@@ -1829,6 +2924,8 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +    pub status: Option<String>,
 +    /// Active preset name for the title bar subtitle.
 +    pub active_preset: Option<String>,
++    /// Where this session reads its prompt bodies from.
++    pub source: PromptSource,
 +    /// Last text-area rect while editing (mouse hit-test + cursor).
 +    pub edit_area: Option<Rect>,
 +    /// Hardware terminal caret `(x, y)` for the current edit surface, or
@@ -1859,6 +2956,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            preview_scrollbar_area: None,
 +            status: None,
 +            active_preset: None,
++            source: PromptSource::Defaults,
 +            edit_area: None,
 +            cursor_pos: None,
 +        };
@@ -1917,7 +3015,8 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +    fn reload_data(&mut self) {
 +        self.entries = build_catalog_entries();
 +        self.presets = list_presets().unwrap_or_default();
-+        self.active_preset = xai_grok_agent::active_preset_name().ok().flatten();
++        self.source = xai_grok_agent::session_source();
++        self.active_preset = self.source.preset_name().map(str::to_string);
 +        self.invalidate_filter();
 +    }
 +
@@ -1931,7 +3030,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                self.filtered_cache = compute_filtered(&self.entries, self.query());
 +            }
 +            PromptsTab::Presets => {
-+                self.filtered_cache = (0..self.presets.len()).collect();
++                self.filtered_cache = compute_filtered_presets(&self.presets, self.query());
 +            }
 +        }
 +    }
@@ -1945,11 +3044,17 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            .and_then(|&i| self.entries.get(i))
 +    }
 +
-+    fn selected_preset_name(&self) -> Option<String> {
++    fn selected_preset(&self) -> Option<&PromptPresetInfo> {
 +        if self.tab != PromptsTab::Presets {
 +            return None;
 +        }
-+        self.presets.get(self.selected).map(|p| p.name.clone())
++        self.filtered_cache
++            .get(self.selected)
++            .and_then(|&i| self.presets.get(i))
++    }
++
++    fn selected_preset_name(&self) -> Option<String> {
++        self.selected_preset().map(|p| p.name.clone())
 +    }
 +
 +    fn switch_tab(&mut self, tab: PromptsTab) {
@@ -2012,7 +3117,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                false
 +            }
 +            PromptsTab::Presets => {
-+                if self.selected + 1 < self.presets.len() {
++                if self.selected + 1 < self.filtered_cache.len() {
 +                    self.selected += 1;
 +                    true
 +                } else {
@@ -2071,7 +3176,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                true
 +            }
 +            PromptsTab::Presets => {
-+                if filt_idx >= self.presets.len() || self.selected == filt_idx {
++                if filt_idx >= self.filtered_cache.len() || self.selected == filt_idx {
 +                    return false;
 +                }
 +                self.selected = filt_idx;
@@ -2099,17 +3204,36 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                self.load_preview();
 +            }
 +            PromptsTab::Presets => {
-+                if self.presets.is_empty() {
++                if self.filtered_cache.is_empty() {
 +                    self.selected = 0;
 +                    self.preview_markdown = None;
 +                    return;
 +                }
-+                if self.selected >= self.presets.len() {
-+                    self.selected = self.presets.len() - 1;
++                if self.selected >= self.filtered_cache.len() {
++                    self.selected = self.filtered_cache.len() - 1;
 +                }
 +                self.load_preview();
 +            }
 +        }
++    }
++
++    /// Open the name field, pre-filled with a free name for `intent`.
++    fn begin_naming(&mut self, intent: NamingIntent) {
++        let suggestion = match &intent {
++            NamingIntent::New => {
++                xai_grok_agent::suggest_preset_name(self.source.preset_name().unwrap_or("preset"))
++            }
++            NamingIntent::Rename(from) => from.clone(),
++            NamingIntent::Duplicate(from) => xai_grok_agent::suggest_preset_name(from),
++        };
++        let mut editor = LineEditor::default();
++        editor.set_text(&suggestion);
++        self.mode = PromptsModalMode::NamingPreset {
++            editor,
++            error: None,
++            intent,
++        };
++        self.status = None;
 +    }
 +
 +    fn begin_edit(&mut self, id: PromptId) {
@@ -2147,16 +3271,17 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                                "**Status:** default (built-in — updates with Grok Build)",
 +                            );
 +                        }
-+                        if let Some(ref preset) = self.active_preset {
-+                            md.push_str(&format!("  \n**Active preset:** `{preset}`"));
-+                        }
++                        md.push_str(&format!(
++                            "  \n**Session source:** `{}`",
++                            self.source.label()
++                        ));
 +                        if id.is_minijinja_template() {
 +                            md.push_str(
 +                                "\n\n> Template uses MiniJinja `${{ }}` / `${% %}` — keep syntax intact.",
 +                            );
 +                        }
 +                        md.push_str(
-+                            "\n\n*Enter / e* edit in TUI · *E* external editor · *r* reset\n\n---\n\n```\n",
++                            "\n\n*Enter / e* edit in TUI · *E* external editor · *r* reset · *n* save as preset\n\n---\n\n```\n",
 +                        );
 +                        md.push_str(&ep.body);
 +                        if !ep.body.ends_with('\n') {
@@ -2167,28 +3292,40 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                    });
 +            }
 +            PromptsTab::Presets => {
-+                self.preview_markdown = if let Some(p) = self.presets.get(self.selected) {
++                let selected = self.selected_preset().cloned();
++                let source_label = self.source.label();
++                self.preview_markdown = if let Some(p) = selected {
 +                    let mut md = format!("# Preset `{}`\n\n", p.name);
++                    if let Some(ref description) = p.description {
++                        md.push_str(&format!("{description}\n\n"));
++                    }
 +                    md.push_str(&format!(
 +                        "**Overrides:** {} prompt(s)\n\n",
 +                        p.override_count
 +                    ));
-+                    if p.is_active {
-+                        md.push_str("**Active** — this snapshot is currently applied.\n\n");
++                    if let Some(ref updated) = p.updated {
++                        md.push_str(&format!("**Updated:** {updated}\n\n"));
 +                    }
++                    if p.is_active {
++                        md.push_str("**Active** — this session resolves through this preset.\n\n");
++                    }
++                    md.push_str(&format!(
++                        "This session currently reads from: `{source_label}`.\n\n"
++                    ));
 +                    md.push_str(
-+                        "Working overrides live in `$GROK_HOME/prompts/` (outside any git repo).\n\
-+                         Presets live in `$GROK_HOME/prompt-presets/`.\n\n\
-+                         Defaults always come from the binary templates — never from disk.\n\n\
-+                         *Enter* apply · *n* save current as new · *u* update selected · *d* delete · *c* clear to pure defaults\n",
++                        "Presets live in `$GROK_HOME/prompt-presets/<name>/`, outside any git repo.\n\
++                         Each session binds to its own preset, so a parallel session is never disturbed.\n\
++                         Prompts you never edited keep coming from the binary, so updates still deliver them.\n\n\
++                         *Enter* use here · *n* new · *u* update from session · *R* rename · *y* duplicate · *d* delete · *c* defaults only\n",
 +                    );
 +                    Some(MarkdownContent::new(md))
 +                } else {
-+                    Some(MarkdownContent::new(
-+                        "# Presets\n\nNo presets yet.\n\n\
-+                         Press **n** to save your current overrides as a named preset.\n\n\
++                    Some(MarkdownContent::new(format!(
++                        "# Presets\n\nNo preset matches.\n\n\
++                         Press **n** to save this session's prompts as a named preset.\n\n\
++                         This session currently reads from: `{source_label}`.\n\n\
 +                         Personal prompts stay under `$GROK_HOME` and are never part of the source tree or GitHub rebuilds.\n",
-+                    ))
++                    )))
 +                };
 +            }
 +        }
@@ -2226,6 +3363,24 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +        }
 +    }
 +    out
++}
++
++fn compute_filtered_presets(presets: &[PromptPresetInfo], query: &str) -> Vec<usize> {
++    if query.is_empty() {
++        return (0..presets.len()).collect();
++    }
++    let needle = query.to_lowercase();
++    presets
++        .iter()
++        .enumerate()
++        .filter(|(_, p)| {
++            p.name.to_lowercase().contains(&needle)
++                || p.description
++                    .as_deref()
++                    .is_some_and(|d| d.to_lowercase().contains(&needle))
++        })
++        .map(|(i, _)| i)
++        .collect()
 +}
 +
 +fn compute_filtered(entries: &[PromptListEntry], query: &str) -> Vec<usize> {
@@ -2344,13 +3499,22 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +    }
 +
 +    // Status strip
++    // Always occupied: without a status the strip names the session's prompt
++    // source, so what the session actually runs on is never a guess.
 +    let mut body = content_area;
-+    if let Some(ref status) = state.status {
-+        let style = Style::default().fg(theme.accent_success).bg(theme.bg_base);
++    {
++        let (text, fg) = match state.status {
++            Some(ref status) => (status.clone(), theme.accent_success),
++            None => (
++                format!("Source: {}", state.source.label()),
++                theme.text_secondary,
++            ),
++        };
++        let style = Style::default().fg(fg).bg(theme.bg_base);
 +        buf.set_span(
 +            body.x,
 +            body.y,
-+            &Span::styled(truncate_to_width(status, body.width as usize), style),
++            &Span::styled(truncate_to_width(&text, body.width as usize), style),
 +            body.width,
 +        );
 +        body.y += 1;
@@ -2492,15 +3656,20 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +}
 +
 +fn render_naming(buf: &mut Buffer, area: Rect, state: &mut PromptsModalState, theme: &Theme) {
-+    let PromptsModalMode::NamingPreset { editor, error } = &state.mode else {
++    let PromptsModalMode::NamingPreset {
++        editor,
++        error,
++        intent,
++    } = &state.mode
++    else {
 +        return;
 +    };
-+    let title = "Save current overrides as preset";
++    let title = intent.title();
 +    buf.set_span(
 +        area.x,
 +        area.y,
 +        &Span::styled(
-+            title,
++            title.as_str(),
 +            Style::default()
 +                .fg(theme.accent_user)
 +                .bg(theme.bg_base)
@@ -2609,6 +3778,30 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            clickable: false,
 +            id: 0,
 +        }],
++        PromptsModalMode::ConfirmingOverwritePreset { .. } => vec![
++            Shortcut {
++                label: "o / Enter replace",
++                clickable: false,
++                id: 0,
++            },
++            Shortcut {
++                label: "Esc keep existing",
++                clickable: false,
++                id: 0,
++            },
++        ],
++        PromptsModalMode::ConfirmingDefaults => vec![
++            Shortcut {
++                label: "c confirm defaults",
++                clickable: false,
++                id: 0,
++            },
++            Shortcut {
++                label: "Esc cancel",
++                clickable: false,
++                id: 0,
++            },
++        ],
 +        PromptsModalMode::FilterFocused => vec![
 +            Shortcut {
 +                label: "type to filter",
@@ -2656,12 +3849,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            ],
 +            PromptsTab::Presets => vec![
 +                Shortcut {
-+                    label: "\u{2191}/\u{2193} nav",
-+                    clickable: false,
-+                    id: 0,
-+                },
-+                Shortcut {
-+                    label: "Enter apply",
++                    label: "Enter use here",
 +                    clickable: false,
 +                    id: 0,
 +                },
@@ -2676,17 +3864,27 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                    id: 0,
 +                },
 +                Shortcut {
++                    label: "R rename",
++                    clickable: false,
++                    id: 0,
++                },
++                Shortcut {
++                    label: "y duplicate",
++                    clickable: false,
++                    id: 0,
++                },
++                Shortcut {
 +                    label: "d delete",
 +                    clickable: false,
 +                    id: 0,
 +                },
 +                Shortcut {
-+                    label: "c clear all",
++                    label: "c defaults",
 +                    clickable: false,
 +                    id: 0,
 +                },
 +                Shortcut {
-+                    label: "Tab catalog",
++                    label: "/ filter",
 +                    clickable: false,
 +                    id: 0,
 +                },
@@ -2698,7 +3896,8 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +fn render_list(buf: &mut Buffer, area: Rect, state: &mut PromptsModalState, theme: &Theme) {
 +    let search_y = area.y;
 +    let filter_focused = matches!(state.mode, PromptsModalMode::FilterFocused);
-+    if state.tab == PromptsTab::Catalog {
++    // Both tabs filter: a long preset list needs `/` as much as the catalog.
++    {
 +        let viewport = state.query.viewport(area.width as usize);
 +        if state.query().is_empty() {
 +            let placeholder = if filter_focused {
@@ -2742,21 +3941,6 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +                cell.set_style(Style::default().fg(theme.bg_base).bg(theme.text_primary));
 +            }
 +        }
-+    } else {
-+        let hint = if let Some(ref p) = state.active_preset {
-+            format!("Active: {p}")
-+        } else {
-+            "Active: (custom / defaults)".to_string()
-+        };
-+        buf.set_span(
-+            area.x,
-+            search_y,
-+            &Span::styled(
-+                truncate_to_width(&hint, area.width as usize),
-+                Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-+            ),
-+            area.width,
-+        );
 +    }
 +
 +    let entries_start_y = search_y + 1;
@@ -2770,10 +3954,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            .saturating_sub(available_height.saturating_sub(1));
 +    }
 +
-+    let total = match state.tab {
-+        PromptsTab::Catalog => state.filtered_cache.len(),
-+        PromptsTab::Presets => state.presets.len(),
-+    };
++    let total = state.filtered_cache.len();
 +    let total_entries = sat_u16(total);
 +    let sb_area = if total_entries > available_height as u16 && area.width > 4 {
 +        Some(Rect {
@@ -2836,11 +4017,12 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            }
 +        }
 +        PromptsTab::Presets => {
-+            let end = state
-+                .presets
-+                .len()
-+                .min(state.scroll_offset + available_height);
-+            for (row, p) in state.presets[state.scroll_offset..end].iter().enumerate() {
++            let filtered = &state.filtered_cache;
++            let end = filtered.len().min(state.scroll_offset + available_height);
++            for (row, &orig_idx) in filtered[state.scroll_offset..end].iter().enumerate() {
++                let Some(p) = state.presets.get(orig_idx) else {
++                    continue;
++                };
 +                let y = entries_start_y + row as u16;
 +                let filt_idx = state.scroll_offset + row;
 +                let is_selected = filt_idx == state.selected;
@@ -3076,19 +4258,46 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            *dirty = textarea.text() != original.as_str();
 +            InputOutcome::Changed
 +        }
-+        PromptsModalMode::NamingPreset { editor, error } => {
++        PromptsModalMode::NamingPreset {
++            editor,
++            error,
++            intent,
++        } => {
 +            if key.code == KeyCode::Esc {
 +                state.mode = PromptsModalMode::Browse;
 +                return InputOutcome::Changed;
 +            }
 +            if key.code == KeyCode::Enter {
 +                let name = editor.text().trim().to_string();
-+                match xai_grok_agent::save_preset(&name) {
++                let intent = intent.clone();
++                let outcome = match &intent {
++                    NamingIntent::New => {
++                        xai_grok_agent::save_preset(&name, PresetWriteMode::Create)
++                    }
++                    NamingIntent::Rename(from) => xai_grok_agent::rename_preset(from, &name),
++                    NamingIntent::Duplicate(from) => xai_grok_agent::duplicate_preset(from, &name),
++                };
++                match outcome {
 +                    Ok(()) => {
-+                        state.status = Some(format!("Preset `{name}` saved"));
++                        state.status = Some(match &intent {
++                            NamingIntent::New => format!("Preset `{name}` saved"),
++                            NamingIntent::Rename(from) => {
++                                format!("Preset `{from}` renamed to `{name}`")
++                            }
++                            NamingIntent::Duplicate(from) => {
++                                format!("Preset `{from}` duplicated as `{name}`")
++                            }
++                        });
 +                        state.mode = PromptsModalMode::Browse;
 +                        state.tab = PromptsTab::Presets;
 +                        state.refresh();
++                    }
++                    // A fresh save onto a name that exists asks first — the old
++                    // behaviour silently replaced the preset.
++                    Err(xai_grok_agent::PromptCatalogError::PresetExists(_))
++                        if intent == NamingIntent::New =>
++                    {
++                        state.mode = PromptsModalMode::ConfirmingOverwritePreset { name };
 +                    }
 +                    Err(e) => {
 +                        *error = Some(e.to_string());
@@ -3132,6 +4341,40 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            state.mode = PromptsModalMode::Browse;
 +            InputOutcome::Changed
 +        }
++        PromptsModalMode::ConfirmingOverwritePreset { name } => {
++            let name = name.clone();
++            if matches!(key.code, KeyCode::Char('o') | KeyCode::Enter) {
++                match xai_grok_agent::save_preset(&name, PresetWriteMode::Overwrite) {
++                    Ok(()) => {
++                        state.status = Some(format!("Preset `{name}` replaced"));
++                        state.tab = PromptsTab::Presets;
++                    }
++                    Err(e) => state.status = Some(format!("Save failed: {e}")),
++                }
++                state.mode = PromptsModalMode::Browse;
++                state.refresh();
++                return InputOutcome::Changed;
++            }
++            state.status = Some("Kept the existing preset".into());
++            state.mode = PromptsModalMode::Browse;
++            InputOutcome::Changed
++        }
++        PromptsModalMode::ConfirmingDefaults => {
++            if key.code == KeyCode::Char('c') {
++                match xai_grok_agent::use_defaults_only() {
++                    Ok(()) => {
++                        state.status =
++                            Some("This session now runs on built-in defaults".into())
++                    }
++                    Err(e) => state.status = Some(format!("Failed: {e}")),
++                }
++                state.mode = PromptsModalMode::Browse;
++                state.refresh();
++                return InputOutcome::Changed;
++            }
++            state.mode = PromptsModalMode::Browse;
++            InputOutcome::Changed
++        }
 +        PromptsModalMode::FilterFocused => handle_filter_focused(state, key),
 +        PromptsModalMode::Browse => handle_browse(state, key),
 +    }
@@ -3148,7 +4391,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            *dirty = textarea.text() != original.as_str();
 +            InputOutcome::Changed
 +        }
-+        PromptsModalMode::NamingPreset { editor, error } => {
++        PromptsModalMode::NamingPreset { editor, error, .. } => {
 +            let _ = editor.insert_paste(text);
 +            *error = None;
 +            InputOutcome::Changed
@@ -3274,10 +4517,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            InputOutcome::Changed
 +        }
 +        KeyCode::Char('n') if key.modifiers.is_empty() => {
-+            state.mode = PromptsModalMode::NamingPreset {
-+                editor: LineEditor::default(),
-+                error: None,
-+            };
++            state.begin_naming(NamingIntent::New);
 +            InputOutcome::Changed
 +        }
 +        _ => InputOutcome::Unchanged,
@@ -3286,13 +4526,17 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +
 +fn handle_presets_browse(state: &mut PromptsModalState, key: &KeyEvent) -> InputOutcome {
 +    match key.code {
++        KeyCode::Char('/') if key.modifiers.is_empty() => {
++            state.mode = PromptsModalMode::FilterFocused;
++            InputOutcome::Changed
++        }
 +        KeyCode::Enter if key.modifiers.is_empty() => {
 +            let Some(name) = state.selected_preset_name() else {
 +                return InputOutcome::Unchanged;
 +            };
 +            match xai_grok_agent::apply_preset(&name) {
 +                Ok(()) => {
-+                    state.status = Some(format!("Applied preset `{name}`"));
++                    state.status = Some(format!("This session now uses `{name}`"));
 +                    state.refresh();
 +                }
 +                Err(e) => state.status = Some(format!("Apply failed: {e}")),
@@ -3300,24 +4544,35 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            InputOutcome::Changed
 +        }
 +        KeyCode::Char('n') if key.modifiers.is_empty() => {
-+            state.mode = PromptsModalMode::NamingPreset {
-+                editor: LineEditor::default(),
-+                error: None,
-+            };
++            state.begin_naming(NamingIntent::New);
 +            InputOutcome::Changed
 +        }
 +        KeyCode::Char('u') if key.modifiers.is_empty() => {
-+            // Update selected preset from current working overrides.
++            // Explicit overwrite of the selected preset from this session's prompts.
 +            let Some(name) = state.selected_preset_name() else {
 +                return InputOutcome::Unchanged;
 +            };
-+            match xai_grok_agent::save_preset(&name) {
++            match xai_grok_agent::save_preset(&name, PresetWriteMode::Overwrite) {
 +                Ok(()) => {
 +                    state.status = Some(format!("Updated preset `{name}`"));
 +                    state.refresh();
 +                }
 +                Err(e) => state.status = Some(format!("Update failed: {e}")),
 +            }
++            InputOutcome::Changed
++        }
++        KeyCode::Char('R') => {
++            let Some(name) = state.selected_preset_name() else {
++                return InputOutcome::Unchanged;
++            };
++            state.begin_naming(NamingIntent::Rename(name));
++            InputOutcome::Changed
++        }
++        KeyCode::Char('y') if key.modifiers.is_empty() => {
++            let Some(name) = state.selected_preset_name() else {
++                return InputOutcome::Unchanged;
++            };
++            state.begin_naming(NamingIntent::Duplicate(name));
 +            InputOutcome::Changed
 +        }
 +        KeyCode::Char('d') if key.modifiers.is_empty() => {
@@ -3328,14 +4583,7 @@ index 0000000000000000000000000000000000000000..974490b25a65d3147c56d3971fb88020
 +            InputOutcome::Changed
 +        }
 +        KeyCode::Char('c') if key.modifiers.is_empty() => {
-+            match xai_grok_agent::clear_all_overrides() {
-+                Ok(()) => {
-+                    state.status =
-+                        Some("Cleared all overrides — pure built-in defaults".into());
-+                    state.refresh();
-+                }
-+                Err(e) => state.status = Some(format!("Clear failed: {e}")),
-+            }
++            state.mode = PromptsModalMode::ConfirmingDefaults;
 +            InputOutcome::Changed
 +        }
 +        _ => InputOutcome::Unchanged,
@@ -3668,15 +4916,18 @@ index 4721b6304f195a8ef5f88722666abcbea9e598a0..93746e48a66a69fd718d4999aa9a279a
  
  ## Features
 diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
-index dde7e38f80042f83111feb8570dc32be411462db..60f9dd1e2fe85e1e28c15f97099d4819d0e13da4 100644
+index dde7e38f80042f83111feb8570dc32be411462db..0e809877c8610d58016c5e8b9c02f3257b86c1b5 100644
 --- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
 +++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
-@@ -86,7 +86,7 @@ impl SessionActor {
+@@ -85,8 +85,10 @@ impl SessionActor {
+             for item in conversation.iter_mut() {
                  if let ConversationItem::System(sys) = item {
                      if use_concise {
++                        // Through the agent so the session's own prompt preset
++                        // applies, not the process-wide default.
                          sys.content = std::sync::Arc::<str>::from(
 -                            xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT,
-+                            xai_grok_agent::resolve_body(xai_grok_agent::PromptId::CompactSystem),
++                            self.agent.borrow().compact_system_prompt(),
                          );
                      } else {
                          sys.content =

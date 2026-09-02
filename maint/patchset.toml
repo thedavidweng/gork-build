@@ -125,6 +125,16 @@ file = "0078-prompts-modal.patch"
 critical = true
 contracts = ["prompts-templates", "prompts-modal-ui"]
 
+[[patch]]
+id = "personas-rewire"
+file = "0079-personas-rewire.patch"
+# Critical for the same reason as prompts-modal. Upstream keeps shipping the
+# stubbed entry point it removed (`format_personas_section` returning None and
+# `persona: None` on the model-facing spawn), so a conflict here is exactly the
+# case where a silent skip would restore the amputation. Stop the sync instead.
+critical = true
+contracts = ["personas-wired"]
+
 # Trailing non-critical: may be skipped on upstream conflict (draft PR still opens).
 [[patch]]
 id = "product-identity"

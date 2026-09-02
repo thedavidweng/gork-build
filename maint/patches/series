@@ -13,6 +13,7 @@
 0070-supply-chain-policy.patch
 0075-win-build-portability.patch
 0078-prompts-modal.patch
+0079-personas-rewire.patch
 0080-product-identity.patch
 0081-package-publishing.patch
 0082-branding-docs.patch
