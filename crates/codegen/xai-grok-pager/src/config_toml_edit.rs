@@ -48,6 +48,40 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
     std::fs::write(path, doc.to_string())
 }
 
+/// Set (or clear) `[subagents].default_persona` in `~/.grok/config.toml`.
+///
+/// Which persona a subagent runs under was otherwise decided by the model
+/// alone, per spawn: there was no way to pin one. This is the durable half of
+/// that pin. `GROK_PERSONA` overrides it for a single session, and a persona
+/// passed at spawn still wins over both.
+///
+/// Same guarantees as [`set_hint`]: sibling tables are preserved, and a
+/// non-blank file that does not parse is left untouched.
+pub(crate) fn set_default_persona(name: Option<&str>) -> std::io::Result<()> {
+    let path =
+        xai_grok_tools::util::grok_home::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME);
+    set_default_persona_at(&path, name)
+}
+
+/// Core of [`set_default_persona`]; takes the path so tests can point it at a temp dir.
+fn set_default_persona_at(path: &Path, name: Option<&str>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let Some(mut doc) = read_config_document_for_edit(path) else {
+        return Ok(());
+    };
+    match name {
+        Some(n) => doc["subagents"]["default_persona"] = toml_edit::value(n),
+        None => {
+            if let Some(table) = doc.get_mut("subagents").and_then(|i| i.as_table_like_mut()) {
+                table.remove("default_persona");
+            }
+        }
+    }
+    std::fs::write(path, doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

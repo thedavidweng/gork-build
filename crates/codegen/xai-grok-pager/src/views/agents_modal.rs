@@ -1183,6 +1183,11 @@ fn build_personas_tab_shortcuts<'a>(state: &AgentsModalState) -> Vec<Shortcut<'a
                 id: 0,
             },
             Shortcut {
+                label: "D default",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
                 label: "d delete",
                 clickable: false,
                 id: 0,
@@ -2336,6 +2341,26 @@ fn handle_personas_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agen
                 } else {
                     state.message = Some(AgentsModalMessage::error("Persona has no source file"));
                 }
+            }
+            AgentsModalOutcome::Changed
+        }
+        // The tab could create, edit and delete personas but not *apply* one:
+        // only the model chose, per spawn. This writes the durable half of the
+        // pin; `GROK_PERSONA` is the per-session half.
+        KeyCode::Char('D') => {
+            if let Some(persona) = state.personas.get(state.persona_selected) {
+                let name = persona.name.clone();
+                state.message = Some(
+                    match crate::config_toml_edit::set_default_persona(Some(&name)) {
+                        Ok(()) => AgentsModalMessage::success(format!(
+                            "`{name}` is now the default persona. GROK_PERSONA overrides it \
+                             for one session; a persona passed at spawn always wins."
+                        )),
+                        Err(e) => {
+                            AgentsModalMessage::error(format!("Could not write config.toml: {e}"))
+                        }
+                    },
+                );
             }
             AgentsModalOutcome::Changed
         }

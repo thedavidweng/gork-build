@@ -3392,6 +3392,7 @@ mod plan_mode_edit_gate_tests {
                     resume_from: None,
                     cwd: None,
                     model: None,
+                    persona: None,
                     task_id: None,
                 })
             ),

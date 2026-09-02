@@ -28,7 +28,9 @@ pub use definition::{
     resolve_runtime_config, select_role, subagent_harness_flavor_is_representable,
     validate_agent_name,
 };
-pub use overrides::{intersect_capability_modes, resolve_effective_overrides};
+pub use overrides::{
+    intersect_capability_modes, resolve_effective_overrides, with_default_persona,
+};
 pub use resume::{ResumeValidationError, validate_resume_identity};
 pub use types::{ContextSource, EffectiveRuntimeConfig, ResolutionError, ResumeSourceData};
 pub use xai_grok_agent::config::AgentDefinition;

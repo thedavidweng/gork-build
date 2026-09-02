@@ -4549,6 +4549,26 @@ impl MvpAgent {
         let respect_gitignore = self.cfg.borrow().respect_gitignore;
         let path_not_found_hints = self.cfg.borrow().path_not_found_hints;
         let subagent_toggle = self.cfg.borrow().subagent_toggle.clone();
+        // Persona catalog for this session's `<personas>` block. Upstream hands
+        // an empty vec to the session, which hides every configured persona from
+        // the model and leaves the `task` tool's `persona` argument unusable.
+        // Sorted by name: the system prompt is cached, so a HashMap's iteration
+        // order must not leak into it.
+        let persona_summaries = {
+            let cfg = self.cfg.borrow();
+            let (_, personas) = crate::config::SubagentsConfig::effective_definition_maps(
+                &cfg.subagent_roles,
+                &cfg.subagent_personas,
+                tool_ctx.cwd.as_path(),
+                crate::agent::folder_trust::project_scope_allowed(tool_ctx.cwd.as_path()),
+            );
+            let mut entries: Vec<_> = personas.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+                .into_iter()
+                .map(|(name, persona)| persona.render_io_summary(&name))
+                .collect::<Vec<String>>()
+        };
         let handle_display_cwd = prompt_display_cwd.clone();
         let auth_manager = Some(self.auth_manager.clone());
         let bash_params_json = {
@@ -4810,7 +4830,7 @@ impl MvpAgent {
                     client_hooks,
                     prompt_display_cwd,
                     subagent_toggle,
-                    Vec::new(),
+                    persona_summaries,
                     xai_grok_agent::prompt::context::PromptAudience::Primary,
                     None,
                     None,

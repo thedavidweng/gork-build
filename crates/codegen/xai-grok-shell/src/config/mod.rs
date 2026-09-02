@@ -21,6 +21,20 @@ pub use xai_grok_config_types::{
 pub struct SubagentsConfig {
     /// Whether subagent support is enabled.
     pub enabled: bool,
+    /// Persona applied to every spawn that does not name one itself.
+    ///
+    /// Personas are otherwise chosen by the model, per spawn, through the
+    /// `task` tool's `persona` argument — which leaves no way to pin one for a
+    /// whole session. This is that floor: an explicit persona on the spawn
+    /// still wins, and `GROK_PERSONA` wins over this key (same shape as
+    /// `GROK_AGENT` over `[agent] name`).
+    ///
+    /// ```toml
+    /// [subagents]
+    /// default_persona = "reviewer"
+    /// ```
+    #[serde(default)]
+    pub default_persona: Option<String>,
     /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped to at least 1 at resolve).
     #[serde(default)]
     pub max_depth: Option<i64>,

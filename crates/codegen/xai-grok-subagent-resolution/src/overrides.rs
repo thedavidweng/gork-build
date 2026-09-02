@@ -144,6 +144,62 @@ pub fn resolve_effective_overrides(
     }
 }
 
+/// Apply a session-wide default persona to a spawn that named none.
+///
+/// A floor, not an override: the `task` tool's `persona` argument decides per
+/// child and always wins. Without this the only thing able to choose a persona
+/// was the model, which left no way to pin one for a whole session — the host
+/// fills `default_persona` from `GROK_PERSONA`, else `[subagents] default_persona`.
+pub fn with_default_persona(
+    overrides: &SubagentRuntimeOverrides,
+    default_persona: Option<&str>,
+) -> SubagentRuntimeOverrides {
+    let mut out = overrides.clone();
+    if out.persona.is_none() {
+        out.persona = default_persona
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+    }
+    out
+}
+
+#[cfg(test)]
+mod default_persona_tests {
+    use super::*;
+
+    #[test]
+    fn a_spawn_persona_wins_over_the_session_default() {
+        let overrides = SubagentRuntimeOverrides {
+            persona: Some("reviewer".into()),
+            ..Default::default()
+        };
+        let out = with_default_persona(&overrides, Some("researcher"));
+        assert_eq!(out.persona.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn the_session_default_fills_a_silent_spawn() {
+        let out = with_default_persona(&SubagentRuntimeOverrides::default(), Some("researcher"));
+        assert_eq!(out.persona.as_deref(), Some("researcher"));
+    }
+
+    #[test]
+    fn no_default_leaves_the_spawn_untouched() {
+        let out = with_default_persona(&SubagentRuntimeOverrides::default(), None);
+        assert!(out.persona.is_none());
+    }
+
+    #[test]
+    fn a_blank_default_is_not_a_persona() {
+        let out = with_default_persona(&SubagentRuntimeOverrides::default(), Some("   "));
+        assert!(
+            out.persona.is_none(),
+            "an empty GROK_PERSONA must read as unset, not as a persona named nothing"
+        );
+    }
+}
+
 /// Resolve persona instructions from inline text and/or instructions_file.
 ///
 /// Returns `(instructions, error, fatal)`:

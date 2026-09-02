@@ -1478,6 +1478,10 @@ pub struct Config {
     #[serde(skip)]
     pub subagent_personas:
         std::collections::HashMap<String, xai_grok_subagent_resolution::config::SubagentPersona>,
+    /// Session-wide persona floor: applied to a spawn that names no persona.
+    /// From `GROK_PERSONA`, else `[subagents] default_persona`.
+    #[serde(skip)]
+    pub subagent_default_persona: Option<String>,
     /// Whether web search is force-disabled via `--disable-web-search` CLI flag.
     /// When true, the web search tool is never added to the agent toolset regardless of available credentials.
     #[serde(default)]
@@ -1766,6 +1770,7 @@ impl Default for Config {
             subagent_toggle: std::collections::HashMap::new(),
             subagent_roles: std::collections::HashMap::new(),
             subagent_personas: std::collections::HashMap::new(),
+            subagent_default_persona: None,
             disable_web_search: false,
             todo_gate: false,
             laziness_debug_log: None,
@@ -2141,6 +2146,14 @@ impl Config {
         self.subagent_toggle = sa.toggle;
         self.subagent_roles = sa.roles;
         self.subagent_personas = sa.personas;
+        // `GROK_PERSONA` beats the config key, exactly as `GROK_AGENT` beats
+        // `[agent] name`: one session can pin a persona without editing
+        // config.toml, which is what a CLI user actually reaches for.
+        self.subagent_default_persona = std::env::var("GROK_PERSONA")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or(sa.default_persona);
         let env = std::env::var(crate::config::SubagentsConfig::ENV_MAX_DEPTH).ok();
         let remote = self
             .remote_settings

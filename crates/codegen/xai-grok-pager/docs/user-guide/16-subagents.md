@@ -89,7 +89,36 @@ Each file defines one persona, and the file name (without the extension) becomes
 
 Manage personas in the Personas tab of the agents modal (`/personas`). Bundled personas are read-only; personas you define are editable.
 
-> **Note:** Grok Build applies personas through subagent resolution and roles, not through a `spawn_subagent` parameter. The main agent does not pass a persona name when it spawns a child.
+### Applying a persona
+
+The personas available to a session are advertised to the model in a `<personas>` block, and the `task` tool takes a `persona` parameter, so the main agent can pick one when it spawns a child:
+
+```
+task(subagent_type="general-purpose", persona="researcher", description="...", prompt="...")
+```
+
+Resolution order stays the same as for a persona applied through a role: an explicit spawn value wins over the role default, which wins over the persona's own defaults. A persona name that does not resolve **fails the spawn** rather than quietly running the child without its overlay, and a resumed subagent should be given the same persona as its source (the resume footer states which one it used).
+
+Personas still apply through subagent resolution and roles as well; the spawn parameter is one more way in, not a replacement.
+
+### Pinning a persona for a whole session
+
+The spawn parameter leaves the choice to the model, per child. To pin one yourself, set a session-wide default; it applies to every spawn that does not name a persona of its own, and an explicit `persona` on the spawn still wins.
+
+```toml
+[subagents]
+default_persona = "researcher"
+```
+
+```bash
+GROK_PERSONA=researcher grok      # wins over the config key, for one session
+```
+
+In the Personas tab of the agents modal (`/personas`), **`D`** writes that key for you, on the selected persona.
+
+Precedence, highest first: `persona` passed at spawn → `GROK_PERSONA` → `[subagents] default_persona` → no persona. The name must resolve like any other, so a typo fails the spawn rather than running the child without its overlay.
+
+This mirrors how an agent is chosen (`--agent` / `GROK_AGENT` / `[agent] name`): the same shape, one level down.
 
 ### Persona Fields
 

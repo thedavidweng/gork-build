@@ -103,6 +103,22 @@ pub struct TaskToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional persona applied to this subagent as a behavioral overlay.
+    ///
+    /// Resolved against the session's personas (`config.toml`
+    /// `[subagents.personas.*]`, `.grok/personas/*.toml`, `~/.grok/personas/*.toml`).
+    /// The available names are advertised to the model in the `<personas>`
+    /// section; an unknown name fails the spawn rather than silently running
+    /// without the overlay.
+    #[schemars(
+        description = "Optional persona name applied to this subagent as a behavioral overlay \
+            (tone, output format, task focus). Use one of the names listed in the <personas> \
+            section; omit it when no persona fits. When resuming, pass the same persona the \
+            source subagent used."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+
     /// Server-injected before execution. Becomes the subagent's session ID.
     #[schemars(skip)]
     #[serde(default)]
@@ -1405,6 +1421,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            persona: None,
             task_id: None,
         };
         let value = serde_json::to_value(&input).unwrap();

@@ -454,6 +454,11 @@ impl xai_tool_runtime::Tool for TaskTool {
             model
         };
 
+        // Same sentinel handling as `model`. Unlike `model`, a persona is kept
+        // on resume: the resume footer asks for the source's persona back, and
+        // resume-identity validation compares them.
+        let persona = xai_tool_types::sanitize_optional_arg(input.persona.clone());
+
         // Treat blank/empty/"null" cwd as absent (models sometimes emit these).
         // Also strip stray surrounding quote characters and expand `~`.
         let cwd = input.cwd.as_deref().and_then(sanitize_cwd_value);
@@ -602,7 +607,7 @@ impl xai_tool_runtime::Tool for TaskTool {
                 model,
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,
-                persona: None,
+                persona,
                 // JSON cannot set this field. Compat-harness adapters still
                 // populate it in-process; model-facing spawns stay `None`.
                 capability_mode: input.capability_mode,
@@ -856,6 +861,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -895,6 +901,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -929,6 +936,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -960,6 +968,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -1018,6 +1027,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -1074,6 +1084,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -1117,6 +1128,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -1225,6 +1237,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            persona: None,
             task_id: None,
         }
     }
@@ -1834,6 +1847,55 @@ mod tests {
     }
 
     #[test]
+    fn task_tool_input_schema_advertises_persona() {
+        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
+        let persona = schema["properties"]
+            .get("persona")
+            .expect("persona must be advertised so the model can apply one");
+        assert!(
+            persona["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("<personas>"),
+            "the description must point at the catalog block that lists valid names"
+        );
+    }
+
+    #[tokio::test]
+    async fn persona_reaches_the_spawn_request() {
+        let (backend, mut rx) = make_backend();
+        let resources = resources_for_task(backend);
+        let shared = resources.into_shared();
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            assert_eq!(
+                request.runtime_overrides.persona.as_deref(),
+                Some("reviewer"),
+                "a model-facing persona must reach subagent resolution"
+            );
+            let id = request.id.clone();
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: true,
+                    output: "ok".into(),
+                    subagent_id: id.clone(),
+                    child_session_id: id,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let mut input = task_input("general-purpose", false);
+        input.persona = Some("  reviewer  ".into());
+        let result = xai_tool_runtime::Tool::run(&TaskTool, test_ctx(shared), input)
+            .await
+            .unwrap();
+        handle.await.unwrap();
+        assert!(matches!(result, ToolOutput::SubagentCompleted(_)));
+    }
+
+    #[test]
     fn runtime_overrides_struct_default_is_all_none() {
         let overrides = SubagentRuntimeOverrides::default();
         assert!(overrides.model.is_none());
@@ -1854,6 +1916,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: Some("test-model".into()),
+            persona: None,
             task_id: Some("task-123".into()),
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2122,6 +2185,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            persona: None,
             task_id: None,
         })
         .unwrap();
@@ -2171,6 +2235,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2207,6 +2272,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            persona: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2253,6 +2319,7 @@ mod tests {
                 resume_from: Some("prev-id".into()),
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2319,6 +2386,7 @@ mod tests {
                     resume_from: Some(sentinel.into()),
                     cwd: None,
                     model: None,
+                    persona: None,
                     task_id: None,
                 },
             )
@@ -2365,6 +2433,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            persona: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2393,6 +2462,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2447,6 +2517,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2497,6 +2568,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("null".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2547,6 +2619,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("  ".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2600,6 +2673,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2634,6 +2708,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2689,6 +2764,7 @@ mod tests {
                     resume_from: None,
                     cwd: Some(sentinel.into()),
                     model: None,
+                    persona: None,
                     task_id: None,
                 },
             )
@@ -2742,6 +2818,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2799,6 +2876,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("\"/tmp".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2851,6 +2929,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )
@@ -2899,6 +2978,7 @@ mod tests {
                 resume_from: Some("prev-id".into()),
                 cwd: Some("/tmp/some-dir".into()),
                 model: None,
+                persona: None,
                 task_id: None,
             },
         )

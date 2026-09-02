@@ -788,6 +788,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                persona: None,
                 task_id: None,
             })),
             AccessKind::Edit(p) if p == "task:general-purpose"

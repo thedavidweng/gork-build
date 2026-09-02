@@ -335,9 +335,14 @@ pub(crate) async fn run_shell_child(
         .parent_session_info
         .as_ref()
         .map(|i| std::path::Path::new(&i.cwd));
+    // The precedence rule lives with the other ones, in the resolution crate.
+    let spawn_overrides = xai_grok_subagent_resolution::with_default_persona(
+        &request.runtime_overrides,
+        ctx.default_persona.as_deref(),
+    );
     let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
         &request.subagent_type,
-        &request.runtime_overrides,
+        &spawn_overrides,
         &ctx.subagent_roles,
         &ctx.subagent_personas,
         cwd,

@@ -219,9 +219,25 @@ impl PromptContext {
         let section = self.format_personas_section()?;
         Some(format!("<system-reminder>\n{section}</system-reminder>"))
     }
-    /// Always returns `None`: the `persona` parameter was removed from the task tool input, so persona summaries are never injected.
+    /// Catalog of personas the parent may apply when it spawns a subagent.
+    ///
+    /// `None` when the session defines no persona: an empty `<personas>` block
+    /// would advertise a capability with nothing behind it.
     pub fn format_personas_section(&self) -> Option<String> {
-        None
+        if self.persona_summaries.is_empty() {
+            return None;
+        }
+        let mut section = String::from("<personas>\n");
+        section.push_str(
+            "Named behavioral overlays for subagents. Pass `persona=\"<name>\"` to the task \
+             tool to apply one; omit it for the subagent type's own default behavior.\n",
+        );
+        for summary in &self.persona_summaries {
+            section.push_str(summary);
+            section.push('\n');
+        }
+        section.push_str("</personas>\n");
+        Some(section)
     }
     /// Build the placeholder JSON for template rendering.
     ///
@@ -553,13 +569,25 @@ mod tests {
         assert!(section.contains("<system-reminder>"));
     }
     #[test]
-    fn test_format_personas_section_always_none() {
+    fn format_personas_section_lists_the_available_personas() {
         let mut ctx = test_context();
         ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
+        let section = ctx
+            .format_personas_section()
+            .expect("personas defined by the session must reach the model");
+        assert!(section.contains("<personas>"));
+        assert!(section.contains("</personas>"));
+        assert!(section.contains("reviewer"));
         assert!(
-            ctx.format_personas_section().is_none(),
-            "persona section is disabled — persona param removed from task tool"
+            section.contains("persona="),
+            "the catalog must name the task-tool parameter that applies a persona"
         );
+    }
+
+    #[test]
+    fn format_personas_section_is_none_without_personas() {
+        let ctx = test_context();
+        assert!(ctx.format_personas_section().is_none());
     }
     /// AGENTS.md user reminder must be present for the default template when files are present.
     #[test]
@@ -590,12 +618,24 @@ mod tests {
         assert!(ctx.format_agents_md_section().is_some());
     }
     #[test]
-    fn personas_user_reminder_always_none() {
+    fn personas_user_reminder_wraps_the_catalog() {
         let mut ctx = test_context();
+        ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
+        let reminder = ctx
+            .personas_user_reminder()
+            .expect("primary sessions receive the persona catalog");
+        assert!(reminder.starts_with("<system-reminder>"));
+        assert!(reminder.contains("reviewer"));
+    }
+
+    #[test]
+    fn personas_user_reminder_skips_subagents() {
+        let mut ctx = test_context();
+        ctx.audience = PromptAudience::Subagent;
         ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
         assert!(
             ctx.personas_user_reminder().is_none(),
-            "persona reminder is disabled — persona param removed from task tool"
+            "`task` is parent-only, so a child never needs the persona catalog"
         );
     }
     fn child_general_purpose_context() -> PromptContext {

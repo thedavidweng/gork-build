@@ -1,3 +1,15 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Personal agent config kept out of the source tree.
+#
+# Personas resolve from two scopes: `~/.grok/personas/` (user) and
+# `<cwd>/.grok/personas/` (project) — and the second one lands inside whatever
+# repository the session runs in, this fork included. Nothing under `.grok/`
+# is tracked here, so ignoring it costs nothing and is what stops a stray
+# `git add -A` from publishing personal persona text. Prompt overrides and
+# presets live under `$GROK_HOME` and never reach a git tree at all.
+#
+# A project that genuinely wants to share a persona still can: `git add -f`.
+.grok/
