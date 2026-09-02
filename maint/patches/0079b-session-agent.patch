@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Wed, 2 Sep 2026 22:57:04 +0200
+Subject: [PATCH] session-agent: open a session on a chosen agent from inside
+ the TUI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The agent a session runs on is decided when the session is created: the
+pager stamps `_meta.agentProfile` and the shell prefers it over
+`[agent] name` and `GROK_AGENT`. That field was only ever filled from
+`--agent` at launch, so picking an agent meant restarting the process —
+and the agents modal, which is where you actually read definitions,
+could not act on one.
+
+`/agent <name>` (alias `/use-agent`) sets the same field and opens a new
+session on it. A new session rather than a conversion of the current one,
+because the agent is fixed at creation; saying so is more honest than
+pretending to switch in place.
+
+Gork-Patch-Id: session-agent
+Gork-Risk: low
+---
+ .../docs/user-guide/04-slash-commands.md      | 12 +++
+ .../codegen/xai-grok-pager/src/app/actions.rs |  5 ++
+ .../xai-grok-pager/src/app/dispatch/router.rs |  8 ++
+ .../src/slash/commands/agent.rs               | 90 +++++++++++++++++++
+ .../xai-grok-pager/src/slash/commands/mod.rs  |  2 +
+ 5 files changed, 117 insertions(+)
+ create mode 100644 crates/codegen/xai-grok-pager/src/slash/commands/agent.rs
+
+diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
+index fcb5c627828d6cc0c9f5dc095727439172145a26..fd932e6eb04cbbb5b812c0e0041c4e0b735da883 100644
+--- a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
++++ b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
+@@ -439,6 +439,18 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
+ 
+ Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
+ 
++### `/agent`
++
++Open a **new session running a named agent definition**. Alias: `/use-agent`.
++
++```
++/agent <name>
++```
++
++The agent a session runs on is decided when the session is created, so this opens a new one rather than converting the current session. Definitions live in `.grok/agents/*.md` and `~/.grok/agents/*.md`; browse and edit them with [`/agents`](16-subagents.md) (that modal manages definitions — `/agents-dashboard` lists running sessions instead).
++
++The same choice at launch: `grok --agent <name>`, or `GROK_AGENT=<name> grok`. To shape a subagent's behavior rather than the session's, see [personas and roles](16-subagents.md).
++
+ ### `/prompts`
+ 
+ Open the [prompt templates](25-prompts.md) browser: preview stock system / subagent prompts, edit overrides in the TUI (or `$EDITOR`), reset to the binary defaults, and save or apply named presets under `~/.grok`. Aliases: `/prompt`, `/system-prompts`.
+diff --git a/crates/codegen/xai-grok-pager/src/app/actions.rs b/crates/codegen/xai-grok-pager/src/app/actions.rs
+index 77c83334ad1d558b7acefea3461450bd0d2a67f2..845a336ace30259619310353e752161d513237be 100644
+--- a/crates/codegen/xai-grok-pager/src/app/actions.rs
++++ b/crates/codegen/xai-grok-pager/src/app/actions.rs
+@@ -128,6 +128,11 @@ pub enum Action {
+     ConfirmWelcomeLocalWorkspaceAck,
+     /// Create a new session with a client-chosen session ID (`--session-id`).
+     NewSessionWithId(String),
++    /// Open a new session running a named agent definition (`/agent <name>`).
++    ///
++    /// Sets the same `agent_override` that `--agent` fills at launch, so the
++    /// next `session/new` carries it as `_meta.agentProfile`.
++    OpenSessionWithAgent(String),
+     /// Startup `--fork-session`: fork `parent` then load the child.
+     /// Optional second string is the desired new session ID.
+     StartupForkSession {
+diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
+index 366d3fe41c265403f321f2a614c2608b799e8736..98e8e4289b2144d81d3402cfe36caa56c724fbfe 100644
+--- a/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
++++ b/crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
+@@ -271,6 +271,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
+             dispatch_load_session(app, session_id, session_cwd, chat_kind)
+         }
+         Action::NewSessionWithId(session_id) => dispatch_new_session_with_id(app, session_id),
++        Action::OpenSessionWithAgent(name) => {
++            // Same field `--agent` fills at launch: the next session/new stamps
++            // it as `_meta.agentProfile`, which the shell prefers over
++            // `[agent] name` and `GROK_AGENT`. It sticks for later sessions of
++            // this process too, matching how the launch flag behaves.
++            app.agent_override = Some(serde_json::Value::String(name));
++            dispatch_new_session(app)
++        }
+         Action::StartupForkSession {
+             parent_session_id,
+             parent_cwd,
+diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/agent.rs b/crates/codegen/xai-grok-pager/src/slash/commands/agent.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3db2f818f2377379c8555e7814d3a4f6ca6c553e
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager/src/slash/commands/agent.rs
+@@ -0,0 +1,90 @@
++//! `/agent` — open a new session on a named agent definition.
++//!
++//! The agent a session runs on is decided at session creation: the pager
++//! stamps `_meta.agentProfile` and the shell gives it priority over
++//! `[agent] name` and `GROK_AGENT`. That field was only ever filled from
++//! `--agent` at launch, so choosing an agent meant restarting the process.
++//! This drives the same field from inside a running session.
++
++use crate::app::actions::Action;
++use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
++
++/// Open a new session on a named agent definition.
++pub struct AgentCommand;
++
++impl SlashCommand for AgentCommand {
++    fn name(&self) -> &str {
++        "agent"
++    }
++
++    fn aliases(&self) -> &[&str] {
++        &["use-agent"]
++    }
++
++    fn description(&self) -> &str {
++        "Open a new session on a named agent definition"
++    }
++
++    fn usage(&self) -> &str {
++        "/agent <name>"
++    }
++
++    fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
++        let name = args.trim();
++        if name.is_empty() {
++            return CommandResult::Error(
++                "Usage: /agent <name> — opens a new session running that agent. \
++                 Browse and edit definitions with /agents; `grok --agent <name>` \
++                 (or GROK_AGENT=<name>) does the same at launch."
++                    .into(),
++            );
++        }
++        CommandResult::Action(Action::OpenSessionWithAgent(name.to_string()))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::acp::model_state::ModelState;
++    use crate::app::bundle::BundleState;
++    use crate::settings::PagerLocalSnapshot;
++
++    fn exec_ctx<'a>(models: &'a ModelState, bundle: &'a BundleState) -> CommandExecCtx<'a> {
++        CommandExecCtx {
++            models,
++            session_id: None,
++            bundle_state: bundle,
++            screen_mode: crate::app::ScreenMode::Inline,
++            billing_surface_visible: true,
++            usage_command_visible: true,
++            pager_state: PagerLocalSnapshot::default(),
++        }
++    }
++
++    #[test]
++    fn a_name_opens_a_session_on_that_agent() {
++        let models = ModelState::default();
++        let bundle = BundleState::default();
++        let result = AgentCommand.run(&mut exec_ctx(&models, &bundle), "  reviewer  ");
++        match result {
++            CommandResult::Action(Action::OpenSessionWithAgent(name)) => {
++                assert_eq!(name, "reviewer", "the name must be trimmed")
++            }
++            other => panic!("expected OpenSessionWithAgent, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn no_name_explains_the_usage() {
++        let models = ModelState::default();
++        let bundle = BundleState::default();
++        match AgentCommand.run(&mut exec_ctx(&models, &bundle), "") {
++            CommandResult::Error(msg) => {
++                assert!(msg.contains("/agent <name>"));
++                assert!(msg.contains("--agent"), "point at the launch-time equivalent");
++            }
++            other => panic!("expected a usage error, got {other:?}"),
++        }
++    }
++}
+diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
+index 909c623f21fd5d594bf7054beb44e17af99b5626..3da33da9ed0090ec89000c32937f2cdf6402ac0e 100644
+--- a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
+@@ -1,4 +1,5 @@
+ //! Each command lives in its own submodule. This module re-exports command structs and provides `builtin_commands()` for registry construction.
++pub mod agent;
+ pub mod always_approve;
+ pub mod announcements;
+ pub mod auto;
+@@ -120,6 +121,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
+         Arc::new(plugin::MarketplaceCommand),
+         Arc::new(workflow::WorkflowCommand),
+         Arc::new(personas::PersonasCommand),
++        Arc::new(agent::AgentCommand),
+         Arc::new(config_agents::ConfigAgentsCommand),
+         // Settings and display.
+         Arc::new(theme::ThemeCommand),
+
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
+prerequisite-patch-id: 5334f8182338a8406ef54556119a815f49cc11ba
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 586f4e22105f7f778afdbe214b0f87de3c01da98
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
+prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
+prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
+prerequisite-patch-id: f350eb478b08b349e42de5d6d841966b29051846
+prerequisite-patch-id: 7a62217e285237a92fd1233f1f5d4e3c52ebb5f0
+-- 
+2.43.0
+
