@@ -1743,13 +1743,34 @@ def fold_finish(root: Path, state: dict) -> int:
         print("fold: export failed — state kept for --continue", file=sys.stderr)
         return int(rc)
 
-    if git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip():
-        head_subject = git(
-            ["log", "-1", "--format=%s"], cwd=root, capture=True
+    head_now = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+    head_subject = git(
+        ["log", "-1", "--format=%s"], cwd=root, capture=True
+    ).stdout.strip()
+    head_is_reexport = head_subject.startswith(
+        CONTROL_REEXPORT_SUBJECT
+    ) and not orphan_product_files(root, commit_changed_files(root, "HEAD"))
+
+    # `product_tip` records the tree the queue has to reproduce. Left on a
+    # pre-fold sha it makes the very next lint fail on a difference this fold
+    # created on purpose, so it moves with the export. It points at the parent
+    # of the control commit below — the one commit this fold will not rewrite,
+    # which keeps the reference from going stale the moment it is written.
+    product_head = head_now
+    if head_is_reexport:
+        parent = git(
+            ["rev-parse", "--verify", "--quiet", "HEAD~1"],
+            cwd=root,
+            capture=True,
+            check=False,
         ).stdout.strip()
-        head_is_reexport = head_subject.startswith(
-            CONTROL_REEXPORT_SUBJECT
-        ) and not orphan_product_files(root, commit_changed_files(root, "HEAD"))
+        if parent:
+            product_head = parent
+    lock_after = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    lock_after.product_tip = product_head
+    lock_after.write(root / "maint/upstream.lock.toml")
+
+    if git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip():
         git(["add", "-A"], cwd=root)
         if head_is_reexport:
             git(
