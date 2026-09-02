@@ -1730,7 +1730,16 @@ def fold_finish(root: Path, state: dict) -> int:
     git(["checkout", branch, "-q"], cwd=root)
 
     lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
-    pairs = commits_with_patch_id(root, lock.commit, "HEAD")
+    # Same filter the export applies: a `control-metadata` / `overlays` /
+    # `cargo-lock` commit carries a trailer without being a functional patch.
+    # Taking one as the tip made the export straddle the overlay restore and
+    # refuse on "non-control files after functional tip" — the very trap this
+    # command exists to remove, reintroduced one filter short.
+    pairs = [
+        (sha, pid)
+        for sha, pid in commits_with_patch_id(root, lock.commit, "HEAD")
+        if pid not in EXCLUDE_PATCH_IDS
+    ]
     if not pairs:
         print("fold: no functional commit left to export", file=sys.stderr)
         return 3
