@@ -1864,38 +1864,72 @@ def cmd_fold(args: argparse.Namespace) -> int:
         return 2
     target = by_id[args.patch_id]
 
-    # Normalize both entry points to "a trailerless commit sits at the tip":
-    # nothing is ever stashed or reset away, so every state is recoverable.
-    if git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip():
-        git(["add", "-A"], cwd=root)
-        git(
-            ["commit", "--no-verify", "-q", "-m", f"fold-wip: {args.patch_id}"],
-            cwd=root,
-            env={GUARD_ENV: "0"},
-        )
-    wip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
-    if commit_trailer_id(root, wip) is not None:
+    # Everything is decided before a single byte moves: a refusal has to leave
+    # the branch and the working tree exactly as it found them.
+    dirty = bool(git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip())
+    if dirty:
+        if commit_trailer_id(root, "HEAD") is None and orphan_product_files(
+            root, commit_changed_files(root, "HEAD")
+        ):
+            print(
+                "fold: HEAD is already an un-queued product commit — fold that "
+                "one first, or amend it with your pending change",
+                file=sys.stderr,
+            )
+            return 2
+        names = git(
+            ["diff", "--name-only", "HEAD"], cwd=root, capture=True
+        ).stdout.splitlines()
+        names += git(
+            ["ls-files", "--others", "--exclude-standard"], cwd=root, capture=True
+        ).stdout.splitlines()
+        pending = sorted({n.strip() for n in names if n.strip()})
+        old_tip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+    else:
+        parents = git(
+            ["rev-list", "--parents", "-n", "1", "HEAD"], cwd=root, capture=True
+        ).stdout.split()
+        if len(parents) != 2:
+            print(
+                "fold: HEAD is a merge or a root commit — unsupported",
+                file=sys.stderr,
+            )
+            return 2
+        old_tip = parents[1]
+        pending = range_changed_files(root, old_tip, "HEAD")
+
+    pending_product = orphan_product_files(root, pending)
+    if not pending_product:
         print(
-            "fold: nothing to fold — the tree is clean and HEAD is already a "
-            "queue commit",
+            "fold: nothing to fold — no product change is pending (clean tree, or "
+            "only control-plane files, which never belong inside a patch)",
             file=sys.stderr,
         )
         return 2
-    parents = git(
-        ["rev-list", "--parents", "-n", "1", wip], cwd=root, capture=True
-    ).stdout.split()
-    if len(parents) != 2:
-        print("fold: HEAD is a merge or a root commit — unsupported", file=sys.stderr)
-        return 2
-    old_tip = parents[1]
+    control_part = sorted(set(pending) - set(pending_product))
+    if control_part:
+        print(
+            "fold: refused — this change mixes the product tree with "
+            "control-plane files:",
+            file=sys.stderr,
+        )
+        for f in control_part:
+            print(f"       {f}", file=sys.stderr)
+        print(
+            "\n  A patch must not carry control files: the apply restores those from\n"
+            "  control-files.toml afterwards, so they would land twice and read as\n"
+            "  part of the feature. Commit the control part on its own first, then\n"
+            "  fold what is left.",
+            file=sys.stderr,
+        )
+        return 3
 
-    pending = range_changed_files(root, old_tip, wip)
     shared: dict[str, str] = {}
     for sha, pid in commits_with_patch_id(root, base, old_tip):
         if sha == target:
             continue
         for f in commit_changed_files(root, sha):
-            if f in pending:
+            if f in pending_product:
                 shared.setdefault(f, pid)
     if shared and not args.allow_shared:
         print(
@@ -1913,6 +1947,18 @@ def cmd_fold(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 3
+
+    # Decided. Materialize the pending change as a commit before touching
+    # anything else, so every intermediate state stays reachable — nothing is
+    # ever stashed or reset away.
+    if dirty:
+        git(["add", "-A"], cwd=root)
+        git(
+            ["commit", "--no-verify", "-q", "-m", f"fold-wip: {args.patch_id}"],
+            cwd=root,
+            env={GUARD_ENV: "0"},
+        )
+    wip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
 
     git(["update-ref", FOLD_BACKUP_REF, wip], cwd=root)
     patch_path = git_dir(root) / FOLD_PATCH_FILE

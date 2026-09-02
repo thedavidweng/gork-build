@@ -32,7 +32,46 @@ python maint/scripts/patchctl.py lint                # static + roundtrip vs HEA
 python maint/scripts/patchctl.py finalize-sync --upstream <SHA> --version X --source-rev Y
 python maint/scripts/patchctl.py roundtrip
 python maint/scripts/patchctl.py report --new <sha> --json
+python maint/scripts/patchctl.py guard --install   # une fois par clone
+python maint/scripts/patchctl.py guard             # audite la branche
+python maint/scripts/patchctl.py fold <patch-id>   # range une modif dans la file
 ```
+
+## Faire entrer une modification dans la file
+
+`patchctl apply` reconstruit une branche `sync/*` depuis upstream **plus
+`maint/patches/` seulement**. Un commit qui touche l'arbre produit sans trailer
+`Gork-Patch-Id` est donc jeté au prochain sync, en silence — c'est comme ça que
+la feature `/prompts` a été perdue une fois.
+
+Deux outils ferment ce trou.
+
+**`guard`** — `patchctl guard --install` pose un hook `commit-msg` versionné
+(`maint/hooks/`, via `core.hooksPath`) qui refuse un tel commit et nomme les
+sorties légitimes. `patchctl lint` rejoue le même contrôle sur toute la branche,
+donc une machine sans hook ne fait pas passer l'erreur en CI. Sont exemptés le
+plan de contrôle, les fichiers gérés par `maint/overlays/` et `Cargo.lock` : un
+apply les remet en place, ils ne sont pas orphelins. Échappatoire assumée :
+`PATCHCTL_GUARD=0 git commit …`.
+
+**`fold`** — remplace la chirurgie manuelle (détacher, `--amend` en préservant le
+trailer, `rebase --onto`, ré-export, commit de contrôle, lint) par une commande :
+
+```bash
+# modification dans l'arbre de travail, rien de commité
+python maint/scripts/patchctl.py fold prompts-modal
+```
+
+Elle transforme d'abord la modification en commit, donc aucun état intermédiaire
+n'est perdu, garde l'ancien sommet sur `refs/patchctl/fold-backup`, et exporte
+depuis le **tip fonctionnel** et non depuis `HEAD` (passer `HEAD` déclenche le
+garde-fou des fichiers de contrôle de l'export — un des pièges que la commande
+supprime). Elle refuse plutôt que de deviner dans deux cas : un fichier déjà
+porté par un autre patch (`--allow-shared` pour passer outre) et un changement
+qui mélange produit et plan de contrôle. En cas de conflit : `fold --continue`
+ou `fold --abort`.
+
+Tests : `python3 maint/scripts/tests/test_patchctl_guard_fold.py`.
 
 ## Apply policy
 

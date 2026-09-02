@@ -287,6 +287,18 @@ class FoldTests(unittest.TestCase):
         self.assertEqual(self.repo.head(), tip_before)
         self.assertIn("stray()", (self.repo.root / "other.rs").read_text(encoding="utf-8"))
 
+    def test_fold_refuses_a_change_that_mixes_control_plane(self) -> None:
+        tip_before = self.repo.head()
+        write(self.repo.root, "app.rs", APP_BASE + "// product side\n")
+        write(self.repo.root, "maint/notes.md", "control side\n")
+        proc = patchctl(self.repo.root, "fold", "alpha", "--no-lint")
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("maint/notes.md", proc.stderr)
+        # control-files.toml restores maint/ after an apply: a patch carrying it
+        # would land the same change twice.
+        self.assertEqual(self.repo.head(), tip_before)
+        self.assertNotIn("control side", self._patch_text("0001-alpha.patch"))
+
     def test_fold_rejects_an_unknown_patch_id(self) -> None:
         write(self.repo.root, "app.rs", APP_BASE + "// x\n")
         proc = patchctl(self.repo.root, "fold", "nosuchpatch", "--no-lint")
