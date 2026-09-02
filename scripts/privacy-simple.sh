@@ -1266,6 +1266,49 @@ menu_port_screen() {
   done
 }
 
+# Ranger une modification dans un patch existant de la file.
+#
+# Le travail réel est dans `patchctl fold` ; le menu ne fait que montrer ce qui
+# va être rangé, proposer les identifiants qui existent, et rapporter le verdict.
+# Sans cette entrée, la seule façon de faire entrer une correction dans la file
+# était une chirurgie git à neuf étapes — et ce qui reste hors file disparaît au
+# prochain repatch, sans bruit.
+menu_fold() {
+  local -a ids=()
+  mapfile -t ids < <(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' maint/patchset.toml 2>/dev/null)
+  if [[ "${#ids[@]}" -eq 0 ]]; then
+    err "aucun patch lisible dans maint/patchset.toml"
+    return 0
+  fi
+
+  local pending
+  pending="$(git status --porcelain 2>/dev/null || true)"
+  printf '\n%s── À ranger ──%s\n' "$D" "$Z"
+  if [[ -n "$pending" ]]; then
+    printf '%s\n' "$pending" | head -12 | sed 's/^/  /'
+    if [[ "$(printf '%s\n' "$pending" | wc -l)" -gt 12 ]]; then printf '  …\n'; fi
+  else
+    printf "  arbre propre — le commit de tête sera rangé, sauf s'il est déjà dans la file\n"
+  fi
+  printf '\n  Dans quel patch ?\n\n'
+
+  local idx cur=0 rc=0
+  local -a items=("${ids[@]}" "Retour")
+  menu_select idx "$cur" "${items[@]}" || rc=$?
+  if [[ "$rc" != "0" ]]; then return 0; fi
+  if [[ "$idx" -ge "${#ids[@]}" ]]; then return 0; fi
+
+  local id="${ids[$idx]}"
+  info "patchctl fold $id"
+  if "$PYTHON" maint/scripts/patchctl.py fold "$id"; then
+    ok "rangé dans $id — file ré-exportée, lint vert"
+  else
+    err "fold interrompu — relire le message ci-dessus (fold --continue / fold --abort)"
+  fi
+  printf '\n'
+  return 0
+}
+
 menu_main() {
   local idx cur=0 rc sha label
   local -a items
@@ -1280,11 +1323,19 @@ menu_main() {
     if [[ "$MENU_NET_OK" == "1" && -n "$MENU_TIP" && "$MENU_TIP" != "$MENU_LOCK_C" ]]; then
       label="Rebuild complet — ${MENU_LOCK_V} → ${MENU_TIP_V}"
     fi
+    # Le libellé compte ce qui attend : une modification oubliée dans l'arbre
+    # est précisément ce que le repatch fait disparaître.
+    local fold_lbl="Ranger une modification dans la file (fold)"
+    local fold_n="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${fold_n:-0}" -gt 0 ]]; then
+      fold_lbl="$fold_lbl — $fold_n en attente"
+    fi
     items=(
       "$label"
       "Rejouer le lock (${MENU_LOCK_V:-?})"
       "Apply seul, sans build"
       "Build + install seuls (worktree courant)"
+      "$fold_lbl"
       "Sonde détaillée"
       "Cible précise (SHA)…"
       "Options avancées…"
@@ -1299,8 +1350,9 @@ menu_main() {
       1) MODE=run; TARGET_MODE=lock; DO_INSTALL=1; return 0 ;;
       2) MODE=run; TARGET_MODE=tip;  DO_INSTALL=0; return 0 ;;
       3) MODE=build-only; return 0 ;;
-      4) MODE=check; return 0 ;;
-      5)
+      4) menu_fold ;;
+      5) MODE=check; return 0 ;;
+      6)
         menu_ask 'SHA amont (vide = annuler) >' sha || continue
         if [[ -z "$sha" ]]; then continue; fi
         if ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null; then
@@ -1308,9 +1360,9 @@ menu_main() {
         fi
         MODE=run; TARGET_MODE=sha; TARGET_SHA="$sha"; DO_INSTALL=1; return 0
         ;;
-      6) menu_advanced ;;
-      7) menu_downstream; menu_probe ;;
-      8) exit 0 ;;
+      7) menu_advanced ;;
+      8) menu_downstream; menu_probe ;;
+      9) exit 0 ;;
     esac
   done
 }
