@@ -89,6 +89,13 @@ file = "0058-update-test-drift.patch"
 critical = true
 contracts = ["updater-product-build"]
 
+# Meme famille que pager-test-drift et update-test-drift : la cible de test ne compile pas dans l'export, ce qui rend toute la suite unitaire du shell inexecutable.
+[[patch]]
+id = "shell-test-drift"
+file = "0059-shell-test-drift.patch"
+critical = true
+contracts = []
+
 [[patch]]
 id = "egress-guard"
 file = "0060-egress-guard.patch"
