@@ -19,6 +19,12 @@ post_apply_commands = [
 # RUSTSEC-2026-0258 : h2 0.4.15 vulnérable (DoS « unbounded empty DATA frames »),
 # correctif 0.4.16 — bump patch-level compatible semver, hors advisory ignorée.
 # À retirer quand le lock amont embarquera h2 >= 0.4.16.
+#
+# RUSTSEC-2026-0274 : rtrb 0.3.2 vulnérable (double free / use-after-free dans
+# `ReadChunk::commit` quand le `Drop` d'un élément panique), correctif 0.3.5 —
+# bump patch-level, transitif via fastrace. À retirer quand le lock amont
+# embarquera rtrb >= 0.3.5.
 cargo_update_pins = [
   ["cargo", "update", "-p", "h2", "--precise", "0.4.16"],
+  ["cargo", "update", "-p", "rtrb", "--precise", "0.3.5"],
 ]
