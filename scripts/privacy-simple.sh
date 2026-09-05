@@ -179,6 +179,27 @@ cd "$REPO"
 [[ -f maint/patches/series ]] || die "maint/patches/series manquant"
 [[ -f maint/upstream.lock.toml ]] || die "maint/upstream.lock.toml manquant"
 
+# Le hook qui refuse un commit produit hors de la file est versionné
+# (maint/hooks/), mais `core.hooksPath` est une config **locale** : sur un clone
+# neuf la protection est silencieusement absente — exactement la forme de panne
+# qu'elle existe pour empêcher. On la pose ici, une fois, et jamais par-dessus
+# une configuration existante.
+ensure_guard_hook() {
+  if [[ "${GROK_PRIVACY_DRY_RUN:-0}" == "1" ]]; then return 0; fi
+  if [[ "${GROK_PRIVACY_NO_GUARD:-0}" == "1" ]]; then return 0; fi
+  if [[ ! -f maint/hooks/commit-msg ]]; then return 0; fi
+  local current=""
+  current="$(git config --get core.hooksPath 2>/dev/null || true)"
+  if [[ -n "$current" ]]; then return 0; fi
+  if "$PYTHON" maint/scripts/patchctl.py guard --install >/dev/null 2>&1; then
+    ok "garde des patches installé (core.hooksPath=maint/hooks)"
+  else
+    warn "garde des patches non installé — \`patchctl guard --install\` pour le poser"
+  fi
+  return 0
+}
+ensure_guard_hook
+
 # L'historique de ce dépôt porte une seule identité. On l'impose repo-local et
 # via l'environnement avant toute opération qui committe (am, finalize-sync) :
 # la config globale de la machine ne doit jamais fuiter dans les commits.
