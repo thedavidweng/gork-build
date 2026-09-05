@@ -2,9 +2,11 @@
 //! build, per-cwd in-flight sharing, flush-deadline detach, and manifest
 //! terminal records.
 use super::*;
-use crate::upload::trace::tests::{
-    assert_artifact_failed, read_tar_gz_entries, test_prompt_trace_ctx,
-};
+// `assert_artifact_failed` and `test_prompt_trace_ctx` were imported here and
+// used nowhere: the export ships this import but not the helpers it names, so
+// the shell test target does not compile. Only `read_tar_gz_entries` exists,
+// and it is the only one the file actually calls.
+use crate::upload::trace::tests::read_tar_gz_entries;
 use crate::upload::trace::{ArchiveBuildFault, set_archive_build_fault, spawn_upload_queue};
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(archive_build_fault)]

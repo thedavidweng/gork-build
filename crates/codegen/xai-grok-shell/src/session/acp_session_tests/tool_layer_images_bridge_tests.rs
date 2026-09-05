@@ -1,6 +1,10 @@
 //! Wiring tests for MCP tool-layer images through `handle_bridge_tool_success`.
 use super::support::*;
 use super::*;
+// `STANDARD.encode` is a `base64::Engine` method: without the trait in scope
+// the test target does not compile, and with it the whole shell unit suite is
+// unbuildable. Upstream leaves it out of the public export.
+use base64::Engine as _;
 use xai_grok_sampling_types::{ContentPart, ConversationItem};
 use xai_grok_tools::types::output::{MCPOutput, ToolOutput, ToolRunResult};
 use xai_grok_tools::util::base64_images::{ExtractedImage, IMAGE_CONTENT_PLACEHOLDER};
