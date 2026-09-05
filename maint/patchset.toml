@@ -95,6 +95,12 @@ id = "shell-test-drift"
 file = "0059-shell-test-drift.patch"
 critical = true
 contracts = []
+# Même appel que pager-test-drift : aucun contrat ne peut se porter garant
+# d'une résolution sur des fichiers de test, et refuser le résolveur ne
+# garantit qu'une chose — un portage à la main à chaque release. Le vrai
+# contrôle reste `cargo test -p xai-grok-shell --lib`, qui doit continuer à
+# rendre des chiffres.
+auto_resolve = true
 
 [[patch]]
 id = "egress-guard"
