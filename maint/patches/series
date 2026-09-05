@@ -9,6 +9,7 @@
 0056-consent-record-hard-off.patch
 0057-pager-test-drift.patch
 0058-update-test-drift.patch
+0059-shell-test-drift.patch
 0060-egress-guard.patch
 0070-supply-chain-policy.patch
 0075-win-build-portability.patch

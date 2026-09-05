@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lycaos <caraboune@gmail.com>
+Date: Sat, 5 Sep 2026 09:36:53 +0200
+Subject: [PATCH] shell-test-drift: make the shell unit suite runnable again
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`cargo test -p xai-grok-shell --lib` did not compile in this export, so the
+fork could not run a single one of the shell's ~6800 unit tests. Three
+independent causes, none of them behavioural:
+
+  - `tool_layer_images_bridge_tests.rs` calls `STANDARD.encode` without
+    `base64::Engine` in scope;
+  - `upload/memory_tests.rs` imports `assert_artifact_failed` and
+    `test_prompt_trace_ctx` from `upload::trace::tests`, which the export does
+    not ship — and which the file never calls. Dead imports;
+  - the pager's `registered_features_are_documented` integration test
+    `include_str!`s `docs/internal/25-enterprise.md` and
+    `22-environment-variables.md`, operator docs kept out of the public
+    export. It cannot pass here, ever, so it goes — the same call
+    `update-test-drift` makes for the desktop installer tests.
+
+`RUST_MIN_STACK` joins `.cargo/config.toml` for a fourth reason: one async
+test overflows its thread stack in a debug build, and an overflow *aborts the
+test binary*, taking the other ~6800 tests down with it. Reserving address
+space costs nothing and is what makes the suite report at all.
+
+It now reports 6750 passed / 46 failed. Those 46 are pre-existing upstream
+failures in this export, and the count barely moves under a clean `$GROK_HOME`
+(6752/44 with the real one) — so they are newly *visible*, not newly broken.
+They are left failing rather than ignored: this patch claims the suite runs,
+not that it is green.
+
+Gork-Patch-Id: shell-test-drift
+---
+ .cargo/config.toml                            |  7 ++++++
+ .../registered_features_are_documented.rs     | 23 -------------------
+ .../tool_layer_images_bridge_tests.rs         |  4 ++++
+ .../xai-grok-shell/src/upload/memory_tests.rs |  8 ++++---
+ 4 files changed, 16 insertions(+), 26 deletions(-)
+ delete mode 100644 crates/codegen/xai-grok-pager/tests/registered_features_are_documented.rs
+
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index 912e93e094e2ee9be61fef0d0f93aaae3a110b51..ae42d3e141b376bf603ec900940ce388ada08cbd 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -74,6 +74,13 @@ rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"
+ # env vars below for those platforms.
+ # See: https://github.com/tikv/jemallocator/issues/122
+ [env]
++# `cargo test -p xai-grok-shell --lib` aborts the whole test binary on a stack
++# overflow in a single async test (`cancel_running_task_tests`), which takes
++# the other ~6800 tests down with it — a debug-build future that does not fit
++# the default thread stack. Reserving more address space costs nothing (it is
++# not committed memory) and is what makes the shell suite runnable at all.
++# Not `force`, so an explicit RUST_MIN_STACK still wins.
++RUST_MIN_STACK = "33554432"
+ SYSTEM_DEPS_DAV1D_BUILD_INTERNAL = "auto"
+ AARCH64_APPLE_DARWIN_JEMALLOC_SYS_WITH_LG_PAGE = "14"
+ AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = "16"
+diff --git a/crates/codegen/xai-grok-pager/tests/registered_features_are_documented.rs b/crates/codegen/xai-grok-pager/tests/registered_features_are_documented.rs
+deleted file mode 100644
+index 9b400c82065e64ad6770ab276cca34d59334130b..0000000000000000000000000000000000000000
+--- a/crates/codegen/xai-grok-pager/tests/registered_features_are_documented.rs
++++ /dev/null
+@@ -1,23 +0,0 @@
+-//! `FEATURES` is the source of truth and the operator tables are hand-maintained mirrors with no compile-time check of their own.
+-//! This test is that check.
+-
+-use xai_grok_shell::agent::config::FEATURES;
+-
+-const ENTERPRISE: &str = include_str!("../docs/internal/25-enterprise.md");
+-const ENV_VARS: &str = include_str!("../docs/internal/22-environment-variables.md");
+-
+-#[test]
+-fn every_registered_feature_reaches_the_operator() {
+-    for spec in FEATURES {
+-        assert!(
+-            ENTERPRISE.contains(&format!("`{}`", spec.key)),
+-            "{} has no row in the 25-enterprise.md pinning table",
+-            spec.key,
+-        );
+-        assert!(
+-            ENV_VARS.contains(&format!("`{}`", spec.env)),
+-            "{} is undocumented in 22-environment-variables.md",
+-            spec.env,
+-        );
+-    }
+-}
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs
+index 63c41fc05d8905c201fafd30c276c43055ff6fd6..3b0a341daa5b77d57640f4e47fbd239b105a5ddd 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_tests/tool_layer_images_bridge_tests.rs
+@@ -1,6 +1,10 @@
+ //! Wiring tests for MCP tool-layer images through `handle_bridge_tool_success`.
+ use super::support::*;
+ use super::*;
++// `STANDARD.encode` is a `base64::Engine` method: without the trait in scope
++// the test target does not compile, and with it the whole shell unit suite is
++// unbuildable. Upstream leaves it out of the public export.
++use base64::Engine as _;
+ use xai_grok_sampling_types::{ContentPart, ConversationItem};
+ use xai_grok_tools::types::output::{MCPOutput, ToolOutput, ToolRunResult};
+ use xai_grok_tools::util::base64_images::{ExtractedImage, IMAGE_CONTENT_PLACEHOLDER};
+diff --git a/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs b/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
+index c43ce4bc90c1d5acfea32daf60808db11df9b1c9..d13c3df7e30a9b36c2ff88a23bf737dbb780213f 100644
+--- a/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
++++ b/crates/codegen/xai-grok-shell/src/upload/memory_tests.rs
+@@ -2,9 +2,11 @@
+ //! build, per-cwd in-flight sharing, flush-deadline detach, and manifest
+ //! terminal records.
+ use super::*;
+-use crate::upload::trace::tests::{
+-    assert_artifact_failed, read_tar_gz_entries, test_prompt_trace_ctx,
+-};
++// `assert_artifact_failed` and `test_prompt_trace_ctx` were imported here and
++// used nowhere: the export ships this import but not the helpers it names, so
++// the shell test target does not compile. Only `read_tar_gz_entries` exists,
++// and it is the only one the file actually calls.
++use crate::upload::trace::tests::read_tar_gz_entries;
+ use crate::upload::trace::{ArchiveBuildFault, set_archive_build_fault, spawn_upload_queue};
+ #[tokio::test(flavor = "current_thread")]
+ #[serial_test::serial(archive_build_fault)]
+
+base-commit: 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
+prerequisite-patch-id: ddec6c071f8276d60ea631d238abd4a26350110b
+prerequisite-patch-id: 5334f8182338a8406ef54556119a815f49cc11ba
+prerequisite-patch-id: 9d2ed8f5725c42a278c44b406704a7d3bb7c4ec1
+prerequisite-patch-id: b5ac2290d8a787d08124e9cd350e3997c1af8994
+prerequisite-patch-id: 2786e4a0c6ea44ab346fc65be826053a9c628781
+prerequisite-patch-id: 78621bb25d68cf8b65908fd94dbc76e11b44832b
+prerequisite-patch-id: 586f4e22105f7f778afdbe214b0f87de3c01da98
+prerequisite-patch-id: 0e555246a66056f4876f40e73e8f379c421e890e
+prerequisite-patch-id: 4074e4dbb26e3624ccd35f3aa6cf30b67d77c5de
+prerequisite-patch-id: 9c3ac0a59910b7a0faa3a8d5586fabac0863dcd0
+-- 
+2.43.0
+
