@@ -16,6 +16,7 @@ Run directly: python3 maint/scripts/tests/test_patchctl_guard_fold.py
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,15 @@ id = "beta"
 file = "0002-beta.patch"
 critical = true
 contracts = []
+"""
+
+CONTRACTS = """schema = 1
+
+[[contract]]
+id = "alpha-holds"
+group = "privacy"
+min_tests = 0
+command = ["true"]
 """
 
 LOCK = """schema = 1
@@ -128,6 +138,7 @@ class QueueRepo:
 
         write(root, "maint/control-files.toml", CONTROL_FILES)
         write(root, "maint/patchset.toml", PATCHSET)
+        write(root, "maint/contracts/privacy-contract.toml", CONTRACTS)
         write(root, "maint/upstream.lock.toml", LOCK.format(commit=self.base))
         # An overlay-managed file: restored after every apply, so a commit
         # touching it is not an orphan even without a trailer.
@@ -163,6 +174,28 @@ class QueueRepo:
 
     def clean(self) -> bool:
         return not git(self.root, "status", "--porcelain").stdout.strip()
+
+    def manifest_ids(self) -> list[str]:
+        text = (self.root / "maint/patchset.toml").read_text(encoding="utf-8")
+        return re.findall(r'^id = "(.+)"$', text, re.M)
+
+    def queue_ids(self) -> list[str]:
+        out = git(
+            self.root, "log", "--reverse", "--format=%B%x00", f"{self.base}..HEAD"
+        ).stdout
+        return [
+            pid
+            for pid in re.findall(r"^Gork-Patch-Id: (\S+)$", out, re.M)
+            if pid != "control-metadata"
+        ]
+
+    def series_files(self) -> list[str]:
+        text = (self.root / "maint/patches/series").read_text(encoding="utf-8")
+        return [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
 
 
 class GuardTests(unittest.TestCase):
@@ -318,7 +351,7 @@ class FoldTests(unittest.TestCase):
     def test_fold_refuses_when_there_is_nothing_to_fold(self) -> None:
         proc = patchctl(self.repo.root, "fold", "alpha", "--no-lint")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("nothing to fold", proc.stderr)
+        self.assertIn("nothing to file", proc.stderr)
 
     def test_abort_restores_the_pending_change_after_a_conflict(self) -> None:
         # beta rewrites the very line alpha owns, so replaying beta over a
@@ -341,6 +374,127 @@ class FoldTests(unittest.TestCase):
         )
         self.assertIn("folded_edit()", (self.repo.root / "app.rs").read_text(encoding="utf-8"))
         self.assertTrue(self.repo.clean())
+
+
+class NewPatchTests(unittest.TestCase):
+    """`new-patch` gives a change its own queue entry, in the right position.
+
+    The refusals share their code with `fold`, so they are covered once there;
+    what is specific here is the positioning, the file naming, and the fact
+    that a refusal must leave the branch untouched.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = QueueRepo(Path(self.tmp.name) / "repo")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _patch_text(self, name: str) -> str:
+        return (self.repo.root / "maint/patches" / name).read_text(encoding="utf-8")
+
+    def test_new_patch_lands_between_its_neighbours(self) -> None:
+        write(
+            self.repo.root,
+            "app.rs",
+            APP_BASE.replace("upstream();", "alpha();\n    gamma();"),
+        )
+        proc = patchctl(
+            self.repo.root,
+            "new-patch",
+            "gamma",
+            "--after",
+            "alpha",
+            "--subject",
+            "a third patch",
+            "--no-lint",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        self.assertEqual(self.repo.manifest_ids(), ["alpha", "gamma", "beta"])
+        self.assertEqual(
+            self.repo.queue_ids(),
+            ["alpha", "gamma", "beta"],
+            "the commit order must match the manifest order, or the export refuses",
+        )
+        # No integer is free between 0001 and 0002, so the name keeps the
+        # position with a letter instead of renumbering beta.
+        self.assertEqual(
+            self.repo.series_files(),
+            ["0001-alpha.patch", "0001b-gamma.patch", "0002-beta.patch"],
+        )
+        self.assertIn("gamma()", self._patch_text("0001b-gamma.patch"))
+        self.assertNotIn("gamma()", self._patch_text("0002-beta.patch"))
+        self.assertTrue(self.repo.clean())
+        self.assertEqual(patchctl(self.repo.root, "guard").returncode, 0)
+
+    def test_default_position_is_after_the_last_critical_patch(self) -> None:
+        write(self.repo.root, "app.rs", APP_BASE + "// tail\n")
+        proc = patchctl(self.repo.root, "new-patch", "gamma", "--no-lint")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.repo.manifest_ids(), ["alpha", "beta", "gamma"])
+        # 0003 is free, so no letter suffix is needed.
+        self.assertIn("0003-gamma.patch", self.repo.series_files())
+
+    def test_an_already_committed_change_is_filed_too(self) -> None:
+        write(
+            self.repo.root,
+            "app.rs",
+            APP_BASE.replace("upstream();", "alpha();\n    committed();"),
+        )
+        commit(self.repo.root, "wip: not in the queue yet")
+        proc = patchctl(
+            self.repo.root, "new-patch", "gamma", "--after", "alpha", "--no-lint"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("committed()", self._patch_text("0001b-gamma.patch"))
+        self.assertEqual(self.repo.queue_ids(), ["alpha", "gamma", "beta"])
+        self.assertNotIn("wip: not in the queue yet", self.repo.subjects())
+        self.assertEqual(patchctl(self.repo.root, "guard").returncode, 0)
+
+    def test_staged_files_do_not_ride_along_in_the_manifest_commit(self) -> None:
+        write(self.repo.root, "app.rs", APP_BASE + "// staged\n")
+        git(self.repo.root, "add", "-A")  # already staged when the command runs
+        proc = patchctl(
+            self.repo.root, "new-patch", "gamma", "--after", "alpha", "--no-lint"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("staged", self._patch_text("0001b-gamma.patch"))
+        # The real pin: a manifest commit that swallowed app.rs would be a
+        # product commit without a trailer, which the guard refuses.
+        self.assertEqual(patchctl(self.repo.root, "guard").returncode, 0)
+
+    def test_a_duplicate_id_is_refused_and_points_at_fold(self) -> None:
+        tip = self.repo.head()
+        write(self.repo.root, "app.rs", APP_BASE + "// x\n")
+        proc = patchctl(self.repo.root, "new-patch", "alpha", "--no-lint")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("fold alpha", proc.stderr)
+        self.assertEqual(self.repo.head(), tip, "a refusal must move nothing")
+
+    def test_an_unknown_contract_is_refused_before_anything_moves(self) -> None:
+        tip = self.repo.head()
+        write(self.repo.root, "app.rs", APP_BASE + "// x\n")
+        refused = patchctl(
+            self.repo.root, "new-patch", "gamma", "--contract", "nope", "--no-lint"
+        )
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("nope", refused.stderr)
+        self.assertEqual(self.repo.head(), tip)
+        self.assertNotIn("gamma", self.repo.manifest_ids())
+
+        ok = patchctl(
+            self.repo.root,
+            "new-patch",
+            "gamma",
+            "--contract",
+            "alpha-holds",
+            "--no-lint",
+        )
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        manifest = (self.repo.root / "maint/patchset.toml").read_text(encoding="utf-8")
+        self.assertIn('"alpha-holds"', manifest)
 
 
 if __name__ == "__main__":

@@ -1685,6 +1685,74 @@ def cmd_guard(args: argparse.Namespace) -> int:
 # ── Fold: land a change inside an existing queue patch ─────────────────────
 
 
+def collect_pending(root: Path, label: str) -> tuple[bool, str, list[str]] | None:
+    """`(dirty, parent_of_the_change, files)` for the change waiting to be filed.
+
+    Normalizes the two entry points — a dirty tree, or a trailerless commit at
+    the tip — **without moving anything**, so a refusal downstream leaves the
+    branch and the working tree exactly as they were.
+    """
+    dirty = bool(git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip())
+    if dirty:
+        if commit_trailer_id(root, "HEAD") is None and orphan_product_files(
+            root, commit_changed_files(root, "HEAD")
+        ):
+            print(
+                f"{label}: HEAD is already an un-queued product commit — file "
+                "that one first, or amend it with your pending change",
+                file=sys.stderr,
+            )
+            return None
+        names = git(
+            ["diff", "--name-only", "HEAD"], cwd=root, capture=True
+        ).stdout.splitlines()
+        names += git(
+            ["ls-files", "--others", "--exclude-standard"], cwd=root, capture=True
+        ).stdout.splitlines()
+        old_tip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+        return dirty, old_tip, sorted({n.strip() for n in names if n.strip()})
+    parents = git(
+        ["rev-list", "--parents", "-n", "1", "HEAD"], cwd=root, capture=True
+    ).stdout.split()
+    if len(parents) != 2:
+        print(f"{label}: HEAD is a merge or a root commit — unsupported", file=sys.stderr)
+        return None
+    old_tip = parents[1]
+    return dirty, old_tip, range_changed_files(root, old_tip, "HEAD")
+
+
+def pending_product_files(
+    root: Path, pending: list[str], label: str
+) -> tuple[list[str] | None, int]:
+    """Product files in `pending`, or `(None, exit_code)` after explaining why not."""
+    product = orphan_product_files(root, pending)
+    if not product:
+        print(
+            f"{label}: nothing to file — no product change is pending (clean tree, "
+            "or only control-plane files, which never belong inside a patch)",
+            file=sys.stderr,
+        )
+        return None, 2
+    control_part = sorted(set(pending) - set(product))
+    if control_part:
+        print(
+            f"{label}: refused — this change mixes the product tree with "
+            "control-plane files:",
+            file=sys.stderr,
+        )
+        for f in control_part:
+            print(f"       {f}", file=sys.stderr)
+        print(
+            "\n  A patch must not carry control files: the apply restores those from\n"
+            "  control-files.toml afterwards, so they would land twice and read as\n"
+            "  part of the feature. Commit the control part on its own first, then\n"
+            "  file what is left.",
+            file=sys.stderr,
+        )
+        return None, 3
+    return product, 0
+
+
 def fold_state_path(root: Path) -> Path:
     return git_dir(root) / FOLD_STATE_FILE
 
@@ -1807,9 +1875,10 @@ def fold_finish(root: Path, state: dict) -> int:
     backup = state["backup"]
     patch_id = state["patch_id"]
     no_lint = state.get("no_lint", False)
+    verb = state.get("verb", "folded into")
     clear_fold_state(root)
     print(
-        f"\nfold: change folded into {patch_id}; queue re-exported from "
+        f"\nfold: change {verb} {patch_id}; queue re-exported from "
         f"{functional_tip[:12]}.\n"
         f"      previous tip kept at {FOLD_BACKUP_REF} ({backup[:12]}) — roll back with\n"
         f"        git reset --hard {backup[:12]}"
@@ -1869,6 +1938,11 @@ def cmd_fold(args: argparse.Namespace) -> int:
             return 2
         if state.get("phase") == "apply":
             return fold_after_apply(root, state, args.message_file)
+        # `new-patch` interrupted between its two rebases: the tail still has to
+        # be replayed, or the queue would be left missing every commit that
+        # followed the insertion point.
+        if state.get("phase") == "rebase-position":
+            return new_patch_replay_tail(root, state)
         return fold_finish(root, state)
     if state:
         print(
@@ -1900,63 +1974,13 @@ def cmd_fold(args: argparse.Namespace) -> int:
 
     # Everything is decided before a single byte moves: a refusal has to leave
     # the branch and the working tree exactly as it found them.
-    dirty = bool(git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip())
-    if dirty:
-        if commit_trailer_id(root, "HEAD") is None and orphan_product_files(
-            root, commit_changed_files(root, "HEAD")
-        ):
-            print(
-                "fold: HEAD is already an un-queued product commit — fold that "
-                "one first, or amend it with your pending change",
-                file=sys.stderr,
-            )
-            return 2
-        names = git(
-            ["diff", "--name-only", "HEAD"], cwd=root, capture=True
-        ).stdout.splitlines()
-        names += git(
-            ["ls-files", "--others", "--exclude-standard"], cwd=root, capture=True
-        ).stdout.splitlines()
-        pending = sorted({n.strip() for n in names if n.strip()})
-        old_tip = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
-    else:
-        parents = git(
-            ["rev-list", "--parents", "-n", "1", "HEAD"], cwd=root, capture=True
-        ).stdout.split()
-        if len(parents) != 2:
-            print(
-                "fold: HEAD is a merge or a root commit — unsupported",
-                file=sys.stderr,
-            )
-            return 2
-        old_tip = parents[1]
-        pending = range_changed_files(root, old_tip, "HEAD")
-
-    pending_product = orphan_product_files(root, pending)
-    if not pending_product:
-        print(
-            "fold: nothing to fold — no product change is pending (clean tree, or "
-            "only control-plane files, which never belong inside a patch)",
-            file=sys.stderr,
-        )
+    collected = collect_pending(root, "fold")
+    if collected is None:
         return 2
-    control_part = sorted(set(pending) - set(pending_product))
-    if control_part:
-        print(
-            "fold: refused — this change mixes the product tree with "
-            "control-plane files:",
-            file=sys.stderr,
-        )
-        for f in control_part:
-            print(f"       {f}", file=sys.stderr)
-        print(
-            "\n  A patch must not carry control files: the apply restores those from\n"
-            "  control-files.toml afterwards, so they would land twice and read as\n"
-            "  part of the feature. Commit the control part on its own first, then\n"
-            "  fold what is left.",
-            file=sys.stderr,
-        )
-        return 3
+    dirty, old_tip, pending = collected
+    pending_product, refusal = pending_product_files(root, pending, "fold")
+    if pending_product is None:
+        return refusal
 
     shared: dict[str, str] = {}
     for sha, pid in commits_with_patch_id(root, base, old_tip):
@@ -2032,6 +2056,286 @@ def cmd_fold(args: argparse.Namespace) -> int:
         )
         return 3
     return fold_after_apply(root, state, args.message_file)
+
+
+# ── New patch: give a change its own entry in the queue ────────────────────
+
+
+def next_patch_filename(root: Path, after_file: str, new_id: str) -> str:
+    """A file name that sorts right after `after_file`.
+
+    The apply order is `patchset.toml`, but the file names are what a human
+    reads in `ls`, so a new patch has to land between its neighbours there too.
+    When the next integer is taken, a letter suffix keeps the position instead
+    of renumbering every patch downstream for cosmetics.
+    """
+    taken = {
+        m.group(1)
+        for p in patches_dir(root).glob("*.patch")
+        if (m := re.match(r"^(\d+[a-z]*)", p.name))
+    }
+    m = re.match(r"^(\d+)([a-z]*)", after_file)
+    if not m:
+        return f"{new_id}.patch"
+    num, width = m.group(1), len(m.group(1))
+    nxt = f"{int(num) + 1:0{width}d}"
+    if nxt not in taken:
+        return f"{nxt}-{new_id}.patch"
+    for letter in "bcdefghijklmnopqrstuvwxyz":
+        if f"{num}{letter}" not in taken:
+            return f"{num}{letter}-{new_id}.patch"
+    raise SystemExit(f"no free file number after {after_file}")
+
+
+def patch_entry_block(
+    new_id: str, file_name: str, critical: bool, contracts: list[str], note: str | None
+) -> str:
+    head = "".join(f"# {line}\n" for line in (note or "").splitlines())
+    joined = ", ".join(f'"{c}"' for c in contracts)
+    return (
+        f"{head}[[patch]]\n"
+        f'id = "{new_id}"\n'
+        f'file = "{file_name}"\n'
+        f"critical = {'true' if critical else 'false'}\n"
+        f"contracts = [{joined}]\n"
+    )
+
+
+def insert_patch_entry(path: Path, after_id: str, block: str) -> None:
+    """Insert `block` immediately after the `[[patch]]` entry named `after_id`."""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.strip() == "[[patch]]"]
+    end = None
+    for idx, start in enumerate(starts):
+        stop = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
+        if re.search(
+            rf'^id = "{re.escape(after_id)}"\s*$', "".join(lines[start:stop]), re.M
+        ):
+            end = stop
+            break
+    if end is None:
+        raise SystemExit(f'patchset.toml has no [[patch]] with id = "{after_id}"')
+    # A comment sitting just above the next `[[patch]]` introduces *that* one
+    # (e.g. "Trailing non-critical: …"), so insert above it, not below.
+    while end > 0 and (
+        lines[end - 1].lstrip().startswith("#") or not lines[end - 1].strip()
+    ):
+        end -= 1
+    lines.insert(end, "\n" + block.rstrip("\n") + "\n")
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def new_patch_replay_tail(root: Path, state: dict) -> int:
+    """Second half: replay everything that followed the insertion point."""
+    positioned = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+    state["phase"] = "rebase-tail"
+    save_fold_state(root, state)
+    proc = git(
+        ["rebase", "--onto", positioned, state["target"], state["old_tip"]],
+        cwd=root,
+        check=False,
+        capture=True,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout or "")
+        sys.stderr.write(proc.stderr or "")
+        print(
+            "\nnew-patch: replaying the commits after the insertion point "
+            "conflicts.\n"
+            "  resolve, `git add`, `git rebase --continue`, then:\n"
+            "    patchctl fold --continue\n"
+            "  or give up with: patchctl fold --abort",
+            file=sys.stderr,
+        )
+        return 3
+    return fold_finish(root, state)
+
+
+def cmd_new_patch(args: argparse.Namespace) -> int:
+    root = repo_root()
+    if load_fold_state(root):
+        print(
+            "new-patch: an operation is already in progress "
+            "(patchctl fold --continue / --abort)",
+            file=sys.stderr,
+        )
+        return 2
+
+    new_id = args.patch_id.strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,48}", new_id):
+        print(
+            "new-patch: id must be lowercase letters, digits and dashes",
+            file=sys.stderr,
+        )
+        return 2
+    if new_id in EXCLUDE_PATCH_IDS:
+        print(f"new-patch: {new_id} is a reserved non-functional id", file=sys.stderr)
+        return 2
+
+    patchset_path = root / "maint/patchset.toml"
+    patchset = load_patchset(patchset_path)
+    ids = [p["id"] for p in patchset]
+    if new_id in ids:
+        print(
+            f"new-patch: {new_id} is already in maint/patchset.toml — "
+            f"`patchctl fold {new_id}` files a change into it",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Default position: after the last *critical* patch, i.e. before the
+    # trailing non-critical ones. Those are skipped silently on conflict, and a
+    # new feature filed behind them would be skipped with them.
+    after_id = args.after
+    if not after_id:
+        criticals = [p["id"] for p in patchset if p.get("critical", True)]
+        if not criticals:
+            print("new-patch: nothing to position after; pass --after", file=sys.stderr)
+            return 2
+        after_id = criticals[-1]
+    if after_id not in ids:
+        print(f"new-patch: --after {after_id} is not in the manifest", file=sys.stderr)
+        print("  available: " + ", ".join(ids), file=sys.stderr)
+        return 2
+    after_entry = next(p for p in patchset if p["id"] == after_id)
+
+    # An unknown contract makes the lint refuse the queue we are about to build.
+    contracts_path = root / "maint/contracts/privacy-contract.toml"
+    known: set[str] = set()
+    if contracts_path.is_file():
+        known = {
+            c["id"]
+            for c in tomllib.loads(contracts_path.read_text(encoding="utf-8")).get(
+                "contract"
+            )
+            or []
+        }
+    unknown = [c for c in args.contract if c not in known]
+    if unknown:
+        print(f"new-patch: unknown contract(s): {', '.join(unknown)}", file=sys.stderr)
+        print(
+            "  declare them in maint/contracts/privacy-contract.toml first",
+            file=sys.stderr,
+        )
+        return 2
+
+    branch = current_branch(root)
+    if not branch:
+        print(
+            "new-patch: detached HEAD — check the sync branch out first",
+            file=sys.stderr,
+        )
+        return 2
+
+    lock = UpstreamLock.load(root / "maint/upstream.lock.toml")
+    by_id = {pid: sha for sha, pid in commits_with_patch_id(root, lock.commit, "HEAD")}
+    if after_id not in by_id:
+        print(
+            f"new-patch: no commit carries {TRAILER_ID}={after_id}", file=sys.stderr
+        )
+        return 2
+    after_sha = by_id[after_id]
+
+    collected = collect_pending(root, "new-patch")
+    if collected is None:
+        return 2
+    dirty, parent, pending = collected
+    product, refusal = pending_product_files(root, pending, "new-patch")
+    if product is None:
+        return refusal
+
+    file_name = args.file or next_patch_filename(root, after_entry["file"], new_id)
+
+    # Decided. Backup ref first, so nothing is unreachable at any point — then
+    # a trailerless commit at the tip goes back into the index, and both entry
+    # points continue as one: "the change is pending". Without this the amend
+    # below would rewrite the manifest commit instead of the change.
+    git(["update-ref", FOLD_BACKUP_REF, "HEAD"], cwd=root)
+    if not dirty:
+        # `--mixed`, not `--soft`: the change has to land in the *working tree*.
+        # Left in the index it would be swallowed by the manifest commit below,
+        # which would then be a control commit carrying product files.
+        git(["reset", "--mixed", parent, "-q"], cwd=root)
+    else:
+        # Same reason, for whatever the user had already staged.
+        git(["reset", "-q"], cwd=root)
+
+    # The manifest entry goes in first: the guard refuses a trailer it does not
+    # know, and the export would have no file to write the patch to.
+    insert_patch_entry(
+        patchset_path,
+        after_id,
+        patch_entry_block(new_id, file_name, not args.no_critical, args.contract, args.note),
+    )
+    git(["add", "--", "maint/patchset.toml"], cwd=root)
+    git(
+        [
+            "commit",
+            "--no-verify",
+            "-q",
+            "-m",
+            f"chore(maint): queue entry for {new_id}",
+        ],
+        cwd=root,
+        env={GUARD_ENV: "0"},
+    )
+    tip_after_manifest = git(
+        ["rev-parse", "HEAD"], cwd=root, capture=True
+    ).stdout.strip()
+
+    if args.message_file:
+        message = Path(args.message_file).read_text(encoding="utf-8")
+        if not re.search(rf"^{TRAILER_ID}:\s*\S+\s*$", message, re.M):
+            message = message.rstrip("\n") + f"\n\n{TRAILER_ID}: {new_id}\n"
+    else:
+        message = (
+            f"{new_id}: {args.subject or new_id}\n\n"
+            f"{TRAILER_ID}: {new_id}\n"
+            f"{TRAILER_RISK}: {args.risk}\n"
+        )
+    msg_path = git_dir(root) / "grok-new-patch-msg"
+    msg_path.write_text(message, encoding="utf-8")
+    git(["add", "-A"], cwd=root)
+    git(
+        ["commit", "--no-verify", "-q", "-F", str(msg_path)],
+        cwd=root,
+        env={GUARD_ENV: "0"},
+    )
+    msg_path.unlink(missing_ok=True)
+    new_sha = git(["rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
+
+    git(["update-ref", FOLD_BACKUP_REF, new_sha], cwd=root)
+    state = {
+        "patch_id": new_id,
+        "branch": branch,
+        "target": after_sha,
+        "old_tip": tip_after_manifest,
+        "backup": new_sha,
+        "phase": "rebase-position",
+        "no_lint": bool(args.no_lint),
+        "verb": "filed as",
+    }
+    save_fold_state(root, state)
+
+    # The patch alone, onto its position in the series.
+    proc = git(
+        ["rebase", "--onto", after_sha, tip_after_manifest, new_sha],
+        cwd=root,
+        check=False,
+        capture=True,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout or "")
+        sys.stderr.write(proc.stderr or "")
+        print(
+            f"\nnew-patch: moving the change onto {after_id} conflicts.\n"
+            "  resolve, `git add`, `git rebase --continue`, then:\n"
+            "    patchctl fold --continue\n"
+            "  or give up with: patchctl fold --abort",
+            file=sys.stderr,
+        )
+        return 3
+    return new_patch_replay_tail(root, state)
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
@@ -2885,6 +3189,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fo.add_argument("--abort", action="store_true", help="Restore the pre-fold tip")
     fo.set_defaults(func=cmd_fold)
+
+    np = sub.add_parser(
+        "new-patch",
+        help="Give the pending change its own entry in the queue and re-export",
+    )
+    np.add_argument("patch_id", help=f"New {TRAILER_ID} (lowercase, dashes)")
+    np.add_argument(
+        "--after",
+        default=None,
+        help="Insert after this patch id (default: the last critical patch, so "
+        "the new one lands before the trailing non-critical branding patches, "
+        "which are skipped silently on conflict)",
+    )
+    np.add_argument(
+        "--file",
+        default=None,
+        help="Patch file name (default: derived from the neighbour's number)",
+    )
+    np.add_argument(
+        "--no-critical",
+        action="store_true",
+        help="File it among the skippable patches (default: critical — a "
+        "conflict must stop the sync rather than drop the feature)",
+    )
+    np.add_argument(
+        "--contract",
+        action="append",
+        default=[],
+        help="Contract id this patch answers for (repeatable; must already exist)",
+    )
+    np.add_argument("--note", default=None, help="Comment above the manifest entry")
+    np.add_argument("--subject", default=None, help="Commit subject after `<id>: `")
+    np.add_argument("--risk", default="low", help=f"{TRAILER_RISK} value")
+    np.add_argument(
+        "--message-file",
+        default=None,
+        help="Full commit message (the trailer is appended when missing)",
+    )
+    np.add_argument("--no-lint", action="store_true", help="Skip the closing lint")
+    np.set_defaults(func=cmd_new_patch)
 
     b = sub.add_parser("bootstrap-stack", help="One-time path-group stack rebuild")
     b.add_argument("--base", default=None)

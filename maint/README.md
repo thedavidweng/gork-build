@@ -71,6 +71,26 @@ porté par un autre patch (`--allow-shared` pour passer outre) et un changement
 qui mélange produit et plan de contrôle. En cas de conflit : `fold --continue`
 ou `fold --abort`.
 
+**`new-patch`** — quand la modification mérite son propre patch plutôt que
+d'alimenter un existant :
+
+```bash
+python maint/scripts/patchctl.py new-patch mon-patch \
+  --subject "ce que fait le patch" --contract mon-contrat
+```
+
+Elle écrit l'entrée `[[patch]]`, choisit un nom de fichier qui garde la
+position (`0079b-…` quand aucun entier n'est libre, plutôt que renuméroter
+toute la suite), commite le manifeste puis le changement avec son trailer,
+insère le commit **avant les patches de branding** — ceux-là sont sautés en
+silence sur conflit et emporteraient une feature neuve avec eux — puis
+ré-exporte et lint. `--after <id>` pour une autre position, `--no-critical`
+pour la filer parmi les sautables. Un contrat inconnu est refusé avant que
+quoi que ce soit ne bouge, parce que le lint refuserait la file juste après.
+
+Les deux commandes sont dans le menu `grok rebuild`, entrée **« Ranger une
+modification dans la file »** (le libellé compte ce qui attend dans l'arbre).
+
 Tests : `python3 maint/scripts/tests/test_patchctl_guard_fold.py`.
 
 ## Apply policy

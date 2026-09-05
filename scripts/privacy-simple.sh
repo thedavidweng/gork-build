@@ -1314,10 +1314,25 @@ menu_fold() {
   printf '\n  Dans quel patch ?\n\n'
 
   local idx cur=0 rc=0
-  local -a items=("${ids[@]}" "Retour")
+  local -a items=("${ids[@]}" "Nouveau patch…" "Retour")
   menu_select idx "$cur" "${items[@]}" || rc=$?
   if [[ "$rc" != "0" ]]; then return 0; fi
-  if [[ "$idx" -ge "${#ids[@]}" ]]; then return 0; fi
+
+  # Juste après la liste : créer un patch au lieu d'alimenter un existant.
+  if [[ "$idx" -eq "${#ids[@]}" ]]; then
+    local new_id=""
+    menu_ask 'Identifiant du nouveau patch (vide = annuler) >' new_id || return 0
+    if [[ -z "$new_id" ]]; then return 0; fi
+    info "patchctl new-patch $new_id"
+    if "$PYTHON" maint/scripts/patchctl.py new-patch "$new_id"; then
+      ok "patch $new_id créé et inséré dans la file"
+    else
+      err "création interrompue — relire le message ci-dessus"
+    fi
+    printf '\n'
+    return 0
+  fi
+  if [[ "$idx" -gt "${#ids[@]}" ]]; then return 0; fi
 
   local id="${ids[$idx]}"
   info "patchctl fold $id"
