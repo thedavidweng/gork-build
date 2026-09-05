@@ -22,19 +22,19 @@ pretending to switch in place.
 Gork-Patch-Id: session-agent
 Gork-Risk: low
 ---
- .../docs/user-guide/04-slash-commands.md      | 12 +++
- .../codegen/xai-grok-pager/src/app/actions.rs |  5 ++
- .../xai-grok-pager/src/app/dispatch/router.rs |  8 ++
- .../src/slash/commands/agent.rs               | 90 +++++++++++++++++++
- .../xai-grok-pager/src/slash/commands/mod.rs  |  2 +
- 5 files changed, 117 insertions(+)
+ .../docs/user-guide/04-slash-commands.md      |  13 ++
+ .../codegen/xai-grok-pager/src/app/actions.rs |   5 +
+ .../xai-grok-pager/src/app/dispatch/router.rs |   8 +
+ .../src/slash/commands/agent.rs               | 146 ++++++++++++++++++
+ .../xai-grok-pager/src/slash/commands/mod.rs  |   2 +
+ 5 files changed, 174 insertions(+)
  create mode 100644 crates/codegen/xai-grok-pager/src/slash/commands/agent.rs
 
 diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
-index fcb5c627828d6cc0c9f5dc095727439172145a26..fd932e6eb04cbbb5b812c0e0041c4e0b735da883 100644
+index fcb5c627828d6cc0c9f5dc095727439172145a26..5ab54ac5e9a16332e15cb27fd5f7d6170da5c1e1 100644
 --- a/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
 +++ b/crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md
-@@ -439,6 +439,18 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
+@@ -439,6 +439,19 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
  
  Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
  
@@ -43,7 +43,8 @@ index fcb5c627828d6cc0c9f5dc095727439172145a26..fd932e6eb04cbbb5b812c0e0041c4e0b
 +Open a **new session running a named agent definition**. Alias: `/use-agent`.
 +
 +```
-+/agent <name>
++/agent            # list the agent definitions discovered here
++/agent <name>     # open a new session running that one
 +```
 +
 +The agent a session runs on is decided when the session is created, so this opens a new one rather than converting the current session. Definitions live in `.grok/agents/*.md` and `~/.grok/agents/*.md`; browse and edit them with [`/agents`](16-subagents.md) (that modal manages definitions — `/agents-dashboard` lists running sessions instead).
@@ -90,10 +91,10 @@ index 366d3fe41c265403f321f2a614c2608b799e8736..98e8e4289b2144d81d3402cfe36caa56
              parent_cwd,
 diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/agent.rs b/crates/codegen/xai-grok-pager/src/slash/commands/agent.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..3db2f818f2377379c8555e7814d3a4f6ca6c553e
+index 0000000000000000000000000000000000000000..c2603698ab152b4063f3df2111791e7a2eec6c2a
 --- /dev/null
 +++ b/crates/codegen/xai-grok-pager/src/slash/commands/agent.rs
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,146 @@
 +//! `/agent` — open a new session on a named agent definition.
 +//!
 +//! The agent a session runs on is decided at session creation: the pager
@@ -128,15 +129,59 @@ index 0000000000000000000000000000000000000000..3db2f818f2377379c8555e7814d3a4f6
 +    fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
 +        let name = args.trim();
 +        if name.is_empty() {
-+            return CommandResult::Error(
-+                "Usage: /agent <name> — opens a new session running that agent. \
-+                 Browse and edit definitions with /agents; `grok --agent <name>` \
-+                 (or GROK_AGENT=<name>) does the same at launch."
-+                    .into(),
-+            );
++            return list_agents_message();
 +        }
 +        CommandResult::Action(Action::OpenSessionWithAgent(name.to_string()))
 +    }
++}
++
++/// Names to pass to `/agent`, discovered the same way a session discovers them.
++///
++/// Answering with the usage line alone left the one question the command
++/// raises — *which names are valid here?* — unanswered.
++fn list_agents_message() -> CommandResult {
++    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
++    let found = xai_grok_agent::discovery::discover(&cwd);
++    let mut out = String::from("Usage: /agent <name> — opens a new session running that agent.");
++    if found.is_empty() {
++        out.push_str(
++            "\n\nNo agent definition discovered from this directory. \
++             Create one with /agents, or drop a `.md` file in `.grok/agents/` \
++             or `~/.grok/agents/`.",
++        );
++    } else {
++        out.push_str("\n\nDiscovered here:");
++        for def in &found {
++            match first_words(&def.description) {
++                Some(summary) => out.push_str(&format!("\n  {} — {summary}", def.name)),
++                None => out.push_str(&format!("\n  {}", def.name)),
++            }
++        }
++    }
++    out.push_str(
++        "\n\nBrowse and edit definitions with /agents. \
++         `grok --agent <name>` (or GROK_AGENT=<name>) does the same at launch.",
++    );
++    CommandResult::Message(out)
++}
++
++/// One short line from an agent's description.
++///
++/// Agent descriptions are written for the model and routinely run several
++/// hundred characters; printed whole they bury the names the list exists to
++/// show. `None` when there is nothing worth printing.
++fn first_words(description: &str) -> Option<String> {
++    const WIDTH: usize = 72;
++    let line = description.lines().next().unwrap_or("").trim();
++    if line.is_empty() {
++        return None;
++    }
++    if line.chars().count() <= WIDTH {
++        return Some(line.to_string());
++    }
++    let cut: String = line.chars().take(WIDTH).collect();
++    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
++    Some(format!("{}…", cut.trim_end_matches([',', ';', ':', '.', ' '])))
 +}
 +
 +#[cfg(test)]
@@ -172,16 +217,28 @@ index 0000000000000000000000000000000000000000..3db2f818f2377379c8555e7814d3a4f6
 +    }
 +
 +    #[test]
-+    fn no_name_explains_the_usage() {
++    fn no_name_lists_the_agents_and_the_usage() {
 +        let models = ModelState::default();
 +        let bundle = BundleState::default();
++        // Which names exist depends on the machine, so only the invariants
++        // that hold anywhere are asserted.
 +        match AgentCommand.run(&mut exec_ctx(&models, &bundle), "") {
-+            CommandResult::Error(msg) => {
++            CommandResult::Message(msg) => {
 +                assert!(msg.contains("/agent <name>"));
 +                assert!(msg.contains("--agent"), "point at the launch-time equivalent");
 +            }
-+            other => panic!("expected a usage error, got {other:?}"),
++            other => panic!("expected the agent list, got {other:?}"),
 +        }
++    }
++
++    #[test]
++    fn a_long_description_is_cut_to_one_readable_line() {
++        let long = "Spécialiste bridge et remote, ".repeat(20);
++        let cut = first_words(&long).expect("a non-empty description yields a summary");
++        assert!(cut.chars().count() <= 73, "got {} chars", cut.chars().count());
++        assert!(cut.ends_with('…'));
++        assert!(first_words("   ").is_none());
++        assert_eq!(first_words("short one").as_deref(), Some("short one"));
 +    }
 +}
 diff --git a/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs b/crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
@@ -219,7 +276,7 @@ prerequisite-patch-id: 1c519f473931ee812a35aa9da4a56632b1373a4f
 prerequisite-patch-id: 5054621d4b6a314c4c2f894e4734d47412346e88
 prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
 prerequisite-patch-id: f350eb478b08b349e42de5d6d841966b29051846
-prerequisite-patch-id: 7a62217e285237a92fd1233f1f5d4e3c52ebb5f0
+prerequisite-patch-id: 180a948604a7a4526db4b18bc23da22038925128
 -- 
 2.43.0
 

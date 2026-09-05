@@ -46,7 +46,9 @@ Gork-Risk: low
 ---
  .gitignore                                    | 12 +++
  .../xai-grok-agent/src/prompt/context.rs      | 54 ++++++++++--
- .../docs/user-guide/16-subagents.md           | 29 ++++++-
+ .../docs/user-guide/16-subagents.md           | 31 ++++++-
+ .../xai-grok-pager/src/config_toml_edit.rs    | 34 ++++++++
+ .../xai-grok-pager/src/views/agents_modal.rs  | 25 ++++++
  .../xai-grok-shell/src/agent/config.rs        | 13 +++
  .../src/agent/mvp_agent/agent_ops.rs          | 22 ++++-
  .../src/agent/mvp_agent/subagent_spawn.rs     |  1 +
@@ -61,7 +63,7 @@ Gork-Risk: low
  .../src/permission/policy.rs                  |  1 +
  .../src/permission/types.rs                   |  1 +
  crates/common/xai-tool-types/src/task.rs      | 17 ++++
- 17 files changed, 306 insertions(+), 12 deletions(-)
+ 19 files changed, 367 insertions(+), 12 deletions(-)
 
 diff --git a/.gitignore b/.gitignore
 index ecbd5bb65a9fab1df60b4522fc1bffa6dcf26bcf..6b84e766a871a5654dd36402f7552857e71ec0fd 100644
@@ -173,10 +175,10 @@ index b217faa26ffd0ca5bf7a6ac8cb9e28c01098059c..6ed48c6d080634d02c83cf63369f08db
      }
      fn child_general_purpose_context() -> PromptContext {
 diff --git a/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md b/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md
-index 47d6ad83183bc55500a4f939f17ef27349be0d63..537914e5dfe452ed30116b46a834c200c60ece1b 100644
+index 47d6ad83183bc55500a4f939f17ef27349be0d63..02a3165482b3eefe4fd6ff2404c6926d2f6c9f0f 100644
 --- a/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md
 +++ b/crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md
-@@ -89,7 +89,34 @@ Each file defines one persona, and the file name (without the extension) becomes
+@@ -89,7 +89,36 @@ Each file defines one persona, and the file name (without the extension) becomes
  
  Manage personas in the Personas tab of the agents modal (`/personas`). Bundled personas are read-only; personas you define are editable.
  
@@ -206,12 +208,102 @@ index 47d6ad83183bc55500a4f939f17ef27349be0d63..537914e5dfe452ed30116b46a834c200
 +GROK_PERSONA=researcher grok      # wins over the config key, for one session
 +```
 +
++In the Personas tab of the agents modal (`/personas`), **`D`** writes that key for you, on the selected persona.
++
 +Precedence, highest first: `persona` passed at spawn → `GROK_PERSONA` → `[subagents] default_persona` → no persona. The name must resolve like any other, so a typo fails the spawn rather than running the child without its overlay.
 +
 +This mirrors how an agent is chosen (`--agent` / `GROK_AGENT` / `[agent] name`): the same shape, one level down.
  
  ### Persona Fields
  
+diff --git a/crates/codegen/xai-grok-pager/src/config_toml_edit.rs b/crates/codegen/xai-grok-pager/src/config_toml_edit.rs
+index 577a7b6aad9a9dcff9aa02ce7dcb0cfe7aa2864a..c703d62330fbd26f0679013c9d991bbb39dce2da 100644
+--- a/crates/codegen/xai-grok-pager/src/config_toml_edit.rs
++++ b/crates/codegen/xai-grok-pager/src/config_toml_edit.rs
+@@ -48,6 +48,40 @@ fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> st
+     std::fs::write(path, doc.to_string())
+ }
+ 
++/// Set (or clear) `[subagents].default_persona` in `~/.grok/config.toml`.
++///
++/// Which persona a subagent runs under was otherwise decided by the model
++/// alone, per spawn: there was no way to pin one. This is the durable half of
++/// that pin. `GROK_PERSONA` overrides it for a single session, and a persona
++/// passed at spawn still wins over both.
++///
++/// Same guarantees as [`set_hint`]: sibling tables are preserved, and a
++/// non-blank file that does not parse is left untouched.
++pub(crate) fn set_default_persona(name: Option<&str>) -> std::io::Result<()> {
++    let path =
++        xai_grok_tools::util::grok_home::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME);
++    set_default_persona_at(&path, name)
++}
++
++/// Core of [`set_default_persona`]; takes the path so tests can point it at a temp dir.
++fn set_default_persona_at(path: &Path, name: Option<&str>) -> std::io::Result<()> {
++    if let Some(parent) = path.parent() {
++        std::fs::create_dir_all(parent)?;
++    }
++    let Some(mut doc) = read_config_document_for_edit(path) else {
++        return Ok(());
++    };
++    match name {
++        Some(n) => doc["subagents"]["default_persona"] = toml_edit::value(n),
++        None => {
++            if let Some(table) = doc.get_mut("subagents").and_then(|i| i.as_table_like_mut()) {
++                table.remove("default_persona");
++            }
++        }
++    }
++    std::fs::write(path, doc.to_string())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/codegen/xai-grok-pager/src/views/agents_modal.rs b/crates/codegen/xai-grok-pager/src/views/agents_modal.rs
+index 9f5aef06385e8c35bf4dc9bef41f16517dd84db8..c245d2b0156b9cf0308257a98a2ee26657b92e6c 100644
+--- a/crates/codegen/xai-grok-pager/src/views/agents_modal.rs
++++ b/crates/codegen/xai-grok-pager/src/views/agents_modal.rs
+@@ -1182,6 +1182,11 @@ fn build_personas_tab_shortcuts<'a>(state: &AgentsModalState) -> Vec<Shortcut<'a
+                 clickable: false,
+                 id: 0,
+             },
++            Shortcut {
++                label: "D default",
++                clickable: false,
++                id: 0,
++            },
+             Shortcut {
+                 label: "d delete",
+                 clickable: false,
+@@ -2339,6 +2344,26 @@ fn handle_personas_tab_key(state: &mut AgentsModalState, key: &KeyEvent) -> Agen
+             }
+             AgentsModalOutcome::Changed
+         }
++        // The tab could create, edit and delete personas but not *apply* one:
++        // only the model chose, per spawn. This writes the durable half of the
++        // pin; `GROK_PERSONA` is the per-session half.
++        KeyCode::Char('D') => {
++            if let Some(persona) = state.personas.get(state.persona_selected) {
++                let name = persona.name.clone();
++                state.message = Some(
++                    match crate::config_toml_edit::set_default_persona(Some(&name)) {
++                        Ok(()) => AgentsModalMessage::success(format!(
++                            "`{name}` is now the default persona. GROK_PERSONA overrides it \
++                             for one session; a persona passed at spawn always wins."
++                        )),
++                        Err(e) => {
++                            AgentsModalMessage::error(format!("Could not write config.toml: {e}"))
++                        }
++                    },
++                );
++            }
++            AgentsModalOutcome::Changed
++        }
+         KeyCode::Char('/') | KeyCode::Char('i') if key.modifiers.is_empty() => {
+             state.search_active = true;
+             AgentsModalOutcome::Changed
 diff --git a/crates/codegen/xai-grok-shell/src/agent/config.rs b/crates/codegen/xai-grok-shell/src/agent/config.rs
 index eac2bc8c9efd893cd6d48055d39f269873b49c09..08f199e923c813508305fa910944d83ed1a1837c 100644
 --- a/crates/codegen/xai-grok-shell/src/agent/config.rs
