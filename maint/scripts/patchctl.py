@@ -1853,24 +1853,16 @@ def fold_finish(root: Path, state: dict) -> int:
 
     if git(["status", "--porcelain"], cwd=root, capture=True).stdout.strip():
         git(["add", "-A"], cwd=root)
+        subject = f"{CONTROL_REEXPORT_SUBJECT} after {state.get('verb', 'folded into')} "
+        subject += state["patch_id"]
+        # Amending keeps one bookkeeping commit instead of a pile of identical
+        # ones — but the message has to name *this* operation. Keeping the
+        # previous one left the tip claiming a patch it had since re-exported
+        # past.
+        commit = ["commit", "--no-verify", "-q", "-m", subject]
         if head_is_reexport:
-            git(
-                ["commit", "--amend", "--no-edit", "--no-verify", "-q"],
-                cwd=root,
-                env={GUARD_ENV: "0"},
-            )
-        else:
-            git(
-                [
-                    "commit",
-                    "--no-verify",
-                    "-q",
-                    "-m",
-                    f"{CONTROL_REEXPORT_SUBJECT} after fold into {state['patch_id']}",
-                ],
-                cwd=root,
-                env={GUARD_ENV: "0"},
-            )
+            commit.insert(1, "--amend")
+        git(commit, cwd=root, env={GUARD_ENV: "0"})
 
     backup = state["backup"]
     patch_id = state["patch_id"]
