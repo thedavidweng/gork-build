@@ -13,7 +13,7 @@ Gork-Risk: critical
 
 diff --git a/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5147effc1479e1c1e98392f7cfc600d90b9913f5
+index 0000000000000000000000000000000000000000..7ddb0861c61fcc61c24b148159a9471553d8d42e
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
 @@ -0,0 +1,110 @@
@@ -105,7 +105,7 @@ index 0000000000000000000000000000000000000000..5147effc1479e1c1e98392f7cfc600d9
 +        std::env::remove_var("GROK_FEEDBACK_ENABLED");
 +    }
 +    let mut cfg = Config::default();
-+    cfg.features.feedback = Some(true);
++    cfg.feature_values.insert(Feature::Feedback, true);
 +    cfg.remote_settings = Some(RemoteSettings {
 +        feedback_enabled: Some(true),
 +        ..Default::default()
@@ -128,12 +128,12 @@ index 0000000000000000000000000000000000000000..5147effc1479e1c1e98392f7cfc600d9
 +    }
 +}
 
-base-commit: eb267feff13129e568df38fb6fdf0ceb65f735d6
-prerequisite-patch-id: 461d9a629c55db377161aa870929fbbc6cb08b71
-prerequisite-patch-id: 8a4d87ffeadd239c0b5c504db10b4cf492fa89fa
-prerequisite-patch-id: 0fc38c6c0c974617e675e3c1061fd32df8f759d3
-prerequisite-patch-id: 561132f565e3d3e04c045251cbe0b2d3d98ecacb
-prerequisite-patch-id: b6702a9eb9a1c961a89eb827a84555ab6934cc72
+base-commit: 4247f661689354b831191f11eeeac8424993fe3d
+prerequisite-patch-id: be79529fe47a8dbb5f7f7174e04a23cfeddc63f7
+prerequisite-patch-id: 1dfbf374d3a68129d96bb06c1026e41ab50363c4
+prerequisite-patch-id: d36844c4188ff12d6b8c1bb65cc44ab9c2a05f30
+prerequisite-patch-id: 8dec628511f56817ca256664dc0e4d43271c68fd
+prerequisite-patch-id: 68d52b2e9a6d5e48cea276eef3c218f72e9f6e9e
 -- 
-2.50.1 (Apple Git-155)
+2.43.0
 

@@ -1,8 +1,8 @@
 {
-  "upstream": "eb267feff13129e568df38fb6fdf0ceb65f735d6",
-  "version": "1.0.3",
-  "source_rev": "e6a67a5408288c98380cd13f3b1fe1fbc01c9f1f",
-  "work_src": ".work/src",
+  "upstream": "4247f661689354b831191f11eeeac8424993fe3d",
+  "version": "1.0.38",
+  "source_rev": "9bb727ccdff0a793ee73bcde4e2e09cbef6b5387",
+  "work_src": "/workspace/.work/src",
   "applied": [
     "0001-privacy-core.patch",
     "0010-telemetry-hard-off.patch",

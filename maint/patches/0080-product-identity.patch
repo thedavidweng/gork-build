@@ -7,24 +7,40 @@ Gork-Patch-Id: product-identity
 Gork-Invariant: product-cli-gork
 Gork-Risk: medium
 ---
- crates/codegen/xai-grok-pager-bin/Cargo.toml  |  20 ++-
- crates/codegen/xai-grok-pager-bin/src/main.rs |  22 +--
- .../xai-grok-pager/src/app/app_view.rs        |  11 ++
+ .../xai-grok-login/src/manager/enrichment.rs  |   5 +-
+ crates/codegen/xai-grok-pager-bin/Cargo.toml  |  20 +-
+ crates/codegen/xai-grok-pager-bin/src/main.rs |  22 +-
+ .../xai-grok-pager/src/app/app_view.rs        |  11 +
  crates/codegen/xai-grok-pager/src/app/cli.rs  |  12 +-
- .../xai-grok-pager/src/app/dispatch/status.rs |   5 +
- .../src/app/dispatch/tests/status.rs          | 152 +++---------------
- .../xai-grok-pager/src/completions_cmd.rs     |  31 ++--
+ .../xai-grok-pager/src/app/dispatch/status.rs |   6 +
+ .../src/app/dispatch/tests/status.rs          | 867 +++++++-----------
+ .../xai-grok-pager/src/completions_cmd.rs     |  31 +-
  crates/codegen/xai-grok-pager/src/lib.rs      |   2 +-
  .../src/views/settings_modal/tests.rs         |   2 +
- .../src/auth/manager/enrichment.rs            |   5 +-
- 10 files changed, 100 insertions(+), 162 deletions(-)
+ 10 files changed, 393 insertions(+), 585 deletions(-)
 
+diff --git a/crates/codegen/xai-grok-login/src/manager/enrichment.rs b/crates/codegen/xai-grok-login/src/manager/enrichment.rs
+index 27ff6586e30f2ec59a224776013aea11a2832773..9c4504bd7eb035fe603fcd3ec452da5417ee7bab 100644
+--- a/crates/codegen/xai-grok-login/src/manager/enrichment.rs
++++ b/crates/codegen/xai-grok-login/src/manager/enrichment.rs
+@@ -246,7 +246,10 @@ pub(super) fn apply_user_info_enrichment(disk: &mut GrokAuth, user_info: UserInf
+     if let Some(reasons) = user_info.team_blocked_reasons {
+         disk.team_blocked_reasons = reasons;
+     }
+-    if let Some(opt_out) = user_info.coding_data_retention_opt_out {
++    if xai_grok_version::coding_data_retention_locked_opt_out() {
++        // Gork Build: server enrichment cannot opt the account into retention.
++        disk.coding_data_retention_opt_out = true;
++    } else if let Some(opt_out) = user_info.coding_data_retention_opt_out {
+         disk.coding_data_retention_opt_out = opt_out;
+     }
+     if let Some(ref email) = user_info.email
 diff --git a/crates/codegen/xai-grok-pager-bin/Cargo.toml b/crates/codegen/xai-grok-pager-bin/Cargo.toml
-index 59ac5e13e16cac6e21bd2de5c15392b84fb64e52..969f381c4476c7a4d01bcc8cd66f20126bd6d115 100644
+index d66f3936425bf52b5eb38b00891e43b7a37993ab..6ee57ee1a836b48a043e9a4110f83f7e97dc8433 100644
 --- a/crates/codegen/xai-grok-pager-bin/Cargo.toml
 +++ b/crates/codegen/xai-grok-pager-bin/Cargo.toml
 @@ -3,14 +3,18 @@ name = "xai-grok-pager-bin"
- version = "1.0.3"
+ version = "1.0.38"
  edition.workspace = true
  license = "Apache-2.0"
 -authors = ["xAI"]
@@ -49,8 +65,8 @@ index 59ac5e13e16cac6e21bd2de5c15392b84fb64e52..969f381c4476c7a4d01bcc8cd66f2012
  [[bin]]
  name = "xai-grok-pager"
  path = "src/main.rs"
-@@ -24,7 +28,7 @@ xai-grok-pager-minimal = { path = "../xai-grok-pager-minimal" }
- # Agent runtime + leader/stdio/headless entry points.
+@@ -25,7 +29,7 @@ xai-grok-pager-minimal = { path = "../xai-grok-pager-minimal" }
+ xai-grok-login = { workspace = true }
  xai-grok-shell = { workspace = true }
  xai-grok-update = { path = "../xai-grok-update" }
 -xai-grok-version = { workspace = true }
@@ -59,7 +75,7 @@ index 59ac5e13e16cac6e21bd2de5c15392b84fb64e52..969f381c4476c7a4d01bcc8cd66f2012
  xai-grok-workspace = { workspace = true }
  xai-crash-handler = { path = "../xai-crash-handler" }
 diff --git a/crates/codegen/xai-grok-pager-bin/src/main.rs b/crates/codegen/xai-grok-pager-bin/src/main.rs
-index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a2dbbbf9e 100644
+index aa448be7f2283f8d10c383c81a363077dddac9a5..ce86d4d22c1d4c10115ec89e284b773d1aa4db7f 100644
 --- a/crates/codegen/xai-grok-pager-bin/src/main.rs
 +++ b/crates/codegen/xai-grok-pager-bin/src/main.rs
 @@ -3,7 +3,8 @@
@@ -70,9 +86,9 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
 +    dead_code,
 +    clippy::possible_missing_else
  )]
+ #![deny(clippy::indexing_slicing)]
  #[cfg(all(feature = "jemalloc", unix))]
- #[global_allocator]
-@@ -156,7 +157,7 @@ async fn run_setup_command(json: bool) {
+@@ -269,7 +270,7 @@ async fn run_setup_command(json: bool) {
      if !managed_config::has_principal() {
          eprintln!("No deployment key or team sign-in found.");
          eprintln!();
@@ -81,7 +97,7 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
          eprintln!("or set a deployment key:");
          eprintln!();
          if cfg!(unix) {
-@@ -164,7 +165,7 @@ async fn run_setup_command(json: bool) {
+@@ -277,7 +278,7 @@ async fn run_setup_command(json: bool) {
          } else {
              eprintln!("  $env:GROK_DEPLOYMENT_KEY=\"<your-key>\"");
          }
@@ -90,7 +106,7 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
          eprintln!();
          eprintln!("Or add the key to ~/.grok/config.toml:");
          eprintln!();
-@@ -204,7 +205,7 @@ async fn run_setup_command(json: bool) {
+@@ -317,7 +318,7 @@ async fn run_setup_command(json: bool) {
          }
          SetupOutcome::Skipped => {
              eprintln!(
@@ -98,8 +114,8 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
 +                "Managed configuration was not applied this run (another process held the apply lock, or the credential changed during the fetch). Run `gork setup` again."
              );
          }
-         SetupOutcome::Failed(e) => {
-@@ -442,14 +443,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
+         SetupOutcome::Staged => {
+@@ -602,14 +603,14 @@ async fn run_workspace_mgmt(args: WorkspaceMgmtArgs) -> Result<()> {
          WorkspaceGate::Enabled => {}
          WorkspaceGate::Disabled => {
              anyhow::bail!(
@@ -117,7 +133,7 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
               try again."
              )
          }
-@@ -1104,7 +1105,7 @@ async fn run_agent_command(
+@@ -1271,7 +1272,7 @@ async fn run_agent_command(
      let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
      if !is_stdio && !is_leader {
          eprintln!(
@@ -126,17 +142,17 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
              xai_grok_version::display_version_with_commit(
                  env!("VERSION_WITH_COMMIT"),
                  xai_grok_update::channel_label(),
-@@ -1788,7 +1789,8 @@ fn install_heap_profile_hooks() {
+@@ -1989,7 +1990,8 @@ fn install_heap_profile_hooks() {
  }
  fn version_text(channel_label: &str) -> String {
      format!(
 -        "grok {}\n",
 +        "{} {}\n",
 +        xai_grok_version::PRODUCT_CLI,
-         xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
-     )
- }
-@@ -2612,7 +2614,7 @@ mod tests {
+         xai_grok_version::display_version_with_commit(
+             xai_grok_version::full_version(),
+             channel_label,
+@@ -2913,7 +2915,7 @@ mod tests {
              let mut output = Vec::new();
              write_version(&mut output, label).unwrap();
              let output = String::from_utf8(output).unwrap();
@@ -146,11 +162,11 @@ index ac1adc4fc7800e507742d4ae4bb7067edf2959f5..707dd59e53fc6f7d272a70695326413a
              assert!(output.ends_with(expected_suffix), "{output:?}");
          }
 diff --git a/crates/codegen/xai-grok-pager/src/app/app_view.rs b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-index 5a960e588c81ecc9d642217455fa28a87fc84b28..f377a2992984d7920a2e2bdf19e3cbb0398d4af1 100644
+index fc9a4553c6c6d4cb850c53783fe1ccffb3527d94..3ed214701e583607ca58d331e22af3e1c695a7c4 100644
 --- a/crates/codegen/xai-grok-pager/src/app/app_view.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/app_view.rs
-@@ -1268,6 +1268,10 @@ impl AppView {
-     /// Why `coding_data_sharing` is locked for this user (`None` = editable).
+@@ -1203,6 +1203,10 @@ impl AppView {
+     /// Why `coding_data_sharing` is locked for this user (`None` means editable).
      /// Mirrors the dispatch guards in `set_coding_data_sharing`.
      pub fn coding_data_sharing_lock(&self) -> Option<crate::settings::CodingDataSharingLock> {
 +        // Gork Build: retention is locked to opt-out for every account.
@@ -160,8 +176,8 @@ index 5a960e588c81ecc9d642217455fa28a87fc84b28..f377a2992984d7920a2e2bdf19e3cbb0
          if self.is_zdr {
              Some(crate::settings::CodingDataSharingLock::Zdr)
          } else if self.is_team_non_admin() {
-@@ -1277,7 +1281,14 @@ impl AppView {
-         }
+@@ -1216,7 +1220,14 @@ impl AppView {
+         self.coding_data_pending_write.map(|w| w.opted_in)
      }
      /// Welcome privacy banner visibility gates.
 +    ///
@@ -176,23 +192,23 @@ index 5a960e588c81ecc9d642217455fa28a87fc84b28..f377a2992984d7920a2e2bdf19e3cbb0
              return false;
          }
 diff --git a/crates/codegen/xai-grok-pager/src/app/cli.rs b/crates/codegen/xai-grok-pager/src/app/cli.rs
-index 4dde3ef372cc8aabe2e123e12b1b88e0c958d355..c0dfaee29ade72d7479f311e0aa3a76cf61fcbcf 100644
+index 87f63aef9443ec272ef9a37dfd774b6114d08d8f..b33783e25c5312c0c31ac850c6451cf5d7950341 100644
 --- a/crates/codegen/xai-grok-pager/src/app/cli.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/cli.rs
-@@ -409,9 +409,9 @@ pub struct LeaderArgs {
+@@ -394,9 +394,9 @@ pub struct LeaderArgs {
  }
  #[derive(Debug, Clone, Parser)]
  #[command(
 -    name = "grok",
 +    name = "gork",
-     version = env!("VERSION_WITH_COMMIT"),
+     version = xai_grok_version::full_version(),
 -    about = "Grok Build TUI",
 +    about = "Gork Build TUI",
      disable_version_flag = true,
      next_display_order = None,
      help_template = "\
-@@ -830,14 +830,18 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
- impl PagerArgs {
+@@ -824,14 +824,18 @@ impl PagerArgs {
+     }
      /// Parse CLI arguments without applying side effects.
      pub fn parse_cli() -> Self {
 +        // Gork Build ships as PRODUCT_CLI ("gork"); keep "grok"/"agent" as
@@ -213,10 +229,10 @@ index 4dde3ef372cc8aabe2e123e12b1b88e0c958d355..c0dfaee29ade72d7479f311e0aa3a76c
          Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
      }
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs
-index f9a88aaa8da4d7a735f39a301e7c8bc5ac8dc77d..bbc17ce21edcae47217a80cb916b19bd6271a81d 100644
+index baa6baf7dbfe2321b74aeb2d2795d2998b678fcd..dbe8cb450868af69b05f6dca65cb60f9b943cb03 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/status.rs
-@@ -201,6 +201,11 @@ pub(super) fn set_coding_data_sharing(
+@@ -235,6 +235,12 @@ pub(super) fn set_coding_data_sharing(
      opted_in: bool,
      source: xai_grok_telemetry::events::CodingDataConsentSource,
  ) -> Vec<Effect> {
@@ -225,14 +241,518 @@ index f9a88aaa8da4d7a735f39a301e7c8bc5ac8dc77d..bbc17ce21edcae47217a80cb916b19bd
 +        app.show_toast("\u{2717} Gork Build locks coding data retention to opt-out");
 +        return vec![];
 +    }
-     // ── Guard 1: Enterprise ZDR ──────────────────────────────────────
++    // ── Guard 1: Enterprise ZDR ──────────────────────────────────────
      if app.is_zdr {
          app.show_toast("\u{2717} Cannot change: Zero Data Retention enabled");
+         return vec![];
 diff --git a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
-index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515cfe29ca7 100644
+index 2d8e1168af969579b3015559a2b7bc91827ace18..52cbfe72b9b3510f2359e51f1c623515cfe29ca7 100644
 --- a/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
 +++ b/crates/codegen/xai-grok-pager/src/app/dispatch/tests/status.rs
-@@ -613,20 +613,20 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
+@@ -2,20 +2,28 @@
+ 
+ use super::*;
+ 
+-/// Regression for the leader-mode turn-end race: this client is briefly Idle while the server still has queued prompts.
+-/// Idle here means `is_turn_running() == false` with `current_prompt_id` cleared; the server's queue is visible as a non-empty `shared_queue` mirror.
+-/// A newly-sent prompt must route to the server (immediate-send), not drain locally as a phantom running turn.
++/// Regression (leader-mode turn-end race): when this client is briefly Idle
++/// (`is_turn_running() == false`, `current_prompt_id` cleared) but the server
++/// still has queued prompts — visible as a non-empty `shared_queue` mirror —
++/// a newly-sent prompt must route to the SERVER (immediate-send), NOT be
++/// locally drained as a phantom running turn. The failure mode: a
++/// `send_route_plain immediate=false is_turn_running=false shared_queue_len=5`
++/// path taking `local_drain`, leaving the prompt shown running on the sender
++/// while it was actually queued behind the existing entries on the leader and
++/// every other client.
+ #[test]
+ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
+     let mut app = test_app_with_agent();
+     let id = AgentId(0);
+-    // Two prompts already queued on the server (as a broadcast would leave things): populate the authoritative map and mirror it into the agent
++    // Two prompts already queued on the server (as a broadcast would leave
++    // things): populate the authoritative map AND mirror it into the agent.
+     app.push_optimistic_prompt_echo("test-session", "q1", "a", "prompt");
+     app.push_optimistic_prompt_echo("test-session", "q2", "b", "prompt");
+     {
+         let snapshot = app.shared_prompt_queue("test-session").cloned().unwrap();
+         let agent = app.agents.get_mut(&id).unwrap();
+-        // Turn-end window: locally Idle with no current prompt, but the server's queue (mirrored from the last broadcast) still has work
++        // Turn-end window: locally Idle with no current prompt, but the
++        // server's queue (mirrored from the last broadcast) still has work.
+         agent.session.state = AgentState::Idle;
+         agent.session.current_prompt_id = None;
+         agent.shared_queue = snapshot;
+@@ -34,19 +42,16 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
+             _ => None,
+         })
+         .unwrap_or_else(|| panic!("expected immediate SendPrompt for 'c', got {effects:?}"));
+-    // The dispatch did not start a local turn or adopt "c" as the running prompt
+-    let Some(agent) = app.agents.get(&id) else {
+-        panic!("expected agent {id:?}");
+-    };
++    // Did NOT start a local turn or adopt "c" as the running prompt.
+     assert!(
+-        !agent.session.state.is_turn_running(),
++        !app.agents[&id].session.state.is_turn_running(),
+         "must not promote 'c' to a local running turn"
+     );
+     assert!(
+-        agent.session.current_prompt_id.is_none(),
++        app.agents[&id].session.current_prompt_id.is_none(),
+         "must not set current_prompt_id locally for a server-queued prompt"
+     );
+-    // Echoed into the shared queue behind the existing entries (position 3)
++    // Echoed into the shared queue BEHIND the existing entries (position 3).
+     let q = app
+         .shared_prompt_queue("test-session")
+         .expect("optimistic echo present");
+@@ -55,11 +60,24 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
+     assert_eq!(q.last().map(|e| e.text.as_str()), Some("c"));
+ }
+ 
+-// coding data sharing dispatch tests
+-// The dispatcher mutates optimistically and rolls back on failure, matching the `set_yolo_mode` pattern minus its toasts
+-// Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
+-
+-/// Idle unchanged opt-in skips ACP and still acks: the only direction allowed to skip the write.
++// ── coding_data_sharing dispatch tests ───
++//
++// The dispatcher uses **optimistic + rollback**, matching the
++// `set_yolo_mode` pattern minus its toasts — the surfaces that change this
++// setting show the result themselves. These tests pin the contract:
++//   - Guards (ZDR, non-admin team) toast and short-circuit; they are the
++//     only paths that still speak up, because nothing else on screen would.
++//   - Idle unchanged opt-in skips the ACP write but still acks (rollout on).
++//   - Optimistic mutation flips `app.coding_data_retention_opt_out`
++//     BEFORE the Effect is emitted.
++//   - `Effect::SetCodingDataSharing` carries
++//     `rollback_to_opted_in = previous_value`.
++//   - `TaskResult::CodingDataSharingFailed` reverts the optimistic
++//     mutation; `TaskResult::CodingDataSharingUpdated` re-anchors
++//     to the server-confirmed value.
++
++/// Idle unchanged opt-in skips ACP and still acks. Already-out is covered
++/// by `settings_opt_out_while_already_out_acks_without_write`.
+ #[test]
+ fn set_coding_data_sharing_unchanged_opt_in_skips_acp_and_acks() {
+     let mut app = test_app_with_agent();
+@@ -78,14 +96,10 @@ fn set_coding_data_sharing_unchanged_opt_in_skips_acp_and_acks() {
+             .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
+         "idle unchanged opt-in must NOT write ACP: {effects:?}"
+     );
+-    assert!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .is_some_and(|a| a.toast.is_none())
+-    );
++    assert!(app.agents[&AgentId(0)].toast.is_none());
+     assert!(!app.coding_data_retention_opt_out);
+     assert!(app.privacy_banner_acked.is_some());
+-    assert!(app.coding_data_pending_write.is_none());
++    assert!(!app.privacy_banner_opt_in_inflight);
+     assert_eq!(app.coding_data_write_seq, 0);
+ }
+ 
+@@ -102,7 +116,7 @@ fn set_coding_data_sharing_blocked_by_zdr() {
+         app.privacy_banner_acked.is_none(),
+         "ZDR block must not ack the banner"
+     );
+-    assert!(app.coding_data_pending_write.is_none());
++    assert!(!app.privacy_banner_opt_in_inflight);
+     let toast = read_toast(&app);
+     assert!(
+         toast.contains("Zero Data Retention"),
+@@ -112,15 +126,17 @@ fn set_coding_data_sharing_blocked_by_zdr() {
+         toast.contains('\u{2717}'),
+         "blocked toast uses ✗ glyph: {toast}"
+     );
+-    // State unchanged: the user was blocked, so the optimistic mutation never happened
++    // State unchanged — the user was blocked, the optimistic
++    // mutation never happened.
+     assert!(
+         !app.coding_data_retention_opt_out,
+         "ZDR block must not mutate state",
+     );
+ }
+ 
+-/// ZDR block fires even when the toggle would be a no-op.
+-/// Defense-in-depth: don't quietly accept a same-value toggle from a user the policy says shouldn't be touching this.
++/// ZDR block fires even when the toggle would be a no-op
++/// (defense-in-depth: don't quietly accept a same-value toggle
++/// from a user the policy says shouldn't be touching this).
+ #[test]
+ fn set_coding_data_sharing_blocked_by_zdr_even_if_idempotent() {
+     let mut app = test_app_with_agent();
+@@ -129,12 +145,12 @@ fn set_coding_data_sharing_blocked_by_zdr_even_if_idempotent() {
+     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+     assert!(effects.is_empty());
+     assert!(app.privacy_banner_acked.is_none());
+-    assert!(app.coding_data_pending_write.is_none());
++    assert!(!app.privacy_banner_opt_in_inflight);
+     assert!(read_toast(&app).contains("Zero Data Retention"));
+ }
+ 
+-/// Non-admin team members are blocked from toggling (matches desktop).
+-/// The blocked path toasts and short-circuits.
++/// Non-admin team members are blocked from toggling (matches
++/// desktop). The blocked path toasts and short-circuits.
+ #[test]
+ fn set_coding_data_sharing_blocked_non_admin() {
+     let mut app = test_app_with_agent();
+@@ -144,7 +160,7 @@ fn set_coding_data_sharing_blocked_non_admin() {
+     let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+     assert!(effects.is_empty());
+     assert!(app.privacy_banner_acked.is_none());
+-    assert!(app.coding_data_pending_write.is_none());
++    assert!(!app.privacy_banner_opt_in_inflight);
+     let toast = read_toast(&app);
+     assert!(
+         toast.contains("team admin"),
+@@ -152,7 +168,8 @@ fn set_coding_data_sharing_blocked_non_admin() {
+     );
+ }
+ 
+-/// Admin team members can toggle.
++/// Admin team members CAN toggle. The admin-allowed path produces
++/// an Effect carrying the rollback value.
+ #[test]
+ fn set_coding_data_sharing_allowed_for_admin() {
+     let mut app = test_app_with_agent();
+@@ -170,8 +187,16 @@ fn set_coding_data_sharing_allowed_for_admin() {
+         .iter()
+         .find(|e| matches!(e, Effect::SetCodingDataSharing { .. }))
+     {
+-        Some(Effect::SetCodingDataSharing { opted_in, .. }) => {
++        Some(Effect::SetCodingDataSharing {
++            opted_in,
++            rollback_to_opted_in,
++            ..
++        }) => {
+             assert!(!*opted_in, "Effect must carry opted_in=false");
++            assert!(
++                *rollback_to_opted_in,
++                "rollback_to_opted_in must capture pre-toggle opt-in=true",
++            );
+         }
+         other => panic!("expected SetCodingDataSharing Effect, got {effects:?} ({other:?})"),
+     }
+@@ -181,9 +206,11 @@ fn set_coding_data_sharing_allowed_for_admin() {
+         "admin-allowed dispatch must optimistically flip state",
+     );
+     assert!(app.privacy_banner_acked.is_none());
++    assert!(!app.privacy_banner_opt_in_inflight);
+ }
+ 
+-/// Non-idempotent dispatch emits one Effect and mutates state optimistically.
++/// Non-idempotent dispatch emits one Effect AND mutates state
++/// optimistically.
+ #[test]
+ fn set_coding_data_sharing_produces_effect_and_optimistic_mutation() {
+     let mut app = test_app_with_agent();
+@@ -202,10 +229,15 @@ fn set_coding_data_sharing_produces_effect_and_optimistic_mutation() {
+         Some(Effect::SetCodingDataSharing {
+             agent_id,
+             opted_in,
++            rollback_to_opted_in,
+             seq,
+         }) => {
+             assert_eq!(*agent_id, AgentId(0));
+             assert!(!*opted_in);
++            assert!(
++                *rollback_to_opted_in,
++                "rollback_to_opted_in must be pre-toggle value (true == opted-in)",
++            );
+             assert_eq!(
+                 *seq, app.coding_data_write_seq,
+                 "the effect must carry the generation it was dispatched under",
+@@ -219,22 +251,15 @@ fn set_coding_data_sharing_produces_effect_and_optimistic_mutation() {
+         "dispatch must optimistically mutate state",
+     );
+     assert!(app.privacy_banner_acked.is_none());
+-    assert_eq!(
+-        app.coding_data_pending_write,
+-        Some(PendingCodingDataWrite {
+-            opted_in: false,
+-            rollback_to_opted_in: true,
+-        })
+-    );
++    assert!(!app.privacy_banner_opt_in_inflight);
+     assert!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .is_some_and(|a| a.toast.is_none()),
++        app.agents[&AgentId(0)].toast.is_none(),
+         "changing this setting must not toast — the settings row is the feedback",
+     );
+ }
+ 
+-/// `TaskResult::CodingDataSharingUpdated` re-anchors state to the server-confirmed value (defense-in-depth).
++/// `TaskResult::CodingDataSharingUpdated` re-anchors state to the
++/// server-confirmed value (defense-in-depth).
+ #[test]
+ fn coding_data_sharing_updated_re_anchors_state() {
+     let mut app = test_app_with_agent();
+@@ -255,19 +280,19 @@ fn coding_data_sharing_updated_re_anchors_state() {
+     // State re-anchored (was already true, stays true).
+     assert!(app.coding_data_retention_opt_out);
+     assert!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .is_some_and(|a| a.toast.is_none()),
++        app.agents[&AgentId(0)].toast.is_none(),
+         "server confirmation must not toast",
+     );
+ }
+ 
+-/// `TaskResult::CodingDataSharingUpdated` corrects the in-memory state if the server reshapes the boolean (e.g. policy override).
+-/// Pins the defense-in-depth re-anchor contract.
++/// `TaskResult::CodingDataSharingUpdated` corrects the in-memory
++/// state if the server reshapes the boolean (e.g. policy
++/// override). Pins the defense-in-depth re-anchor contract.
+ #[test]
+ fn coding_data_sharing_updated_corrects_state_if_server_disagrees() {
+     let mut app = test_app_with_agent();
+-    // Optimistic mutation said "opt-out", but the server overrides to "opt-in" (e.g. policy that prevents opt-out).
++    // Optimistic mutation said "opt-out" — but the server
++    // overrides to "opt-in" (e.g. policy that prevents opt-out).
+     app.coding_data_retention_opt_out = true;
+     let id = AgentId(0);
+     let seq = app.coding_data_write_seq;
+@@ -287,24 +312,26 @@ fn coding_data_sharing_updated_corrects_state_if_server_disagrees() {
+     );
+ }
+ 
+-/// `TaskResult::CodingDataSharingFailed` reverts the optimistic mutation and shows a failure toast.
+-/// Pins the rollback contract.
+-/// The failure toast uses the standardised "coding data sharing" wording.
++/// `TaskResult::CodingDataSharingFailed` REVERTS the optimistic
++/// mutation and surfaces a failure toast. Pins the rollback
++/// contract.
++///
++/// Failure toast uses the standardised "coding data sharing"
++/// wording.
+ #[test]
+ fn coding_data_sharing_failed_rolls_back_and_toasts_error() {
+     let mut app = test_app_with_agent();
+-    // Post-optimistic state: the user picked opt-out from opt-in, then the ACP call failed
++    // Simulate post-optimistic state: user picked opt-out, state
++    // was flipped, then the ACP call failed. The pre-toggle value
++    // was opt-in (true), so `rollback_to_opted_in = true`.
+     app.coding_data_retention_opt_out = true;
+-    app.coding_data_pending_write = Some(PendingCodingDataWrite {
+-        opted_in: false,
+-        rollback_to_opted_in: true,
+-    });
+     let id = AgentId(0);
+     let seq = app.coding_data_write_seq;
+     let effects = dispatch(
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: id,
+             error: "server error".into(),
++            rollback_to_opted_in: true,
+             seq,
+         }),
+         &mut app,
+@@ -326,22 +353,21 @@ fn coding_data_sharing_failed_rolls_back_and_toasts_error() {
+     assert!(toast.contains('\u{2717}'), "failure toast uses ✗: {toast}");
+ }
+ 
+-/// `TaskResult::CodingDataSharingFailed` reverts in the other direction too (the pre-toggle state could have been either).
++/// `TaskResult::CodingDataSharingFailed` reverts in the OTHER
++/// direction too (the pre-toggle state could have been either).
+ #[test]
+ fn coding_data_sharing_failed_rolls_back_to_opt_out() {
+     let mut app = test_app_with_agent();
+-    // Post-optimistic: opted-in (the user picked opt-in from opt-out, the server failed)
++    // Post-optimistic: opted-in (user picked opt-in, server
++    // failed, pre-toggle was opt-out).
+     app.coding_data_retention_opt_out = false;
+-    app.coding_data_pending_write = Some(PendingCodingDataWrite {
+-        opted_in: true,
+-        rollback_to_opted_in: false,
+-    });
+     let id = AgentId(0);
+     let seq = app.coding_data_write_seq;
+     let effects = dispatch(
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: id,
+             error: "network timeout".into(),
++            rollback_to_opted_in: false,
+             seq,
+         }),
+         &mut app,
+@@ -355,7 +381,8 @@ fn coding_data_sharing_failed_rolls_back_to_opt_out() {
+ }
+ 
+ /// Optimistic mutation refreshes any open settings modal.
+-/// Without this refresh, the modal indicator would stay at the pre-toggle value until a manual re-render.
++/// Without this refresh, the modal indicator would stay at the
++/// pre-toggle value until manual re-render.
+ #[test]
+ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
+     let mut app = test_app_with_agent();
+@@ -365,11 +392,7 @@ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
+     // Verify snapshot reads opted-in.
+     let agent_id = AgentId(0);
+     {
+-        let state = match app
+-            .agents
+-            .get(&agent_id)
+-            .and_then(|a| a.active_modal.as_ref())
+-        {
++        let state = match &app.agents[&agent_id].active_modal {
+             Some(crate::views::modal::ActiveModal::Settings { state }) => state,
+             _ => panic!("expected Settings modal open after OpenSettings dispatch"),
+         };
+@@ -381,11 +404,7 @@ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
+     // Dispatch the toggle.
+     let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+     // Snapshot now reflects the optimistic mutation.
+-    let state = match app
+-        .agents
+-        .get(&agent_id)
+-        .and_then(|a| a.active_modal.as_ref())
+-    {
++    let state = match &app.agents[&agent_id].active_modal {
+         Some(crate::views::modal::ActiveModal::Settings { state }) => state,
+         _ => panic!("Settings modal must still be open after SetCodingDataSharing dispatch"),
+     };
+@@ -395,7 +414,8 @@ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
+     );
+ }
+ 
+-/// Rollback also refreshes the modal: the user sees the reverted value, not the stale optimistic one.
++/// Rollback also refreshes the modal — the user sees the
++/// reverted value, not the stale optimistic one.
+ #[test]
+ fn coding_data_sharing_failed_refreshes_open_modal_snapshot() {
+     let mut app = test_app_with_agent();
+@@ -409,15 +429,12 @@ fn coding_data_sharing_failed_refreshes_open_modal_snapshot() {
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: AgentId(0),
+             error: "x".into(),
++            rollback_to_opted_in: true,
+             seq,
+         }),
+         &mut app,
+     );
+-    let state = match app
+-        .agents
+-        .get(&AgentId(0))
+-        .and_then(|a| a.active_modal.as_ref())
+-    {
++    let state = match &app.agents[&AgentId(0)].active_modal {
+         Some(crate::views::modal::ActiveModal::Settings { state }) => state,
+         _ => panic!("Settings modal must still be open after rollback TaskResult"),
+     };
+@@ -434,29 +451,30 @@ fn set_coding_data_sharing_is_silent_in_both_directions() {
+         app.coding_data_retention_opt_out = opted_in; // a real change either way
+         let _ = dispatch(Action::SetCodingDataSharing { opted_in }, &mut app);
+         assert!(
+-            app.agents
+-                .get(&AgentId(0))
+-                .is_some_and(|a| a.toast.is_none()),
++            app.agents[&AgentId(0)].toast.is_none(),
+             "opted_in={opted_in} must not toast, got {:?}",
+-            app.agents.get(&AgentId(0)).and_then(|a| a.toast.as_ref()),
++            app.agents[&AgentId(0)].toast,
+         );
+     }
+ }
+ 
+-/// The failure toast substitutes a generic placeholder when the error string is too long or contains control characters / newlines.
+-/// Pins the scrub contract.
++/// The failure toast
++/// substitutes a generic placeholder when the error string is
++/// too long OR contains control characters / newlines. Pins the
++/// scrub contract.
+ #[test]
+ fn coding_data_sharing_failed_scrubs_long_error_messages() {
+     let mut app = test_app_with_agent();
+     app.coding_data_retention_opt_out = true;
+     let id = AgentId(0);
+-    // A roughly 500-char error simulating a stack trace / HTML 502 page
++    // ~500-char error simulating a stack trace / HTML 502 page.
+     let huge_error = "a".repeat(500);
+     let seq = app.coding_data_write_seq;
+     let _ = dispatch(
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: id,
+             error: huge_error.clone(),
++            rollback_to_opted_in: false,
+             seq,
+         }),
+         &mut app,
+@@ -473,8 +491,9 @@ fn coding_data_sharing_failed_scrubs_long_error_messages() {
+     );
+ }
+ 
+-/// Control characters (CR/LF/NUL) in the error trigger the scrub path even on short strings.
+-/// This preserves the toast's single-line layout.
++/// Control characters (CR/LF/NUL)
++/// in the error trigger the scrub path even on short strings —
++/// preserves the toast's single-line layout.
+ #[test]
+ fn coding_data_sharing_failed_scrubs_control_chars_in_error() {
+     let mut app = test_app_with_agent();
+@@ -487,6 +506,7 @@ fn coding_data_sharing_failed_scrubs_control_chars_in_error() {
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: id,
+             error: multiline.clone(),
++            rollback_to_opted_in: false,
+             seq,
+         }),
+         &mut app,
+@@ -503,8 +523,9 @@ fn coding_data_sharing_failed_scrubs_control_chars_in_error() {
+     );
+ }
+ 
+-/// The scrub path preserves short, sanitised error messages verbatim.
+-/// The typical happy-path shell-side error string stays unscrubbed.
++/// The scrub path preserves short,
++/// sanitised error messages verbatim — the typical happy-path
++/// shell-side error string stays unscrubbed.
+ #[test]
+ fn coding_data_sharing_failed_preserves_short_clean_error_message() {
+     let mut app = test_app_with_agent();
+@@ -516,6 +537,7 @@ fn coding_data_sharing_failed_preserves_short_clean_error_message() {
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: id,
+             error: short_clean.clone(),
++            rollback_to_opted_in: false,
+             seq,
+         }),
+         &mut app,
+@@ -531,10 +553,11 @@ fn coding_data_sharing_failed_preserves_short_clean_error_message() {
+     );
+ }
+ 
+-/// Direct unit test of the `scrub_error_for_toast` helper; pins the threshold and the fallback string against drift.
++/// Direct unit test of the `scrub_error_for_toast` helper —
++/// pins the threshold and the fallback string against drift.
+ #[test]
+ fn scrub_error_for_toast_unit() {
+-    // Empty and short messages pass through
++    // Empty + short messages pass through.
+     assert_eq!(scrub_error_for_toast(""), "");
+     assert_eq!(scrub_error_for_toast("ok"), "ok");
+     assert_eq!(scrub_error_for_toast("network timeout"), "network timeout");
+@@ -556,8 +579,11 @@ fn scrub_error_for_toast_unit() {
+         scrub_error_for_toast("hi\rthere"),
+         "server error (see logs for details)"
+     );
+-    // Format-category (Cf) chars also trigger scrub: bidi overrides, zero-width joiner / space, BOM
+-    // This prevents Trojan-Source-style spoofing: a toast that reads as one thing while the bytes encode another via a RIGHT-TO-LEFT OVERRIDE
++    // Format-category (Cf) chars also trigger scrub — bidi
++    // overrides, zero-width joiner / space, BOM. Prevents
++    // Trojan-Source-style visual spoofing
++    // where a toast READS as one thing but bytes encode
++    // another via embedded RIGHT-TO-LEFT-OVERRIDE.
+     assert_eq!(
+         scrub_error_for_toast("opt\u{202E}-out"),
+         "server error (see logs for details)",
+@@ -587,20 +613,20 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
      app.agents.clear();
      app.active_view = ActiveView::Welcome;
      app.coding_data_retention_opt_out = true;
@@ -244,8 +764,8 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
 -    assert_eq!(effects.len(), 1, "no-agent path must still emit Effect");
      assert!(
 -        matches!(
--            &effects[0],
--            Effect::SetCodingDataSharing { opted_in: true, .. }
+-            effects.first(),
+-            Some(Effect::SetCodingDataSharing { opted_in: true, .. })
 -        ),
 -        "changed opt-in must be the ACP write, not an early ack: {effects:?}"
 +        effects.is_empty(),
@@ -257,12 +777,20 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
 +        app.coding_data_retention_opt_out,
 +        "opt-in must not apply under privacy lock",
      );
--    assert!(app.privacy_banner_opt_in_inflight);
+-    assert_eq!(app.coding_data_pending_opted_in(), Some(true));
 +    assert!(!app.privacy_banner_opt_in_inflight);
      assert!(app.privacy_banner_acked.is_none());
  }
  
-@@ -645,141 +645,35 @@ fn privacy_banner_ready_app() -> AppView {
+@@ -612,378 +638,97 @@ fn privacy_banner_ready_app() -> AppView {
+     app.privacy_notice_rollout = true;
+     app.privacy_banner_acked = None;
+     app.privacy_banner_reshow_days = None;
+-    app.coding_data_pending_write = None;
++    app.privacy_banner_opt_in_inflight = false;
+     app.is_zdr = false;
+     app.team_name = None;
+     app.coding_data_retention_opt_out = true;
      app
  }
  
@@ -288,7 +816,8 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
      assert!(
          !app.privacy_banner_should_show(),
 -        "recently acked, no reshow"
--    );
++        "Gork Build must never surface the retention opt-in banner"
+     );
 -
 -    app.privacy_banner_reshow_days = Some(30);
 -    app.privacy_banner_acked = Some("2020-01-01T00:00:00Z".into());
@@ -299,19 +828,22 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
 -
 -    app.privacy_notice_rollout = false;
 -    assert!(!app.privacy_banner_should_show(), "rollout off");
--}
--
+ }
+ 
 -/// `[Opt in]` success: ACP confirmation acks the banner.
--#[test]
++/// Opt-in and Opt-out banner actions are inert under the privacy lock
++/// because `privacy_banner_should_show` is always false.
+ #[test]
 -fn privacy_banner_opt_in_success_acks() {
--    let mut app = privacy_banner_ready_app();
--    let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
++fn privacy_banner_opt_in_and_opt_out_are_inert_in_gork_build() {
+     let mut app = privacy_banner_ready_app();
+     let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
 -    assert_eq!(effects.len(), 1);
 -    assert!(matches!(
--        &effects[0],
--        Effect::SetCodingDataSharing { opted_in: true, .. }
+-        effects.first(),
+-        Some(Effect::SetCodingDataSharing { opted_in: true, .. })
 -    ));
--    assert!(app.privacy_banner_opt_in_inflight);
+-    assert_eq!(app.coding_data_pending_opted_in(), Some(true));
 -    assert!(!app.coding_data_retention_opt_out);
 -    assert!(app.privacy_banner_acked.is_none());
 -
@@ -324,48 +856,48 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
 -        }),
 -        &mut app,
 -    );
--    assert!(!app.privacy_banner_opt_in_inflight);
+-    assert!(app.coding_data_pending_write.is_none());
 -    assert!(app.privacy_banner_acked.is_some());
 -    assert!(!app.privacy_banner_should_show());
--    assert!(
++    assert!(effects.is_empty(), "OptIn must emit nothing: {effects:?}");
++    assert!(!app.privacy_banner_opt_in_inflight);
+     assert!(
 -        ack_effects
 -            .iter()
 -            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
 -        "success must persist ack: {ack_effects:?}"
-+        "Gork Build must never surface the retention opt-in banner"
++        app.coding_data_retention_opt_out,
++        "OptIn must not opt the user in"
      );
- }
- 
--/// `[Opt in]` failure: no ack; welcome toast carries the error.
-+/// Opt-in and Opt-out banner actions are inert under the privacy lock
-+/// because `privacy_banner_should_show` is always false.
- #[test]
--fn privacy_banner_opt_in_failure_no_ack_sets_welcome_toast() {
-+fn privacy_banner_opt_in_and_opt_out_are_inert_in_gork_build() {
-     let mut app = privacy_banner_ready_app();
-     let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
--    assert_eq!(effects.len(), 1);
--    assert!(app.privacy_banner_opt_in_inflight);
+-}
 -
+-/// `[Opt in]` failure: no ack; welcome toast carries the error.
+-#[test]
+-fn privacy_banner_opt_in_failure_no_ack_sets_welcome_toast() {
+-    let mut app = privacy_banner_ready_app();
+-    let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
+-    assert_eq!(effects.len(), 1);
+-    assert_eq!(app.coding_data_pending_opted_in(), Some(true));
++    assert!(app.privacy_banner_acked.is_none());
+ 
 -    let seq = app.coding_data_write_seq;
 -    let fail_effects = dispatch(
 -        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
 -            agent_id: AgentId(0),
 -            error: "server error".into(),
--            rollback_to_opted_in: false,
 -            seq,
 -        }),
 -        &mut app,
 -    );
 -    assert!(fail_effects.is_empty());
-+    assert!(effects.is_empty(), "OptIn must emit nothing: {effects:?}");
-     assert!(!app.privacy_banner_opt_in_inflight);
--    assert!(app.privacy_banner_acked.is_none());
-     assert!(
-         app.coding_data_retention_opt_out,
+-    assert!(app.coding_data_pending_write.is_none());
++    let effects = dispatch(Action::PrivacyBannerOptOut, &mut app);
++    assert!(effects.is_empty(), "OptOut must emit nothing: {effects:?}");
+     assert!(app.privacy_banner_acked.is_none());
+-    assert!(
+-        app.coding_data_retention_opt_out,
 -        "rollback restores opt-out"
-+        "OptIn must not opt the user in"
-     );
+-    );
 -    assert!(
 -        app.privacy_banner_should_show(),
 -        "failed [Opt in] must leave the banner eligible"
@@ -380,17 +912,19 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
 -        "welcome toast on [Opt in] failure: {toast}"
 -    );
 -    assert!(toast.contains("server error"), "error in toast: {toast}");
--}
--
+ }
+ 
 -/// `[Opt out]` while an `[Opt in]` ACP call is inflight must be a no-op:
 -/// an eager ack would survive the opt-in-failure rollback and hide the
 -/// banner forever.
--#[test]
++/// Already-out `[Opt out]` acks now and must not force an ACP write.
+ #[test]
 -fn privacy_banner_opt_out_noop_while_opt_in_inflight() {
--    let mut app = privacy_banner_ready_app();
++fn privacy_banner_opt_out_acks_now_without_write() {
++    use crate::views::modal::ActiveModal;
+     let mut app = privacy_banner_ready_app();
 -    let _ = dispatch(Action::PrivacyBannerOptIn, &mut app);
--    assert!(app.privacy_banner_opt_in_inflight);
-+    assert!(app.privacy_banner_acked.is_none());
+-    assert_eq!(app.coding_data_pending_opted_in(), Some(true));
  
      let effects = dispatch(Action::PrivacyBannerOptOut, &mut app);
 -    assert!(
@@ -398,31 +932,845 @@ index 0cf73959d491ab5f43c5de41ea8c764d5886b8b7..52cbfe72b9b3510f2359e51f1c623515
 -        "[Opt out] during an inflight [Opt in] must be a no-op: {effects:?}"
 -    );
 -    assert!(app.privacy_banner_acked.is_none(), "no ack while inflight");
--
+ 
 -    let seq = app.coding_data_write_seq;
 -    let _ = dispatch(
 -        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
 -            agent_id: AgentId(0),
 -            error: "server error".into(),
--            rollback_to_opted_in: false,
 -            seq,
 -        }),
 -        &mut app,
 -    );
--    assert!(
+     assert!(
 -        app.privacy_banner_should_show(),
 -        "a failed [Opt in] must keep the banner even after a raced [Opt out]"
++        app.privacy_banner_acked.is_some(),
++        "the ack lands on click, not on an ACP reply"
+     );
+-}
+-
+-/// Coalescing and the idle opt-in shortcut key on the pending write's choice, not the mirror a subscription check can
+-/// rewrite mid-flight. Otherwise a pending opt-in lands as the answer to Opt out, or Opt in acks with nothing sent.
+-#[test]
+-fn stale_mirror_does_not_coalesce_an_opposite_choice() {
+-    for pending in [true, false] {
+-        let mut app = privacy_banner_ready_app();
+-        app.coding_data_retention_opt_out = pending;
+-        let _ = dispatch(Action::SetCodingDataSharing { opted_in: pending }, &mut app);
+-
+-        // Background refresh still carries the pre-write value
+-        let meta = serde_json::to_value(xai_grok_login::AuthMeta {
+-            coding_data_retention_opt_out: pending,
+-            ..Default::default()
+-        })
+-        .unwrap();
+-        let _ = dispatch(
+-            Action::TaskComplete(TaskResult::CheckSubscriptionComplete {
+-                verify: None,
+-                meta: Some(meta),
+-            }),
+-            &mut app,
+-        );
+-        assert_eq!(
+-            app.coding_data_retention_opt_out, pending,
+-            "mirror rewritten"
+-        );
+-        assert_eq!(
+-            app.coding_data_pending_opted_in(),
+-            Some(pending),
+-            "pending untouched"
+-        );
+-
+-        let effects = dispatch(
+-            Action::SetCodingDataSharing { opted_in: !pending },
+-            &mut app,
+-        );
+-        assert!(
+-            matches!(
+-                effects.as_slice(),
+-                [Effect::SetCodingDataSharing { opted_in, seq: 2, .. }] if *opted_in != pending
+-            ),
+-            "pending={pending}: the opposite choice must write: {effects:?}"
+-        );
+-        assert!(
+-            app.privacy_banner_acked.is_none(),
+-            "pending={pending}: no local ack"
+-        );
+-    }
+-}
+-
+-/// Already-out opt-out, from the banner or Settings, still writes: the local "out" may be the unconfirmed fail-safe default.
+-#[test]
+-fn already_out_opt_out_writes_and_acks_on_success() {
+-    for from_banner in [true, false] {
+-        let action = if from_banner {
+-            Action::PrivacyBannerOptOut
+-        } else {
+-            Action::SetCodingDataSharing { opted_in: false }
+-        };
+-        let mut app = privacy_banner_ready_app();
+-
+-        let effects = dispatch(action, &mut app);
+-        let action = if from_banner { "[Opt out]" } else { "Settings" };
+-
+-        assert!(
+-            matches!(
+-                effects.as_slice(),
+-                [Effect::SetCodingDataSharing {
+-                    opted_in: false,
+-                    seq: 1,
+-                    ..
+-                }]
+-            ),
+-            "{action}: already-out must still write, and only write: {effects:?}"
+-        );
+-        assert!(
+-            app.privacy_banner_acked.is_none(),
+-            "{action}: no ack before the reply"
+-        );
+-
+-        let ack_effects = dispatch(
+-            Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
+-                agent_id: AgentId(0),
+-                opted_in: false,
+-                seq: 1,
+-            }),
+-            &mut app,
+-        );
+-        assert!(
+-            ack_effects
+-                .iter()
+-                .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+-            "{action}: success must persist the ack: {ack_effects:?}"
+-        );
+-        assert!(!app.privacy_banner_should_show());
+-    }
+-}
+-
+-/// A Settings opt-out must not raise the banner mid-write: the optimistic "out" is unconfirmed, and a banner
+-/// there would re-ask the choice the user just made, with buttons that no-op until the reply lands.
+-#[test]
+-fn settings_opt_out_does_not_reveal_banner_while_inflight() {
+-    let mut app = privacy_banner_ready_app();
+-    app.coding_data_retention_opt_out = false;
+-
+-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+     assert!(
+         !app.privacy_banner_should_show(),
+-        "the pending write already carries the user's answer"
 -    );
-+    assert!(effects.is_empty(), "OptOut must emit nothing: {effects:?}");
-+    assert!(app.privacy_banner_acked.is_none());
+-
+-    let _ = dispatch(
+-        Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
+-            agent_id: AgentId(0),
+-            opted_in: false,
+-            seq: app.coding_data_write_seq,
+-        }),
+-        &mut app,
++        "the banner is gone the moment it is dismissed"
+     );
+-    assert!(app.privacy_banner_acked.is_some(), "the reply acks");
+-    assert!(!app.privacy_banner_should_show());
+-}
+-
+-/// The always-write opt-out starts with the unconfirmed fail-safe value as its rollback.
+-/// An auth-meta refresh mid-flight replaces it: reverting to the snapshot on failure would show an opt-out the server never made.
+-#[test]
+-fn opt_out_failure_keeps_a_mid_flight_auth_meta_value() {
+-    let mut app = privacy_banner_ready_app();
+-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+-    let seq = app.coding_data_write_seq;
+-
+-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
+-        coding_data_retention_opt_out: false,
+-        ..Default::default()
+-    });
+-
+-    let fail = dispatch(
+-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+-            agent_id: AgentId(0),
+-            error: "server error".into(),
+-            seq,
+-        }),
+-        &mut app,
+-    );
+-
+-    assert!(fail.is_empty());
+     assert!(
+-        !app.coding_data_retention_opt_out,
+-        "the refresh is newer than the click-time snapshot"
+-    );
+-}
+-
+-/// A superseded write's success becomes the rollback of the write that replaced it.
+-/// Otherwise: pending opt-in, refresh restores the old "out", user opts out, opt-in succeeds (dropped as stale), opt-out
+-/// fails and reverts to "out" while the server retains.
+-#[test]
+-fn superseded_opt_in_success_is_kept_when_later_opt_out_fails() {
+-    let mut app = privacy_banner_ready_app();
+-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+-    app.apply_auth_meta(&xai_grok_login::AuthMeta {
+-        coding_data_retention_opt_out: true,
+-        ..Default::default()
+-    });
+-    let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+-    assert_eq!(app.coding_data_write_seq, 2);
+-
+-    let _ = dispatch(
+-        Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
+-            agent_id: AgentId(0),
+-            opted_in: true,
+-            seq: 1,
+-        }),
+-        &mut app,
+-    );
+-    let _ = dispatch(
+-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+-            agent_id: AgentId(0),
+-            error: "server error".into(),
+-            seq: 2,
+-        }),
+-        &mut app,
++        effects
++            .iter()
++            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
++        "ack must persist: {effects:?}"
+     );
+-
+     assert!(
+-        !app.coding_data_retention_opt_out,
+-        "the failed opt-out must fall back to the opt-in the server confirmed"
++        !effects
++            .iter()
++            .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
++        "already-out must not force an ACP write: {effects:?}"
+     );
+-    assert!(app.coding_data_pending_write.is_none());
+-}
+-
+-/// A refused opt-out must not dismiss the banner: the server is still retaining, and the user has to see that.
+-#[test]
+-fn privacy_banner_opt_out_failure_keeps_banner_and_toasts() {
+-    let mut app = privacy_banner_ready_app();
+-    let effects = dispatch(Action::PrivacyBannerOptOut, &mut app);
+-    assert_eq!(effects.len(), 1, "opt-out must write: {effects:?}");
+-
+-    let fail_effects = dispatch(
+-        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+-            agent_id: AgentId(0),
+-            error: "team policy forbids opt-out".into(),
+-            seq: app.coding_data_write_seq,
+-        }),
+-        &mut app,
++    assert_eq!(app.coding_data_write_seq, 0, "already-out is not a write");
++    assert!(
++        !app.privacy_banner_opt_in_inflight,
++        "opt-out must not arm the opt-in inflight guard"
+     );
+-    assert!(fail_effects.is_empty());
+-    assert!(app.privacy_banner_acked.is_none());
+     assert!(
+-        app.privacy_banner_should_show(),
+-        "a refused [Opt out] must leave the banner up"
++        app.coding_data_retention_opt_out,
++        "declining leaves the user opted out"
+     );
+-    let toast = app
+-        .welcome_toast
+-        .as_ref()
+-        .map(|(m, _)| m.as_str())
+-        .unwrap_or("");
+     assert!(
+-        toast.contains("team policy forbids opt-out"),
+-        "the refusal must reach the user: {toast}"
++        app.agents
++            .values()
++            .all(|a| !matches!(a.active_modal, Some(ActiveModal::Settings { .. }))),
++        "[Opt out] answers the question; it must not detour into settings"
+     );
  }
  
- /// Already-out `[Opt out]` acks now and must not force an ACP write.
+-/// Settings opt-out is write 1, the user opts in before it lands, and write 2 answers first.
+-/// Covered: write 2 succeeds and the stale write 1 reply (either kind) must not set the mirror or toast; both writes fail and
+-/// write 2 must fall back to the opt-in it inherited from write 1, not to write 1's optimistic out.
+-/// Not covered: write 2 fails, then write 1 succeeds — the pending write is already gone, so that success is dropped (deferred).
++/// A superseded reply must not touch state. Settings opt-out is write 1,
++/// the user opts in before it lands, and only then does the stale decline
++/// answer. Applying its success (`opted_in: false`) would flip the pager
++/// to opted-out while the server holds opted-in — claiming data isn't
++/// retained when it is. Its failure must not toast either.
+ #[test]
+-fn stale_reply_after_newer_success_or_double_failure_keeps_opt_in() {
+-    let welcome_toast = |app: &AppView| app.welcome_toast.as_ref().map(|(m, _)| m.clone());
+-    for (newer_ok, stale_failed) in [(true, true), (true, false), (false, true)] {
++fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {
++    for stale_failed in [true, false] {
+         let mut app = privacy_banner_ready_app();
+         app.coding_data_retention_opt_out = false;
+ 
+@@ -1001,35 +746,25 @@ fn stale_reply_after_newer_success_or_double_failure_keeps_opt_in() {
+         );
+         assert_eq!(app.coding_data_write_seq, 1);
+ 
+-        // Write 2: the user opts in from settings, and it answers first.
++        // Write 2: the user opts in from settings, and it confirms.
+         let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+         assert_eq!(app.coding_data_write_seq, 2);
+-        let newer_reply = if newer_ok {
+-            TaskResult::CodingDataSharingUpdated {
++        let _ = dispatch(
++            Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
+                 agent_id: AgentId(0),
+                 opted_in: true,
+                 seq: 2,
+-            }
+-        } else {
+-            TaskResult::CodingDataSharingFailed {
+-                agent_id: AgentId(0),
+-                error: "server error".into(),
+-                seq: 2,
+-            }
+-        };
+-        let _ = dispatch(Action::TaskComplete(newer_reply), &mut app);
+-        assert!(
+-            !app.coding_data_retention_opt_out,
+-            "opted in either way (newer_ok={newer_ok})"
++            }),
++            &mut app,
+         );
+-        assert_eq!(app.privacy_banner_acked.is_some(), newer_ok);
+-        let toast_before = welcome_toast(&app);
++        assert!(!app.coding_data_retention_opt_out, "opted in");
+ 
+         // Write 1 finally answers, either way it can.
+         let stale_reply = if stale_failed {
+             TaskResult::CodingDataSharingFailed {
+                 agent_id: AgentId(0),
+                 error: "network timeout".into(),
++                rollback_to_opted_in: true,
+                 seq: 1,
+             }
+         } else {
+@@ -1044,18 +779,17 @@ fn stale_reply_after_newer_success_or_double_failure_keeps_opt_in() {
+         assert!(effects.is_empty(), "stale reply must emit nothing");
+         assert!(
+             !app.coding_data_retention_opt_out,
+-            "stale reply must not undo the opt-in (newer_ok={newer_ok}, failed={stale_failed})"
++            "stale reply must not undo the newer opt-in (failed={stale_failed})"
+         );
+-        assert_eq!(
+-            welcome_toast(&app),
+-            toast_before,
+-            "stale reply must not toast"
++        assert!(
++            app.agents[&AgentId(0)].toast.is_none(),
++            "stale reply must not toast — nothing the user is looking at failed"
+         );
+-        assert!(app.coding_data_pending_write.is_none());
+     }
+ }
+ 
+-/// A double-click (or a stale frame's hit rect) must not send a second decline.
++/// A double-click (or a stale frame's hit rect) must not send a second
++/// decline.
+ #[test]
+ fn privacy_banner_opt_out_is_idempotent() {
+     let mut app = privacy_banner_ready_app();
+@@ -1067,21 +801,69 @@ fn privacy_banner_opt_out_is_idempotent() {
+     );
+ }
+ 
+-/// A duplicate Settings opt-out rides the pending write: a second write would supersede the first and drop its reply for nothing new.
++/// Settings Opt out while already out (banner eligible): acks, no ACP write.
+ #[test]
+-fn duplicate_settings_opt_out_rides_the_pending_write() {
++fn settings_opt_out_while_already_out_acks_without_write() {
++    let mut app = privacy_banner_ready_app();
++    assert!(app.privacy_banner_should_show());
++    assert!(app.coding_data_retention_opt_out);
++
++    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
++
++    assert!(
++        effects
++            .iter()
++            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
++        "already-out Settings Opt out must ack: {effects:?}"
++    );
++    assert!(
++        !effects
++            .iter()
++            .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
++        "already-out must not write ACP: {effects:?}"
++    );
++    assert!(app.privacy_banner_acked.is_some());
++    assert!(!app.privacy_banner_should_show());
++    assert!(app.coding_data_retention_opt_out);
++    assert!(!app.privacy_banner_opt_in_inflight);
++    assert_eq!(app.coding_data_write_seq, 0);
++}
++
++/// Settings Opt out while currently in: acks now + ACP write.
++#[test]
++fn settings_opt_out_from_in_acks_now_and_writes() {
+     let mut app = privacy_banner_ready_app();
+     app.coding_data_retention_opt_out = false;
+-    let first = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+-    assert_eq!(first.len(), 1, "changed opt-out must write: {first:?}");
++    assert!(!app.privacy_banner_should_show());
++
++    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+ 
+-    let again = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+     assert!(
+-        again.is_empty(),
+-        "duplicate must not write or ack: {again:?}"
++        effects
++            .iter()
++            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
++        "changed opt-out must ack now: {effects:?}"
+     );
+-    assert_eq!(app.coding_data_write_seq, 1);
+-    assert!(app.privacy_banner_acked.is_none());
++    match effects
++        .iter()
++        .find(|e| matches!(e, Effect::SetCodingDataSharing { .. }))
++    {
++        Some(Effect::SetCodingDataSharing {
++            opted_in,
++            rollback_to_opted_in,
++            seq,
++            ..
++        }) => {
++            assert!(!*opted_in);
++            assert!(*rollback_to_opted_in);
++            assert_eq!(*seq, app.coding_data_write_seq);
++        }
++        other => panic!("expected SetCodingDataSharing, got {effects:?} ({other:?})"),
++    }
++    assert!(app.privacy_banner_acked.is_some());
++    assert!(app.coding_data_retention_opt_out);
++    assert!(!app.privacy_banner_should_show());
++    assert!(!app.privacy_banner_opt_in_inflight);
+ }
+ 
+ /// Re-committing Opt in while the first write is inflight must not ack.
+@@ -1102,7 +884,7 @@ fn settings_opt_in_recommitted_while_inflight_does_not_ack() {
+             .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+         "first commit must not ack: {first:?}"
+     );
+-    assert_eq!(app.coding_data_pending_opted_in(), Some(true));
++    assert!(app.privacy_banner_opt_in_inflight);
+     assert!(app.privacy_banner_acked.is_none());
+     let seq = app.coding_data_write_seq;
+     assert_eq!(seq, 1);
+@@ -1120,7 +902,7 @@ fn settings_opt_in_recommitted_while_inflight_does_not_ack() {
+             .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
+         "re-commit while inflight must not write again: {again:?}"
+     );
+-    assert_eq!(app.coding_data_pending_opted_in(), Some(true));
++    assert!(app.privacy_banner_opt_in_inflight);
+     assert_eq!(app.coding_data_write_seq, seq);
+     assert!(app.privacy_banner_acked.is_none());
+ 
+@@ -1128,18 +910,20 @@ fn settings_opt_in_recommitted_while_inflight_does_not_ack() {
+         Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+             agent_id: AgentId(0),
+             error: "server error".into(),
++            rollback_to_opted_in: false,
+             seq,
+         }),
+         &mut app,
+     );
+     assert!(fail_effects.is_empty());
+-    assert!(app.coding_data_pending_write.is_none());
++    assert!(!app.privacy_banner_opt_in_inflight);
+     assert!(app.privacy_banner_acked.is_none());
+     assert!(app.coding_data_retention_opt_out);
+     assert!(app.privacy_banner_should_show());
+ }
+ 
+-/// A Settings pick before the notice is rolled out must not stamp an ack that would hide the banner when the cohort turns on.
++/// A Settings pick before the notice is rolled out must not stamp an ack
++/// that would hide the banner when the cohort turns on.
+ #[test]
+ fn settings_choice_does_not_ack_when_rollout_off() {
+     for opted_in in [true, false] {
+@@ -1186,14 +970,12 @@ fn dispatch_rename_session_updates_display_name_locally() {
+     let effects = dispatch_rename_session(&mut app, "renamed via slash".into());
+     assert_eq!(effects.len(), 1);
+     assert_eq!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .and_then(|a| a.display_name.as_deref()),
++        app.agents[&AgentId(0)].display_name.as_deref(),
+         Some("renamed via slash"),
+         "/rename must also update local display_name cache"
+     );
+-    match effects.first() {
+-        Some(Effect::RenameSession { kind, .. }) => {
++    match &effects[0] {
++        Effect::RenameSession { kind, .. } => {
+             assert_eq!(
+                 *kind,
+                 xai_grok_shell::session::unified_list::SessionKind::Build,
+@@ -1210,13 +992,11 @@ fn dispatch_rename_session_strips_controls_before_display_name_and_effect() {
+     let effects =
+         dispatch_rename_session(&mut app, "  Hello\u{1b}[31mWorld\u{07}\u{9b}C1  ".into());
+     assert_eq!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .and_then(|a| a.display_name.as_deref()),
++        app.agents[&AgentId(0)].display_name.as_deref(),
+         Some("Hello[31mWorldC1"),
+         "optimistic display_name must match the shell strip (no OSC/CSI/BEL/C1)"
+     );
+-    match effects.as_slice() {
++    match &effects[..] {
+         [Effect::RenameSession { title, .. }] => {
+             assert_eq!(title, "Hello[31mWorldC1");
+         }
+@@ -1230,9 +1010,7 @@ fn dispatch_rename_session_strips_controls_before_display_name_and_effect() {
+         "control-only title must not emit RenameSession: {effects:?}"
+     );
+     assert!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .is_some_and(|a| a.display_name.is_none()),
++        app.agents[&AgentId(0)].display_name.is_none(),
+         "control-only title must not paint a blank/dirty display_name"
+     );
+     assert!(
+@@ -1248,7 +1026,7 @@ fn dispatch_rename_session_chat_kind_stamps_kind_chat() {
+     agent.chat_kind = true;
+     agent.conversation_entry = true;
+     let effects = dispatch_rename_session(&mut app, "chat rename".into());
+-    match effects.as_slice() {
++    match &effects[..] {
+         [Effect::RenameSession { kind, title, .. }] => {
+             assert_eq!(title, "chat rename");
+             assert_eq!(
+@@ -1266,11 +1044,11 @@ fn dispatch_rename_session_sticky_chat_local_build_stays_build() {
+     let mut app = test_app_with_agent();
+     app.chat_mode = true;
+     let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+-    // `chat_kind` is the sticky `--chat` UI bit; `conversation_entry = false` marks a local-disk history bypass, not a conversation
++    // Sticky `--chat` UI bit, local-disk history-bypass (not a conversation).
+     agent.chat_kind = true;
+     agent.conversation_entry = false;
+     let effects = dispatch_rename_session(&mut app, "local title".into());
+-    match effects.as_slice() {
++    match &effects[..] {
+         [Effect::RenameSession { kind, title, .. }] => {
+             assert_eq!(title, "local title");
+             assert_eq!(
+@@ -1351,9 +1129,7 @@ fn dispatch_reset_session_title_clears_titles_and_emits_effect() {
+         agent.generated_session_title = Some("Manual".into());
+     }
+     let effects = dispatch_reset_session_title(&mut app);
+-    let Some(agent) = app.agents.get(&AgentId(0)) else {
+-        panic!("expected agent 0");
+-    };
++    let agent = &app.agents[&AgentId(0)];
+     assert!(
+         agent.display_name.is_none(),
+         "optimistic unpin must clear display_name"
+@@ -1367,7 +1143,7 @@ fn dispatch_reset_session_title_clears_titles_and_emits_effect() {
+         "Manual",
+         "dashboard/tab entry_title must not stay the manual pin"
+     );
+-    match effects.as_slice() {
++    match &effects[..] {
+         [
+             Effect::ResetSessionTitle {
+                 agent_id,
+@@ -1401,9 +1177,7 @@ fn dispatch_reset_session_title_never_manual_keeps_generated_title() {
+         agent.generated_session_title = Some("Auto".into());
+     }
+     let effects = dispatch_reset_session_title(&mut app);
+-    let Some(agent) = app.agents.get(&AgentId(0)) else {
+-        panic!("expected agent 0");
+-    };
++    let agent = &app.agents[&AgentId(0)];
+     assert!(agent.display_name.is_none());
+     assert_eq!(agent.generated_session_title.as_deref(), Some("Auto"));
+     assert_eq!(
+@@ -1413,7 +1187,7 @@ fn dispatch_reset_session_title_never_manual_keeps_generated_title() {
+     );
+     assert!(
+         matches!(
+-            effects.as_slice(),
++            &effects[..],
+             [Effect::ResetSessionTitle {
+                 kind: xai_grok_shell::session::unified_list::SessionKind::Build,
+                 ..
+@@ -1435,7 +1209,7 @@ fn dispatch_reset_session_title_sticky_chat_local_build_stays_build() {
+         agent.generated_session_title = Some("Auto".into());
+     }
+     let effects = dispatch_reset_session_title(&mut app);
+-    match effects.as_slice() {
++    match &effects[..] {
+         [Effect::ResetSessionTitle { kind, .. }] => {
+             assert_eq!(
+                 *kind,
+@@ -1445,15 +1219,9 @@ fn dispatch_reset_session_title_sticky_chat_local_build_stays_build() {
+         }
+         other => panic!("expected ResetSessionTitle, got {other:?}"),
+     }
+-    assert!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .is_some_and(|a| a.display_name.is_none())
+-    );
++    assert!(app.agents[&AgentId(0)].display_name.is_none());
+     assert_eq!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .and_then(|a| a.generated_session_title.as_deref()),
++        app.agents[&AgentId(0)].generated_session_title.as_deref(),
+         Some("Auto")
+     );
+ }
+@@ -1468,18 +1236,13 @@ fn dispatch_reset_session_title_refuses_chat_kind() {
+         agent.display_name = Some("Chat title".into());
+         agent.generated_session_title = Some("Kept".into());
+     }
+-    let Some(agent) = app.agents.get(&AgentId(0)) else {
+-        panic!("expected agent 0");
+-    };
+-    let scrollback_len_before = agent.scrollback.len();
++    let scrollback_len_before = app.agents[&AgentId(0)].scrollback.len();
+     let effects = dispatch_reset_session_title(&mut app);
+     assert!(
+         effects.is_empty(),
+         "chat-kind unpin must not emit an effect, got {effects:?}"
+     );
+-    let Some(agent) = app.agents.get(&AgentId(0)) else {
+-        panic!("expected agent 0");
+-    };
++    let agent = &app.agents[&AgentId(0)];
+     assert_eq!(agent.display_name.as_deref(), Some("Chat title"));
+     assert_eq!(agent.generated_session_title.as_deref(), Some("Kept"));
+     assert_eq!(agent.scrollback.len(), scrollback_len_before + 1);
+@@ -1497,15 +1260,20 @@ fn dispatch_reset_session_title_refuses_chat_kind() {
+     );
+ }
+ 
+-/// `ConfirmResetSetting { choice: Reset }` on a shared Bool target restores the Settings modal.
+-/// It also fires the typed `Action::SetCompactMode(default)` via recursive dispatch; the `Effect::PersistSetting` is the observable signal.
+-/// Also asserts the ui_snapshot was refreshed to the new (post-reset) value (symmetric with the Cancel test's snapshot assertion).
++/// `ConfirmResetSetting { choice: Reset }` on a SHARED Bool
++/// target restores the Settings modal AND fires the typed
++/// `Action::SetCompactMode(default)` via recursive dispatch —
++/// the `Effect::PersistSetting` is the externally-observable
++/// signal. Also asserts the ui_snapshot was
++/// refreshed to the new (post-reset) value (symmetric with the
++/// Cancel test's snapshot assertion).
+ #[test]
+ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool() {
+     use crate::settings::SettingValue;
+     use crate::views::modal::{ActiveModal, ResetSettingsResult};
+     let mut app = test_app_with_agent();
+-    // Flip compact_mode to true so we can observe the reset back to its default (false)
++    // Flip compact_mode to true so we can observe the reset back
++    // to its default (false).
+     let _ = dispatch(Action::SetCompactMode(true), &mut app);
+     assert!(app.current_ui.compact_mode);
+ 
+@@ -1518,10 +1286,11 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
+         &mut app,
+     );
+ 
+-    // Recursive dispatch into Action::SetCompactMode(false) emits the persist effect
++    // Recursive dispatch into Action::SetCompactMode(false) emits
++    // the persist effect.
+     assert_eq!(effects.len(), 1);
+-    match effects.first() {
+-        Some(Effect::PersistSetting { key, value, .. }) => {
++    match &effects[0] {
++        Effect::PersistSetting { key, value, .. } => {
+             assert_eq!(*key, "compact_mode");
+             assert_eq!(value, &SettingValue::Bool(false));
+         }
+@@ -1529,7 +1298,8 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
+     }
+     // In-memory state is reset to the default.
+     assert!(!app.current_ui.compact_mode);
+-    // The modal is restored and ui_snapshot reflects the new value (symmetric with the Cancel test)
++    // Modal is restored AND ui_snapshot reflects the new value
++    // (symmetric with the Cancel test).
+     let agent = app.agents.get(&AgentId(0)).expect("agent must exist");
+     match &agent.active_modal {
+         Some(ActiveModal::Settings { state }) => {
+@@ -1542,13 +1312,15 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
+     }
+ }
+ 
+-/// `ConfirmResetSetting { choice: Reset }` on a shared Enum target (`theme`) dispatches `Action::SetTheme(default)` via recursive dispatch.
+-/// Verifies the action_for_reset Enum arm.
++/// `ConfirmResetSetting { choice: Reset }` on a SHARED Enum
++/// target (`theme`) dispatches `Action::SetTheme(default)` via
++/// recursive dispatch — verifies the action_for_reset Enum arm.
+ #[test]
+ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum() {
+     use crate::settings::SettingValue;
+     use crate::views::modal::ResetSettingsResult;
+-    // SetTheme mutates the global theme cache, so serialize with the other theme tests via the theme test lock
++    // SetTheme mutates the global theme cache — serialize with the
++    // other theme tests via the theme test lock.
+     with_theme_test_env(|| {
+         let mut app = test_app_with_agent();
+         // Flip theme to a non-default first.
+@@ -1564,10 +1336,10 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum(
+             &mut app,
+         );
+ 
+-        // Reset dispatches SetTheme("groknight"), the registered default
++        // Reset → SetTheme("groknight") (the registered default).
+         assert_eq!(effects.len(), 1);
+-        match effects.first() {
+-            Some(Effect::PersistSetting { key, value, .. }) => {
++        match &effects[0] {
++            Effect::PersistSetting { key, value, .. } => {
+                 assert_eq!(*key, "theme");
+                 assert_eq!(value, &SettingValue::Enum("groknight"));
+             }
+@@ -1587,10 +1359,7 @@ fn seed_scrolled_up(app: &mut AppView) {
+ }
+ 
+ fn current_usage_nonce(app: &AppView) -> u64 {
+-    let Some(agent) = app.agents.get(&AgentId(0)) else {
+-        panic!("expected agent 0");
+-    };
+-    match agent.active_modal.as_ref() {
++    match app.agents[&AgentId(0)].active_modal.as_ref() {
+         Some(crate::views::modal::ActiveModal::UsageInfo { state }) => state.fetch_nonce,
+         _ => 0,
+     }
+@@ -1646,7 +1415,7 @@ fn stale_context_info_results_do_not_update_replaced_session() {
+             agent_id: id,
+             session_id: "test-session".into(),
+             info: Box::new(context_info_response()),
+-            nonce: Default::default(),
++            nonce: 0,
+         }),
+         &mut app,
+     );
+@@ -1655,7 +1424,7 @@ fn stale_context_info_results_do_not_update_replaced_session() {
+             agent_id: id,
+             session_id: "test-session".into(),
+             error: "request failed".to_string(),
+-            nonce: Default::default(),
++            nonce: 0,
+         }),
+         &mut app,
+     );
+@@ -1689,12 +1458,7 @@ fn session_usage_keeps_scroll_when_page_flip_off() {
+     app.usage_visible = false;
+     seed_scrolled_up(&mut app);
+     complete_session_usage(&mut app);
+-    assert_eq!(
+-        app.agents
+-            .get(&AgentId(0))
+-            .map(|a| a.scrollback.scroll_offset()),
+-        Some(0)
+-    );
++    assert_eq!(app.agents[&AgentId(0)].scrollback.scroll_offset(), 0);
+     crate::appearance::cache::set_page_flip_on_send(prev);
+ }
+ 
+@@ -1726,6 +1490,8 @@ fn show_usage_with_redirect_url_fetches_session_only() {
+     assert_eq!(agent_scrollback_len(&app), before);
+ }
+ 
++// ── Minimal update-notice tests ──────────────────────────────────────
++
+ #[test]
+ fn minimal_update_notice_commits_a_system_block() {
+     let mut app = test_app_with_agent();
+@@ -1734,7 +1500,7 @@ fn minimal_update_notice_commits_a_system_block() {
+     assert_eq!(agent_scrollback_len(&app), before + 1);
+     let text = last_system_text(&app, AgentId(0));
+     assert!(text.contains("Update available: v9.9.9"), "got: {text:?}");
+-    assert!(text.contains("Restart to apply."), "got: {text:?}");
++    assert!(text.contains("restart to apply"), "got: {text:?}");
+ }
+ 
+ #[test]
+@@ -1744,8 +1510,10 @@ fn minimal_update_notice_no_active_agent_is_noop() {
+     commit_minimal_update_notice(&mut app, "9.9.9");
+ }
+ 
+-/// `/tutorial` (and the palette entry) open the overlay; dispatching again while open toggles it closed.
+-/// No side effects either way.
++// ── Tutorial dispatch tests ──────────────────────────────────────────
++
++/// `/tutorial` (and the palette entry) open the overlay; dispatching again
++/// while open toggles it closed. No side effects either way.
+ #[test]
+ fn open_tutorial_toggles_overlay_without_effects() {
+     let mut app = test_app();
+@@ -1758,12 +1526,10 @@ fn open_tutorial_toggles_overlay_without_effects() {
+     assert!(effects.is_empty(), "close emits nothing, got: {effects:?}");
+ }
+ 
++// ── Usage modal (full TUI) dispatch tests ────────────────────────────
++
+ fn usage_modal_state(app: &AppView) -> &crate::views::usage_modal::UsageInfoModalState {
+-    match app
+-        .agents
+-        .get(&AgentId(0))
+-        .and_then(|a| a.active_modal.as_ref())
+-    {
++    match app.agents[&AgentId(0)].active_modal.as_ref() {
+         Some(crate::views::modal::ActiveModal::UsageInfo { state }) => state,
+         _ => panic!("expected the usage modal to be open"),
+     }
+@@ -1857,10 +1623,7 @@ fn usage_results_populate_open_modal_not_scrollback() {
+         .as_ref()
+         .expect("session fields populated");
+     assert_eq!(fields.len(), 1);
+-    let Some(field) = fields.first() else {
+-        panic!("expected a session field: {fields:?}");
+-    };
+-    assert_eq!(field.value, "test-session");
++    assert_eq!(fields[0].value, "test-session");
+     assert!(state.context.is_some());
+ }
+ 
+@@ -1874,7 +1637,7 @@ fn usage_results_without_open_modal_are_dropped_in_full_mode() {
+             agent_id: AgentId(0),
+             session_id: "test-session".into(),
+             error: "boom".to_string(),
+-            nonce: Default::default(),
++            nonce: 0,
+         }),
+         &mut app,
+     );
+@@ -1883,7 +1646,7 @@ fn usage_results_without_open_modal_are_dropped_in_full_mode() {
+             agent_id: AgentId(0),
+             session_id: "test-session".into(),
+             error: "boom".to_string(),
+-            nonce: Default::default(),
++            nonce: 0,
+         }),
+         &mut app,
+     );
+@@ -1899,7 +1662,7 @@ fn reply_from_previous_modal_open_is_dropped() {
+     app.agents.get_mut(&AgentId(0)).unwrap().active_modal = None;
+     dispatch(Action::ShowUsage, &mut app);
+     assert_ne!(current_usage_nonce(&app), old_nonce);
+-    // The first open's reply lands late; it must not populate the modal
++    // The first open's reply lands late — it must not populate the modal.
+     dispatch(
+         Action::TaskComplete(TaskResult::SessionInfoComplete {
+             agent_id: AgentId(0),
 diff --git a/crates/codegen/xai-grok-pager/src/completions_cmd.rs b/crates/codegen/xai-grok-pager/src/completions_cmd.rs
-index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab4eba9241 100644
+index ad15d0fe2ed7bdf904b2f1259829ee13d6f891a8..1a04da4d622cab330e4b1b3534dc7419eb32ce8d 100644
 --- a/crates/codegen/xai-grok-pager/src/completions_cmd.rs
 +++ b/crates/codegen/xai-grok-pager/src/completions_cmd.rs
-@@ -58,18 +58,25 @@ fn fix_zsh_root_prompt_positional(script: &str) -> String {
+@@ -42,18 +42,25 @@ fn fix_zsh_root_prompt_positional(script: &str) -> String {
              out.push_str(line);
              out.push('\n');
          });
@@ -454,7 +1802,7 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
      }
      out
  }
-@@ -103,6 +110,7 @@ mod tests {
+@@ -84,6 +91,7 @@ mod tests {
          );
  
          let fixed = fix_zsh_root_prompt_positional(&raw);
@@ -462,7 +1810,7 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
          assert!(
              !fixed.contains("::prompt"),
              "prompt positional must not appear in the emitted zsh script"
-@@ -112,15 +120,20 @@ mod tests {
+@@ -93,15 +101,20 @@ mod tests {
              "root dispatch must be shifted to $line[1]"
          );
          assert!(
@@ -487,20 +1835,23 @@ index 176f49dcdd81ea2c20aa599dcbd9cbf2e7362093..8dcd3379b3f9aedc95f223ef6aeb56ab
      }
  }
 diff --git a/crates/codegen/xai-grok-pager/src/lib.rs b/crates/codegen/xai-grok-pager/src/lib.rs
-index 2747f2a7a35f6c4fa444cc830cb06e5049e4e594..c900c13bf631ff8dc7ad69daafba2e8dd76917a6 100644
+index 714678bdbfe9946fa83161dc9a965c462f6043f2..b542e688cc89d4608d9367383b2e2e5c8e8db965 100644
 --- a/crates/codegen/xai-grok-pager/src/lib.rs
 +++ b/crates/codegen/xai-grok-pager/src/lib.rs
-@@ -1,4 +1,4 @@
--//! xai-grok-pager — Grok Build TUI.
+@@ -5,7 +5,7 @@
+     unreachable_code,
+     dead_code
+ )]
+-//! xai-grok-pager: Grok Build TUI.
 +//! xai-grok-pager — Gork Build TUI.
  //!
  //! A clean-room implementation built on the v3 pager rendering engine.
- 
+ #![deny(clippy::indexing_slicing)]
 diff --git a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
-index 2b64e239d2028a1847584abd312fec2e604fe73c..58b789a94804eb34dd2861ca3fea1c6f3beefc54 100644
+index 788104bb88eefe2f523eb8a3df3ad484ec6e48c6..892ac127ee4388fc291f4c169be727d6cd3721a7 100644
 --- a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
 +++ b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
-@@ -7973,6 +7973,7 @@ fn locked_coding_data_sharing_row_does_not_open_picker() {
+@@ -7472,6 +7472,7 @@ fn locked_coding_data_sharing_row_does_not_open_picker() {
      for lock in [
          CodingDataSharingLock::Zdr,
          CodingDataSharingLock::TeamManaged,
@@ -508,7 +1859,7 @@ index 2b64e239d2028a1847584abd312fec2e604fe73c..58b789a94804eb34dd2861ca3fea1c6f
      ] {
          let mut s = make_locked_state(lock);
          s.selected = coding_data_sharing_row_idx(&s);
-@@ -8008,6 +8009,7 @@ fn locked_coding_data_sharing_row_refuses_reset() {
+@@ -7506,6 +7507,7 @@ fn locked_coding_data_sharing_row_refuses_reset() {
      for lock in [
          CodingDataSharingLock::Zdr,
          CodingDataSharingLock::TeamManaged,
@@ -516,33 +1867,17 @@ index 2b64e239d2028a1847584abd312fec2e604fe73c..58b789a94804eb34dd2861ca3fea1c6f
      ] {
          let mut s = make_locked_state(lock);
          s.selected = coding_data_sharing_row_idx(&s);
-diff --git a/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs b/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs
-index 03749b2927ac24b22a4abd1902818e59a12eaff5..75d192bf96d8582541f4ce74c825e8358da269c4 100644
---- a/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs
-+++ b/crates/codegen/xai-grok-shell/src/auth/manager/enrichment.rs
-@@ -255,7 +255,10 @@ pub(super) fn apply_user_info_enrichment(disk: &mut GrokAuth, user_info: UserInf
-     if let Some(reasons) = user_info.team_blocked_reasons {
-         disk.team_blocked_reasons = reasons;
-     }
--    if let Some(opt_out) = user_info.coding_data_retention_opt_out {
-+    if xai_grok_version::coding_data_retention_locked_opt_out() {
-+        // Gork Build: server enrichment cannot opt the account into retention.
-+        disk.coding_data_retention_opt_out = true;
-+    } else if let Some(opt_out) = user_info.coding_data_retention_opt_out {
-         disk.coding_data_retention_opt_out = opt_out;
-     }
-     if let Some(ref email) = user_info.email
 
-base-commit: eb267feff13129e568df38fb6fdf0ceb65f735d6
-prerequisite-patch-id: 461d9a629c55db377161aa870929fbbc6cb08b71
-prerequisite-patch-id: 8a4d87ffeadd239c0b5c504db10b4cf492fa89fa
-prerequisite-patch-id: 0fc38c6c0c974617e675e3c1061fd32df8f759d3
-prerequisite-patch-id: 561132f565e3d3e04c045251cbe0b2d3d98ecacb
-prerequisite-patch-id: b6702a9eb9a1c961a89eb827a84555ab6934cc72
-prerequisite-patch-id: af0edcd4d732f947ad389b939b5e9ea11cd00fa3
-prerequisite-patch-id: 1b6387045e2e53669f82c3625f622d782cbd40c2
+base-commit: 4247f661689354b831191f11eeeac8424993fe3d
+prerequisite-patch-id: be79529fe47a8dbb5f7f7174e04a23cfeddc63f7
+prerequisite-patch-id: 1dfbf374d3a68129d96bb06c1026e41ab50363c4
+prerequisite-patch-id: d36844c4188ff12d6b8c1bb65cc44ab9c2a05f30
+prerequisite-patch-id: 8dec628511f56817ca256664dc0e4d43271c68fd
+prerequisite-patch-id: 68d52b2e9a6d5e48cea276eef3c218f72e9f6e9e
+prerequisite-patch-id: c949df5e3d5ff223baa095f9c830d7548226c6e8
+prerequisite-patch-id: 64f0ec9605ebcdac1565a84ebd7259eea8836736
 prerequisite-patch-id: dd9b541d2aae4b7accaeebbd529bb87e4a50bf2c
 prerequisite-patch-id: a7e187a5b844c651a576f0404b4b832536ec93db
 -- 
-2.50.1 (Apple Git-155)
+2.43.0
 
