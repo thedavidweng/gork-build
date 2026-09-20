@@ -1,10 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Gork CI <gork-ci@users.noreply.github.com>
-Date: Thu, 13 Aug 2026 00:35:35 -0700
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 20 Sep 2026 10:55:59 +0000
 Subject: [PATCH] privacy-core: PRIVACY_BUILD and product identity
 
 Gork-Patch-Id: privacy-core
+
 Gork-Invariant: privacy-build-enabled
+
 Gork-Risk: critical
 ---
  crates/codegen/xai-grok-version/Cargo.toml |  8 ++-
@@ -12,12 +14,12 @@ Gork-Risk: critical
  2 files changed, 63 insertions(+), 2 deletions(-)
 
 diff --git a/crates/codegen/xai-grok-version/Cargo.toml b/crates/codegen/xai-grok-version/Cargo.toml
-index f1bc30884be3874a9b2967684fe8577ccfcf714b..8dd5cf87f81cd6f1fe1b7a4a3b52c16ce052ab06 100644
+index 20c503b0633b98a9e9fe16ef199993e1f4d6132c..79f0866d5552c71ea484ff00dbdb1aaa81269dc7 100644
 --- a/crates/codegen/xai-grok-version/Cargo.toml
 +++ b/crates/codegen/xai-grok-version/Cargo.toml
 @@ -3,7 +3,13 @@ license = "Apache-2.0"
  name = "xai-grok-version"
- version = "1.0.3"
+ version = "1.0.38"
  edition.workspace = true
 -description = "Lockstepped grok CLI version."
 +description = "Lockstepped Gork Build CLI version and privacy-build constants."
@@ -31,11 +33,11 @@ index f1bc30884be3874a9b2967684fe8577ccfcf714b..8dd5cf87f81cd6f1fe1b7a4a3b52c16c
  [dependencies]
  semver = { workspace = true }
 diff --git a/crates/codegen/xai-grok-version/src/lib.rs b/crates/codegen/xai-grok-version/src/lib.rs
-index 29fdfc1e64ea1df96f0ca3e1afe78c9ac37843bd..59b1c9a20a8fceeda799ec6ab16b281b421db12d 100644
+index d78baa06c11a48083c390aa578f7094d3da0d2a3..2e9034693cf87212db8f13f316b72f7389fa5dd6 100644
 --- a/crates/codegen/xai-grok-version/src/lib.rs
 +++ b/crates/codegen/xai-grok-version/src/lib.rs
-@@ -1,7 +1,42 @@
--//! Installed grok CLI version, lockstepped with shipping binaries.
+@@ -1,4 +1,10 @@
+-//! Installed grok CLI version, kept in sync with the shipping binaries.
 +//! Installed Gork Build CLI version, lockstepped with shipping binaries.
 +//!
 +//! **Gork Build** is a community privacy fork of xAI Grok Build (same role as
@@ -43,6 +45,10 @@ index 29fdfc1e64ea1df96f0ca3e1afe78c9ac37843bd..59b1c9a20a8fceeda799ec6ab16b281b
 +//! trace uploads, no xAI branding. Model inference still uses the user's
 +//! credentials against the Grok API — that is the only network path required
 +//! for the agent to work.
+ 
+ #![deny(clippy::indexing_slicing)]
+ 
+@@ -6,6 +12,35 @@ use std::sync::OnceLock;
  
  use semver::Version;
  
@@ -78,7 +84,7 @@ index 29fdfc1e64ea1df96f0ca3e1afe78c9ac37843bd..59b1c9a20a8fceeda799ec6ab16b281b
  pub const TEST_VERSION_ENV: &str = "GROK_TEST_VERSION";
  
  pub const VERSION: &str = match option_env!("GROK_VERSION") {
-@@ -44,6 +79,26 @@ pub fn display_version_with_commit(version_with_commit: &str, channel_label: &st
+@@ -58,6 +93,26 @@ pub fn display_version_with_commit(version_with_commit: &str, channel_label: &st
  mod tests {
      use super::*;
  
@@ -102,11 +108,11 @@ index 29fdfc1e64ea1df96f0ca3e1afe78c9ac37843bd..59b1c9a20a8fceeda799ec6ab16b281b
 +        assert_eq!(PRODUCT_NAME, "Gork Build");
 +    }
 +
-     /// Display formatting invariant matrix — verifies label appending
-     /// works correctly across all label states (alpha, stable, empty).
+     /// Checks that the channel label is appended for alpha, stable, and empty labels.
      #[test]
+     fn test_display_version_formatting_matrix() {
 
-base-commit: eb267feff13129e568df38fb6fdf0ceb65f735d6
+base-commit: 4247f661689354b831191f11eeeac8424993fe3d
 -- 
-2.50.1 (Apple Git-155)
+2.43.0
 

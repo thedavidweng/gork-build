@@ -7,7 +7,7 @@ Gork-Patch-Id: egress-guard
 Gork-Invariant: egress-denylist-enforced
 Gork-Risk: critical
 ---
- scripts/privacy_egress_check.sh | 147 ++++++++++++++++++++++++++++++++
+ scripts/privacy_egress_check.sh | 147 ++++++++++++++++++++++++++++++
  scripts/privacy_egress_proxy.py | 156 ++++++++++++++++++++++++++++++++
  2 files changed, 303 insertions(+)
  create mode 100755 scripts/privacy_egress_check.sh
@@ -15,7 +15,7 @@ Gork-Risk: critical
 
 diff --git a/scripts/privacy_egress_check.sh b/scripts/privacy_egress_check.sh
 new file mode 100755
-index 0000000000000000000000000000000000000000..820af1d02138ae86879a66008ba4471443827d58
+index 0000000000000000000000000000000000000000..27e84c1480e4aca0da9b926478fe0ea4be1a3096
 --- /dev/null
 +++ b/scripts/privacy_egress_check.sh
 @@ -0,0 +1,147 @@
@@ -329,13 +329,13 @@ index 0000000000000000000000000000000000000000..3ffd22ba7de2fb028b11999428235fff
 +if __name__ == "__main__":
 +    sys.exit(main())
 
-base-commit: eb267feff13129e568df38fb6fdf0ceb65f735d6
-prerequisite-patch-id: 461d9a629c55db377161aa870929fbbc6cb08b71
-prerequisite-patch-id: 8a4d87ffeadd239c0b5c504db10b4cf492fa89fa
-prerequisite-patch-id: 0fc38c6c0c974617e675e3c1061fd32df8f759d3
-prerequisite-patch-id: 561132f565e3d3e04c045251cbe0b2d3d98ecacb
-prerequisite-patch-id: b6702a9eb9a1c961a89eb827a84555ab6934cc72
-prerequisite-patch-id: af0edcd4d732f947ad389b939b5e9ea11cd00fa3
+base-commit: 4247f661689354b831191f11eeeac8424993fe3d
+prerequisite-patch-id: be79529fe47a8dbb5f7f7174e04a23cfeddc63f7
+prerequisite-patch-id: 1dfbf374d3a68129d96bb06c1026e41ab50363c4
+prerequisite-patch-id: d36844c4188ff12d6b8c1bb65cc44ab9c2a05f30
+prerequisite-patch-id: 8dec628511f56817ca256664dc0e4d43271c68fd
+prerequisite-patch-id: 68d52b2e9a6d5e48cea276eef3c218f72e9f6e9e
+prerequisite-patch-id: c949df5e3d5ff223baa095f9c830d7548226c6e8
 -- 
-2.50.1 (Apple Git-155)
+2.43.0
 
