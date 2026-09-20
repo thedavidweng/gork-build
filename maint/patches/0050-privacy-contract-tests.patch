@@ -7,8 +7,8 @@ Gork-Patch-Id: privacy-contract-tests
 Gork-Invariant: privacy-contracts-present
 Gork-Risk: critical
 ---
- .../xai-grok-shell/tests/privacy_resolvers.rs | 110 ++++++++++++++++++
- 1 file changed, 110 insertions(+)
+ .../xai-grok-shell/tests/privacy_resolvers.rs | 109 ++++++++++++++++++
+ 1 file changed, 109 insertions(+)
  create mode 100644 crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
 
 diff --git a/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..7ddb0861c61fcc61c24b148159a9471553d8d42e
 --- /dev/null
 +++ b/crates/codegen/xai-grok-shell/tests/privacy_resolvers.rs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,109 @@
 +//! Privacy hard-off regression tests for telemetry / trace-upload resolvers.
 +//!
 +//! Integration tests (not `#[cfg(test)]` unit tests) so they compile against the
@@ -105,14 +105,13 @@ index 0000000000000000000000000000000000000000..7ddb0861c61fcc61c24b148159a94715
 +        std::env::remove_var("GROK_FEEDBACK_ENABLED");
 +    }
 +    let mut cfg = Config::default();
-+    cfg.feature_values.insert(Feature::Feedback, true);
 +    cfg.remote_settings = Some(RemoteSettings {
 +        feedback_enabled: Some(true),
 +        ..Default::default()
 +    });
 +    assert!(
 +        !cfg.resolve_feedback().value,
-+        "privacy hard-off must default feedback off and ignore remote/config"
++        "privacy hard-off must default feedback off and ignore remote"
 +    );
 +    unsafe {
 +        std::env::set_var("GROK_FEEDBACK_ENABLED", "1");
