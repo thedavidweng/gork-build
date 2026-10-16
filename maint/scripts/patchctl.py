@@ -528,7 +528,7 @@ def ensure_upstream_clone(root: Path, repository: str) -> Path:
             capture=True,
         )
         return clone
-    print(f"cloning upstream {repository} -> {clone}")
+    print(f"cloning upstream {repository} -> {clone}", file=sys.stderr)
     run(
         [
             "git",
@@ -552,7 +552,7 @@ def fetch_upstream_sha(clone: Path, sha: str) -> None:
     )
     if proc.returncode == 0:
         return
-    print(f"fetching upstream {sha}")
+    print(f"fetching upstream {sha}", file=sys.stderr)
     run(["git", "fetch", "--no-tags", "origin", sha], cwd=clone)
 
 

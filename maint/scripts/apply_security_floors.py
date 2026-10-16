@@ -4,7 +4,7 @@
 Reads maint/security-floors.toml and, for each floor, runs
 `cargo update -p <package>@<locked> --precise <precise>` ONLY when the locked
 version is strictly lower than the floor. Never downgrades; exits non-zero on
-ambiguity (multiple locked versions of a floored package) so the sync fails
+ambiguity (multiple locked versions in the selected package series) so the sync fails
 closed instead of guessing.
 """
 
@@ -52,6 +52,11 @@ def main() -> int:
         precise = floor["precise"]
         advisory = floor.get("advisory", "")
         versions = locked.get(name)
+        if "series" in floor:
+            versions = [
+                version for version in versions or []
+                if ".".join(version.split(".")[:2]) == floor["series"]
+            ]
         if not versions:
             print(f"security-floors: {name} not in Cargo.lock — skip ({advisory})")
             continue

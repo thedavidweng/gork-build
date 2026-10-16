@@ -15,10 +15,18 @@ package = "crossbeam-epoch"
 precise = "0.9.20"
 advisory = "RUSTSEC-2026-0204"
 
+# quinn-proto 0.11.18 requires rand >=0.10.1. Select only this series;
+# the inherited workspace also contains rand 0.8 and must retain that API.
+[[floor]]
+package = "rand"
+series = "0.10"
+precise = "0.10.1"
+advisory = "RUSTSEC-2026-0097"
+
 [[floor]]
 package = "quinn-proto"
-precise = "0.11.15"
-advisory = "RUSTSEC-2026-0185"
+precise = "0.11.18"
+advisory = "RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341, RUSTSEC-2026-0342"
 
 [[floor]]
 package = "webbrowser"
@@ -27,5 +35,5 @@ advisory = "RUSTSEC-2026-0257"
 
 [[floor]]
 package = "rustls"
-precise = "0.23.45"
-advisory = "RUSTSEC-2026-0285"
+precise = "0.23.46"
+advisory = "RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349"
