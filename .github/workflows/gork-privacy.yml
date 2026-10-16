@@ -6,13 +6,14 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: gork-privacy-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -23,6 +24,7 @@ env:
 
 jobs:
   patch-lint:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: Patch queue lint
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -40,6 +42,7 @@ jobs:
         run: python3 maint/scripts/patchctl.py lint
 
   privacy-contracts:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: Privacy contracts
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -90,6 +93,7 @@ jobs:
             --exclude-group egress
 
   cargo-audit:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -120,6 +124,7 @@ jobs:
         run: python3 maint/scripts/patchctl.py verify --only cargo-audit
 
   clippy:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -174,6 +179,7 @@ jobs:
             -- -D warnings
 
   fmt:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: Format
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -202,6 +208,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   build-gork:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: Build gork
     runs-on: ubuntu-latest
     timeout-minutes: 120
