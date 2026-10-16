@@ -28,6 +28,9 @@ jobs:
           git config --global user.email "gork-ci@users.noreply.github.com"
           git config --global user.name "Gork CI"
 
+      - name: JSON report regression
+        run: python3 maint/scripts/test_patchctl_report.py
+
       - name: Cache upstream clone
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
