@@ -1,0 +1,113 @@
+From 713445b0dd14b14b3f06f6638aa01a05f1ddaa26 Mon Sep 17 00:00:00 2001
+From: Davy <95214375+thedavidweng@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:55:54 -0700
+Subject: [PATCH] zip-security: require zip 9 and propagate entry-name errors
+
+Gork-Patch-Id: zip-security
+---
+ Cargo.toml                                       |  2 +-
+ crates/codegen/xai-grok-tools/Cargo.toml         |  2 +-
+ .../src/implementations/read_file/pptx.rs        |  6 +++++-
+ crates/codegen/xai-grok-update/Cargo.toml        |  2 +-
+ .../xai-grok-update/src/windows_payload.rs       | 16 +++++++++-------
+ 5 files changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index cedf2365..f219e800 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -381,7 +381,7 @@ xai-tool-types = { path = "crates/common/xai-tool-types" }
+ xai-tracing = { path = "crates/common/xai-tracing" }
+ xai-tty-utils = { path = "crates/codegen/xai-tty-utils" }
+ zbus = { version = "5" }
+-zip = "3"
++zip = "9"
+ zstd = "0.13"
+ 
+ [profile.release]
+diff --git a/crates/codegen/xai-grok-tools/Cargo.toml b/crates/codegen/xai-grok-tools/Cargo.toml
+index 61d5a9af..d68b0dba 100644
+--- a/crates/codegen/xai-grok-tools/Cargo.toml
++++ b/crates/codegen/xai-grok-tools/Cargo.toml
+@@ -41,7 +41,7 @@ pdf_oxide = { workspace = true }
+ # `workspace = true`: the workspace `zip` pin has default features on, which
+ # drag aes/bzip2/lzma/zstd into the shipped pager binary. PPTX entries are
+ # only ever stored or deflated.
+-zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
++zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+ quick-xml = { workspace = true }
+ indexmap = { workspace = true, features = ["serde"] }
+ minijinja = { version = "2", features = ["custom_syntax"] }
+diff --git a/crates/codegen/xai-grok-tools/src/implementations/read_file/pptx.rs b/crates/codegen/xai-grok-tools/src/implementations/read_file/pptx.rs
+index c10b2c9a..317b9d11 100644
+--- a/crates/codegen/xai-grok-tools/src/implementations/read_file/pptx.rs
++++ b/crates/codegen/xai-grok-tools/src/implementations/read_file/pptx.rs
+@@ -32,8 +32,12 @@ pub(crate) fn extract_pptx_text_from_bytes(bytes: &[u8]) -> Result<String, Strin
+ 
+     // Collect slide numbers from `ppt/slides/slideN.xml` entries and sort
+     // numerically so slide ordering matches the presentation.
+-    let mut slide_numbers: Vec<u32> = archive
++    let names = archive
+         .file_names()
++        .collect::<Result<Vec<_>, _>>()
++        .map_err(|e| format!("Failed to decode PPTX entry name: {e}"))?;
++    let mut slide_numbers: Vec<u32> = names
++        .into_iter()
+         .filter_map(|name| {
+             name.strip_prefix("ppt/slides/slide")?
+                 .strip_suffix(".xml")?
+diff --git a/crates/codegen/xai-grok-update/Cargo.toml b/crates/codegen/xai-grok-update/Cargo.toml
+index 1460ee46..34b3ebe2 100644
+--- a/crates/codegen/xai-grok-update/Cargo.toml
++++ b/crates/codegen/xai-grok-update/Cargo.toml
+@@ -38,7 +38,7 @@ sha2 = { workspace = true }
+ xai-tty-utils = { workspace = true }
+ # MinGit archive extraction. Not `workspace = true`: the workspace pin has
+ # default features on (aes/bzip2/lzma/zstd); MinGit entries are only deflated.
+-zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
++zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+ libc = { workspace = true }
+diff --git a/crates/codegen/xai-grok-update/src/windows_payload.rs b/crates/codegen/xai-grok-update/src/windows_payload.rs
+index 2c3bb7b5..b90b6f5a 100644
+--- a/crates/codegen/xai-grok-update/src/windows_payload.rs
++++ b/crates/codegen/xai-grok-update/src/windows_payload.rs
+@@ -150,17 +150,19 @@ pub(super) fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
+     let mut total: u64 = 0;
+     for index in 0..archive.len() {
+         let mut entry = archive.by_index(index).context("read zip entry")?;
+-        let Some(relative) = entry.enclosed_name() else {
+-            anyhow::bail!("archive entry escapes the destination: {}", entry.name());
+-        };
+-        if relative
++        let entry_name = entry.name().context("decode zip entry name")?.into_owned();
++        // Validate the original name before zip normalizes dot components.
++        if Path::new(&entry_name)
+             .components()
+             .any(|c| !matches!(c, Component::Normal(_)))
+         {
+-            anyhow::bail!("archive entry escapes the destination: {}", entry.name());
++            anyhow::bail!("archive entry escapes the destination: {}", entry_name);
+         }
++        let Some(relative) = entry.enclosed_name() else {
++            anyhow::bail!("archive entry escapes the destination: {}", entry_name);
++        };
+         if entry.is_symlink() {
+-            anyhow::bail!("archive entry is a symlink: {}", entry.name());
++            anyhow::bail!("archive entry is a symlink: {}", entry_name);
+         }
+         let out = dest.join(relative);
+         if entry.is_dir() {
+@@ -174,7 +176,7 @@ pub(super) fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
+             std::fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
+         let budget = MAX_MINGIT_EXTRACTED_BYTES - total + 1;
+         let written = std::io::copy(&mut entry.by_ref().take(budget), &mut out_file)
+-            .with_context(|| format!("extract {}", entry.name()))?;
++            .with_context(|| format!("extract {}", entry_name))?;
+         total += written;
+         if total > MAX_MINGIT_EXTRACTED_BYTES {
+             anyhow::bail!("archive expands past the {MAX_MINGIT_EXTRACTED_BYTES}-byte cap");
+-- 
+2.54.0 (Apple Git-157)
+

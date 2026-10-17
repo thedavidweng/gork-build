@@ -37,3 +37,10 @@ advisory = "RUSTSEC-2026-0257"
 package = "rustls"
 precise = "0.23.46"
 advisory = "RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349"
+
+# pdf_oxide permits this compatible office_oxide release, whose ZIP parser
+# moves from vulnerable zip 8 to zip 9. Direct users require zip 9 in 0072.
+[[floor]]
+package = "office_oxide"
+precise = "0.1.15"
+advisory = "RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369"
