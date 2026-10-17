@@ -77,6 +77,13 @@ once upstream catches up the floor is a no-op and should be deleted. Never add
 ordinary version bumps here — drift from upstream is the failure mode, and the
 `cargo audit` required check is the gate that tells us when a floor is needed.
 
+ZIP extraction advisories RUSTSEC-2026-0367/0368/0369 require a major upgrade:
+`0072-zip-security.patch` moves the three direct manifest requirements from
+zip 3 to zip 9. The office_oxide security floor also moves pdf_oxide's transitive
+ZIP parser from zip 8 to zip 9. Keep the audit and archive tests enabled; this
+cannot be fixed by a lock-only floor against the old major requirements.
+
+
 Dependabot is deliberately muted (`.github/dependabot.yml`,
 automated-security-fixes off): automated bump PRs would decouple the tree from
 upstream. Action pins in workflows are bumped manually in `maint/control/`
