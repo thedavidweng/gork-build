@@ -1,16 +1,16 @@
-From 29dc0326b23d9b748f7f43c9a3ddacb4e71631de Mon Sep 17 00:00:00 2001
+From 713445b0dd14b14b3f06f6638aa01a05f1ddaa26 Mon Sep 17 00:00:00 2001
 From: Davy <95214375+thedavidweng@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 21:55:54 -0700
 Subject: [PATCH] zip-security: require zip 9 and propagate entry-name errors
 
 Gork-Patch-Id: zip-security
 ---
- Cargo.toml                                               | 2 +-
- crates/codegen/xai-grok-tools/Cargo.toml                 | 2 +-
- .../xai-grok-tools/src/implementations/read_file/pptx.rs | 6 +++++-
- crates/codegen/xai-grok-update/Cargo.toml                | 2 +-
- crates/codegen/xai-grok-update/src/windows_payload.rs    | 9 +++++----
- 5 files changed, 13 insertions(+), 8 deletions(-)
+ Cargo.toml                                       |  2 +-
+ crates/codegen/xai-grok-tools/Cargo.toml         |  2 +-
+ .../src/implementations/read_file/pptx.rs        |  6 +++++-
+ crates/codegen/xai-grok-update/Cargo.toml        |  2 +-
+ .../xai-grok-update/src/windows_payload.rs       | 16 +++++++++-------
+ 5 files changed, 17 insertions(+), 11 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
 index cedf2365..f219e800 100644
@@ -70,32 +70,36 @@ index 1460ee46..34b3ebe2 100644
  [target.'cfg(target_os = "macos")'.dependencies]
  libc = { workspace = true }
 diff --git a/crates/codegen/xai-grok-update/src/windows_payload.rs b/crates/codegen/xai-grok-update/src/windows_payload.rs
-index 2c3bb7b5..6a678a7e 100644
+index 2c3bb7b5..b90b6f5a 100644
 --- a/crates/codegen/xai-grok-update/src/windows_payload.rs
 +++ b/crates/codegen/xai-grok-update/src/windows_payload.rs
-@@ -150,17 +150,18 @@ pub(super) fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
+@@ -150,17 +150,19 @@ pub(super) fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
      let mut total: u64 = 0;
      for index in 0..archive.len() {
          let mut entry = archive.by_index(index).context("read zip entry")?;
-+        let entry_name = entry.name().context("decode zip entry name")?.into_owned();
-         let Some(relative) = entry.enclosed_name() else {
+-        let Some(relative) = entry.enclosed_name() else {
 -            anyhow::bail!("archive entry escapes the destination: {}", entry.name());
-+            anyhow::bail!("archive entry escapes the destination: {}", entry_name);
-         };
-         if relative
+-        };
+-        if relative
++        let entry_name = entry.name().context("decode zip entry name")?.into_owned();
++        // Validate the original name before zip normalizes dot components.
++        if Path::new(&entry_name)
              .components()
              .any(|c| !matches!(c, Component::Normal(_)))
          {
 -            anyhow::bail!("archive entry escapes the destination: {}", entry.name());
 +            anyhow::bail!("archive entry escapes the destination: {}", entry_name);
          }
++        let Some(relative) = entry.enclosed_name() else {
++            anyhow::bail!("archive entry escapes the destination: {}", entry_name);
++        };
          if entry.is_symlink() {
 -            anyhow::bail!("archive entry is a symlink: {}", entry.name());
 +            anyhow::bail!("archive entry is a symlink: {}", entry_name);
          }
          let out = dest.join(relative);
          if entry.is_dir() {
-@@ -174,7 +175,7 @@ pub(super) fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
+@@ -174,7 +176,7 @@ pub(super) fn extract_zip(zip_path: &Path, dest: &Path) -> anyhow::Result<()> {
              std::fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
          let budget = MAX_MINGIT_EXTRACTED_BYTES - total + 1;
          let written = std::io::copy(&mut entry.by_ref().take(budget), &mut out_file)
